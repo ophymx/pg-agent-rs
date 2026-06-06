@@ -1,0 +1,24 @@
+[package]
+name        = "pg-agentd"
+description = "pg_agentd — coordinator daemon for pgpool-II clusters. Runs on every PostgreSQL backend, owns local PostgreSQL operations and cluster coordination over mTLS gRPC."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "pg_agentd"
+path = "src/main.rs"
+
+[dependencies]
+pg-agent-core = { workspace = true }
+
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio-util         = { workspace = true }
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+sd-notify          = { workspace = true }

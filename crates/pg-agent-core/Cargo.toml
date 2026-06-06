@@ -1,0 +1,64 @@
+[package]
+name        = "pg-agent-core"
+description = "Core types and traits for pg_agent: Agent, config, peers, pgstandby, db, systemd, walstore, maintenance, replay markers, healthz, certreload, preflight."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+pg-agent-proto    = { workspace = true }
+pg-agent-hookspec = { workspace = true }
+
+# Async + IO
+tokio       = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "signal", "sync", "time"] }
+tokio-util  = { workspace = true }
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+
+# gRPC
+tonic       = { workspace = true, features = ["codegen", "prost", "transport", "tls"] }
+prost       = { workspace = true }
+prost-types = { workspace = true }
+
+# Web (healthz + REST)
+axum  = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+tower = { workspace = true }
+http  = { workspace = true }
+
+# TLS
+rustls         = { workspace = true }
+tokio-rustls   = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser    = { workspace = true }
+
+# Storage / DB / system
+tokio-postgres    = { workspace = true, features = ["with-chrono-0_4"] }
+deadpool-postgres = { workspace = true }
+zbus              = { workspace = true }
+
+# Config / serde
+serde      = { workspace = true }
+serde_json = { workspace = true }
+toml       = { workspace = true }
+
+# Observability
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Misc
+arc-swap  = { workspace = true }
+thiserror = { workspace = true }
+anyhow    = { workspace = true }
+regex     = { workspace = true }
+sha2      = { workspace = true }
+hex       = { workspace = true }
+chrono    = { workspace = true }
+rand      = { workspace = true }
+libc      = { workspace = true }
+nix       = { workspace = true }

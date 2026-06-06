@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package pgagentpb;
+
+// OpResult is returned by all non-streaming operations.
+message OpResult {
+  bool   ok      = 1;
+  string message = 2; // human-readable error or status
+}
+
+// OpProgress is streamed by long-running data-directory operations.
+message OpProgress {
+  int64  bytes_done  = 1;
+  int64  bytes_total = 2; // 0 when unknown
+  string phase       = 3; // e.g. "streaming", "rewinding", "done"
+  string message     = 4;
+}
+
+// NodeStatus describes the current state of the local PostgreSQL instance.
+// `is_postgres_running` / `is_pgpool_running` carry the actual systemd active
+// state when their `_status_ok` companion is true, and a default `false`
+// when the agent could not reach systemd. Treat them as "stopped" only when
+// the corresponding `_status_ok` is true; otherwise the field is unknown.
+message NodeStatus {
+  bool   is_running              = 1;
+  bool   is_in_recovery          = 2; // true = standby, false = primary
+  bool   is_ready                = 3; // accepting connections AND every readiness probe succeeded
+  int64  replication_lag_bytes   = 4; // 0 if primary or unknown
+  string replication_state       = 5; // "streaming", "catchup", "" (primary)
+  bool   is_postgres_running     = 6;
+  bool   is_pgpool_running       = 7;
+  bool   is_postgres_status_ok   = 8;
+  bool   is_pgpool_status_ok     = 9;
+}
+
+message GetStatusRequest {}
+message NodeConfigRequest {}
+
+message NodeConfigResponse {
+  int32  pg_port     = 1;
+  string pg_data_dir = 2;
+}

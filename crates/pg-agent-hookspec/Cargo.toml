@@ -1,0 +1,12 @@
+[package]
+name        = "pg-agent-hookspec"
+description = "Positional-argument schemas for every pgpool-II and PostgreSQL hook pg_agent dispatches. Shared between pg_agentc (parser) and pg_agentctl (printer/validator)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+thiserror = { workspace = true }

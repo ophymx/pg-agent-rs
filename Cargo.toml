@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["pg-agent-rs contributors"]
+repository = "https://github.com/ophymx/pg-agent-rs"
+
+[workspace.dependencies]
+# Internal
+pg-agent-proto    = { path = "crates/pg-agent-proto" }
+pg-agent-hookspec = { path = "crates/pg-agent-hookspec" }
+pg-agent-core     = { path = "crates/pg-agent-core" }
+
+# Async runtime
+tokio       = { version = "1.40", default-features = false }
+tokio-util  = { version = "0.7" }
+futures-core = { version = "0.3" }
+futures-util = { version = "0.3" }
+async-trait = { version = "0.1" }
+bytes       = { version = "1" }
+
+# gRPC / proto
+tonic       = { version = "0.12", default-features = false }
+prost       = { version = "0.13" }
+prost-types = { version = "0.13" }
+tonic-build = { version = "0.12" }
+
+# Web (healthz + REST)
+axum  = { version = "0.7" }
+hyper = { version = "1" }
+tower = { version = "0.5" }
+http  = { version = "1" }
+
+# TLS
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls   = { version = "0.26" }
+rustls-pemfile = { version = "2" }
+x509-parser    = { version = "0.16" }
+
+# Storage / DB / system
+tokio-postgres    = { version = "0.7", default-features = false }
+deadpool-postgres = { version = "0.14" }
+zbus              = { version = "5", default-features = false, features = ["tokio"] }
+
+# Config / serde
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+toml       = { version = "0.8" }
+
+# Observability
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Misc
+arc-swap  = { version = "1.7" }
+thiserror = { version = "2" }
+anyhow    = { version = "1" }
+regex     = { version = "1" }
+sha2      = { version = "0.10" }
+hex       = { version = "0.4" }
+chrono    = { version = "0.4", features = ["serde"] }
+rand      = { version = "0.8" }
+libc      = { version = "0.2" }
+nix       = { version = "0.29", features = ["signal", "fs"] }
+sd-notify = { version = "0.4" }
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"

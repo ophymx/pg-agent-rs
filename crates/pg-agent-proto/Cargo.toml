@@ -1,0 +1,17 @@
+[package]
+name        = "pg-agent-proto"
+description = "Generated tonic/prost types for pg_agent's PgAgentLocal and PgAgentPeer services."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+tonic       = { workspace = true, features = ["codegen", "prost", "transport"] }
+prost       = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

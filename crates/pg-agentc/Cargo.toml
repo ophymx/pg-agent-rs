@@ -1,0 +1,27 @@
+[package]
+name        = "pg-agentc"
+description = "pg_agentc — pgpool-II hook client for pg_agent. Thin forwarder: marshals pgpool's positional arguments into a single gRPC call on the local Unix socket, then exits."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "pg_agentc"
+path = "src/main.rs"
+
+# Deliberately tiny — no pg-agent-core dep. The hook client carries no
+# config and resolves no nodes (SPEC §17 invariant 14).
+[dependencies]
+pg-agent-proto    = { workspace = true }
+pg-agent-hookspec = { workspace = true }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tonic = { workspace = true, features = ["codegen", "prost", "transport"] }
+tower = { workspace = true }
+hyper = { workspace = true }
+http  = { workspace = true }
+
+anyhow = { workspace = true }

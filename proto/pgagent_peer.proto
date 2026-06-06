@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package pgagentpb;
+
+import "common.proto";
+
+// PgAgentPeer — served on mTLS TCP port 9701.
+//
+// Only peer agents connect here. Client cert SAN must match a known node.
+//
+// Data transport model:
+//   WAL segments (16 MiB each): streamed via FetchWal gRPC server-streaming.
+//   Large binary data (pg_basebackup, pg_rewind): those tools connect
+//     directly to PostgreSQL's replication protocol; the agent spawns them
+//     locally and reports progress only.
+
+message StartRequest {}
+message StopRequest {}
+message ReloadRequest {}
+message ReloadPgpoolRequest {}
+message PromoteRequest {}
+
+message CreateSlotRequest { string slot_name = 1; }
+message DropSlotRequest   { string slot_name = 1; }
+
+message ConfigureStandbyRequest {
+  string primary_host = 1;
+  int32  primary_port = 2; // > 0
+  string repl_user    = 3;
+  string slot_name    = 4;
+}
+
+message BasebackupRequest {
+  string primary_host = 1;
+  int32  primary_port = 2; // > 0
+  string repl_user    = 3;
+  string slot_name    = 4;
+}
+
+message RewindRequest {
+  string primary_host = 1;
+  int32  primary_port = 2; // > 0
+  string repl_user    = 3;
+}
+
+message FetchWalRequest {
+  string wal_file = 1; // ^([0-9A-F]{24}|[0-9A-F]{8}\.history)$
+}
+
+message WalChunk {
+  bytes data = 1;
+}
+
+message RemoveVipRequest {
+  string address = 1;
+  string device  = 2;
+}
+
+service PgAgentPeer {
+  rpc Start            (StartRequest)            returns (OpResult);
+  rpc Stop             (StopRequest)             returns (OpResult);
+  rpc Reload           (ReloadRequest)           returns (OpResult);
+  rpc ReloadPgpool     (ReloadPgpoolRequest)     returns (OpResult);
+  rpc Promote          (PromoteRequest)          returns (OpResult);
+  rpc CreateSlot       (CreateSlotRequest)       returns (OpResult);
+  rpc DropSlot         (DropSlotRequest)         returns (OpResult);
+  rpc ConfigureStandby (ConfigureStandbyRequest) returns (OpResult);
+  rpc Basebackup       (BasebackupRequest)       returns (stream OpProgress);
+  rpc Rewind           (RewindRequest)           returns (stream OpProgress);
+  rpc FetchWal         (FetchWalRequest)         returns (stream WalChunk);
+  rpc RemoveVip        (RemoveVipRequest)        returns (OpResult);
+  rpc GetStatus        (GetStatusRequest)        returns (NodeStatus);
+  rpc GetNodeConfig    (NodeConfigRequest)       returns (NodeConfigResponse);
+}

@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package pgagentpb;
+
+import "common.proto";
+
+// PgAgentLocal — served on Unix socket /run/pg_agentd.sock.
+//
+// Only pg_agentc and local tooling connect here. No authentication beyond
+// filesystem permissions on the socket.
+//
+// Field-level validation rules (enforced in Rust handlers, not by
+// protovalidate):
+//   - slot_name, dest_path, id (where present): min_len 1
+//   - wal_file: matches ^([0-9A-F]{24}|[0-9A-F]{8}\.history)$
+//   - primary_port: > 0
+
+message NodeRef {
+  int32  id       = 1; // pgpool node ID (0-based); -1 means unset
+  string hostname = 2;
+  int32  pg_port  = 3; // informational; agent uses config-sourced value
+  string pg_data  = 4; // informational; same
+}
+
+message FailoverRequest {
+  NodeRef detached    = 1;
+  NodeRef new_main    = 2;
+  NodeRef old_primary = 3;
+  NodeRef old_main    = 4;
+}
+
+message FollowPrimaryRequest {
+  NodeRef detached    = 1;
+  NodeRef new_primary = 2;
+  NodeRef old_main    = 3;
+  NodeRef old_primary = 4;
+}
+
+message RecoveryRequest {
+  NodeRef standby = 1;
+  NodeRef primary = 2;
+}
+
+message RemoteStartRequest {
+  NodeRef target = 1;
+}
+
+message EscalationRequest {}
+
+message RestoreWalRequest {
+  string wal_file  = 1; // %f — must match ^([0-9A-F]{24}|[0-9A-F]{8}\.history)$
+  string dest_path = 2; // %p — destination path on this standby (absolute, inside PGDATA)
+}
+
+message MaintenanceIntent {
+  string id            = 1;
+  string op            = 2;
+  string status        = 3; // "pending" | "done" | "abandoned"
+  bytes  payload       = 4;
+  int32  attempts      = 5;
+  string last_error    = 6;
+  string created_at    = 7; // RFC3339Nano UTC
+  string updated_at    = 8;
+  string next_retry_at = 9; // empty when unset
+}
+
+message ListMaintenanceRequest {
+  repeated string statuses = 1;
+}
+
+message SkippedMaintenanceIntent {
+  string path  = 1;
+  string error = 2;
+}
+
+message ListMaintenanceResponse {
+  repeated MaintenanceIntent        intents = 1;
+  repeated SkippedMaintenanceIntent skipped = 2;
+}
+
+message GetMaintenanceRequest {
+  string id = 1; // min_len 1
+}
+
+message RetryMaintenanceRequest {
+  string id = 1; // min_len 1
+}
+
+message ClusterInitRequest {
+  optional int32 only_node_id = 1;
+}
+
+message ClusterInitStandbyResult {
+  int32  node_id  = 1;
+  string hostname = 2;
+  bool   ok       = 3;
+  string message  = 4;
+}
+
+message ClusterInitResponse {
+  bool                              ok        = 1;
+  string                            message   = 2;
+  string                            repl_user = 3;
+  repeated ClusterInitStandbyResult standbys  = 4;
+}
+
+service PgAgentLocal {
+  rpc Failover         (FailoverRequest)         returns (OpResult);
+  rpc FollowPrimary    (FollowPrimaryRequest)    returns (OpResult);
+  rpc Recovery1stStage (RecoveryRequest)         returns (OpResult);
+  rpc RemoteStart      (RemoteStartRequest)      returns (OpResult);
+  rpc Escalation       (EscalationRequest)       returns (OpResult);
+  rpc RestoreWal       (RestoreWalRequest)       returns (OpResult);
+
+  rpc GetStatus        (GetStatusRequest)        returns (NodeStatus);
+  rpc GetNodeConfig    (NodeConfigRequest)       returns (NodeConfigResponse);
+
+  rpc ClusterInit      (ClusterInitRequest)      returns (ClusterInitResponse);
+
+  rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);
+  rpc GetMaintenance   (GetMaintenanceRequest)   returns (MaintenanceIntent);
+  rpc RetryMaintenance (RetryMaintenanceRequest) returns (OpResult);
+}

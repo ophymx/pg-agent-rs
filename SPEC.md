@@ -947,6 +947,18 @@ body is informational.
 }
 ```
 
+> **Wire-compat caveat:** the field is named `backends_up` in the Go version
+> but is populated from `pcp_node_count`, which per upstream docs
+> (`pcp-node-count.html`) "displays the total number of database nodes defined
+> in `pgpool.conf` … does not distinguish between nodes status, ie
+> attached/detached. ALL nodes are counted." So the field is really
+> `backends_configured`. The Rust port has two reasonable options:
+> (a) keep the misleading name for wire compatibility (status code is the real
+> contract — see §9.1 — so anyone parsing the body is doing it for ops, not
+> SLO routing); or (b) rename to `backends_configured` and additionally query
+> `pcp_node_info` for each node to compute a true up-count. Pick (a) by
+> default; (b) is a follow-up if operators ask for it.
+
 ### 9.3 TLS
 
 Reuses the peer cert (`[tls]`). Server-only TLS (no client cert). If TLS is
@@ -1118,6 +1130,9 @@ pcp_node_count  -h localhost -p <pcp_port> -U <pcp_user> -w
 format `localhost:<port>:<user>:<password>`). The agent never reads or
 handles the PCP password directly.
 
+`pcp_node_count` returns the number of backends **defined** in `pgpool.conf`,
+not the number currently up. See §9.2 for the consequence on `/healthz`.
+
 ### 11.4 Progress scanner (shared)
 
 Both pg_basebackup and pg_rewind print progress to stderr with carriage
@@ -1184,6 +1199,91 @@ and sends a final `OpProgress { phase = "done" }` on success.
 For RPCs that dial peers (`gen-pgpool`, `cluster init`) the CLI builds its
 own `PeerPool` from config (it does not go through the local daemon).
 Maintenance + `gen-pgpool`'s local-node query go through the Unix socket.
+
+### 13.1 Ansible integration
+
+Cluster deployment is expected to be driven by Ansible. The agent's job is
+to **give Ansible good seams where they help and stay out of the way
+otherwise**. Concretely:
+
+**What Ansible owns** (the agent never does these — duplicating them would
+fight the deployment tooling):
+
+- Installing the `.deb` / binaries themselves.
+- Writing `/etc/pg_agent/config.toml`, `/etc/default/pg_agentd`,
+  `/etc/polkit-1/rules.d/50-pg-agent.rules`, TLS cert material.
+- Enabling / starting `pg_agentd.service` and `pgpool2.service`. The
+  package explicitly does **not** auto-enable (SPEC §10.4).
+- Writing `pgpool.conf`, `postgresql.conf`, `pg_hba.conf`, `pool_passwd`,
+  `.pgpass`, `.pcppass`, the `pgpool_node_id` file.
+- `CREATE EXTENSION pgpool_recovery` and replication-role bootstrap (or
+  delegate the role part to `pg_agentctl cluster init` — operator's call).
+
+**What the agent exposes that Ansible plays well with:**
+
+- **Stable exit codes** across every `pg_agentctl` subcommand:
+  - `0` — success / clean / no action needed
+  - `1` — work to do, hard failure, or any check returned `ERR`
+  - `2` — usage / argument error
+  This lets Ansible `register:` + `failed_when:` cleanly.
+
+- **`--json` everywhere** that produces output an operator would parse.
+  Stable schemas:
+
+  ```
+  pg_agentctl --json print-hooks       # for the `template` module
+  pg_agentctl --json preflight ...
+  pg_agentctl --json maintenance list
+  pg_agentctl --json cluster status    # v1.x
+  ```
+
+- **No interactive prompts, ever.** Destructive commands take `--force`
+  rather than reading from stdin.
+
+- **Idempotent by default.** Re-running `cluster init`, `maintenance
+  retry`, or a future `cluster pause` against an already-correct state is
+  a no-op, not an error. This makes `changed_when:` honest.
+
+- **Atomic file writes** for everything operator-facing
+  (`gen-pgpool --write`, the daemon's symlink repair). Partial writes
+  never appear under target paths.
+
+- **SIGHUP reload, not restart**, for cert rotation. The systemd unit's
+  `ExecReload=/bin/kill -HUP $MAINPID` makes the Ansible
+  `ansible.builtin.service: state=reloaded` idiom Just Work.
+
+- **`preflight` is the universal post-deploy assertion.** Running it as a
+  task after every config change gives Ansible a single-call "is this node
+  ready?" probe. The JSON output is structured per-check so playbooks can
+  conditionally remediate (e.g. install the polkit rule iff that check is
+  `ERR`).
+
+**Recommended playbook shape:**
+
+```yaml
+- name: pg-agent preflight
+  ansible.builtin.command: pg_agentctl --json preflight
+  register: preflight
+  changed_when: false
+  failed_when: (preflight.stdout | from_json).has_errors
+
+- name: render pgpool include from live cluster
+  ansible.builtin.command: pg_agentctl gen-pgpool --write /etc/pgpool2/pg_agent.conf
+  register: gen
+  changed_when: "'wrote' in gen.stderr"
+  notify: reload pgpool
+```
+
+**Anti-patterns the agent should never adopt** (because they make
+Ansible's life harder):
+
+- Reading state from environment variables that aren't documented.
+- Writing to paths outside `<agent_dir>` / `$PGDATA` / `/run/pg_agentd/`
+  unless explicitly told to (e.g. `gen-pgpool --write <path>`).
+- Bundling its own service-management of pgpool / postgres beyond the
+  D-Bus calls already specified.
+- Auto-creating directories Ansible owns (`/etc/pg_agent/`,
+  `/etc/pgpool2/`).
 
 ---
 
