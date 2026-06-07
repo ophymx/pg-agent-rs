@@ -131,11 +131,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             // render fragment; atomic write or stdout.
             Ok(ExitCode::from(2))
         }
-        Cmd::Preflight { .. } => {
-            // TODO(v1): load config; optionally open local DB; call
-            // pg_agent_core::preflight::preflight(); print human or JSON.
-            Ok(ExitCode::from(2))
-        }
+        Cmd::Preflight { config, skip_db } => preflight(config, skip_db, cli.json).await,
         Cmd::Maintenance { .. } => Ok(ExitCode::from(2)),
         Cmd::Cluster { .. } => Ok(ExitCode::from(2)),
     }
@@ -167,6 +163,57 @@ fn print_hooks(as_json: bool) {
             hookspec::restore_command(),
             width = KEY_WIDTH
         );
+    }
+}
+
+async fn preflight(config_path: PathBuf, skip_db: bool, json: bool) -> anyhow::Result<ExitCode> {
+    use pg_agent_core::localdb::{LocalDb, PgLocalDb};
+    use std::sync::Arc;
+
+    let cfg = config_loader::load_config(&config_path)?;
+
+    // Try to open a local DB connection unless explicitly skipped.
+    // If the connect fails (PG not up yet, socket dir mismatch), pass
+    // None and the preflight body downgrades the DB-backed checks to
+    // a single WARN. That's the right shape for "pre-bootstrap"
+    // preflights where PG may not be running yet.
+    let db: Option<Arc<dyn LocalDb>> = if skip_db {
+        None
+    } else {
+        let socket_dir = cfg
+            .postgres
+            .socket_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("postgres.socket_dir unset after apply_defaults"))?;
+        let port = cfg
+            .postgres
+            .port
+            .ok_or_else(|| anyhow::anyhow!("postgres.port unset after apply_defaults"))?;
+        match PgLocalDb::connect(&socket_dir, port).await {
+            Ok(db) => Some(Arc::new(db) as Arc<dyn LocalDb>),
+            Err(e) => {
+                eprintln!("warning: local DB unreachable ({e}); skipping DB-backed checks");
+                None
+            }
+        }
+    };
+
+    let report = pg_agent_core::preflight::preflight(&cfg, db, false).await;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json())
+                .expect("preflight report serialisation")
+        );
+    } else {
+        report.print(&mut std::io::stdout())?;
+    }
+
+    if report.has_errors() {
+        Ok(ExitCode::FAILURE)
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
 }
 
