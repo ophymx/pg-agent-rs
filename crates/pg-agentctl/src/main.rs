@@ -133,7 +133,11 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Cmd::Preflight { config, skip_db } => preflight(config, skip_db, cli.json).await,
         Cmd::Maintenance { .. } => Ok(ExitCode::from(2)),
-        Cmd::Cluster { .. } => Ok(ExitCode::from(2)),
+        Cmd::Cluster { cmd } => match cmd {
+            ClusterCmd::Init { only_node, config } => {
+                cluster_init(config, only_node, cli.socket.as_deref(), cli.json).await
+            }
+        },
     }
 }
 
@@ -214,6 +218,64 @@ async fn preflight(config_path: PathBuf, skip_db: bool, json: bool) -> anyhow::R
         Ok(ExitCode::FAILURE)
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+async fn cluster_init(
+    config_path: PathBuf,
+    only_node: Option<i32>,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::ClusterInitRequest;
+
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .cluster_init(ClusterInitRequest {
+            only_node_id: only_node,
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("ClusterInit RPC failed: {s}"))?
+        .into_inner();
+
+    if json {
+        let payload = serde_json::json!({
+            "ok":        resp.ok,
+            "message":   resp.message,
+            "repl_user": resp.repl_user,
+            "standbys":  resp.standbys.iter().map(|s| serde_json::json!({
+                "node_id":  s.node_id,
+                "hostname": s.hostname,
+                "ok":       s.ok,
+                "message":  s.message,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        if !resp.message.is_empty() {
+            println!("{}", resp.message);
+        }
+        if !resp.repl_user.is_empty() {
+            println!("repl_user: {}", resp.repl_user);
+        }
+        if !resp.standbys.is_empty() {
+            println!();
+            println!("standbys:");
+            for s in &resp.standbys {
+                let tag = if s.ok { "OK  " } else { "FAIL" };
+                println!(
+                    "  {} node {} ({})  {}",
+                    tag, s.node_id, s.hostname, s.message
+                );
+            }
+        }
+    }
+
+    if resp.ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
     }
 }
 
