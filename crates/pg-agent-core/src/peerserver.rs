@@ -27,8 +27,11 @@
 
 use crate::agent::NodeInfo;
 use crate::certreload::{extract_sans, CertReloader, ReloadingServerCertResolver};
+use crate::errors::AgentError;
 use crate::localdb::LocalDb;
-use crate::pgstandby::{allowed_slot_name, StandbyOps, WriteRecoveryConfOpts};
+use crate::pgstandby::{
+    allowed_slot_name, BasebackupOpts, ProgressCb, RewindOpts, StandbyOps, WriteRecoveryConfOpts,
+};
 use crate::systemd::Systemd;
 use crate::walstore::WalStore;
 use futures_core::Stream;
@@ -495,25 +498,128 @@ impl PgAgentPeer for PeerServer {
         ))
     }
 
-    // ----- streaming ops (TODO(v1)) -------------------------------------
+    // ----- streaming: subprocess-backed ----------------------------------
 
     async fn basebackup(
         &self,
-        _req: Request<BasebackupRequest>,
+        req: Request<BasebackupRequest>,
     ) -> Result<Response<Self::BasebackupStream>, Status> {
-        Err(Status::unimplemented("basebackup"))
+        let req = req.into_inner();
+        info!(
+            slot = %req.slot_name,
+            primary_host = %req.primary_host,
+            "peer: Basebackup"
+        );
+
+        let opts = BasebackupOpts {
+            primary_host: req.primary_host,
+            primary_port: u16::try_from(req.primary_port)
+                .map_err(|_| Status::invalid_argument("primary_port must fit in u16 and be > 0"))?,
+            repl_user: req.repl_user,
+            slot_name: req.slot_name,
+        };
+        opts.validate()
+            .map_err(|e| Status::invalid_argument(format!("invalid basebackup: {e}")))?;
+
+        // Refuse to wipe a live datadir. pg_basebackup itself refuses a
+        // non-empty target dir, and StandbyOps::basebackup clears `$PGDATA`
+        // contents — catching the "PG running" case here is the only way
+        // to keep us from blowing away a live cluster.
+        let pg_running = self.sd.status_postgres().await.map_err(internal)?;
+        if pg_running {
+            return Err(Status::failed_precondition(
+                "refusing to basebackup while postgres is running",
+            ));
+        }
+
+        let standby = self.standby.clone();
+        Ok(Response::new(spawn_progress_stream(
+            "streaming",
+            move |tx| async move { standby.basebackup(opts, Some(progress_cb(tx))).await },
+        )))
     }
+
     async fn rewind(
         &self,
-        _req: Request<RewindRequest>,
+        req: Request<RewindRequest>,
     ) -> Result<Response<Self::RewindStream>, Status> {
-        Err(Status::unimplemented("rewind"))
+        let req = req.into_inner();
+        info!(primary_host = %req.primary_host, "peer: Rewind");
+
+        let opts = RewindOpts {
+            primary_host: req.primary_host,
+            primary_port: u16::try_from(req.primary_port)
+                .map_err(|_| Status::invalid_argument("primary_port must fit in u16 and be > 0"))?,
+            repl_user: req.repl_user,
+        };
+        opts.validate()
+            .map_err(|e| Status::invalid_argument(format!("invalid rewind: {e}")))?;
+
+        let standby = self.standby.clone();
+        Ok(Response::new(spawn_progress_stream(
+            "rewinding",
+            move |tx| async move { standby.rewind(opts, Some(progress_cb(tx))).await },
+        )))
     }
+
+    // ----- streaming: WAL fetch ------------------------------------------
+
     async fn fetch_wal(
         &self,
-        _req: Request<FetchWalRequest>,
+        req: Request<FetchWalRequest>,
     ) -> Result<Response<Self::FetchWalStream>, Status> {
-        Err(Status::unimplemented("fetch_wal"))
+        let req = req.into_inner();
+        info!(wal_file = %req.wal_file, "peer: FetchWal");
+
+        if req.wal_file.is_empty() {
+            return Err(Status::invalid_argument("wal_file is required"));
+        }
+
+        // WalStore returns typed errors (WalNotFound / WalInvalid /
+        // other). Map them onto the corresponding gRPC codes so the
+        // archive_command on the requesting standby can pause vs. fail.
+        let file = self.wal.open_archive(&req.wal_file).await.map_err(|e| {
+            warn!(?e, wal_file = %req.wal_file, "peer: FetchWal open failed");
+            match e {
+                AgentError::WalNotFound(name) => {
+                    Status::not_found(format!("WAL segment not found: {name}"))
+                }
+                AgentError::WalInvalid { wal_file, reason } => {
+                    Status::invalid_argument(format!("invalid wal_file {wal_file:?}: {reason}"))
+                }
+                other => Status::internal(format!("open {}: {other}", req.wal_file)),
+            }
+        })?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<WalChunk, Status>>(4);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut file = file;
+            let mut buf = vec![0u8; WAL_CHUNK_SIZE];
+            loop {
+                let n = match file.read(&mut buf).await {
+                    Ok(0) => return, // EOF — channel closes when tx drops
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = tx.send(Err(Status::internal(format!("read: {e}")))).await;
+                        return;
+                    }
+                };
+                if tx
+                    .send(Ok(WalChunk {
+                        data: buf[..n].to_vec(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return; // Client dropped
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::FetchWalStream
+        ))
     }
 }
 
@@ -522,6 +628,62 @@ fn ok() -> OpResult {
         ok: true,
         message: String::new(),
     }
+}
+
+/// 1 MiB. Kept well under tonic's default 4 MiB max message size so a
+/// chunk + framing overhead never trips the encoder.
+const WAL_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Bounded buffer between the subprocess progress callback and the gRPC
+/// stream consumer. Progress events are non-essential — `try_send` drops
+/// new ones when the buffer fills, which is preferable to either
+/// `blocking_send` (deadlock risk from an async context) or unbounded
+/// growth.
+const PROGRESS_BUFFER: usize = 16;
+
+/// Build a `Fn(i64,i64)` progress callback that pushes "phase=streaming"
+/// OpProgress events into the given sender. Phase is fixed at the call
+/// site (`spawn_progress_stream` overwrites the final message); the cb
+/// only ever emits the intermediate phase.
+fn progress_cb(tx: tokio::sync::mpsc::Sender<Result<OpProgress, Status>>) -> ProgressCb {
+    Box::new(move |done, total| {
+        // try_send: drop the event rather than block the subprocess
+        // driver (which calls this from an async stderr-drain task).
+        let _ = tx.try_send(Ok(OpProgress {
+            phase: "streaming".to_string(),
+            bytes_done: done,
+            bytes_total: total,
+            message: String::new(),
+        }));
+    })
+}
+
+/// Spawn the subprocess driver, route its progress events into a tonic
+/// stream, and tack on a final `phase = "done"` (or an Internal error)
+/// once it returns. `intermediate_phase` is the label emitted by the
+/// progress callback — `"streaming"` for basebackup, `"rewinding"` for
+/// rewind. The final phase is always `"done"`.
+fn spawn_progress_stream<F, Fut>(intermediate_phase: &'static str, f: F) -> ProgressStream
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<Result<OpProgress, Status>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<OpProgress, Status>>(PROGRESS_BUFFER);
+    let driver_tx = tx.clone();
+    tokio::spawn(async move {
+        let result = f(driver_tx).await;
+        let final_msg = match result {
+            Ok(()) => Ok(OpProgress {
+                phase: "done".to_string(),
+                bytes_done: 0,
+                bytes_total: 0,
+                message: String::new(),
+            }),
+            Err(e) => Err(Status::internal(format!("{intermediate_phase}: {e}"))),
+        };
+        let _ = tx.send(final_msg).await;
+    });
+    Box::pin(ReceiverStream::new(rx)) as ProgressStream
 }
 
 /// Reject empty or non-alphabet slot names with InvalidArgument before
@@ -684,14 +846,39 @@ mod tests {
     #[derive(Default)]
     struct StubStandby {
         recovery_calls: StdMutex<Vec<WriteRecoveryConfOpts>>,
+        /// (bytes_done, bytes_total) pairs emitted via the progress
+        /// callback before the operation returns.
+        progress_steps: StdMutex<Vec<(i64, i64)>>,
+        /// When true, basebackup/rewind return Err instead of Ok.
+        fail: AtomicBool,
     }
 
     #[async_trait]
     impl StandbyOps for StubStandby {
-        async fn basebackup(&self, _: BasebackupOpts, _: Option<ProgressCb>) -> anyhow::Result<()> {
+        async fn basebackup(
+            &self,
+            _: BasebackupOpts,
+            progress: Option<ProgressCb>,
+        ) -> anyhow::Result<()> {
+            if let Some(cb) = &progress {
+                for (d, t) in self.progress_steps.lock().unwrap().iter() {
+                    cb(*d, *t);
+                }
+            }
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("stub basebackup boom");
+            }
             Ok(())
         }
-        async fn rewind(&self, _: RewindOpts, _: Option<ProgressCb>) -> anyhow::Result<()> {
+        async fn rewind(&self, _: RewindOpts, progress: Option<ProgressCb>) -> anyhow::Result<()> {
+            if let Some(cb) = &progress {
+                for (d, t) in self.progress_steps.lock().unwrap().iter() {
+                    cb(*d, *t);
+                }
+            }
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("stub rewind boom");
+            }
             Ok(())
         }
         async fn write_recovery_conf(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()> {
@@ -700,16 +887,49 @@ mod tests {
         }
     }
 
-    struct StubWal;
+    /// WalStore stub that serves files staged via `stage`. Missing files
+    /// surface as `WalNotFound`; names staged via `stage_invalid` surface
+    /// as `WalInvalid`.
+    #[derive(Default)]
+    struct StubWal {
+        archived: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
+        invalid: StdMutex<std::collections::HashSet<String>>,
+    }
+
+    impl StubWal {
+        fn stage(&self, name: &str, content: Vec<u8>) {
+            self.archived
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), content);
+        }
+        fn stage_invalid(&self, name: &str) {
+            self.invalid.lock().unwrap().insert(name.to_string());
+        }
+    }
 
     #[async_trait]
     impl WalStore for StubWal {
         async fn open_archive(
             &self,
-            _: &str,
+            wal_file: &str,
         ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, crate::errors::AgentError>
         {
-            Err(crate::errors::AgentError::WalNotFound("stub".into()))
+            if self.invalid.lock().unwrap().contains(wal_file) {
+                return Err(crate::errors::AgentError::WalInvalid {
+                    wal_file: wal_file.to_string(),
+                    reason: "stub invalid".to_string(),
+                });
+            }
+            let content = {
+                let archived = self.archived.lock().unwrap();
+                archived.get(wal_file).cloned()
+            };
+            match content {
+                Some(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))
+                    as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+                None => Err(crate::errors::AgentError::WalNotFound(wal_file.to_string())),
+            }
         }
         async fn write_restore(
             &self,
@@ -723,19 +943,25 @@ mod tests {
     /// Build a PeerServer + return Arc clones of stubs so the test can
     /// inspect call counters.
     #[allow(clippy::type_complexity)]
-    fn make_server() -> (PeerServer, Arc<StubSd>, Arc<StubDb>, Arc<StubStandby>) {
+    fn make_server() -> (
+        PeerServer,
+        Arc<StubSd>,
+        Arc<StubDb>,
+        Arc<StubStandby>,
+        Arc<StubWal>,
+    ) {
         let sd = Arc::new(StubSd::default());
         let db = Arc::new(StubDb::default());
         let standby = Arc::new(StubStandby::default());
-        let wal: Arc<dyn WalStore> = Arc::new(StubWal);
+        let wal = Arc::new(StubWal::default());
         let server = PeerServer::new(
             Arc::new(FakeNodeInfo),
             sd.clone(),
             db.clone(),
             standby.clone(),
-            wal,
+            wal.clone(),
         );
-        (server, sd, db, standby)
+        (server, sd, db, standby, wal)
     }
 
     // ----- read-only ------------------------------------------------------
@@ -813,7 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_calls_db() {
-        let (s, _sd, db, _standby) = make_server();
+        let (s, _sd, db, _standby, _wal) = make_server();
         s.promote(Request::new(PromoteRequest::default()))
             .await
             .unwrap();
@@ -824,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_slot_calls_db() {
-        let (s, _sd, db, _standby) = make_server();
+        let (s, _sd, db, _standby, _wal) = make_server();
         s.create_slot(Request::new(CreateSlotRequest {
             slot_name: "node1".into(),
         }))
@@ -835,7 +1061,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_slot_rejects_empty_name() {
-        let (s, _sd, db, _standby) = make_server();
+        let (s, _sd, db, _standby, _wal) = make_server();
         let err = s
             .create_slot(Request::new(CreateSlotRequest {
                 slot_name: String::new(),
@@ -848,7 +1074,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_slot_rejects_injection_attempt() {
-        let (s, _sd, db, _standby) = make_server();
+        let (s, _sd, db, _standby, _wal) = make_server();
         let err = s
             .create_slot(Request::new(CreateSlotRequest {
                 slot_name: "node1; DROP TABLE x;".into(),
@@ -861,7 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_slot_calls_db() {
-        let (s, _sd, db, _standby) = make_server();
+        let (s, _sd, db, _standby, _wal) = make_server();
         s.drop_slot(Request::new(DropSlotRequest {
             slot_name: "node1".into(),
         }))
@@ -886,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_standby_writes_recovery_conf() {
-        let (s, _sd, _db, standby) = make_server();
+        let (s, _sd, _db, standby, _wal) = make_server();
         s.configure_standby(Request::new(ConfigureStandbyRequest {
             primary_host: "primary.local".into(),
             primary_port: 5432,
@@ -904,7 +1130,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_standby_rejects_bad_host() {
-        let (s, _sd, _db, standby) = make_server();
+        let (s, _sd, _db, standby, _wal) = make_server();
         let err = s
             .configure_standby(Request::new(ConfigureStandbyRequest {
                 primary_host: "primary host=attacker".into(), // libpq injection attempt
@@ -964,19 +1190,234 @@ mod tests {
         assert!(err.message().contains("HAProxy"));
     }
 
-    // ----- streaming ops still unimplemented in this commit --------------
+    // ----- streaming: basebackup -----------------------------------------
+
+    fn valid_basebackup_req() -> BasebackupRequest {
+        BasebackupRequest {
+            primary_host: "primary.local".into(),
+            primary_port: 5432,
+            repl_user: "repl".into(),
+            slot_name: "node1".into(),
+        }
+    }
+
+    type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+    /// Drain a tonic streaming Response into a Vec, capped by a deadline.
+    async fn drain<T: 'static + Send>(resp: Response<BoxedStream<T>>) -> Result<Vec<T>, Status> {
+        use futures_util::StreamExt;
+        let mut stream = resp.into_inner();
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await {
+                Ok(Some(Ok(item))) => out.push(item),
+                Ok(Some(Err(e))) => return Err(e),
+                Ok(None) => return Ok(out),
+                Err(_) => panic!("stream drain timed out"),
+            }
+        }
+    }
 
     #[tokio::test]
-    async fn basebackup_returns_unimplemented() {
-        // `BasebackupStream` is `Pin<Box<dyn Stream>>` which doesn't impl
-        // Debug, so unwrap_err() won't compile — match instead.
-        let (s, ..) = make_server();
-        match s
-            .basebackup(Request::new(BasebackupRequest::default()))
+    async fn basebackup_streams_progress_then_done() {
+        let (s, _sd, _db, standby, _wal) = make_server();
+        standby
+            .progress_steps
+            .lock()
+            .unwrap()
+            .extend([(0, 1024), (512, 1024), (1024, 1024)]);
+        let resp = s
+            .basebackup(Request::new(valid_basebackup_req()))
             .await
-        {
-            Err(e) => assert_eq!(e.code(), tonic::Code::Unimplemented),
-            Ok(_) => panic!("expected unimplemented"),
+            .expect("basebackup");
+        let events = drain::<OpProgress>(resp).await.expect("stream");
+        // Final message is "done". Earlier ones are "streaming" with the
+        // bytes_done/total from the stub. Intermediate count may be lower
+        // than 3 if try_send dropped under a tight scheduler — accept any
+        // count as long as a "done" arrives.
+        assert!(events.iter().any(|e| e.phase == "done"));
+        assert_eq!(events.last().unwrap().phase, "done");
+        // At least one streaming event landed.
+        assert!(events
+            .iter()
+            .any(|e| e.phase == "streaming" && e.bytes_total == 1024));
+    }
+
+    #[tokio::test]
+    async fn basebackup_refuses_when_postgres_running() {
+        // StubSd defaults to pg_running=false; spin a tiny pg-running
+        // variant so basebackup's precondition check sees `true`.
+        struct PgRunning;
+        #[async_trait]
+        impl Systemd for PgRunning {
+            async fn start_postgres(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn stop_postgres(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn status_postgres(&self) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn status_pgpool(&self) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let server = PeerServer::new(
+            Arc::new(FakeNodeInfo),
+            Arc::new(PgRunning),
+            Arc::new(StubDb::default()),
+            Arc::new(StubStandby::default()),
+            Arc::new(StubWal::default()),
+        );
+        let result = server
+            .basebackup(Request::new(valid_basebackup_req()))
+            .await;
+        match result {
+            Err(e) => {
+                assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+                assert!(e.message().contains("postgres is running"));
+            }
+            Ok(_) => panic!("expected FailedPrecondition"),
+        }
+    }
+
+    #[tokio::test]
+    async fn basebackup_rejects_bad_host() {
+        let (s, ..) = make_server();
+        let mut req = valid_basebackup_req();
+        req.primary_host = "primary host=attacker".into();
+        let result = s.basebackup(Request::new(req)).await;
+        match result {
+            Err(e) => assert_eq!(e.code(), tonic::Code::InvalidArgument),
+            Ok(_) => panic!("expected InvalidArgument"),
+        }
+    }
+
+    #[tokio::test]
+    async fn basebackup_surface_subprocess_error_in_stream() {
+        let (s, _sd, _db, standby, _wal) = make_server();
+        standby.fail.store(true, Ordering::SeqCst);
+        let resp = s
+            .basebackup(Request::new(valid_basebackup_req()))
+            .await
+            .expect("basebackup call should accept; failure surfaces in-stream");
+        let err = drain::<OpProgress>(resp)
+            .await
+            .expect_err("stream should terminate with error");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("basebackup boom"));
+    }
+
+    // ----- streaming: rewind ----------------------------------------------
+
+    fn valid_rewind_req() -> RewindRequest {
+        RewindRequest {
+            primary_host: "primary.local".into(),
+            primary_port: 5432,
+            repl_user: "repl".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rewind_streams_progress_then_done() {
+        let (s, _sd, _db, standby, _wal) = make_server();
+        standby
+            .progress_steps
+            .lock()
+            .unwrap()
+            .extend([(0, 200), (200, 200)]);
+        let resp = s
+            .rewind(Request::new(valid_rewind_req()))
+            .await
+            .expect("rewind");
+        let events = drain::<OpProgress>(resp).await.expect("stream");
+        assert_eq!(events.last().unwrap().phase, "done");
+    }
+
+    #[tokio::test]
+    async fn rewind_rejects_zero_port() {
+        let (s, ..) = make_server();
+        let mut req = valid_rewind_req();
+        req.primary_port = 0;
+        let result = s.rewind(Request::new(req)).await;
+        match result {
+            Err(e) => assert_eq!(e.code(), tonic::Code::InvalidArgument),
+            Ok(_) => panic!("expected InvalidArgument"),
+        }
+    }
+
+    // ----- streaming: fetch_wal -------------------------------------------
+
+    #[tokio::test]
+    async fn fetch_wal_streams_archive_content() {
+        let (s, _sd, _db, _standby, wal) = make_server();
+        // Stage content slightly larger than a chunk so we get 2+ chunks.
+        let content: Vec<u8> = (0..(WAL_CHUNK_SIZE + 4096))
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        wal.stage("000000010000000000000001", content.clone());
+
+        let resp = s
+            .fetch_wal(Request::new(FetchWalRequest {
+                wal_file: "000000010000000000000001".into(),
+            }))
+            .await
+            .expect("fetch_wal");
+        let chunks = drain::<WalChunk>(resp).await.expect("stream");
+        let assembled: Vec<u8> = chunks.into_iter().flat_map(|c| c.data).collect();
+        assert_eq!(assembled, content);
+    }
+
+    #[tokio::test]
+    async fn fetch_wal_returns_not_found_for_unknown_segment() {
+        let (s, ..) = make_server();
+        let result = s
+            .fetch_wal(Request::new(FetchWalRequest {
+                wal_file: "missing.wal".into(),
+            }))
+            .await;
+        match result {
+            Err(e) => {
+                assert_eq!(e.code(), tonic::Code::NotFound);
+                assert!(e.message().contains("WAL segment not found"));
+            }
+            Ok(_) => panic!("expected NotFound"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_wal_returns_invalid_argument_for_invalid_filename() {
+        let (s, _sd, _db, _standby, wal) = make_server();
+        wal.stage_invalid("bad name");
+        let result = s
+            .fetch_wal(Request::new(FetchWalRequest {
+                wal_file: "bad name".into(),
+            }))
+            .await;
+        match result {
+            Err(e) => assert_eq!(e.code(), tonic::Code::InvalidArgument),
+            Ok(_) => panic!("expected InvalidArgument"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_wal_rejects_empty_filename() {
+        let (s, ..) = make_server();
+        let result = s
+            .fetch_wal(Request::new(FetchWalRequest {
+                wal_file: String::new(),
+            }))
+            .await;
+        match result {
+            Err(e) => assert_eq!(e.code(), tonic::Code::InvalidArgument),
+            Ok(_) => panic!("expected InvalidArgument"),
         }
     }
 
@@ -1045,7 +1486,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let s = shutdown.clone();
         let h = tokio::spawn(async move {
-            let (server, _sd, _db, _standby) = make_server();
+            let (server, _sd, _db, _standby, _wal) = make_server();
             server.serve(listener, Some(tls), s).await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
