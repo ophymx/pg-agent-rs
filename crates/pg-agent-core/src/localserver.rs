@@ -505,11 +505,175 @@ impl PgAgentLocal for LocalServer {
             message: format!("follow_primary complete for {}", detached.hostname),
         }))
     }
+    /// `recovery_1st_stage_command` — operator-initiated standby rebuild
+    /// from this primary (the local node). Flow on this primary:
+    ///
+    /// 1. Replay marker on `(primary_id, standby_id)`; skip on hit.
+    /// 2. Resolve `primary` via `resolve_local_node` — defensive check
+    ///    that we ARE the configured primary. The request comes from
+    ///    pgpool's recovery extension which only runs it on the primary,
+    ///    but a misconfigured operator could fire it elsewhere.
+    /// 3. `db.checkpoint()` + `db.create_slot(standby.slot_name())`.
+    /// 4. `peer.basebackup(opts)` — wipes the standby's $PGDATA and
+    ///    streams ours into it. Streamed via OpProgress; drained by
+    ///    `PeerClient::basebackup` waiting for `phase="done"`.
+    /// 5. `peer.configure_standby(opts)` writes recovery.conf on top
+    ///    of the streamed $PGDATA. Order matters — basebackup wipes,
+    ///    configure_standby populates after.
+    /// 6. Write replay marker.
+    ///
+    /// What we do NOT do (vs. FollowPrimary):
+    ///   - no `peer.stop()` first — the standby is offline awaiting
+    ///     basebackup; pgpool wouldn't be running this otherwise.
+    ///   - no rewind fallback — operator-initiated means we go straight
+    ///     to a full clone.
+    ///   - no `peer.start()` — pgpool starts the standby via
+    ///     `pgpool_remote_start` in 2nd stage.
+    ///   - no `pcp.attach_node()` — pgpool drives re-attach in 2nd stage.
+    ///
+    /// Failure between (3) and (5) drops the slot via the shared
+    /// `cleanup_slot_after_failure` helper; if the drop itself fails it
+    /// queues a `DropSlotCleanup` maintenance intent.
     async fn recovery_first_stage(
         &self,
-        _req: Request<RecoveryRequest>,
+        req: Request<RecoveryRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("recovery_first_stage"))
+        let req = req.into_inner();
+        let primary_ref = req
+            .primary
+            .ok_or_else(|| Status::invalid_argument("recovery_1st_stage: primary is required"))?;
+        let standby_ref = req
+            .standby
+            .ok_or_else(|| Status::invalid_argument("recovery_1st_stage: standby is required"))?;
+
+        let replay_key = format!("primary={},standby={}", primary_ref.id, standby_ref.id);
+        match self.replay.has("recovery_1st_stage", &replay_key).await {
+            Ok(true) => {
+                info!(%replay_key, "recovery_1st_stage: replay detected, skipping");
+                return Ok(Response::new(OpResult {
+                    ok: true,
+                    message: "recovery_1st_stage: already processed; skipping duplicate".into(),
+                }));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(internal(anyhow::anyhow!(
+                    "recovery_1st_stage: idempotency marker check: {e}"
+                )));
+            }
+        }
+
+        let primary = self
+            .node_pool
+            .resolve_local_node(&primary_ref)
+            .map_err(|e| Status::invalid_argument(format!("recovery_1st_stage: primary: {e}")))?;
+        let standby = self
+            .node_pool
+            .resolve_node(&standby_ref)
+            .map_err(|e| Status::invalid_argument(format!("recovery_1st_stage: standby: {e}")))?;
+        info!(
+            primary = %primary.hostname,
+            standby = %standby.hostname,
+            "recovery_1st_stage"
+        );
+
+        // SPEC §2: checkpoint then create_slot so the slot's restart_lsn
+        // sits at the current WAL position. Without this, basebackup
+        // could start from an older checkpoint and the slot would
+        // immediately need WAL we no longer keep.
+        self.db
+            .checkpoint()
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("recovery_1st_stage: checkpoint: {e}")))?;
+
+        let slot_name = standby.slot_name();
+        self.db.create_slot(&slot_name).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "recovery_1st_stage: create slot {slot_name}: {e}"
+            ))
+        })?;
+
+        // From here through `configure_standby`, any failure drops the
+        // slot — it would otherwise pin WAL forever on this primary.
+        let peer = match self.peers.client(standby).await {
+            Ok(p) => p,
+            Err(e) => {
+                let err = anyhow::anyhow!(
+                    "recovery_1st_stage: peer client for {}: {e}",
+                    standby.hostname
+                );
+                self.cleanup_slot_after_failure(
+                    &slot_name,
+                    &primary.hostname,
+                    "recovery_1st_stage_peer_dial_failed",
+                    &err,
+                )
+                .await;
+                return Err(internal(err));
+            }
+        };
+
+        let bb_opts = BasebackupOpts {
+            primary_host: primary.hostname.clone(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+            slot_name: slot_name.clone(),
+        };
+        if let Err(e) = peer.basebackup(bb_opts).await {
+            let err = anyhow::anyhow!("recovery_1st_stage: basebackup {}: {e}", standby.hostname);
+            self.cleanup_slot_after_failure(
+                &slot_name,
+                &primary.hostname,
+                "recovery_1st_stage_basebackup_failed",
+                &err,
+            )
+            .await;
+            return Err(internal(err));
+        }
+
+        let cfg_opts = WriteRecoveryConfOpts {
+            primary_host: primary.hostname.clone(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+            slot_name: slot_name.clone(),
+        };
+        if let Err(e) = peer.configure_standby(cfg_opts).await {
+            let err = anyhow::anyhow!(
+                "recovery_1st_stage: configure_standby {}: {e}",
+                standby.hostname
+            );
+            self.cleanup_slot_after_failure(
+                &slot_name,
+                &primary.hostname,
+                "recovery_1st_stage_configure_standby_failed",
+                &err,
+            )
+            .await;
+            return Err(internal(err));
+        }
+
+        // SPEC §5: do NOT call pcp_attach_node here — pgpool drives
+        // re-attachment after 2nd stage completes (which is triggered
+        // by pgpool itself via pgpool_remote_start, not us).
+        self.replay
+            .mark_done("recovery_1st_stage", &replay_key)
+            .await
+            .map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "recovery_1st_stage: idempotency marker write: {e}"
+                ))
+            })?;
+
+        info!(
+            primary = %primary.hostname,
+            standby = %standby.hostname,
+            slot = %slot_name,
+            "recovery_1st_stage: complete"
+        );
+        Ok(Response::new(OpResult {
+            ok: true,
+            message: format!("recovery complete for {}", standby.hostname),
+        }))
     }
     /// `restore_command` — PostgreSQL calls `pg_agentc restore-wal %f %p`
     /// when a WAL segment is missing from its local pg_wal. We fan out
@@ -2009,6 +2173,163 @@ mod tests {
         req.detached = None;
         let err = s.failover(Request::new(req)).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ----- recovery_first_stage ------------------------------------------
+
+    fn recovery_req(primary: i32, standby: i32) -> RecoveryRequest {
+        RecoveryRequest {
+            primary: Some(NodeRef {
+                id: primary,
+                hostname: pool_hostname(primary),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            standby: Some(NodeRef {
+                id: standby,
+                hostname: pool_hostname(standby),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+        }
+    }
+
+    /// Default setup: local node (id 0) is the primary; peer1 (id 1) is
+    /// the standby being recovered. Returns the StubPeerClient that
+    /// represents peer1 so tests can configure it.
+    #[allow(clippy::type_complexity)]
+    fn make_recovery_setup() -> (
+        LocalServer,
+        Arc<StubDb>,
+        Arc<StubPeers>,
+        Arc<StubMaint>,
+        Arc<StubReplay>,
+        Arc<StubPeerClient>,
+    ) {
+        let (s, db, peers, maint, _wal, replay, _pcp) = make_server();
+        let standby_client = Arc::new(StubPeerClient::default());
+        peers.override_client(1, standby_client.clone());
+        (s, db, peers, maint, replay, standby_client)
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_happy_path() {
+        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let resp = s
+            .recovery_first_stage(Request::new(recovery_req(0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("recovery complete"));
+        // Sequence: checkpoint → create_slot → basebackup → configure_standby
+        // → mark_done. No promote/start/attach.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*db.created_slots.lock().unwrap(), vec!["node1".to_string()]);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.configure_standby_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.promote_calls.load(Ordering::SeqCst), 0);
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+        assert!(replay
+            .has("recovery_1st_stage", "primary=0,standby=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_skips_when_replay_marker_present() {
+        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        replay.mark("recovery_1st_stage", "primary=0,standby=1");
+        let resp = s
+            .recovery_first_stage(Request::new(recovery_req(0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("already processed"));
+        // Nothing downstream of the marker touched.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_rejects_non_local_primary() {
+        // Pool: id=0 is local. Request claims id=1 is primary — rejected.
+        let (s, ..) = make_server();
+        let err = s
+            .recovery_first_stage(Request::new(recovery_req(1, 0)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("primary"));
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_rejects_missing_primary() {
+        let (s, ..) = make_server();
+        let mut req = recovery_req(0, 1);
+        req.primary = None;
+        let err = s.recovery_first_stage(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_basebackup_failure_drops_slot() {
+        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        standby.basebackup_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .recovery_first_stage(Request::new(recovery_req(0, 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("basebackup"));
+        // Slot was dropped during cleanup; no replay marker.
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        assert!(!replay
+            .has("recovery_1st_stage", "primary=0,standby=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_configure_standby_failure_drops_slot() {
+        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        standby
+            .configure_standby_fails
+            .store(true, Ordering::SeqCst);
+
+        let err = s
+            .recovery_first_stage(Request::new(recovery_req(0, 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("configure_standby"));
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn recovery_first_stage_drop_slot_failure_queues_maintenance() {
+        let (s, db, _peers, maint, _replay, standby) = make_recovery_setup();
+        standby.basebackup_fails.store(true, Ordering::SeqCst);
+        db.drop_slot_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .recovery_first_stage(Request::new(recovery_req(0, 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+
+        // drop_slot was attempted (and failed) → intent appended.
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        let intents = maint.intents.lock().unwrap();
+        assert_eq!(intents.len(), 1);
+        match &intents[0].payload {
+            MaintenancePayload::DropSlotCleanup { cause, .. } => {
+                assert!(cause.contains("basebackup_failed"));
+            }
+        }
     }
 
     // ----- restore_wal ---------------------------------------------------
