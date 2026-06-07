@@ -37,7 +37,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<()> {
     // TODO(v1): load config, apply env + CLI overrides, build CertReloader,
-    // wire AgentDeps (LocalDb / PeerPool / PgStandbyOps / PcpCli /
+    // wire AgentDeps (LocalDb / PeerPool / PgStandbyExec / PcpCli /
     // DbusSystemd / FileReplayMarkerStore / FileWalStore /
     // FileMaintenanceStore), construct Agent, repair $PGDATA hook symlinks,
     // install SIGHUP cert-reload task, install SIGINT/SIGTERM shutdown

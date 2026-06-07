@@ -8,8 +8,8 @@ use crate::{
     localdb::LocalDb,
     maintenance::MaintenanceStore,
     pcp::Pcp,
-    peers::Peers,
-    pgstandby::PgStandby,
+    peers::PeerRegistry,
+    pgstandby::StandbyOps,
     replay_markers::ReplayMarkerStore,
     systemd::Systemd,
     walstore::WalStore,
@@ -24,7 +24,7 @@ use std::time::Duration;
 /// `GetStatus`/`GetNodeConfig` handlers here so a single canonical
 /// implementation drives both responses.
 #[async_trait]
-pub trait NodeIntrospection: Send + Sync {
+pub trait NodeInfo: Send + Sync {
     async fn get_status(&self) -> anyhow::Result<pb::NodeStatus>;
     async fn get_node_config(&self) -> anyhow::Result<pb::NodeConfigResponse>;
 }
@@ -32,8 +32,8 @@ pub trait NodeIntrospection: Send + Sync {
 /// External collaborators. Every field must be non-nil at agent construction.
 pub struct AgentDeps {
     pub db: Arc<dyn LocalDb>,
-    pub peers: Arc<dyn Peers>,
-    pub standby: Arc<dyn PgStandby>,
+    pub peers: Arc<dyn PeerRegistry>,
+    pub standby: Arc<dyn StandbyOps>,
     pub pcp: Arc<dyn Pcp>,
     pub sd: Arc<dyn Systemd>,
     pub replay: Arc<dyn ReplayMarkerStore>,
@@ -77,7 +77,7 @@ impl Agent {
 }
 
 // TODO(v1):
-//   - NodeIntrospection impl on Agent (parallel postgres + systemd queries,
+//   - NodeInfo impl on Agent (parallel postgres + systemd queries,
 //     readiness verdict from §5.9).
 //   - bestEffortCleanupContext-equivalent helper for cleanup paths that
 //     must run after the hook ctx cancels.

@@ -10,10 +10,11 @@ use crate::config::NodeConfig;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Outbound peer client surface. Implementations key on `NodeConfig` so
-/// callers work with resolved config objects rather than raw addresses.
+/// Outbound peer client registry. Hands out a [`PeerClient`] keyed by
+/// `NodeConfig` so callers work with resolved config objects rather than
+/// raw addresses. The concrete implementation is `PeerPool` (TODO).
 #[async_trait]
-pub trait Peers: Send + Sync {
+pub trait PeerRegistry: Send + Sync {
     /// Returns a client targeting `node`. Caller must not call this for the
     /// local node.
     async fn client(&self, node: &NodeConfig) -> anyhow::Result<Arc<dyn PeerClient>>;

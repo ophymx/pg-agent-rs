@@ -34,7 +34,7 @@ pub struct WriteRecoveryConfOpts {
 }
 
 #[async_trait]
-pub trait PgStandby: Send + Sync {
+pub trait StandbyOps: Send + Sync {
     /// Clears `$PGDATA` contents first, then exec's pg_basebackup.
     async fn basebackup(
         &self,
@@ -49,6 +49,7 @@ pub trait PgStandby: Send + Sync {
     async fn write_recovery_conf(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()>;
 }
 
-// TODO(v1): PgStandbyOps impl. Carries PgHome / PgDataDir / ReplicationTls.
+// TODO(v1): PgStandbyExec impl (the only concrete impl). Carries PgHome /
+// PgDataDir / ReplicationTls.
 // Render myrecovery.conf via a template that rejects ' \r \n in the
 // conninfo (defense in depth — inputs already validated).

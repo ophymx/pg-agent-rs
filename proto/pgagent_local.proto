@@ -107,7 +107,10 @@ message ClusterInitResponse {
 service PgAgentLocal {
   rpc Failover         (FailoverRequest)         returns (OpResult);
   rpc FollowPrimary    (FollowPrimaryRequest)    returns (OpResult);
-  rpc Recovery1stStage (RecoveryRequest)         returns (OpResult);
+  // Hook *script* name on disk stays `recovery_1st_stage` (pgpool-imposed
+  // — see hookspec::HOOK_RECOVERY_1ST_STAGE). The RPC is renamed to avoid
+  // tonic's ugly `recovery1st_stage` snake_case for a digit-letter boundary.
+  rpc RecoveryFirstStage (RecoveryRequest)       returns (OpResult);
   rpc RemoteStart      (RemoteStartRequest)      returns (OpResult);
   rpc Escalation       (EscalationRequest)       returns (OpResult);
   rpc RestoreWal       (RestoreWalRequest)       returns (OpResult);

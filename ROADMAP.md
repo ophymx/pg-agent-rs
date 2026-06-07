@@ -194,7 +194,7 @@ in v1.x and v2 should not foreclose them.
 
 - **Pluggable backup providers** — pgbackrest / wal-g / barman as
   first-class alternatives to `pg_basebackup` for cluster_init and
-  recovery_1st_stage. The current `PgStandby` trait already abstracts
+  recovery_1st_stage. The current `StandbyOps` trait already abstracts
   basebackup; the lift is mostly adding adapters and a config knob.
 
 - **Pure-Rust `pg_basebackup` replacement** over a temporary HTTPS

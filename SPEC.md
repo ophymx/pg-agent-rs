@@ -112,9 +112,11 @@ tests can swap in cross-process HTTP-observable fakes (mirroring the Go
 
 ## 3. Protocol surface
 
-Two gRPC services. Both are versioned by the `.proto` file; both must stay
-wire-compatible with the existing Go implementation so a mixed-version
-cluster works during a rolling upgrade.
+Two gRPC services. Both are versioned by the `.proto` file. Wire
+compatibility is required **across Rust deployments** (so rolling upgrades
+work between any two pg-agent-rs versions) but not back to the original Go
+agent — pg-agent-rs is a successor, not a peer; mixed Go/Rust clusters are
+not a supported topology.
 
 Common messages (`common.proto`):
 
@@ -160,7 +162,7 @@ Filesystem permissions on the socket are the access control. The socket is
 service PgAgentLocal {
   rpc Failover         (FailoverRequest)      returns (OpResult);
   rpc FollowPrimary    (FollowPrimaryRequest) returns (OpResult);
-  rpc Recovery1stStage (RecoveryRequest)      returns (OpResult);
+  rpc RecoveryFirstStage (RecoveryRequest)    returns (OpResult);
   rpc RemoteStart      (RemoteStartRequest)   returns (OpResult);
   rpc Escalation       (EscalationRequest)    returns (OpResult);   // no-op
   rpc RestoreWal       (RestoreWalRequest)    returns (OpResult);
@@ -303,16 +305,16 @@ following Go interfaces to Rust traits, every method `async fn` returning
 
 | Trait              | Real impl                          | Surface |
 |--------------------|------------------------------------|---------|
-| `LocalDb`          | tokio-postgres pool to local Unix socket | `promote()`, `checkpoint()`, `create_slot(name)`, `drop_slot(name)`, `is_in_recovery()`, `replication_lag()` → `(bytes, state)`, `setting(name)`, `extension_exists(name)`, `role_exists(name)`, `create_replication_role(name)` |
-| `Peers`            | mTLS gRPC pool                     | `client(node) -> PeerClient`, `close()` |
-| `PgStandby`        | subprocess + filesystem            | `basebackup(opts, progress_cb)`, `rewind(opts, progress_cb)`, `write_recovery_conf(opts)` |
+| `LocalDb`          | tokio-postgres pool to local Unix socket | `promote()`, `checkpoint()`, `create_slot(name)`, `drop_slot(name)`, `is_in_recovery()`, `replication_lag()` → `ReplicationLag { bytes, state }`, `setting(name)`, `extension_exists(name)`, `role_exists(name)`, `create_replication_role(name)` |
+| `PeerRegistry`     | mTLS gRPC pool (`PeerPool`)        | `client(node) -> PeerClient`, `close()` |
+| `StandbyOps`       | subprocess + filesystem            | `basebackup(opts, progress_cb)`, `rewind(opts, progress_cb)`, `write_recovery_conf(opts)` |
 | `Pcp`              | `pcp_attach_node` / `pcp_node_count` subprocess | `attach_node(id)`, `node_count() -> int` |
 | `Systemd`          | zbus to `systemd1`                 | `start_postgres()`, `stop_postgres()`, `status_postgres()`, `status_pgpool()`, `reload_or_restart_postgres()`, `reload_or_restart_pgpool()` |
 | `ReplayMarkerStore` | dotfiles under `$PGDATA`          | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
 | `MaintenanceStore` | one JSON file per intent under `<agent_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
 
-A `NodeIntrospection` trait (`get_status`, `get_node_config`) is satisfied by
+A `NodeInfo` trait (`get_status`, `get_node_config`) is satisfied by
 `Agent` itself; `LocalServer` and `PeerServer` both delegate `GetStatus` /
 `GetNodeConfig` to it so there is one canonical implementation.
 
@@ -412,7 +414,7 @@ On any failure between step 6 and 10, drop the slot via a best-effort
 cleanup context; on cleanup failure enqueue the drop_slot_cleanup
 maintenance intent. On `pcp_attach` failure (step 11): do not drop the slot.
 
-### 5.3 `Recovery1stStage(standby, primary)`
+### 5.3 `RecoveryFirstStage(standby, primary)`
 
 Invoked indirectly: pgpool calls the `pgpool_recovery` PostgreSQL extension
 on the primary, which exec's `$PGDATA/recovery_1st_stage` (a symlink to
@@ -504,7 +506,7 @@ so the request carries no password.
 | `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pghome>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |
 | `FetchWal`          | validate filename. Open `<archive_dir>/<wal_file>` (after `filepath.Localize`-equivalent rejection of `..`/absolute paths). Stream 1 MiB chunks. `NotFound` if absent. |
 | `RemoveVip`         | always `Unimplemented`. |
-| `GetStatus` / `GetNodeConfig` | delegate to `NodeIntrospection`. |
+| `GetStatus` / `GetNodeConfig` | delegate to `NodeInfo`. |
 
 ### 5.9 `GetStatus` implementation
 
@@ -514,7 +516,7 @@ whether a `false` means "stopped" or "unknown"):
 - `systemd.status_postgres()`
 - `systemd.status_pgpool()`
 - `db.is_in_recovery()`
-- `db.replication_lag()` → `(bytes, state)`
+- `db.replication_lag()` → `ReplicationLag { bytes, state }`
 
 `is_ready` is true iff every probe succeeded (no errors). A standby that
 can't report lag isn't ready. An unreachable systemd makes the role
@@ -522,7 +524,7 @@ indistinguishable from "down" → not ready.
 
 ### 5.10 `myrecovery.conf` template
 
-Rendered by `PgStandby::write_recovery_conf`. Single-quoted values; the
+Rendered by `StandbyOps::write_recovery_conf`. Single-quoted values; the
 agent rejects any conninfo that contains `'`, `\r`, or `\n` after rendering
 (defense in depth — inputs are already validated):
 
@@ -568,7 +570,7 @@ into libpq's conninfo and redirect a basebackup to an attacker host.
 
 ### 5.12 Replay markers (idempotency)
 
-`Failover`, `FollowPrimary`, `Recovery1stStage` each derive a stable key
+`Failover`, `FollowPrimary`, `RecoveryFirstStage` each derive a stable key
 from their request and check `replay_marker_store.has(op, key)` before
 doing any work. On success they `mark_done(op, key)`. Markers are stored as
 dotfiles under `$PGDATA`:
@@ -1164,7 +1166,7 @@ and sends a final `OpProgress { phase = "done" }` on success.
 7. Spawn a SIGHUP handler task that calls `CertReloader::reload()`.
 8. Open `LocalDb` pool to local PostgreSQL.
 9. Build `PeerTransport` (CA pool, SAN allowlist), then `PeerPool`.
-10. Build `PgStandby`, `PcpCli`, `Systemd`, `ReplayMarkerStore`, `WalStore`,
+10. Build `StandbyOps`, `PcpCli`, `Systemd`, `ReplayMarkerStore`, `WalStore`,
     `MaintenanceStore`.
 11. Construct `Agent` with all deps.
 12. Repair `$PGDATA` hook symlinks (fail fast on conflicts).
@@ -1376,7 +1378,7 @@ Functional multi-node tests should work the same way they do today:
 - Three loopback IPs (`127.0.0.0/8`), one daemon per IP, exercised end-to-end.
 - A `faked-agentd` test helper binary linked against cross-process fakes:
   same `Agent` wiring as `pg_agentd`, but `LocalDb` / `Systemd` /
-  `PgStandby` etc. swapped for HTTP-observable fakes that expose
+  `StandbyOps` etc. swapped for HTTP-observable fakes that expose
   `GET/DELETE /<service>/calls`, `POST /<service>/errors`,
   `PUT /<service>/state`. Tests poll those endpoints to assert peers were
   called.
@@ -1410,7 +1412,7 @@ cluster:
 5. **`pg_rewind` clears `$PGDATA/pg_replslot/*` before *and* after.** Before:
    stale slot dirs from this node's pre-rewind role. After: slot dirs
    pg_rewind copied from the source's role would crash recovery.
-6. **`pcp_attach_node` is `FollowPrimary`-only.** Not Recovery1stStage.
+6. **`pcp_attach_node` is `FollowPrimary`-only.** Not RecoveryFirstStage.
 7. **`RemoteStart` asserts the local node is the primary.** Pgpool's
    `pgpool_recovery` extension is supposed to call it on the primary; if
    we're a standby, refuse.

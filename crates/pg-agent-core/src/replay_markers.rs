@@ -1,4 +1,4 @@
-//! Hook-idempotency markers. Failover / FollowPrimary / Recovery1stStage
+//! Hook-idempotency markers. Failover / FollowPrimary / RecoveryFirstStage
 //! each compute a stable key from their request, check
 //! [`ReplayMarkerStore::has`], short-circuit on hit, otherwise execute and
 //! [`ReplayMarkerStore::mark_done`] on success.

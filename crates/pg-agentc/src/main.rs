@@ -281,7 +281,7 @@ async fn handle_recovery_1st_stage(
         )?),
     };
 
-    let resp = with_deadline(timeout, client.recovery1st_stage(req)).await?;
+    let resp = with_deadline(timeout, client.recovery_first_stage(req)).await?;
     finish(hookspec::HOOK_RECOVERY_1ST_STAGE, resp)
 }
 

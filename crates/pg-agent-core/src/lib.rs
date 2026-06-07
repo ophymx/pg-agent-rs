@@ -3,8 +3,8 @@
 //! This crate intentionally contains **no transport code** — `LocalServer`
 //! and `PeerServer` (which translate tonic requests into trait calls) live
 //! in the same crate but are gated behind feature flags so the operator CLI
-//! (`pg_agentctl`) can pull in `Config` / `Peers` / `Preflight` without
-//! linking the gRPC server bits.
+//! (`pg_agentctl`) can pull in `Config` / `PeerRegistry` / `Preflight`
+//! without linking the gRPC server bits.
 //!
 //! See [`../../SPEC.md`](../../SPEC.md) for the architecture and
 //! [`../../ROADMAP.md`](../../ROADMAP.md) for the v1.x / v2 / exploratory

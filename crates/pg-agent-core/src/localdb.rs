@@ -6,8 +6,16 @@
 
 use async_trait::async_trait;
 
-/// Replication state on a standby. Empty when there is no receiver.
-pub type ReplicationState = String;
+/// Lag of a standby behind its primary, plus the WAL receiver's state.
+/// `bytes = 0, state = ""` on a primary (no receiver, no lag to report).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationLag {
+    /// `pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())`.
+    pub bytes: i64,
+    /// `pg_stat_wal_receiver.status` — `"streaming"`, `"catchup"`, or `""`
+    /// when there is no WAL receiver row.
+    pub state: String,
+}
 
 #[async_trait]
 pub trait LocalDb: Send + Sync {
@@ -20,8 +28,8 @@ pub trait LocalDb: Send + Sync {
 
     async fn is_in_recovery(&self) -> anyhow::Result<bool>;
 
-    /// Returns `(lag_bytes, replication_state)`. `(0, "")` on a primary.
-    async fn replication_lag(&self) -> anyhow::Result<(i64, ReplicationState)>;
+    /// On a primary returns `ReplicationLag::default()` (zeros).
+    async fn replication_lag(&self) -> anyhow::Result<ReplicationLag>;
 
     /// `SHOW`-equivalent. Empty string + Ok(_) when the setting doesn't exist.
     async fn setting(&self, name: &str) -> anyhow::Result<String>;
