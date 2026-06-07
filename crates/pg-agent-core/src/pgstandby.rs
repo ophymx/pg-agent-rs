@@ -58,11 +58,58 @@ pub struct BasebackupOpts {
     pub slot_name: String,
 }
 
+impl BasebackupOpts {
+    /// Input validation that the gRPC `Basebackup` handler runs before
+    /// dispatching. Same connection-param rules as
+    /// [`WriteRecoveryConfOpts`] plus slot_name.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_connection(&self.primary_host, self.primary_port, &self.repl_user)?;
+        if self.slot_name.is_empty() {
+            anyhow::bail!("slot_name is required");
+        }
+        if !allowed_slot_name().is_match(&self.slot_name) {
+            anyhow::bail!("slot_name contains invalid characters");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RewindOpts {
     pub primary_host: String,
     pub primary_port: u16,
     pub repl_user: String,
+}
+
+impl RewindOpts {
+    /// Input validation that the gRPC `Rewind` handler runs before
+    /// dispatching. No slot_name (rewind talks libpq, not a slot).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_connection(&self.primary_host, self.primary_port, &self.repl_user)
+    }
+}
+
+/// Shared host/port/user check used by basebackup, rewind, and recovery-conf
+/// validation. Strict alphabets defeat conninfo injection — a host like
+/// `"primary host=attacker"` would otherwise add a second `host=` key=value
+/// pair via libpq's whitespace tokeniser and redirect to an attacker host.
+fn validate_connection(host: &str, port: u16, user: &str) -> anyhow::Result<()> {
+    if host.is_empty() {
+        anyhow::bail!("primary_host is required");
+    }
+    if !allowed_primary_host().is_match(host) {
+        anyhow::bail!("primary_host contains invalid characters");
+    }
+    if port == 0 {
+        anyhow::bail!("primary_port must be greater than zero");
+    }
+    if user.is_empty() {
+        anyhow::bail!("repl_user is required");
+    }
+    if !allowed_repl_user().is_match(user) {
+        anyhow::bail!("repl_user contains invalid characters");
+    }
+    Ok(())
 }
 
 /// Wire-shaped input — local concerns (TLS material, `$PGDATA`) live on
@@ -80,26 +127,12 @@ impl WriteRecoveryConfOpts {
     /// Input validation that the gRPC `ConfigureStandby` handler runs
     /// before dispatching. Repeated inside the impl as defense in depth.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.primary_host.is_empty() {
-            anyhow::bail!("primary_host is required");
-        }
-        if !allowed_primary_host().is_match(&self.primary_host) {
-            anyhow::bail!("primary_host contains invalid characters");
-        }
-        if self.primary_port == 0 {
-            anyhow::bail!("primary_port must be greater than zero");
-        }
+        validate_connection(&self.primary_host, self.primary_port, &self.repl_user)?;
         if self.slot_name.is_empty() {
             anyhow::bail!("slot_name is required");
         }
         if !allowed_slot_name().is_match(&self.slot_name) {
             anyhow::bail!("slot_name contains invalid characters");
-        }
-        if self.repl_user.is_empty() {
-            anyhow::bail!("repl_user is required");
-        }
-        if !allowed_repl_user().is_match(&self.repl_user) {
-            anyhow::bail!("repl_user contains invalid characters");
         }
         Ok(())
     }
@@ -582,7 +615,7 @@ fn allowed_repl_user() -> &'static regex::Regex {
 }
 
 /// Replication slot names use the same identifier alphabet.
-fn allowed_slot_name() -> &'static regex::Regex {
+pub(crate) fn allowed_slot_name() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"^[A-Za-z0-9_.-]+$").unwrap())
 }

@@ -241,7 +241,15 @@ impl Agent {
             let me: Arc<dyn NodeInfo> = self.clone();
             let s = shutdown.clone();
             let tls = self.build_peer_tls_config();
-            js.spawn(async move { PeerServer::new(me).serve(listeners.peer, tls, s).await });
+            let sd = self.deps.sd.clone();
+            let db = self.deps.db.clone();
+            let standby = self.deps.standby.clone();
+            let wal = self.deps.wal.clone();
+            js.spawn(async move {
+                PeerServer::new(me, sd, db, standby, wal)
+                    .serve(listeners.peer, tls, s)
+                    .await
+            });
         }
 
         // MaintenanceWorker (no listener; ticks on sweep_every).

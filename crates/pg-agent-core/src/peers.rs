@@ -343,7 +343,13 @@ mod tests {
     use super::*;
     use crate::agent::NodeInfo;
     use crate::config::TlsConfig;
+    use crate::localdb::{LocalDb, ReplicationLag};
     use crate::peerserver::{PeerServer, PeerTlsConfig};
+    use crate::pgstandby::{
+        BasebackupOpts, ProgressCb, RewindOpts, StandbyOps, WriteRecoveryConfOpts,
+    };
+    use crate::systemd::Systemd;
+    use crate::walstore::WalStore;
     use pg_agent_proto::pgagentpb::NodeStatus;
     use rcgen::{CertificateParams, IsCa, KeyPair};
     use std::collections::HashSet;
@@ -424,13 +430,110 @@ mod tests {
         let shutdown = CancellationToken::new();
         let s = shutdown.clone();
         let h = tokio::spawn(async move {
-            let _ = PeerServer::new(Arc::new(FakeNodeInfo))
+            let sd: Arc<dyn Systemd> = Arc::new(NoOpSystemd);
+            let db: Arc<dyn LocalDb> = Arc::new(NoOpDb);
+            let standby: Arc<dyn StandbyOps> = Arc::new(NoOpStandby);
+            let wal: Arc<dyn WalStore> = Arc::new(NoOpWal);
+            let _ = PeerServer::new(Arc::new(FakeNodeInfo), sd, db, standby, wal)
                 .serve(listener, Some(tls), s)
                 .await;
         });
         // Brief settle so the server's accept loop is ready.
         tokio::time::sleep(Duration::from_millis(50)).await;
         (port, shutdown, h)
+    }
+
+    // ----- minimal no-op deps for the PeerServer test instance ---------
+
+    struct NoOpSystemd;
+    #[async_trait]
+    impl Systemd for NoOpSystemd {
+        async fn start_postgres(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop_postgres(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn status_postgres(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn status_pgpool(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoOpDb;
+    #[async_trait]
+    impl LocalDb for NoOpDb {
+        async fn promote(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn create_slot(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_in_recovery(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
+            Ok(ReplicationLag::default())
+        }
+        async fn setting(&self, _: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn extension_exists(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn role_exists(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn create_replication_role(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoOpStandby;
+    #[async_trait]
+    impl StandbyOps for NoOpStandby {
+        async fn basebackup(&self, _: BasebackupOpts, _: Option<ProgressCb>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn rewind(&self, _: RewindOpts, _: Option<ProgressCb>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn write_recovery_conf(&self, _: WriteRecoveryConfOpts) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoOpWal;
+    #[async_trait]
+    impl WalStore for NoOpWal {
+        async fn open_archive(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, crate::errors::AgentError>
+        {
+            Err(crate::errors::AgentError::WalNotFound("noop".into()))
+        }
+        async fn write_restore(
+            &self,
+            _: &std::path::Path,
+            _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        ) -> Result<(), crate::errors::AgentError> {
+            Ok(())
+        }
     }
 
     // ----- direct unit tests ----------------------------------------------
@@ -565,9 +668,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_slot_surfaces_server_unimplemented() {
-        // PeerServer's drop_slot returns Status::unimplemented today; the
-        // client should surface that cleanly as anyhow::Error.
+    async fn drop_slot_round_trip_succeeds() {
+        // PeerServer's drop_slot is now wired through to the LocalDb stub
+        // (NoOpDb here) — verifies the end-to-end client → server →
+        // localdb path completes without error.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = TempDir::new().unwrap();
         let (ca_cert, ca_key, ca_pem) = gen_ca();
@@ -592,11 +696,10 @@ mod tests {
             hostname: "127.0.0.1".into(),
         };
         let client = pool.client(&node).await.unwrap();
-        let err = client.drop_slot("nodeX").await.unwrap_err().to_string();
-        assert!(
-            err.to_lowercase().contains("unimplemented"),
-            "expected Unimplemented status, got: {err}"
-        );
+        client
+            .drop_slot("node2")
+            .await
+            .expect("drop_slot round trip");
 
         shutdown.cancel();
         let _ = handle.await;

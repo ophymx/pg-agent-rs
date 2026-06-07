@@ -27,6 +27,10 @@
 
 use crate::agent::NodeInfo;
 use crate::certreload::{extract_sans, CertReloader, ReloadingServerCertResolver};
+use crate::localdb::LocalDb;
+use crate::pgstandby::{allowed_slot_name, StandbyOps, WriteRecoveryConfOpts};
+use crate::systemd::Systemd;
+use crate::walstore::WalStore;
 use futures_core::Stream;
 use pg_agent_proto::pgagentpb::{
     pg_agent_peer_server::{PgAgentPeer, PgAgentPeerServer},
@@ -197,13 +201,27 @@ fn build_server_config(tls: &PeerTlsConfig) -> anyhow::Result<ServerConfig> {
 
 pub struct PeerServer {
     node_info: Arc<dyn NodeInfo>,
-    // TODO(v1): action deps — Arc<dyn Systemd>, Arc<dyn LocalDb>,
-    // Arc<dyn StandbyOps>, Arc<dyn WalStore>.
+    sd: Arc<dyn Systemd>,
+    db: Arc<dyn LocalDb>,
+    standby: Arc<dyn StandbyOps>,
+    wal: Arc<dyn WalStore>,
 }
 
 impl PeerServer {
-    pub fn new(node_info: Arc<dyn NodeInfo>) -> Self {
-        Self { node_info }
+    pub fn new(
+        node_info: Arc<dyn NodeInfo>,
+        sd: Arc<dyn Systemd>,
+        db: Arc<dyn LocalDb>,
+        standby: Arc<dyn StandbyOps>,
+        wal: Arc<dyn WalStore>,
+    ) -> Self {
+        Self {
+            node_info,
+            sd,
+            db,
+            standby,
+            wal,
+        }
     }
 
     /// Serve until `shutdown` cancels.
@@ -362,50 +380,122 @@ impl PgAgentPeer for PeerServer {
             .map_err(internal)
     }
 
-    // ----- action surface (TODO(v1)) ----------------------------------------
+    // ----- service control ----------------------------------------------
 
     async fn start(&self, _req: Request<StartRequest>) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("start"))
+        info!("peer: Start");
+        self.sd.start_postgres().await.map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
     async fn stop(&self, _req: Request<StopRequest>) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("stop"))
+        info!("peer: Stop");
+        self.sd.stop_postgres().await.map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
     async fn reload(&self, _req: Request<ReloadRequest>) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("reload"))
+        info!("peer: Reload");
+        self.sd
+            .reload_or_restart_postgres()
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
     async fn reload_pgpool(
         &self,
         _req: Request<ReloadPgpoolRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("reload_pgpool"))
+        info!("peer: ReloadPgpool");
+        self.sd.reload_or_restart_pgpool().await.map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
     async fn promote(&self, _req: Request<PromoteRequest>) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("promote"))
+        info!("peer: Promote");
+        self.db.promote().await.map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
+    // ----- replication slot management ----------------------------------
+
     async fn create_slot(
         &self,
-        _req: Request<CreateSlotRequest>,
+        req: Request<CreateSlotRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("create_slot"))
+        let req = req.into_inner();
+        info!(slot = %req.slot_name, "peer: CreateSlot");
+        validate_slot_name(&req.slot_name)?;
+        self.db
+            .create_slot(&req.slot_name)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(ok()))
     }
-    async fn drop_slot(
-        &self,
-        _req: Request<DropSlotRequest>,
-    ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("drop_slot"))
+
+    async fn drop_slot(&self, req: Request<DropSlotRequest>) -> Result<Response<OpResult>, Status> {
+        let req = req.into_inner();
+        info!(slot = %req.slot_name, "peer: DropSlot");
+        validate_slot_name(&req.slot_name)?;
+        self.db.drop_slot(&req.slot_name).await.map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
+    // ----- standby config ------------------------------------------------
+
     async fn configure_standby(
         &self,
-        _req: Request<ConfigureStandbyRequest>,
+        req: Request<ConfigureStandbyRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("configure_standby"))
+        let req = req.into_inner();
+        info!(
+            primary_host = %req.primary_host,
+            primary_port = req.primary_port,
+            repl_user = %req.repl_user,
+            slot = %req.slot_name,
+            "peer: ConfigureStandby"
+        );
+        let opts = WriteRecoveryConfOpts {
+            primary_host: req.primary_host,
+            primary_port: u16::try_from(req.primary_port)
+                .map_err(|_| Status::invalid_argument("primary_port must fit in u16 and be > 0"))?,
+            repl_user: req.repl_user,
+            slot_name: req.slot_name,
+        };
+        opts.validate()
+            .map_err(|e| Status::invalid_argument(format!("invalid configure_standby: {e}")))?;
+        self.standby
+            .write_recovery_conf(opts)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(ok()))
     }
+
+    // ----- network ------------------------------------------------------
+
+    /// Intentionally Unimplemented. This deployment uses HAProxy in front
+    /// of pgpool; there is no VIP to remove. Returning a deliberate
+    /// `Unimplemented` (instead of silent ok=true) prevents callers from
+    /// drifting into relying on non-existent VIP behaviour. The RPC stays
+    /// in the proto for forward compatibility if a VIP-managing
+    /// deployment is ever added.
     async fn remove_vip(
         &self,
-        _req: Request<RemoveVipRequest>,
+        req: Request<RemoveVipRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("remove_vip"))
+        let req = req.into_inner();
+        warn!(
+            address = %req.address,
+            device = %req.device,
+            "peer: RemoveVip rejected (HAProxy deployment has no VIP)"
+        );
+        Err(Status::unimplemented(
+            "RemoveVip not implemented: this deployment uses HAProxy, not VIP management",
+        ))
     }
+
+    // ----- streaming ops (TODO(v1)) -------------------------------------
 
     async fn basebackup(
         &self,
@@ -427,6 +517,34 @@ impl PgAgentPeer for PeerServer {
     }
 }
 
+fn ok() -> OpResult {
+    OpResult {
+        ok: true,
+        message: String::new(),
+    }
+}
+
+/// Reject empty or non-alphabet slot names with InvalidArgument before
+/// the libpq call. PG would otherwise reject with a less helpful error,
+/// and a strict alphabet defeats identifier-quoting accidents.
+///
+/// `tonic::Status` is large (~176 bytes); clippy's
+/// `result_large_err` flags every `Result<_, Status>` shape. The trait-
+/// generated handler impls are unavoidable; this helper is allowed
+/// because boxing here would just move the cost without removing it.
+#[allow(clippy::result_large_err)]
+fn validate_slot_name(name: &str) -> Result<(), Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("slot_name is required"));
+    }
+    if !allowed_slot_name().is_match(name) {
+        return Err(Status::invalid_argument(
+            "slot_name contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
 fn internal(e: anyhow::Error) -> Status {
     Status::internal(e.to_string())
 }
@@ -439,12 +557,16 @@ fn internal(e: anyhow::Error) -> Status {
 mod tests {
     use super::*;
     use crate::config::TlsConfig;
+    use crate::localdb::ReplicationLag;
+    use crate::pgstandby::{BasebackupOpts, ProgressCb, RewindOpts};
     use async_trait::async_trait;
     use rcgen::{CertificateParams, IsCa, KeyPair};
     use rustls::pki_types::ServerName;
     use rustls::ClientConfig;
     use std::convert::TryFrom;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
     use tokio_rustls::TlsConnector;
 
@@ -475,15 +597,152 @@ mod tests {
         }
     }
 
-    fn server() -> PeerServer {
-        PeerServer::new(Arc::new(FakeNodeInfo))
+    // ----- Stub deps ------------------------------------------------------
+
+    #[derive(Default)]
+    struct StubSd {
+        start_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+        reload_pg_calls: AtomicUsize,
+        reload_pgpool_calls: AtomicUsize,
+        fail: AtomicBool,
     }
 
-    // ----- direct-impl tests (no transport) ---------------------------------
+    #[async_trait]
+    impl Systemd for StubSd {
+        async fn start_postgres(&self) -> anyhow::Result<()> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("stub sd: start boom");
+            }
+            Ok(())
+        }
+        async fn stop_postgres(&self) -> anyhow::Result<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn status_postgres(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn status_pgpool(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
+            self.reload_pg_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
+            self.reload_pgpool_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct StubDb {
+        promote_calls: AtomicUsize,
+        created_slots: StdMutex<Vec<String>>,
+        dropped_slots: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl LocalDb for StubDb {
+        async fn promote(&self) -> anyhow::Result<()> {
+            self.promote_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn create_slot(&self, name: &str) -> anyhow::Result<()> {
+            self.created_slots.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+        async fn drop_slot(&self, name: &str) -> anyhow::Result<()> {
+            self.dropped_slots.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+        async fn is_in_recovery(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
+            Ok(ReplicationLag::default())
+        }
+        async fn setting(&self, _: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn extension_exists(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn role_exists(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn create_replication_role(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct StubStandby {
+        recovery_calls: StdMutex<Vec<WriteRecoveryConfOpts>>,
+    }
+
+    #[async_trait]
+    impl StandbyOps for StubStandby {
+        async fn basebackup(&self, _: BasebackupOpts, _: Option<ProgressCb>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn rewind(&self, _: RewindOpts, _: Option<ProgressCb>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn write_recovery_conf(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()> {
+            self.recovery_calls.lock().unwrap().push(opts);
+            Ok(())
+        }
+    }
+
+    struct StubWal;
+
+    #[async_trait]
+    impl WalStore for StubWal {
+        async fn open_archive(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, crate::errors::AgentError>
+        {
+            Err(crate::errors::AgentError::WalNotFound("stub".into()))
+        }
+        async fn write_restore(
+            &self,
+            _: &std::path::Path,
+            _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        ) -> Result<(), crate::errors::AgentError> {
+            Ok(())
+        }
+    }
+
+    /// Build a PeerServer + return Arc clones of stubs so the test can
+    /// inspect call counters.
+    #[allow(clippy::type_complexity)]
+    fn make_server() -> (PeerServer, Arc<StubSd>, Arc<StubDb>, Arc<StubStandby>) {
+        let sd = Arc::new(StubSd::default());
+        let db = Arc::new(StubDb::default());
+        let standby = Arc::new(StubStandby::default());
+        let wal: Arc<dyn WalStore> = Arc::new(StubWal);
+        let server = PeerServer::new(
+            Arc::new(FakeNodeInfo),
+            sd.clone(),
+            db.clone(),
+            standby.clone(),
+            wal,
+        );
+        (server, sd, db, standby)
+    }
+
+    // ----- read-only ------------------------------------------------------
 
     #[tokio::test]
     async fn get_status_routes_to_node_info() {
-        let s = server();
+        let (s, ..) = make_server();
         let resp = s
             .get_status(Request::new(GetStatusRequest {}))
             .await
@@ -495,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_node_config_routes_to_node_info() {
-        let s = server();
+        let (s, ..) = make_server();
         let resp = s
             .get_node_config(Request::new(NodeConfigRequest {}))
             .await
@@ -504,21 +763,214 @@ mod tests {
         assert_eq!(resp.pg_port, 5433);
     }
 
+    // ----- service control ------------------------------------------------
+
     #[tokio::test]
-    async fn promote_returns_unimplemented() {
-        let s = server();
+    async fn start_calls_systemd() {
+        let (s, sd, ..) = make_server();
+        s.start(Request::new(StartRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(sd.start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn start_propagates_systemd_failure_as_internal() {
+        let (s, sd, ..) = make_server();
+        sd.fail.store(true, Ordering::SeqCst);
         let err = s
-            .promote(Request::new(PromoteRequest::default()))
+            .start(Request::new(StartRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("start boom"));
+    }
+
+    #[tokio::test]
+    async fn stop_calls_systemd() {
+        let (s, sd, ..) = make_server();
+        s.stop(Request::new(StopRequest::default())).await.unwrap();
+        assert_eq!(sd.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_calls_systemd_pg() {
+        let (s, sd, ..) = make_server();
+        s.reload(Request::new(ReloadRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(sd.reload_pg_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_pgpool_calls_systemd_pgpool() {
+        let (s, sd, ..) = make_server();
+        s.reload_pgpool(Request::new(ReloadPgpoolRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(sd.reload_pgpool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn promote_calls_db() {
+        let (s, _sd, db, _standby) = make_server();
+        s.promote(Request::new(PromoteRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(db.promote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ----- slots ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_slot_calls_db() {
+        let (s, _sd, db, _standby) = make_server();
+        s.create_slot(Request::new(CreateSlotRequest {
+            slot_name: "node1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*db.created_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn create_slot_rejects_empty_name() {
+        let (s, _sd, db, _standby) = make_server();
+        let err = s
+            .create_slot(Request::new(CreateSlotRequest {
+                slot_name: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(db.created_slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_slot_rejects_injection_attempt() {
+        let (s, _sd, db, _standby) = make_server();
+        let err = s
+            .create_slot(Request::new(CreateSlotRequest {
+                slot_name: "node1; DROP TABLE x;".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(db.created_slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drop_slot_calls_db() {
+        let (s, _sd, db, _standby) = make_server();
+        s.drop_slot(Request::new(DropSlotRequest {
+            slot_name: "node1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drop_slot_rejects_empty_name() {
+        let (s, ..) = make_server();
+        let err = s
+            .drop_slot(Request::new(DropSlotRequest {
+                slot_name: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ----- configure_standby ---------------------------------------------
+
+    #[tokio::test]
+    async fn configure_standby_writes_recovery_conf() {
+        let (s, _sd, _db, standby) = make_server();
+        s.configure_standby(Request::new(ConfigureStandbyRequest {
+            primary_host: "primary.local".into(),
+            primary_port: 5432,
+            repl_user: "repl".into(),
+            slot_name: "node1".into(),
+        }))
+        .await
+        .unwrap();
+        let calls = standby.recovery_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].primary_host, "primary.local");
+        assert_eq!(calls[0].primary_port, 5432);
+        assert_eq!(calls[0].slot_name, "node1");
+    }
+
+    #[tokio::test]
+    async fn configure_standby_rejects_bad_host() {
+        let (s, _sd, _db, standby) = make_server();
+        let err = s
+            .configure_standby(Request::new(ConfigureStandbyRequest {
+                primary_host: "primary host=attacker".into(), // libpq injection attempt
+                primary_port: 5432,
+                repl_user: "repl".into(),
+                slot_name: "node1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(standby.recovery_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn configure_standby_rejects_zero_port() {
+        let (s, ..) = make_server();
+        let err = s
+            .configure_standby(Request::new(ConfigureStandbyRequest {
+                primary_host: "primary.local".into(),
+                primary_port: 0,
+                repl_user: "repl".into(),
+                slot_name: "node1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn configure_standby_rejects_negative_port() {
+        let (s, ..) = make_server();
+        let err = s
+            .configure_standby(Request::new(ConfigureStandbyRequest {
+                primary_host: "primary.local".into(),
+                primary_port: -1,
+                repl_user: "repl".into(),
+                slot_name: "node1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ----- remove_vip is deliberately unimplemented ----------------------
+
+    #[tokio::test]
+    async fn remove_vip_returns_unimplemented() {
+        let (s, ..) = make_server();
+        let err = s
+            .remove_vip(Request::new(RemoveVipRequest {
+                address: "10.0.0.1".into(),
+                device: "eth0".into(),
+            }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("HAProxy"));
     }
+
+    // ----- streaming ops still unimplemented in this commit --------------
 
     #[tokio::test]
     async fn basebackup_returns_unimplemented() {
         // `BasebackupStream` is `Pin<Box<dyn Stream>>` which doesn't impl
         // Debug, so unwrap_err() won't compile — match instead.
-        let s = server();
+        let (s, ..) = make_server();
         match s
             .basebackup(Request::new(BasebackupRequest::default()))
             .await
@@ -593,9 +1045,8 @@ mod tests {
         let shutdown = CancellationToken::new();
         let s = shutdown.clone();
         let h = tokio::spawn(async move {
-            PeerServer::new(Arc::new(FakeNodeInfo))
-                .serve(listener, Some(tls), s)
-                .await
+            let (server, _sd, _db, _standby) = make_server();
+            server.serve(listener, Some(tls), s).await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         (port, shutdown, h)
