@@ -8,8 +8,12 @@
 //!   - No interactive prompts. `--yes` is implied; destructive commands
 //!     require an explicit `--force` flag.
 
+mod client;
+mod config_loader;
+
 use clap::{Parser, Subcommand};
 use pg_agent_hookspec as hookspec;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -19,6 +23,13 @@ struct Cli {
     /// subcommand supports it.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Override the Unix socket path. Precedence: this flag → config
+    /// `unix_socket` → /run/pg_agentd/pg_agentd.sock. Only relevant
+    /// for subcommands that dial the local daemon (cluster init,
+    /// maintenance, …).
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,

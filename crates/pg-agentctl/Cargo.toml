@@ -17,8 +17,10 @@ pg-agent-core     = { workspace = true }
 pg-agent-proto    = { workspace = true }
 pg-agent-hookspec = { workspace = true }
 
-tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net"] }
 tonic              = { workspace = true, features = ["codegen", "prost", "transport", "tls"] }
+tower              = { workspace = true, features = ["util"] }
+hyper-util         = { workspace = true, features = ["tokio"] }
 clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
