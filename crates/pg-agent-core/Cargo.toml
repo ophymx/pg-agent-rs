@@ -63,3 +63,7 @@ rand      = { workspace = true }
 libc      = { workspace = true }
 nix       = { workspace = true }
 sd-notify = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["macros"] }
