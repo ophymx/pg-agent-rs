@@ -55,6 +55,43 @@ fn is_known_command(name: &str) -> bool {
     name == STATUS_SUBCOMMAND || hookspec::HOOK_NAMES.contains(&name)
 }
 
+/// Result of decoding process argv into a hook + positional args.
+struct Invocation {
+    hook: String,
+    args: Vec<String>,
+}
+
+/// Decide which hook to run from process argv.
+///
+/// - If `argv[0]`'s basename is in [`hookspec::PGDATA_SYMLINK_HOOKS`], the
+///   binary was invoked via a `$PGDATA` symlink — basename is the hook,
+///   `argv[1..]` are the positional args (no hook-name prefix).
+/// - Otherwise `argv[1]` is the hook and `argv[2..]` are the args.
+///
+/// Returns `None` when argv has no hook position (no symlink match and
+/// `argv.len() < 2`) — caller treats this as a usage error.
+fn parse_invocation(argv: &[String]) -> Option<Invocation> {
+    let argv0_basename = argv
+        .first()
+        .and_then(|s| Path::new(s).file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    if hookspec::PGDATA_SYMLINK_HOOKS.contains(&argv0_basename) {
+        return Some(Invocation {
+            hook: argv0_basename.to_string(),
+            args: argv[1..].to_vec(),
+        });
+    }
+    if argv.len() >= 2 {
+        return Some(Invocation {
+            hook: argv[1].clone(),
+            args: argv[2..].to_vec(),
+        });
+    }
+    None
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match dispatch().await {
@@ -68,23 +105,12 @@ async fn main() -> ExitCode {
 
 async fn dispatch() -> Result<ExitCode> {
     let argv: Vec<String> = env::args().collect();
-    let argv0 = Path::new(argv.first().map_or("", String::as_str))
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-
-    // Symlink invocation under $PGDATA — argv[0] basename IS the hook name,
-    // and pgpool's positional args start at argv[1] (no hook-name prefix).
-    let (hook, args): (String, &[String]) =
-        if hookspec::PGDATA_SYMLINK_HOOKS.contains(&argv0.as_str()) {
-            (argv0, &argv[1..])
-        } else if argv.len() >= 2 {
-            (argv[1].clone(), &argv[2..])
-        } else {
-            print_help();
-            return Ok(ExitCode::from(2));
-        };
+    let Some(invocation) = parse_invocation(&argv) else {
+        print_help();
+        return Ok(ExitCode::from(2));
+    };
+    let Invocation { hook, args } = invocation;
+    let args: &[String] = &args;
 
     // Synthetic top-level commands handled before dialing the socket.
     match hook.as_str() {
@@ -641,6 +667,78 @@ mod tests {
     fn humantime_rejects_empty() {
         assert!(humantime::parse("").is_err());
         assert!(humantime::parse("   ").is_err());
+    }
+
+    fn argv(slice: &[&str]) -> Vec<String> {
+        slice.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_invocation_normal_form_uses_argv1_as_hook() {
+        let inv = parse_invocation(&argv(&["pg_agentc", "failover", "1", "h1", "5432"])).unwrap();
+        assert_eq!(inv.hook, "failover");
+        assert_eq!(inv.args, vec!["1", "h1", "5432"]);
+    }
+
+    #[test]
+    fn parse_invocation_symlink_uses_argv0_basename_as_hook() {
+        // pgpool exec's $PGDATA/recovery_1st_stage with positional args
+        // starting at argv[1] — no hook-name prefix.
+        let inv = parse_invocation(&argv(&[
+            "/var/lib/postgresql/17/main/recovery_1st_stage",
+            "/var/lib/postgresql/17/main", // $1 = primary data
+            "stby.local",                  // $2 = standby host
+            "/var/lib/postgresql/17/main", // $3 = standby data
+            "5432",                        // $4
+            "1",                           // $5
+            "5432",                        // $6
+            "primary.local",               // $7
+        ]))
+        .unwrap();
+        assert_eq!(inv.hook, "recovery_1st_stage");
+        assert_eq!(inv.args.len(), 7);
+        assert_eq!(inv.args[0], "/var/lib/postgresql/17/main");
+        assert_eq!(inv.args[6], "primary.local");
+    }
+
+    #[test]
+    fn parse_invocation_symlink_recognises_pgpool_remote_start() {
+        let inv = parse_invocation(&argv(&[
+            "/var/lib/postgresql/17/main/pgpool_remote_start",
+            "stby.local",
+            "/var/lib/postgresql/17/main",
+        ]))
+        .unwrap();
+        assert_eq!(inv.hook, "pgpool_remote_start");
+        assert_eq!(inv.args, vec!["stby.local", "/var/lib/postgresql/17/main"]);
+    }
+
+    #[test]
+    fn parse_invocation_bare_binary_returns_none() {
+        // Just `pg_agentc` with no further args — caller falls through
+        // to print_help + exit 2.
+        assert!(parse_invocation(&argv(&["pg_agentc"])).is_none());
+    }
+
+    #[test]
+    fn parse_invocation_empty_argv_returns_none() {
+        // env::args() never yields an empty Vec on Linux, but the
+        // helper should be total — guard against the impossible case.
+        assert!(parse_invocation(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_invocation_symlink_takes_precedence_over_argv1() {
+        // If argv[0] is a symlinked hook, we MUST treat argv[1] as the
+        // first positional arg, not a hook name. Otherwise pgpool's
+        // first positional arg would be interpreted as a hook.
+        let inv = parse_invocation(&argv(&[
+            "/var/lib/postgresql/17/main/recovery_1st_stage",
+            "failover", // would be misread as a hook in the wrong branch
+        ]))
+        .unwrap();
+        assert_eq!(inv.hook, "recovery_1st_stage");
+        assert_eq!(inv.args, vec!["failover"]);
     }
 
     #[test]
