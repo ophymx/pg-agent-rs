@@ -131,7 +131,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             gen_pgpool(config, write, cli.socket.as_deref(), cli.json).await
         }
         Cmd::Preflight { config, skip_db } => preflight(config, skip_db, cli.json).await,
-        Cmd::Maintenance { .. } => Ok(ExitCode::from(2)),
+        Cmd::Maintenance { cmd } => maintenance(cmd, cli.socket.as_deref(), cli.json).await,
         Cmd::Cluster { cmd } => match cmd {
             ClusterCmd::Init { only_node, config } => {
                 cluster_init(config, only_node, cli.socket.as_deref(), cli.json).await
@@ -419,6 +419,157 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+async fn maintenance(
+    cmd: MaintenanceCmd,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::{
+        GetMaintenanceRequest, ListMaintenanceRequest, RetryMaintenanceRequest,
+    };
+
+    // The maintenance subcommands never need to load config.toml just
+    // to find the socket — operators run them against a known-live
+    // daemon, and a missing config file shouldn't block triage.
+    let socket = match cli_socket {
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from(pg_agent_core::config::DEFAULT_UNIX_SOCKET),
+    };
+    let mut client = client::dial_local(&socket).await?;
+
+    match cmd {
+        MaintenanceCmd::List { status } => {
+            let statuses = status.map(|s| vec![s]).unwrap_or_default();
+            let resp = client
+                .list_maintenance(ListMaintenanceRequest { statuses })
+                .await
+                .map_err(|s| anyhow::anyhow!("ListMaintenance failed: {s}"))?
+                .into_inner();
+
+            // SPEC §13: skipped files go to stderr.
+            for s in &resp.skipped {
+                eprintln!("warning: skipped {}: {}", s.path, s.error);
+            }
+
+            if json {
+                let payload = serde_json::json!({
+                    "intents": resp.intents.iter().map(intent_to_json).collect::<Vec<_>>(),
+                    "skipped": resp.skipped.iter().map(|s| serde_json::json!({
+                        "path": s.path, "error": s.error,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if resp.intents.is_empty() {
+                println!("(no maintenance intents)");
+            } else {
+                println!(
+                    "{:<36}  {:<10}  {:<10}  {:>4}  next_retry_at",
+                    "ID", "OP", "STATUS", "TRY"
+                );
+                for i in &resp.intents {
+                    println!(
+                        "{:<36}  {:<10}  {:<10}  {:>4}  {}",
+                        i.id,
+                        i.op,
+                        i.status,
+                        i.attempts,
+                        if i.next_retry_at.is_empty() {
+                            "-"
+                        } else {
+                            &i.next_retry_at
+                        }
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        MaintenanceCmd::Show { id } => {
+            let resp = client
+                .get_maintenance(GetMaintenanceRequest { id: id.clone() })
+                .await
+                .map_err(|s| anyhow::anyhow!("GetMaintenance({id}) failed: {s}"))?
+                .into_inner();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&intent_to_json(&resp))?);
+            } else {
+                print_intent_human(&resp);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        MaintenanceCmd::Retry { id } => {
+            let resp = client
+                .retry_maintenance(RetryMaintenanceRequest { id: id.clone() })
+                .await
+                .map_err(|s| anyhow::anyhow!("RetryMaintenance({id}) failed: {s}"))?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"ok": resp.ok, "message": resp.message})
+                    )?
+                );
+            } else if !resp.message.is_empty() {
+                println!("{}", resp.message);
+            }
+            if resp.ok {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+fn intent_to_json(i: &pg_agent_proto::pgagentpb::MaintenanceIntent) -> serde_json::Value {
+    // Try to decode the payload as JSON for the structured view; fall
+    // back to a base64 string if it isn't valid UTF-8/JSON.
+    let payload = match std::str::from_utf8(&i.payload) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => v,
+            Err(_) => serde_json::Value::String(s.to_string()),
+        },
+        Err(_) => serde_json::Value::String(format!("<{} bytes>", i.payload.len())),
+    };
+    serde_json::json!({
+        "id":            i.id,
+        "op":            i.op,
+        "status":        i.status,
+        "attempts":      i.attempts,
+        "last_error":    i.last_error,
+        "created_at":    i.created_at,
+        "updated_at":    i.updated_at,
+        "next_retry_at": i.next_retry_at,
+        "payload":       payload,
+    })
+}
+
+fn print_intent_human(i: &pg_agent_proto::pgagentpb::MaintenanceIntent) {
+    println!("id:            {}", i.id);
+    println!("op:            {}", i.op);
+    println!("status:        {}", i.status);
+    println!("attempts:      {}", i.attempts);
+    println!("created_at:    {}", i.created_at);
+    println!("updated_at:    {}", i.updated_at);
+    if !i.next_retry_at.is_empty() {
+        println!("next_retry_at: {}", i.next_retry_at);
+    }
+    if !i.last_error.is_empty() {
+        println!("last_error:    {}", i.last_error);
+    }
+    println!("payload:");
+    match std::str::from_utf8(&i.payload) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => println!(
+                "{}",
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| s.to_string())
+            ),
+            Err(_) => println!("{s}"),
+        },
+        Err(_) => println!("  <{} non-UTF8 bytes>", i.payload.len()),
+    }
 }
 
 fn init_logging() {
