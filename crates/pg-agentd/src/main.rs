@@ -18,7 +18,9 @@ struct Cli {
     #[arg(long, env = "PG_AGENTD_SOCKET")]
     socket: Option<PathBuf>,
 
-    /// Development mode: unlock `allow_insecure_remote_peer` from config.toml.
+    /// Development mode: allow plaintext peer connections to non-loopback
+    /// hostnames. The only escape hatch from mandatory mTLS — deliberately
+    /// CLI-only (no config-file knob).
     #[arg(long)]
     dev: bool,
 }

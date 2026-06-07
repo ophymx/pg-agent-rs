@@ -704,14 +704,15 @@ postgres's tokens, not pgpool's — they happen to collide visually with
 
 ### 7.1 When TLS is required
 
-- Required whenever any pool hostname resolves to a non-loopback IP.
-  Checked at startup; an unresolvable hostname is conservatively treated as
-  remote.
-- Loopback-only pools (e.g. `127.0.0.x` in functional tests) may run
-  plaintext.
-- `--dev` (CLI flag) combined with `allow_insecure_remote_peer = true` in
-  config is the **only** way to disable the check. Either alone is a hard
-  error.
+- Required whenever any pool hostname is not a literal loopback string
+  (`localhost`, `ip6-localhost`, `127.0.0.x`, or `::1`). Pure string
+  check — no DNS lookup, no startup blocking.
+- Loopback-only pools (e.g. `127.0.0.x` in functional tests) run plaintext
+  without any flags.
+- For non-loopback pools, the `--dev` CLI flag is the **only** way to
+  disable the check. Deliberately CLI-only — a config-file knob could be
+  committed by accident; a flag has to be passed every time the process
+  starts.
 
 ### 7.2 Where TLS material lives
 
@@ -771,7 +772,6 @@ unix_socket = "/run/pg_agentd/pg_agentd.sock"     # local socket
 # node_id_file = "/etc/pgpool2/pgpool_node_id"    # or via file
 # state_dir    = "/var/lib/postgresql/pg_agent"   # agent-owned persistent state
 
-# allow_insecure_remote_peer = false              # requires --dev to actually disable
 
 [tls]
 ca_cert = "/etc/pg_agent/ca.crt"
@@ -1424,9 +1424,9 @@ cluster:
    bounding the path to `$PGDATA`).
 10. **Hostname-authoritative node resolution.** Topology lookups prefer
     `NodeRef.hostname`; `NodeRef.id` is fallback only.
-11. **mTLS required for non-loopback peers.** `allow_insecure_remote_peer`
-    requires both the config field and the `--dev` CLI flag — neither
-    alone disables it.
+11. **mTLS required for non-loopback peers.** `--dev` CLI flag is the
+    only escape hatch. No config-file knob — the choice has to be re-made
+    at every startup, so it can't be silently committed.
 12. **`pg_agentd.service` starts before `pgpool2.service`.** Otherwise the
     first failover hook fires against a missing Unix socket.
 13. **The Unix socket is `0600 postgres:postgres`.** No auth beyond that.
