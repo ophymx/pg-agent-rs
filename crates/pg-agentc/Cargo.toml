@@ -18,10 +18,11 @@ path = "src/main.rs"
 pg-agent-proto    = { workspace = true }
 pg-agent-hookspec = { workspace = true }
 
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
-tonic = { workspace = true, features = ["codegen", "prost", "transport"] }
-tower = { workspace = true }
-hyper = { workspace = true }
-http  = { workspace = true }
+tokio      = { workspace = true, features = ["rt", "macros", "net", "time"] }
+tonic      = { workspace = true, features = ["codegen", "prost", "transport"] }
+tower      = { workspace = true, features = ["util"] }
+hyper      = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
+http       = { workspace = true }
 
 anyhow = { workspace = true }

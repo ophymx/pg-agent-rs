@@ -1469,6 +1469,7 @@ dependencies = [
  "anyhow",
  "http",
  "hyper",
+ "hyper-util",
  "pg-agent-hookspec",
  "pg-agent-proto",
  "tokio",

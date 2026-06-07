@@ -31,10 +31,11 @@ prost-types = { version = "0.13" }
 tonic-build = { version = "0.12" }
 
 # Web (healthz + REST)
-axum  = { version = "0.7" }
-hyper = { version = "1" }
-tower = { version = "0.5" }
-http  = { version = "1" }
+axum       = { version = "0.7" }
+hyper      = { version = "1" }
+hyper-util = { version = "0.1" }
+tower      = { version = "0.5" }
+http       = { version = "1" }
 
 # TLS
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
