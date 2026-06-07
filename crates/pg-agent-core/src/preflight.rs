@@ -94,12 +94,30 @@ impl PreflightReport {
 }
 
 /// Run every check in a deterministic order. DB-backed checks are skipped
-/// with a WARN if `db` is None.
-pub async fn preflight(_cfg: &Config, _db: Option<Arc<dyn LocalDb>>) -> PreflightReport {
-    // TODO(v1): port every checker from agent/preflight.go:
+/// with a WARN if `db` is None; peer-reachability checks are skipped with
+/// a WARN if `skip_peers` is true or if TLS isn't configured.
+pub async fn preflight(
+    _cfg: &Config,
+    _db: Option<Arc<dyn LocalDb>>,
+    _skip_peers: bool,
+) -> PreflightReport {
+    // TODO(v1): port every checker — see SPEC §14.
+    //
+    // Filesystem (always):
     //   tls material, polkit rule, pgpool_node_id, .pcppass, .pgpass,
-    //   pcp.conf, pool_passwd, recovery tools, postgres settings,
-    //   postgres SSL config, pgpool_recovery extension, postgres roles,
-    //   pg_hba.conf. Path constants per Debian layout (/etc/pgpool2/).
+    //   pcp.conf, pool_passwd, recovery tools. Path constants per Debian
+    //   layout (/etc/pgpool2/).
+    //
+    // Peer connectivity (skipped if !cfg.tls.is_configured() OR skip_peers):
+    //   for each non-local pool entry, dial <peer>:agent_port via tonic
+    //   with our mTLS material, call PgAgentPeer::GetStatus, surface
+    //   distinct ERR categories for connect-refused / TLS-handshake /
+    //   RPC-error. This is the network-level twin of "tls material" —
+    //   verifies the cluster mTLS topology end-to-end before a real
+    //   failover surfaces a misconfigured link.
+    //
+    // DB-backed (skipped if db is None):
+    //   postgres settings, postgres SSL config, pgpool_recovery extension,
+    //   postgres roles, pg_hba.conf.
     PreflightReport::default()
 }

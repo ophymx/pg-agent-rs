@@ -19,7 +19,7 @@ node (which also runs pgpool-II and HAProxy):
 
 | Binary        | Role | Loads config? | Talks to peers? |
 |---------------|------|---------------|-----------------|
-| `pg_agentd`   | Daemon. Owns local PostgreSQL operations + cluster coordination. Serves a Unix-socket RPC for local callers and an mTLS TCP RPC for peer agents. Plus an HTTPS `/healthz` listener. | yes | yes |
+| `pg_agentd`   | Daemon. Owns local PostgreSQL operations + cluster coordination. Serves a Unix-socket RPC for local callers and an mTLS TCP RPC for peer agents. Plus a plain-HTTP `/healthz` listener (see §9.2 for why no TLS). | yes | yes |
 | `pg_agentc`   | One-shot hook client. Marshals pgpool's positional argv into a single gRPC call on the local Unix socket, then exits. Also `pg_agentc status`. **No config. No node resolution. No PostgreSQL logic.** | no | no |
 | `pg_agentctl` | Operator CLI. `print-hooks`, `check-hooks`, `gen-pgpool`, `preflight`, `maintenance {list,show,retry}`, `cluster init`. May dial peer agents. | yes | yes |
 
@@ -40,7 +40,7 @@ clients → HAProxy (TCP LB, 5432) → Pgpool-II (9999) → PostgreSQL backends
 
 | Node    | Pgpool | PCP  | WD   | Heartbeat  | Agent gRPC | Agent /healthz |
 |---------|--------|------|------|------------|------------|----------------|
-| serverN | 9999   | 9898 | 9000 | 9694/udp   | 9701 mTLS  | 9702 HTTPS     |
+| serverN | 9999   | 9898 | 9000 | 9694/udp   | 9701 mTLS  | 9702 HTTP      |
 
 VIP management is intentionally absent — HAProxy replaces it. The
 `Escalation`/`DeEscalation` watchdog hooks are no-ops in this deployment. The
@@ -72,7 +72,7 @@ implementation language is not. Default choices:
 | async runtime                    | `tokio` (full)                                     | multi-threaded scheduler |
 | gRPC server + client             | `tonic` + `tonic-build`, `prost`                   | matches the Go grpc surface; supports server-streaming for `Basebackup`/`Rewind`/`FetchWal` |
 | protovalidate (field constraints) | `protovalidate` (Rust port) or hand-rolled        | only one rule in use today — see §3.3. A hand-rolled regex check is acceptable if `protovalidate` lags. |
-| TLS                              | `rustls` + `tokio-rustls`                          | for both peer mTLS and /healthz server-only TLS |
+| TLS                              | `rustls` + `tokio-rustls`                          | peer mTLS only — `/healthz` is plain HTTP (see §9.2) |
 | TOML config                      | `toml` + `serde`                                   | matches BurntSushi/toml semantics |
 | CLI                              | `clap` (derive)                                    | one binary per crate inside the workspace |
 | Logging                          | `tracing` + `tracing-subscriber` (JSON or fmt)     | replace Go's `log/slog` |
@@ -80,10 +80,10 @@ implementation language is not. Default choices:
 | systemd D-Bus                    | `zbus` (async)                                     | replace `coreos/go-systemd/v22/dbus`; talk to `org.freedesktop.systemd1` |
 | sd_notify                        | `sd-notify` crate, or the documented `NOTIFY_SOCKET` envelope written directly | for `READY=1` / `STOPPING=1` |
 | Atomic snapshot pointers         | `arc-swap` (`ArcSwap<T>`, `ArcSwapOption<T>`)      | for `CertReloader` bundle and `HealthSnapshotter` snapshot |
-| HTTP server for /healthz         | `axum` or `hyper` directly                         | request path does no async I/O |
+| HTTP server for /healthz         | `axum`                                             | request path does no async I/O; one route |
 | Concurrent peer map              | `tokio::sync::Mutex<HashMap<…>>` or `dashmap`      | small N (3 peers); a `parking_lot::Mutex` is fine |
 | Signal handling                  | `tokio::signal::unix` (`SIGINT`, `SIGTERM`, `SIGHUP`) | drives shutdown + cert reload |
-| Subprocess                       | `tokio::process::Command`                          | drives `pg_basebackup`, `pg_rewind`, `pcp_attach_node`, `pcp_node_count` |
+| Subprocess                       | `tokio::process::Command`                          | drives `pg_basebackup`, `pg_rewind`, `pcp_attach_node`, `pcp_node_info -a` |
 | Error model                      | `thiserror` for typed errors, `anyhow` only at binary entrypoints | mirror the named errors used in the Go agent (`ErrInsecureRemotePeer`, `ErrReplicationTLSPartial`, etc.) |
 
 ### 2.1 Suggested workspace layout
@@ -308,7 +308,7 @@ following Go interfaces to Rust traits, every method `async fn` returning
 | `LocalDb`          | tokio-postgres pool to local Unix socket | `promote()`, `checkpoint()`, `create_slot(name)`, `drop_slot(name)`, `is_in_recovery()`, `replication_lag()` → `ReplicationLag { bytes, state }`, `setting(name)`, `extension_exists(name)`, `role_exists(name)`, `create_replication_role(name)` |
 | `PeerRegistry`     | mTLS gRPC pool (`PeerPool`)        | `client(node) -> PeerClient`, `close()` |
 | `StandbyOps`       | subprocess + filesystem            | `basebackup(opts, progress_cb)`, `rewind(opts, progress_cb)`, `write_recovery_conf(opts)` |
-| `Pcp`              | `pcp_attach_node` / `pcp_node_count` subprocess | `attach_node(id)`, `node_count() -> int` |
+| `Pcp`              | `pcp_attach_node` / `pcp_node_info` subprocess | `attach_node(id)`, `node_info_all() -> Vec<NodeInfo>`, `node_count() -> int` (legacy / preflight only — `/healthz` uses `node_info_all`) |
 | `Systemd`          | zbus to `systemd1`                 | `start_postgres()`, `stop_postgres()`, `status_postgres()`, `status_pgpool()`, `reload_or_restart_postgres()`, `reload_or_restart_pgpool()` |
 | `ReplayMarkerStore` | JSON files under `<state_dir>/replay/` | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
@@ -810,11 +810,13 @@ address, node id, etc. require a restart.
 The `pg_agentd.service` unit ships `ExecReload=/bin/kill -HUP $MAINPID`, so
 `systemctl reload pg_agentd` is the operator interface.
 
-### 7.5 `/healthz` TLS
+### 7.5 `/healthz` does not use TLS
 
-The healthz HTTPS listener reuses the same cert (server-only — no client
-cert is required). HAProxy probes it without presenting a cert. The cert
-reloader's `ServerOnlyConfig`/equivalent serves it.
+The healthz listener is **plain HTTP** — `CertReloader` has nothing to
+do with it. See §9.2 for the reasoning. Mentioned here because earlier
+revisions of this SPEC and the Go version did wire the cert reloader to
+healthz; new readers who reach for that pattern should know we
+deliberately don't.
 
 ---
 
@@ -973,58 +975,154 @@ for local smoke tests).
 
 ## 9. Health endpoint (`/healthz`)
 
-Separate HTTPS listener on port 9702. Status code is the contract; JSON
-body is informational.
+Separate **plain-HTTP** listener on port 9702. Status code is the
+contract; JSON body is informational only.
 
-| Path                | 200 iff |
-|---------------------|---------|
-| `/healthz`          | snapshot is fresh — pure liveness for the agent process |
-| `/healthz/primary`  | snapshot fresh, postgres reachable, role=primary, pgpool reachable |
-| `/healthz/replica`  | snapshot fresh, postgres reachable, role=replica, WAL receiver active, pgpool reachable |
+### 9.1 What `/healthz` answers
 
-### 9.1 Mechanism
+> *"Can this pgpool field queries right now?"*
 
-- A background "snapshotter" probes postgres and pgpool every **1 s**,
-  each sub-probe with a **500 ms** timeout, in parallel.
-- Latest snapshot is published via `ArcSwap<HealthSnapshot>` (initially
-  None).
+That is the entire contract. There is **one path** (`/healthz`); there is
+**no `/healthz/primary` or `/healthz/replica`** — pgpool is the
+role-aware routing layer in this architecture (see §1.1), so HAProxy's
+job is "pick any healthy pgpool" rather than "pick the primary". The
+JSON body still carries role + lag + sub-probe state for operators, but
+it is not part of the status-code contract.
+
+| Status | Meaning |
+|--------|---------|
+| `200`  | Snapshot is fresh (`age < 30 s`) AND **at least one backend has `status == "up"`** (or `"waiting"`, which is also routable per pgpool docs). The cluster can field queries through this pgpool. |
+| `503`  | Snapshot is stale (probe loop wedged → process is wedged) OR the last `pcp_node_info -a` probe failed (pgpool unreachable) OR every backend is `down`. |
+| `405`  | Method other than GET / HEAD. |
+
+The "at least one backend up" gate matters because a pgpool with PCP
+answering but every backend `down` will accept connections from HAProxy
+and then return `"no available backend"` errors to clients. The current
+gate makes `/healthz` honest about that case.
+
+The stale-gate stays: without it a wedged probe loop could keep
+returning 200 forever based on its last successful probe. Fresh AND
+at-least-one-up is the joint condition.
+
+### 9.2 Why plain HTTP, not HTTPS
+
+The body contains operational state (role, lag, in-recovery, configured
+backends) — nothing an attacker on the same network couldn't infer by
+probing pgpool's wire protocol directly. **Error strings are filtered
+from the body** (logged to tracing instead), so the body has no schema /
+role / path leakage. Given that, TLS at the agent's listener buys
+encryption of "lag is 0, role is primary" — worth essentially nothing —
+while costing operators the friction of CA-trust gymnastics in every
+monitoring tool (blackbox-exporter, k8s probes, HAProxy `httpchk`).
+
+Operators who need TLS (zero-trust LAN, public exposure via tunnel) put
+a reverse proxy in front. That's the standard pattern for making a
+plain-HTTP service HTTPS; we don't bake the TLS path into the agent
+itself.
+
+Net: no `[tls]` interaction with the healthz listener at all.
+`CertReloader` exists solely for the peer mTLS port (9701).
+
+### 9.3 Mechanism
+
+- A background **snapshotter** probes postgres and pgpool every **1 s**,
+  each sub-probe with a **500 ms** timeout, concurrently.
+- The pgpool sub-probe uses `pcp_node_info -a` (one subprocess
+  invocation; returns one line per backend with status code, role,
+  replication delay, etc. — see `pcp-node-info.html`). This replaces
+  the `pcp_node_count` we used in earlier revisions: same subprocess
+  cost, much richer signal (per-backend up/down, role, replication
+  state), and lets `/healthz` answer "can this pgpool actually field
+  queries" instead of just "is PCP answering".
+- Latest snapshot lives in `ArcSwap<HealthSnapshot>` (initially `None`).
+- An **initial synchronous probe runs before `sd_notify::ready()`** so
+  the listener is fresh-and-true from the very first request after the
+  daemon says READY. Without this, there's a ~1 s window where
+  `/healthz` returns 503 because the snapshot hasn't landed yet —
+  which would make HAProxy briefly mark the node down right after
+  startup.
 - Handler is hot-path-cheap: atomic load + small struct read + JSON marshal.
 - **No DB or PCP calls happen on the request path.**
-- A snapshot older than **30 s** flips `/healthz` to 503 (the
-  snapshotter goroutine is wedged → process is wedged). Sub-probes that
-  fail still stamp a fresh timestamp with `reachable: false` in the body.
-- HEAD is supported alongside GET; method != GET/HEAD → 405.
+- HEAD is supported alongside GET; everything else → 405.
+- Sub-probes that fail still stamp a fresh `timestamp` with
+  `reachable: false` in the body — so the stale-gate distinguishes
+  "probe loop wedged" (no fresh timestamp) from "pgpool just answered
+  and said it's down" (fresh timestamp, `reachable: false`).
 
-### 9.2 Snapshot body (informational JSON)
+### 9.4 Snapshot body (informational JSON)
 
 ```json
 {
-  "role": "primary|replica|unknown",
   "ready": true,
-  "pgpool":   { "reachable": true,  "backends_up": 3, "error": "" },
-  "postgres": { "reachable": true,  "in_recovery": false, "error": "" },
-  "replication": { "lag_bytes": 0, "wal_receiver_state": "" },
-  "snapshot_age_ms": 137
+  "snapshot_age_ms": 137,
+  "role": "primary",
+  "postgres":    { "reachable": true, "in_recovery": false },
+  "pgpool": {
+    "reachable": true,
+    "backends": [
+      { "id": 0, "hostname": "server1", "role": "primary", "status": "up",      "replication_state": "none"      },
+      { "id": 1, "hostname": "server2", "role": "standby", "status": "up",      "replication_state": "streaming" },
+      { "id": 2, "hostname": "server3", "role": "standby", "status": "down",    "replication_state": "none"      }
+    ]
+  },
+  "replication": { "lag_bytes": 0, "wal_receiver_state": "" }
 }
 ```
 
-> **Wire-compat caveat:** the field is named `backends_up` in the Go version
-> but is populated from `pcp_node_count`, which per upstream docs
-> (`pcp-node-count.html`) "displays the total number of database nodes defined
-> in `pgpool.conf` … does not distinguish between nodes status, ie
-> attached/detached. ALL nodes are counted." So the field is really
-> `backends_configured`. The Rust port has two reasonable options:
-> (a) keep the misleading name for wire compatibility (status code is the real
-> contract — see §9.1 — so anyone parsing the body is doing it for ops, not
-> SLO routing); or (b) rename to `backends_configured` and additionally query
-> `pcp_node_info` for each node to compute a true up-count. Pick (a) by
-> default; (b) is a follow-up if operators ask for it.
+- `role` is one of `"primary"`, `"replica"`, `"unknown"`.
+  Serialised from a typed `HealthRole` enum — no stringly-typed
+  constants in code.
+- `pgpool.backends` is a per-backend array, one element per
+  `[[pool]]` entry, with the pgpool-side view of each backend. Fields
+  are projected from `pcp_node_info -a`'s 11-field output (a curated
+  subset — full structure available via `Pcp::node_info_all()` for
+  consumers that want more, e.g. the eventual `/metrics` endpoint).
+- `status` is `"up"` / `"waiting"` / `"down"` — the textual form of
+  pgpool's status code. `"up"` and `"waiting"` both count toward the
+  readiness gate; `"down"` does not.
+- The previous `backends_configured` count is implicit in
+  `backends.len()`.
+- **No `postgres.error` / `pgpool.error` strings.** Sub-probe failures
+  set `reachable: false`; the error message is logged via `tracing` for
+  operator review. The body carries operational state, not failure
+  diagnostics — which avoids leaking PostgreSQL error contents (schema
+  names, role names, file paths) over an unauthenticated endpoint.
 
-### 9.3 TLS
+### 9.5 Snapshot struct shape
 
-Reuses the peer cert (`[tls]`). Server-only TLS (no client cert). If TLS is
-not configured, refuse to bind unless `--dev` is set (so a botched cert
-install can't silently expose role/lag over the network).
+The struct mirrors the JSON body (nested, not flat):
+
+```rust
+struct HealthSnapshot {
+    timestamp: DateTime<Utc>,
+    role: HealthRole,
+    postgres: PostgresProbe,        // reachable, in_recovery
+    pgpool: PgpoolProbe,            // reachable, backends: Vec<BackendStatus>
+    replication: ReplicationProbe,  // lag_bytes, wal_receiver_state
+}
+
+struct PgpoolProbe {
+    reachable: bool,
+    /// Per-backend snapshot from `pcp_node_info -a`. Empty when
+    /// `reachable == false`.
+    backends: Vec<BackendStatus>,
+}
+
+struct BackendStatus {
+    id: i32,
+    hostname: String,
+    role: String,              // "primary" | "standby" | "main" | "replica" | "unknown"
+    status: String,            // "up" | "waiting" | "down"
+    replication_state: String, // "streaming" | "catchup" | "none" | ""
+}
+```
+
+The full 11-field `NodeInfo` returned by `Pcp::node_info_all()` is
+available to other consumers (preflight, the future `/metrics`
+endpoint, `pg_agentctl cluster status`); the snapshot body carries
+only the projected subset above. Avoids the `postgres_*` / `pgpool_*`
+prefix soup the Go version carried; lets `#[serde(rename_all =
+"snake_case")]` handle the wire shape automatically.
 
 ---
 
@@ -1181,10 +1279,11 @@ must not be running on this node (refused by `PeerServer::Basebackup` →
 
 Pre + post: `rm -rf $PGDATA/pg_replslot/*` (notes §3).
 
-### 11.3 `pcp_attach_node` / `pcp_node_count` (PCP impl)
+### 11.3 `pcp_*` PCP impl
 
 ```
 pcp_attach_node -h localhost -p <pcp_port> -U <pcp_user> -n <id> -w
+pcp_node_info   -h localhost -p <pcp_port> -U <pcp_user> -w -a
 pcp_node_count  -h localhost -p <pcp_port> -U <pcp_user> -w
 ```
 
@@ -1192,8 +1291,17 @@ pcp_node_count  -h localhost -p <pcp_port> -U <pcp_user> -w
 format `localhost:<port>:<user>:<password>`). The agent never reads or
 handles the PCP password directly.
 
-`pcp_node_count` returns the number of backends **defined** in `pgpool.conf`,
-not the number currently up. See §9.2 for the consequence on `/healthz`.
+`pcp_node_info -a` dumps all backends in one subprocess invocation — one
+line per backend, 11 space-separated fields per `pcp-node-info.html`
+(hostname, port, status code, weight, status name, actual status,
+role, actual role, replication delay, replication state, sync state)
+followed by a `last_status_change` timestamp the agent currently
+discards. This is what `/healthz` consumes (see §9) and what
+`pg_agentctl cluster status` will use (ROADMAP v1.x).
+
+`pcp_node_count` returns the count of backends defined in `pgpool.conf`
+(not the count currently up — per upstream docs). Kept in the `Pcp`
+trait for preflight and operator use; not on the `/healthz` hot path.
 
 ### 11.4 Progress scanner (shared)
 
@@ -1231,12 +1339,18 @@ and sends a final `OpProgress { phase = "done" }` on success.
 11. Construct `Agent` with all deps.
 12. Repair `$PGDATA` hook symlinks (fail fast on conflicts).
 13. `Agent::serve(ctx)`:
-    a. Bind Unix socket (chmod 0600, remove stale), start `LocalServer`.
-    b. Bind TCP peer addr, start `PeerServer` with mTLS.
-    c. Start `MaintenanceWorker` background task (initial sweep + 30s ticker).
-    d. Start `/healthz` HTTPS listener (snapshot loop ticking at 1 s).
-    e. `sd_notify("READY=1")`.
-    f. Wait for SIGINT/SIGTERM. On shutdown: `sd_notify("STOPPING=1")`,
+    a. Bind Unix socket synchronously (chmod 0600, remove stale).
+    b. Bind TCP peer addr synchronously.
+    c. Bind `/healthz` TCP listener synchronously (plain HTTP, port 9702).
+    d. Run **one synchronous probe** to seed the healthz snapshot so
+       the listener is fresh-and-true from the very first request.
+    e. Spawn the `LocalServer`, `PeerServer`, `MaintenanceWorker`, and
+       healthz serve loops on their respective bound listeners (the
+       background snapshot loop also starts here, ticking at 1 s).
+    f. `sd_notify::ready()` — only after every listener is bound AND
+       the initial snapshot is in place. See SPEC §9.3 and the
+       `sdnotify` module docs for the race this ordering prevents.
+    g. Wait for SIGINT/SIGTERM. On shutdown: `sd_notify::stopping()`,
        gracefully stop both gRPC servers, shut down healthz with a 5 s
        grace window.
 
@@ -1251,7 +1365,7 @@ and sends a final `OpProgress { phase = "done" }` on success.
 | `print-hooks`                                      | Emit canonical `pgpool.conf` and `postgresql.conf` hook lines. |
 | `check-hooks <pgpool.conf>`                        | Parse the given file (`key = 'value'` lines, single-quote stripping, `#` comment trimming). For every entry in the canonical list: missing/wrong → `ERR`, exact match → `OK`. Exit 0 iff all rows are `OK`. |
 | `gen-pgpool [--write <path>] [--config <path>]`    | Build `pg_agent.conf` include fragment by querying every pool member via `GetNodeConfig` (local via Unix socket, peers via mTLS) for live `pg_port` / `pg_data_dir`. Emits `backend_hostname{i} / backend_port{i} / backend_data_directory{i} / backend_flag{i} = ALLOW_TO_FAILOVER`, then the canonical hook block. Stdout by default; `--write` does atomic temp+rename. |
-| `preflight [--config <path>] [--skip-db]`          | Run the preflight checks (see §14). Exit 0 if no `ERR` rows. |
+| `preflight [--config <path>] [--skip-db] [--skip-peers]` | Run the preflight checks (see §14). Exit 0 if no `ERR` rows. `--skip-peers` is useful during multi-node deployments where you're running preflight on each node before the others are up. |
 | `maintenance list [--status pending|done|abandoned]` | Tabular dump of `ListMaintenance`. Surfaces `Skipped` files to stderr. |
 | `maintenance show <id>`                            | `GetMaintenance(id)`; pretty-print fields and JSON payload. |
 | `maintenance retry <id>`                           | `RetryMaintenance(id)`. Refuses non-pending intents. |
@@ -1347,6 +1461,27 @@ Ansible's life harder):
 - Auto-creating directories Ansible owns (`/etc/pg_agent/`,
   `/etc/pgpool2/`).
 
+**HAProxy configuration gotchas** (deployment-time, not agent-time —
+included here so the playbook author has the matching context):
+
+- **Do NOT enable PROXY protocol** (`send-proxy`, `send-proxy-v2`) on the
+  HAProxy backend that fronts pgpool. Pgpool-II does not understand
+  PROXY protocol headers (verified against pgpool 4.6 docs — no
+  `proxy_protocol` config, no PROXY header parsing); PostgreSQL itself
+  also doesn't support it natively as of PG 17. Enabling PROXY on the
+  HAProxy side would prepend bytes pgpool reads as garbage during the
+  startup phase, dropping every client connection.
+- Client identity is consequently lost at the first proxy hop. Postgres
+  and pgpool both see the previous hop's IP. The intended pattern is
+  `pg_hba.conf` rules using `samenet` for the `pgpool` / `postgres` /
+  `repl` users (which the preflight check verifies in §14); real
+  client IP visibility for audit / debugging lives in HAProxy's access
+  log, correlated with pgpool / postgres logs via timestamps.
+- HAProxy's backend health-check on pgpool should be `option pgsql-check
+  user pgpool` (a real wire-protocol probe). Don't use the agent's
+  `/healthz` for routing — pgpool is the role-aware routing layer in
+  this architecture (see §1.1 and §9.1).
+
 ---
 
 ## 14. Preflight checks
@@ -1376,6 +1511,27 @@ Filesystem (always):
   `pgpool` and `postgres`.
 - **Recovery tools** — `<pghome>/bin/pg_basebackup` and
   `<pghome>/bin/pg_rewind` exist and are executable.
+
+Peer connectivity (skipped with a WARN if `--skip-peers` or
+`[tls]` unset — a loopback-only dev pool doesn't need mTLS):
+
+- **Peer mTLS reachability** (one row per non-local pool entry).
+  TCP-connects to `<peer_hostname>:agent_port`, performs a full mTLS
+  handshake using our cert material, then issues a
+  `PgAgentPeer.GetStatus` call. ERR with a category if any step fails:
+  - *connect refused / timeout* → peer agent down, or firewall blocked
+  - *TLS handshake* → cert chain mismatch, CA divergence, expired cert,
+    SAN allowlist rejection of our identity by the peer
+  - *RPC error* → tonic layer broken on the peer, agent process wedged
+  This is the **network-level twin of the local "TLS material" check**:
+  "TLS material" verifies our cert is valid in our own eyes; this
+  verifies every peer agrees. **The reason this matters:** failover
+  orchestration runs single-leader on the pgpool watchdog leader (see
+  §1.1 — only the leader's pg_agentd RPCs into peer agents to
+  coordinate). A broken mTLS link between two nodes only surfaces
+  during a real failover when the leader tries to dial a peer it can't
+  reach — *exactly* when you want it not to surface. Preflight catches
+  it ahead of time.
 
 DB-backed (skipped with a WARN if `--skip-db` or DB unreachable):
 

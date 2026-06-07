@@ -27,7 +27,7 @@ section exists so the rest of the roadmap has a clear "from" to its "to".
 - Hook idempotency via on-disk replay markers, swept on a cadence.
 - `pg_agentctl preflight` (TLS, polkit, .pcppass, PostgreSQL tuning, roles,
   extensions, pg_hba — every silent-failure mode we know about).
-- `/healthz` HTTPS listener with snapshot-based readiness for HAProxy.
+- `/healthz` plain-HTTP listener with snapshot-based readiness for HAProxy.
 - `pg_agentctl cluster init` one-shot bootstrap from a chosen primary.
 - Strict input validation (regex on every value reaching libpq / subprocess
   / SQL identifier).
