@@ -37,6 +37,14 @@ const SOCKET_ENV: &str = "PG_AGENTD_SOCKET";
 const TIMEOUT_ENV: &str = "PG_AGENTC_TIMEOUT";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Cap on the initial socket connect. `UnixStream::connect` to a dead
+/// socket already fails fast with ECONNREFUSED/ENOENT, but a daemon
+/// that's accepted the connection and then hangs would otherwise tie
+/// up the hook indefinitely. Tight enough that pgpool's hook retry
+/// kicks in promptly; wide enough for a real startup race where
+/// pg_agentd is still binding the listener.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 const STATUS_SUBCOMMAND: &str = "status";
 
 /// True iff `name` is a hook (sourced from [`hookspec::HOOK_NAMES`]) or
@@ -154,6 +162,7 @@ async fn dial(socket: &str) -> Result<Channel> {
     // string is required because Endpoint::try_from validates it.
     Endpoint::try_from("http://[::]:0")
         .context("build endpoint")?
+        .connect_timeout(CONNECT_TIMEOUT)
         .connect_with_connector(service_fn(move |_| {
             let path = path.clone();
             async move {
