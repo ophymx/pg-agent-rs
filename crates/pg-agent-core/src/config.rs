@@ -255,6 +255,47 @@ impl PgReplicationTlsConfig {
         }
         Some(self.sslmode.as_deref().unwrap_or("verify-full"))
     }
+
+    /// Build a libpq conninfo string. `dbname` is included only when
+    /// non-empty (`pg_basebackup` + `primary_conninfo` speak the
+    /// replication protocol and don't take a dbname; pass `"postgres"`
+    /// for `pg_rewind`, which needs a regular DB connection).
+    ///
+    /// Inputs are trusted — the gRPC handler validates host/port/user at
+    /// the wire boundary and [`PgReplicationTlsConfig::validate`] checks
+    /// the cert paths at config load. This method does no escaping; the
+    /// caller is responsible for upstream validation.
+    pub fn conninfo(&self, host: &str, port: u16, user: &str, dbname: &str) -> String {
+        use std::fmt::Write as _;
+        let mut s = format!("host={host} port={port} user={user}");
+        if !dbname.is_empty() {
+            write!(s, " dbname={dbname}").unwrap();
+        }
+        if self.is_configured() {
+            let mode = self.effective_sslmode().unwrap_or("verify-full");
+            let ca = self
+                .ca_cert
+                .as_deref()
+                .expect("is_configured implies ca_cert")
+                .display();
+            let cert = self
+                .cert
+                .as_deref()
+                .expect("is_configured implies cert")
+                .display();
+            let key = self
+                .key
+                .as_deref()
+                .expect("is_configured implies key")
+                .display();
+            write!(
+                s,
+                " sslmode={mode} sslrootcert={ca} sslcert={cert} sslkey={key}"
+            )
+            .unwrap();
+        }
+        s
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1004,6 +1045,53 @@ mod tests {
         };
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.effective_sslmode(), Some("verify-full"));
+    }
+
+    #[test]
+    fn conninfo_without_tls_omits_ssl_params() {
+        let cfg = PgReplicationTlsConfig::default();
+        assert_eq!(
+            cfg.conninfo("server1", 5432, "repl", ""),
+            "host=server1 port=5432 user=repl"
+        );
+    }
+
+    #[test]
+    fn conninfo_with_dbname_includes_it() {
+        let cfg = PgReplicationTlsConfig::default();
+        assert_eq!(
+            cfg.conninfo("server1", 5432, "postgres", "postgres"),
+            "host=server1 port=5432 user=postgres dbname=postgres"
+        );
+    }
+
+    #[test]
+    fn conninfo_with_tls_appends_ssl_params() {
+        let cfg = PgReplicationTlsConfig {
+            ca_cert: Some("/etc/x/ca.crt".into()),
+            cert: Some("/etc/x/c.crt".into()),
+            key: Some("/etc/x/k.key".into()),
+            sslmode: None, // default verify-full
+        };
+        let got = cfg.conninfo("server1", 5432, "repl", "");
+        assert_eq!(
+            got,
+            "host=server1 port=5432 user=repl sslmode=verify-full \
+             sslrootcert=/etc/x/ca.crt sslcert=/etc/x/c.crt sslkey=/etc/x/k.key"
+        );
+    }
+
+    #[test]
+    fn conninfo_with_tls_respects_explicit_sslmode() {
+        let cfg = PgReplicationTlsConfig {
+            ca_cert: Some("/etc/x/ca.crt".into()),
+            cert: Some("/etc/x/c.crt".into()),
+            key: Some("/etc/x/k.key".into()),
+            sslmode: Some("verify-ca".into()),
+        };
+        assert!(cfg
+            .conninfo("server1", 5432, "repl", "")
+            .contains("sslmode=verify-ca"));
     }
 
     #[test]
