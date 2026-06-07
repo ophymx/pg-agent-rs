@@ -34,7 +34,7 @@
 //! changed blocks). After: rewind may have copied slot dirs from the
 //! source's role that would crash PG recovery if left in place.
 
-use crate::config::PgReplicationTlsConfig;
+use crate::config::PgReplicationConfig;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -180,7 +180,7 @@ pub trait StandbyOps: Send + Sync {
 pub struct StandbyExec {
     pub pg_home: PathBuf,
     pub pg_data_dir: PathBuf,
-    pub replication_tls: PgReplicationTlsConfig,
+    pub replication: PgReplicationConfig,
     /// Path to the `pg_agentc` binary the post-basebackup hook-symlink
     /// repair should point at. Threaded through from daemon main where
     /// [`crate::symlinks::find_pg_agentc`] resolves it once at startup.
@@ -193,13 +193,13 @@ impl StandbyExec {
     pub fn new(
         pg_home: PathBuf,
         pg_data_dir: PathBuf,
-        replication_tls: PgReplicationTlsConfig,
+        replication: PgReplicationConfig,
         pg_agentc_bin: PathBuf,
     ) -> Self {
         Self {
             pg_home,
             pg_data_dir,
-            replication_tls,
+            replication,
             pg_agentc_bin,
         }
     }
@@ -230,12 +230,9 @@ impl StandbyOps for StandbyExec {
 
         // dbname is empty — pg_basebackup speaks the replication protocol
         // and doesn't take one.
-        let conninfo = self.replication_tls.conninfo(
-            &opts.primary_host,
-            opts.primary_port,
-            &opts.repl_user,
-            "",
-        );
+        let conninfo =
+            self.replication
+                .conninfo(&opts.primary_host, opts.primary_port, &opts.repl_user, "");
 
         let bin = self.basebackup_bin();
         let mut args = vec![
@@ -291,7 +288,7 @@ impl StandbyOps for StandbyExec {
 
         // pg_rewind needs a regular DB connection (dbname=postgres),
         // unlike pg_basebackup which uses the replication protocol.
-        let conninfo = self.replication_tls.conninfo(
+        let conninfo = self.replication.conninfo(
             &opts.primary_host,
             opts.primary_port,
             &opts.repl_user,
@@ -332,12 +329,9 @@ impl StandbyOps for StandbyExec {
         opts.validate()
             .map_err(|e| anyhow::anyhow!("write_recovery_conf: validate: {e}"))?;
 
-        let conninfo = self.replication_tls.conninfo(
-            &opts.primary_host,
-            opts.primary_port,
-            &opts.repl_user,
-            "",
-        );
+        let conninfo =
+            self.replication
+                .conninfo(&opts.primary_host, opts.primary_port, &opts.repl_user, "");
 
         let content = render_recovery_conf(&conninfo, &opts.slot_name)?;
 
@@ -1000,7 +994,7 @@ mod tests {
         let exec = StandbyExec::new(
             pg_home,
             pgdata.clone(),
-            PgReplicationTlsConfig::default(),
+            PgReplicationConfig::default(),
             agentc_bin.clone(),
         );
 

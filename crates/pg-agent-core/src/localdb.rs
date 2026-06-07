@@ -15,7 +15,7 @@
 //! This connection is for the AGENT'S work only (failover/checkpoint/slot
 //! management/status). Replication-protocol connections (pg_basebackup,
 //! pg_rewind, primary_conninfo) are a separate code path that uses
-//! [`crate::config::PgReplicationTlsConfig`] for client-cert auth and
+//! [`crate::config::PgReplicationConfig`] for sslmode + libpq's default
 //! does **not** flow through this pool.
 //!
 //! See SPEC §4.1 for the verbatim SQL each method runs.

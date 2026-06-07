@@ -125,7 +125,7 @@ async fn run() -> anyhow::Result<()> {
     let standby = Arc::new(StandbyExec::new(
         config.postgres.pghome.clone().unwrap(),
         postgres.data_dir.clone(),
-        config.postgres.replication_tls.clone(),
+        config.postgres.replication.clone(),
         pg_agentc_bin,
     ));
 

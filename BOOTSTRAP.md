@@ -63,30 +63,48 @@ empty cluster). That's fine — on the chosen primary the empty cluster
 IS the cluster; on the standbys ClusterInit's defensive `peer.stop()`
 step shuts it down before basebackup wipes pgdata.
 
-`pg_agentd` will also auto-start at install (our own `.deb` follows
-the same `dh_installsystemd` pattern). That's also fine — we want the
-agent up everywhere so the mesh is reachable when the operator runs
-`cluster init`.
+`pg_agentd` does NOT auto-start at install — our `.deb` is built
+with `dh_installsystemd --no-enable`. The agent needs `config.toml`
+in place + a valid mTLS bundle before it can do anything useful, and
+those are written in Phases 1.2–1.6. Phase 1.7 turns the service on
+once Ansible has staged everything.
 
-The *only* unit that needs masking is `pgpool2.service`.
+`pgpool2.service` is the *only* unit that needs explicit masking
+(its upstream postinst would auto-enable + auto-start).
 
 ### 1.2 mTLS material
 
-Generated from a central CA Ansible owns (Vault, step-ca, etc.).
-Distributed to each node:
+Two cert populations, in two different homes. Ansible owns both —
+pg-agent only reads them.
+
+**Cluster-internal mesh (pg_agent peer RPCs):**
 
 ```
 /etc/pg_agent/tls/ca.crt              # the CA cert
 /etc/pg_agent/tls/node.crt            # leaf with SAN = this node's hostname
 /etc/pg_agent/tls/node.key            # mode 0600 postgres:postgres
-/etc/pg_agent/tls/replication/ca.crt  # if replication uses TLS too
-/etc/pg_agent/tls/replication/node.crt
-/etc/pg_agent/tls/replication/node.key
 ```
 
-Two separate sets because the cluster-internal mesh (pg_agent peer
-RPCs) and PostgreSQL replication can have different trust roots. They
-*can* be the same CA — operator's choice.
+pg-agent reads these paths explicitly (declared in its config.toml).
+
+**PostgreSQL replication TLS — libpq defaults, NOT under /etc/pg_agent:**
+
+```
+~postgres/.postgresql/root.crt        # CA for verifying primary's cert
+~postgres/.postgresql/postgresql.crt  # leaf, presented as replication client
+~postgres/.postgresql/postgresql.key  # mode 0600 postgres:postgres
+```
+
+This is the path libpq looks at by default. pg_basebackup, pg_rewind,
+and PostgreSQL's own walreceiver pick these up automatically — pg-agent
+does not need to know they exist and does not name them in conninfo.
+The agent only chooses `sslmode` (default `verify-full`); the paths
+are libpq's problem.
+
+The two CAs *can* be the same — operator's choice. Symmetric with how
+`.pcppass` (Phase 1.4) and `.pgpass` live in `~postgres/` and are
+picked up via libpq's default search; one home, one owner (Ansible),
+multiple readers (PostgreSQL, pgpool, pg-agent).
 
 ### 1.3 PostgreSQL config
 
@@ -105,9 +123,9 @@ PGDATA in `/var/lib/postgresql/17/main/`):
   archive_command    = 'test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f'
   restore_command    = 'pg_agentc restore-wal %f %p'
   ssl                = on
-  ssl_ca_file        = '/etc/pg_agent/tls/replication/ca.crt'
-  ssl_cert_file      = '/etc/pg_agent/tls/replication/node.crt'
-  ssl_key_file       = '/etc/pg_agent/tls/replication/node.key'
+  ssl_ca_file        = '/var/lib/postgresql/.postgresql/root.crt'
+  ssl_cert_file      = '/var/lib/postgresql/.postgresql/postgresql.crt'
+  ssl_key_file       = '/var/lib/postgresql/.postgresql/postgresql.key'
   include_if_exists  = 'myrecovery.conf'
 ```
 
@@ -145,12 +163,18 @@ agent's `[[pool]]` so both stay in sync):
 /etc/pgpool2/pcp.conf
   pgpool:md5<hash>                  # pcp admin user
 
-/etc/pgpool2/.pcppass               # pg_agentd reads this
+~postgres/.pcppass                  # pg_agentd reads this via libpq default
   *:9898:pgpool:<plaintext>         # mode 0600 postgres:postgres
 
 /etc/pgpool2/pgpool_node_id         # per-host: the integer node id
   1                                 # mode 0644; matches [[pool]].id for THIS host
 ```
+
+`~postgres/.pcppass` is libpq/pgpool's default search location when
+the `postgres` user runs `pcp_*` commands — same convention as
+`~/.pgpass` for libpq. pg-agent doesn't carry a config field for the
+path; it relies on the default. Symmetric with the replication TLS
+material in Phase 1.2.
 
 `pgpool_node_id` is the single source of truth that both pgpool and
 pg_agent read. Writing it once per node (Ansible's per-host inventory
@@ -200,17 +224,18 @@ touch this file (it's a pgpool concern).
   service   = "postgresql@17-main.service"
   repl_user = "repl"
 
-  [postgres.replication_tls]
-  ca_cert = "/etc/pg_agent/tls/replication/ca.crt"
-  cert    = "/etc/pg_agent/tls/replication/node.crt"
-  key     = "/etc/pg_agent/tls/replication/node.key"
-  sslmode = "verify-full"
+  # [postgres.replication] section is optional.
+  # sslmode defaults to "verify-full". Cert paths come from libpq's
+  # own search (~postgres/.postgresql/) — pg-agent does NOT name them.
+  # [postgres.replication]
+  # sslmode = "verify-full"
 
   [pcp]
   user     = "pgpool"
   port     = 9898
-  pcp_pass_file  = "/etc/pgpool2/.pcppass"
   pgpool_service = "pgpool2.service"
+  # No .pcppass field — pg-agent calls pcp_* binaries as the postgres
+  # user; libpq picks up ~postgres/.pcppass automatically.
 
   [healthz]
   enabled = true
@@ -241,12 +266,24 @@ by stopping and re-basebackup'ing).
 
 ```
 on every node:
+  # pg-agent's .deb deliberately does NOT auto-enable at install time.
+  # Ansible writes config.toml first (steps 1.5 above), then turns the
+  # service on.
   systemctl enable --now pg_agentd.service
 ```
 
+The pg-agent Debian package is built with `dh_installsystemd
+--no-enable`, which means the postinst installs the unit file but
+doesn't enable it (so it stays off across reboots) and doesn't start
+it. Ansible is responsible for the activation in this step. On
+upgrade, dh_installsystemd's restart-if-running default still applies
+— a running agent picks up new binaries via a restart.
+
 Each agent at boot:
-- Loads `/etc/pg_agent/config.toml`, resolves local node id by hostname
-- Validates config (mTLS material readable, paths absolute, etc.)
+- Loads `/etc/pg_agent/config.toml`, resolves local node id from
+  `/etc/pgpool2/pgpool_node_id` (or hostname fallback)
+- Validates config (mTLS material readable, paths absolute, sslmode in
+  libpq's set)
 - Connects to systemd D-Bus, PG Unix socket, builds PCP CLI
 - Repairs hook symlinks in `$PGDATA` (creates them on the chosen primary
   whose pgdata exists; standbys without pgdata yet will get repaired
@@ -396,8 +433,8 @@ HAProxy → pgpool:9999 → PG). Out of scope.
 | Identity | Where used | Who creates | How it authenticates | Where its credential lives |
 |---|---|---|---|---|
 | `postgres` (PG superuser) | initdb default | `pg_createcluster` (Debian package) | `local … peer` in `pg_hba.conf` | n/a (peer auth from `postgres` OS user) |
-| `repl` (PG replication role) | replication / basebackup / rewind | **ClusterInit** (`db.create_replication_role`) | mTLS client cert (`hostssl replication repl … cert`) | `/etc/pg_agent/tls/replication/` |
-| Pgpool admin (`pgpool`) | PCP commands (`pcp_attach_node`) | Ansible | md5 in `pcp.conf` | `/etc/pgpool2/.pcppass` (read by agent) |
+| `repl` (PG replication role) | replication / basebackup / rewind | **ClusterInit** (`db.create_replication_role`) | mTLS client cert (`hostssl replication repl … cert`) | `~postgres/.postgresql/` (libpq default) |
+| Pgpool admin (`pgpool`) | PCP commands (`pcp_attach_node`) | Ansible | md5 in `pcp.conf` | `~postgres/.pcppass` (libpq default) |
 | App user(s) | application traffic | **Operator** (psql) | md5 in `pg_hba.conf` + `pool_passwd` | `/etc/pgpool2/pool_passwd` (Ansible-managed) |
 | pg-agent peer mesh | inter-node RPC | Ansible (mints from CA) | mTLS client cert + SAN allowlist | `/etc/pg_agent/tls/` |
 

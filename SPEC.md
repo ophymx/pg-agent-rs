@@ -543,17 +543,27 @@ file is included from `postgresql.conf` via
 `include_if_exists = 'myrecovery.conf'` (provisioning is outside the
 agent's scope).
 
-`<conninfo>` is built by `PgReplicationTls::conninfo(host, port, user, dbname)`:
+`<conninfo>` is built by `PgReplicationConfig::conninfo(host, port, user, dbname)`:
 
-- Always: `host=<h> port=<p> user=<u>` (plus ` dbname=<d>` for `pg_rewind`).
-- When `[postgres.replication_tls]` is configured (all three of ca/cert/key):
-  append ` sslmode=<effective> sslrootcert=<ca> sslcert=<cert> sslkey=<key>`.
-  Default `sslmode = "verify-full"`.
-- Partial config (1 or 2 paths) → reject at config load
-  (`ErrReplicationTLSPartial`).
+- Always: `host=<h> port=<p> user=<u> sslmode=<m>` (plus ` dbname=<d>` for
+  `pg_rewind`). The agent ALWAYS emits `sslmode=`; libpq's own default
+  is `prefer`, which silently accepts an MITM, so secure-by-default
+  requires us to force the operator's hand.
+- `sslmode` defaults to `verify-full` when `[postgres.replication]` is
+  absent. Operators relax this only deliberately (`disable` for
+  dev/test, `require` if the CA isn't distributable, etc.).
 - `sslmode` outside libpq's set (`disable|allow|prefer|require|verify-ca|verify-full`)
-  → `ErrReplicationTLSSSLMode`.
-- Cert paths must match `^/[A-Za-z0-9._/-]+$` → `ErrReplicationTLSBadPath`.
+  → `ErrReplicationSslMode`.
+
+The conninfo does **not** carry `sslcert=`, `sslkey=`, or `sslrootcert=`.
+libpq picks those up from its own defaults
+(`~postgres/.postgresql/postgresql.crt`, `…/postgresql.key`,
+`…/root.crt`) or from `PGSSLCERT` / `PGSSLKEY` / `PGSSLROOTCERT` env
+vars on the `postgresql@*.service` unit. Ansible provisions cert
+material into libpq's expected locations; pg-agent does NOT own those
+paths. Symmetric with `.pcppass` and `.pgpass`, which both live in the
+postgres user's home and are also picked up via libpq's default
+search.
 
 ### 5.11 Input validation regexes
 

@@ -68,15 +68,9 @@ pub enum AgentError {
     #[error("tls: build: {reason}")]
     TlsBuild { reason: String },
 
-    // ----- Replication TLS ----------------------------------------------
-    #[error(
-        "config: postgres.replication_tls requires ca_cert, cert, and key (all three or none)"
-    )]
-    ReplicationTlsPartial,
-    #[error("config: postgres.replication_tls.sslmode must be one of disable, allow, prefer, require, verify-ca, verify-full")]
-    ReplicationTlsSslMode,
-    #[error("config: postgres.replication_tls cert paths must be absolute and contain only [A-Za-z0-9._/-]")]
-    ReplicationTlsBadPath,
+    // ----- Replication --------------------------------------------------
+    #[error("config: postgres.replication.sslmode must be one of disable, allow, prefer, require, verify-ca, verify-full")]
+    ReplicationSslMode,
 
     // ----- WAL store ----------------------------------------------------
     #[error("dest_path is outside pgdata root")]

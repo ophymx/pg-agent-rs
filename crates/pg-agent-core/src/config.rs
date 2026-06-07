@@ -9,7 +9,7 @@
 //! 3. [`Config::resolve_local_node_id`] picks the local node id via the
 //!    four-way priority documented on the method.
 //! 4. [`Config::validate`] enforces structural rules (pool non-empty,
-//!    unique ids/hostnames, replication_tls all-or-nothing, local node
+//!    unique ids/hostnames, replication sslmode in libpq's set, local node
 //!    resolved).
 //!
 //! Optional after `load`: [`Config::apply_env_overrides`] (called by the
@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -81,13 +80,12 @@ const ALLOWED_SSLMODES: &[&str] = &[
     "verify-full",
 ];
 
-/// Restrict cert paths to a conservative ASCII subset. The paths are written
-/// verbatim into a single-quoted libpq conninfo, so they must not contain
-/// whitespace, quotes, or shell metacharacters that could escape the quoting.
-fn allowed_ssl_path() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"^/[A-Za-z0-9._/-]+$").unwrap())
-}
+/// Default replication `sslmode`. libpq itself defaults to `prefer`, which
+/// does NOT verify the server cert — insecure. pg-agent always emits an
+/// explicit `sslmode=` in conninfo so the operator either gets
+/// verify-full (secure-by-default) or has consciously chosen something
+/// else via `[postgres.replication].sslmode`.
+pub const DEFAULT_REPL_SSLMODE: &str = "verify-full";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -186,7 +184,7 @@ pub struct PostgresConfig {
     pub service: Option<String>,
 
     #[serde(default)]
-    pub replication_tls: PgReplicationTlsConfig,
+    pub replication: PgReplicationConfig,
 }
 
 impl PostgresConfig {
@@ -207,59 +205,41 @@ impl PostgresConfig {
     }
 }
 
+/// `[postgres.replication]` — connection knobs for the replication
+/// conninfo string (basebackup, rewind, `myrecovery.conf`'s
+/// `primary_conninfo`). pg-agent does NOT own the TLS material itself:
+/// libpq looks up cert paths from its own defaults
+/// (`~postgres/.postgresql/{postgresql.crt,postgresql.key,root.crt}`)
+/// or from `PGSSLCERT` / `PGSSLKEY` / `PGSSLROOTCERT` env vars on the
+/// `postgresql@*.service` unit. Ansible provisions cert material into
+/// libpq's default locations; pg-agent only chooses the `sslmode`.
+///
+/// `sslmode` defaults to `verify-full` because libpq's own default is
+/// `prefer`, which silently accepts an MITM — pg-agent always emits an
+/// explicit value so secure-by-default is the standing posture.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PgReplicationTlsConfig {
-    #[serde(default)]
-    pub ca_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub cert: Option<PathBuf>,
-    #[serde(default)]
-    pub key: Option<PathBuf>,
+pub struct PgReplicationConfig {
     #[serde(default)]
     pub sslmode: Option<String>,
 }
 
-impl PgReplicationTlsConfig {
-    /// All three paths present (sslmode defaults to verify-full when so).
-    pub fn is_configured(&self) -> bool {
-        self.ca_cert.is_some() && self.cert.is_some() && self.key.is_some()
-    }
-
-    /// Reject half-configured blocks (1 or 2 of 3 paths set), any sslmode
-    /// libpq wouldn't recognise, and cert paths containing characters that
-    /// could escape the single-quoted libpq conninfo they're rendered into.
+impl PgReplicationConfig {
+    /// Reject any `sslmode` libpq wouldn't recognise. Other validations
+    /// belong elsewhere — there are no cert paths in this struct.
     pub fn validate(&self) -> Result<(), AgentError> {
-        let set = [&self.ca_cert, &self.cert, &self.key]
-            .iter()
-            .filter(|o| o.is_some())
-            .count();
-        if set != 0 && set != 3 {
-            return Err(AgentError::ReplicationTlsPartial);
-        }
         if let Some(mode) = self.sslmode.as_deref() {
             if !ALLOWED_SSLMODES.contains(&mode) {
-                return Err(AgentError::ReplicationTlsSslMode);
-            }
-        }
-        if set == 3 {
-            let re = allowed_ssl_path();
-            for p in [&self.ca_cert, &self.cert, &self.key].into_iter().flatten() {
-                let s = p.to_string_lossy();
-                if !re.is_match(&s) {
-                    return Err(AgentError::ReplicationTlsBadPath);
-                }
+                return Err(AgentError::ReplicationSslMode);
             }
         }
         Ok(())
     }
 
-    /// `sslmode` value to write into `primary_conninfo`. `None` means "omit
-    /// sslmode entirely" — used when the block is not configured.
-    pub fn effective_sslmode(&self) -> Option<&str> {
-        if !self.is_configured() {
-            return None;
-        }
-        Some(self.sslmode.as_deref().unwrap_or("verify-full"))
+    /// `sslmode` value to write into `primary_conninfo`. Never empty —
+    /// falls back to [`DEFAULT_REPL_SSLMODE`] when the operator hasn't
+    /// set one. See SPEC §5.10 for why this is always emitted.
+    pub fn effective_sslmode(&self) -> &str {
+        self.sslmode.as_deref().unwrap_or(DEFAULT_REPL_SSLMODE)
     }
 
     /// Build a libpq conninfo string. `dbname` is included only when
@@ -268,38 +248,16 @@ impl PgReplicationTlsConfig {
     /// for `pg_rewind`, which needs a regular DB connection).
     ///
     /// Inputs are trusted — the gRPC handler validates host/port/user at
-    /// the wire boundary and [`PgReplicationTlsConfig::validate`] checks
-    /// the cert paths at config load. This method does no escaping; the
-    /// caller is responsible for upstream validation.
+    /// the wire boundary. The conninfo carries `sslmode=` only;
+    /// `sslcert`/`sslkey`/`sslrootcert` are picked up from libpq defaults
+    /// (`~postgres/.postgresql/…`) or env vars.
     pub fn conninfo(&self, host: &str, port: u16, user: &str, dbname: &str) -> String {
         use std::fmt::Write as _;
         let mut s = format!("host={host} port={port} user={user}");
         if !dbname.is_empty() {
             write!(s, " dbname={dbname}").unwrap();
         }
-        if self.is_configured() {
-            let mode = self.effective_sslmode().unwrap_or("verify-full");
-            let ca = self
-                .ca_cert
-                .as_deref()
-                .expect("is_configured implies ca_cert")
-                .display();
-            let cert = self
-                .cert
-                .as_deref()
-                .expect("is_configured implies cert")
-                .display();
-            let key = self
-                .key
-                .as_deref()
-                .expect("is_configured implies key")
-                .display();
-            write!(
-                s,
-                " sslmode={mode} sslrootcert={ca} sslcert={cert} sslkey={key}"
-            )
-            .unwrap();
-        }
+        write!(s, " sslmode={}", self.effective_sslmode()).unwrap();
         s
     }
 }
@@ -749,7 +707,7 @@ impl Config {
         // local node must resolve to a pool entry.
         self.local_node()?;
 
-        self.postgres.replication_tls.validate()?;
+        self.postgres.replication.validate()?;
         Ok(())
     }
 
@@ -1117,111 +1075,68 @@ mod tests {
     }
 
     #[test]
-    fn replication_tls_partial_errors() {
-        let cfg = PgReplicationTlsConfig {
-            ca_cert: Some("/etc/x/ca.crt".into()),
-            cert: None,
-            key: None,
-            sslmode: None,
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(AgentError::ReplicationTlsPartial)
-        ));
-    }
-
-    #[test]
-    fn replication_tls_unknown_sslmode_errors() {
-        let cfg = PgReplicationTlsConfig {
-            ca_cert: None,
-            cert: None,
-            key: None,
+    fn replication_unknown_sslmode_errors() {
+        let cfg = PgReplicationConfig {
             sslmode: Some("totally-secure".into()),
         };
         assert!(matches!(
             cfg.validate(),
-            Err(AgentError::ReplicationTlsSslMode)
+            Err(AgentError::ReplicationSslMode)
         ));
     }
 
     #[test]
-    fn replication_tls_bad_path_errors() {
-        let cfg = PgReplicationTlsConfig {
-            ca_cert: Some("/etc/x ca.crt".into()), // space rejected
-            cert: Some("/etc/x/c.crt".into()),
-            key: Some("/etc/x/k.key".into()),
-            sslmode: None,
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(AgentError::ReplicationTlsBadPath)
-        ));
-    }
-
-    #[test]
-    fn replication_tls_unconfigured_validates() {
-        let cfg = PgReplicationTlsConfig::default();
+    fn replication_default_validates_and_yields_verify_full() {
+        let cfg = PgReplicationConfig::default();
         assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.effective_sslmode(), None);
+        assert_eq!(cfg.effective_sslmode(), "verify-full");
     }
 
     #[test]
-    fn replication_tls_configured_defaults_to_verify_full() {
-        let cfg = PgReplicationTlsConfig {
-            ca_cert: Some("/etc/x/ca.crt".into()),
-            cert: Some("/etc/x/c.crt".into()),
-            key: Some("/etc/x/k.key".into()),
-            sslmode: None,
+    fn replication_explicit_sslmode_round_trips() {
+        let cfg = PgReplicationConfig {
+            sslmode: Some("verify-ca".into()),
         };
         assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.effective_sslmode(), Some("verify-full"));
+        assert_eq!(cfg.effective_sslmode(), "verify-ca");
     }
 
     #[test]
-    fn conninfo_without_tls_omits_ssl_params() {
-        let cfg = PgReplicationTlsConfig::default();
+    fn conninfo_always_emits_sslmode() {
+        // No paths in conninfo — libpq picks them up from
+        // ~postgres/.postgresql/ or PGSSL* env vars.
+        let cfg = PgReplicationConfig::default();
         assert_eq!(
             cfg.conninfo("server1", 5432, "repl", ""),
-            "host=server1 port=5432 user=repl"
+            "host=server1 port=5432 user=repl sslmode=verify-full"
         );
     }
 
     #[test]
     fn conninfo_with_dbname_includes_it() {
-        let cfg = PgReplicationTlsConfig::default();
+        let cfg = PgReplicationConfig::default();
         assert_eq!(
             cfg.conninfo("server1", 5432, "postgres", "postgres"),
-            "host=server1 port=5432 user=postgres dbname=postgres"
+            "host=server1 port=5432 user=postgres dbname=postgres sslmode=verify-full"
         );
     }
 
     #[test]
-    fn conninfo_with_tls_appends_ssl_params() {
-        let cfg = PgReplicationTlsConfig {
-            ca_cert: Some("/etc/x/ca.crt".into()),
-            cert: Some("/etc/x/c.crt".into()),
-            key: Some("/etc/x/k.key".into()),
-            sslmode: None, // default verify-full
-        };
-        let got = cfg.conninfo("server1", 5432, "repl", "");
-        assert_eq!(
-            got,
-            "host=server1 port=5432 user=repl sslmode=verify-full \
-             sslrootcert=/etc/x/ca.crt sslcert=/etc/x/c.crt sslkey=/etc/x/k.key"
-        );
-    }
-
-    #[test]
-    fn conninfo_with_tls_respects_explicit_sslmode() {
-        let cfg = PgReplicationTlsConfig {
-            ca_cert: Some("/etc/x/ca.crt".into()),
-            cert: Some("/etc/x/c.crt".into()),
-            key: Some("/etc/x/k.key".into()),
+    fn conninfo_respects_explicit_sslmode() {
+        let cfg = PgReplicationConfig {
             sslmode: Some("verify-ca".into()),
         };
         assert!(cfg
             .conninfo("server1", 5432, "repl", "")
             .contains("sslmode=verify-ca"));
+    }
+
+    #[test]
+    fn conninfo_disable_sslmode_for_dev() {
+        let cfg = PgReplicationConfig {
+            sslmode: Some("disable".into()),
+        };
+        assert!(cfg.conninfo("h", 5432, "u", "").contains("sslmode=disable"));
     }
 
     #[test]
