@@ -16,7 +16,7 @@ use pg_agent_core::{
     localdb::PgLocalDb,
     maintenance::{FileMaintenanceStore, DEFAULT_SWEEP_INTERVAL},
     pcp::PcpCli,
-    peers::NoOpPeerRegistry,
+    peers::{PeerPool, PeerRegistry},
     pgstandby::StandbyExec,
     replay_markers::{FileReplayMarkerStore, DEFAULT_RETENTION},
     systemd::DbusSystemd,
@@ -130,10 +130,13 @@ async fn run() -> anyhow::Result<()> {
         chrono::Duration::days(7),
     ));
 
-    // PeerPool is not yet implemented — see [`pg_agent_core::peers`] TODO.
-    // Until it lands, MaintenanceWorker will exhaust retries on any
-    // cross-node intent; acceptable in dev / single-node deployments.
-    let peers = Arc::new(NoOpPeerRegistry);
+    // PeerPool: mTLS when cert material is configured, plain TCP only
+    // for `--dev` / single-node. The validate() path already rejects
+    // "remote peers + no TLS + no --dev".
+    let peers: Arc<dyn PeerRegistry> = match cert_reloader.clone() {
+        Some(reloader) => PeerPool::new(reloader, serve.agent_port)?,
+        None => PeerPool::new_dev(serve.agent_port),
+    };
 
     let deps = AgentDeps {
         db,

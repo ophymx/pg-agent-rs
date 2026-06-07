@@ -26,11 +26,13 @@ tonic       = { workspace = true, features = ["codegen", "prost", "transport", "
 prost       = { workspace = true }
 prost-types = { workspace = true }
 
-# Web (healthz + REST)
-axum  = { workspace = true }
-hyper = { workspace = true, features = ["server", "http1"] }
-tower = { workspace = true }
-http  = { workspace = true }
+# Web (healthz + REST) + the tower::service_fn / hyper bridge for tonic
+# outbound mTLS dialing via a custom connector.
+axum       = { workspace = true }
+hyper      = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tower      = { workspace = true, features = ["util"] }
+http       = { workspace = true }
 
 # TLS
 rustls         = { workspace = true }

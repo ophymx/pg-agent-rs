@@ -1428,6 +1428,7 @@ dependencies = [
  "hex",
  "http",
  "hyper",
+ "hyper-util",
  "libc",
  "nix",
  "pg-agent-hookspec",
