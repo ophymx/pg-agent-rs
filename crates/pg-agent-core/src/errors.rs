@@ -57,6 +57,16 @@ pub enum AgentError {
          (dev/test only — there is intentionally no config-file knob for this)"
     )]
     InsecureRemotePeer,
+    #[error("tls: read {path}: {source}")]
+    TlsRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("tls: parse {path}: {reason}")]
+    TlsParse { path: PathBuf, reason: String },
+    #[error("tls: build: {reason}")]
+    TlsBuild { reason: String },
 
     // ----- Replication TLS ----------------------------------------------
     #[error(

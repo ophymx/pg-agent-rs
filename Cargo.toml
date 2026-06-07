@@ -73,6 +73,7 @@ libc      = { version = "0.2" }
 nix       = { version = "0.29", features = ["signal", "fs", "hostname"] }
 sd-notify = { version = "0.4" }
 tempfile  = { version = "3" }
+rcgen     = { version = "0.13" }
 
 [profile.release]
 lto           = "thin"

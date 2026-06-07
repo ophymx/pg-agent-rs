@@ -67,3 +67,4 @@ sd-notify = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["macros"] }
+rcgen    = { workspace = true }
