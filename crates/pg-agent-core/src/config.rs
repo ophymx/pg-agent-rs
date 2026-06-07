@@ -1,5 +1,5 @@
 //! `config.toml` schema, defaults, and projections (`ServeSettings`,
-//! `TopologySnapshot`, `PostgresRuntime`). See SPEC §8.
+//! `NodePool`, `PostgresRuntime`). See SPEC §8.
 //!
 //! TODO(v1): implement load/validate/apply_env_overrides; node-id resolution
 //! (config field → file → `<state_dir>/node_id` → hostname); peer-listen-addr
@@ -219,17 +219,27 @@ pub struct PostgresRuntime {
     pub repl_user: String,
 }
 
-/// Immutable in-memory view of cluster topology + the local node's PostgreSQL
-/// runtime config. Used by `ResolveNode` to warn on drift.
+/// The set of nodes that make up the cluster, plus which one is us.
+///
+/// Pure membership — no operational config lives here. The local node's
+/// PostgreSQL runtime is a sibling [`PostgresRuntime`] on `Options`; the
+/// drift-warning that needs both (`warn_node_ref_mismatch`, TODO) is a
+/// free function so consumers that only do member lookup don't
+/// transitively depend on PG runtime.
 #[derive(Debug, Clone)]
-pub struct TopologySnapshot {
-    pub pool: Vec<NodeConfig>,
+pub struct NodePool {
+    /// Pool members in declaration order. (`NodePool` is a runtime
+    /// projection of `Config`, not a TOML-deserialised type — the
+    /// `[[pool]]` directive lives on `Config::pool` directly.)
+    pub members: Vec<NodeConfig>,
+    /// Pool id of the local node, or `-1` if unresolved at config-load time.
     pub local_node_id: i32,
-    pub local_pg: PostgresRuntime,
 }
 
 // TODO(v1): impl Config::{load, validate, apply_env_overrides,
 //   resolve_local_node_id, peer_listen_addr, has_remote_peers,
-//   to_serve_settings, to_topology_snapshot, to_postgres_runtime}.
-// TODO(v1): impl TopologySnapshot::{node_by_id, node_by_hostname, local_node,
-//   is_local, resolve_node, resolve_local_node, warn_ref_mismatch}.
+//   to_serve_settings, to_node_pool, to_postgres_runtime}.
+// TODO(v1): impl NodePool::{node_by_id, node_by_hostname, local_node,
+//   is_local, resolve_node, resolve_local_node}.
+// TODO(v1): free fn warn_node_ref_mismatch(ref, node, local_pg) — only
+//   called by the agent when resolving a NodeRef known to be local.

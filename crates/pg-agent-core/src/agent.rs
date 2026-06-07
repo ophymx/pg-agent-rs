@@ -4,7 +4,7 @@
 
 use crate::{
     certreload::CertReloader,
-    config::{PostgresRuntime, ServeSettings, TopologySnapshot},
+    config::{NodePool, PostgresRuntime, ServeSettings},
     localdb::LocalDb,
     maintenance::MaintenanceStore,
     pcp::Pcp,
@@ -42,7 +42,7 @@ pub struct AgentDeps {
 
 pub struct Options {
     pub serve: ServeSettings,
-    pub topology: TopologySnapshot,
+    pub node_pool: NodePool,
     pub postgres: PostgresRuntime,
     pub maintenance_store: Arc<dyn MaintenanceStore>,
     pub maintenance_sweep_interval: Duration,
