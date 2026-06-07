@@ -123,7 +123,7 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("hook symlink setup: {e}"))?;
 
     let standby = Arc::new(StandbyExec::new(
-        config.postgres.pghome.clone().unwrap(),
+        config.postgres.pg_install_prefix.clone().unwrap(),
         postgres.data_dir.clone(),
         config.postgres.replication.clone(),
         pg_agentc_bin,

@@ -505,8 +505,8 @@ so the request carries no password.
 | `CreateSlot`        | `pg_create_physical_replication_slot(name)`, SQLSTATE 42710 ok |
 | `DropSlot`          | `pg_drop_replication_slot(name)` |
 | `ConfigureStandby`  | validate (`primary_host` regex, port>0, repl_user regex, slot regex). Write `$PGDATA/myrecovery.conf` (template — see §5.10) and create empty `$PGDATA/standby.signal`. Both files mode `0640`. |
-| `Basebackup`        | refuse if PostgreSQL is running (`FailedPrecondition`). Clear `$PGDATA` contents. Exec `<pghome>/bin/pg_basebackup --pgdata <data> --dbname '<conninfo>' --wal-method=stream --checkpoint=fast --no-password [--slot <name>] [--progress]`. Scan stderr line-by-line (split on `\r` *or* `\n`), forward `done/total kB` lines as `OpProgress { phase="streaming", bytes_done=done*1024, bytes_total=total*1024 }`, log other lines, capture last ~4 KiB into the error tail if the subprocess exits non-zero. Final `OpProgress { phase="done" }`. |
-| `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pghome>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |
+| `Basebackup`        | refuse if PostgreSQL is running (`FailedPrecondition`). Clear `$PGDATA` contents. Exec `<pg_install_prefix>/bin/pg_basebackup --pgdata <data> --dbname '<conninfo>' --wal-method=stream --checkpoint=fast --no-password [--slot <name>] [--progress]`. Scan stderr line-by-line (split on `\r` *or* `\n`), forward `done/total kB` lines as `OpProgress { phase="streaming", bytes_done=done*1024, bytes_total=total*1024 }`, log other lines, capture last ~4 KiB into the error tail if the subprocess exits non-zero. Final `OpProgress { phase="done" }`. |
+| `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pg_install_prefix>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |
 | `FetchWal`          | validate filename. Open `<archive_dir>/<wal_file>` (after `filepath.Localize`-equivalent rejection of `..`/absolute paths). Stream 1 MiB chunks. `NotFound` if absent. |
 | `RemoveVip`         | always `Unimplemented`. |
 | `GetStatus` / `GetNodeConfig` | delegate to `NodeInfo`. |
@@ -860,20 +860,25 @@ id       = 2
 hostname = "server3"
 
 [postgres]
-# port       = 5432
-# pghome     = "/usr/lib/postgresql/17"
-# data_dir   = "/var/lib/postgresql/17/main"
-# socket_dir = "/var/run/postgresql"
-# repl_user  = "repl"
-# home       = "/var/lib/postgresql"
-# archive_dir = "/var/lib/postgresql/archive"
-# service    = "postgresql@17-main.service"
+# port               = 5432
+# pg_install_prefix  = "/usr/lib/postgresql/17"     # contains bin/pg_basebackup
+# data_dir           = "/var/lib/postgresql/17/main" # $PGDATA
+# socket_dir         = "/var/run/postgresql"
+# repl_user          = "repl"
+# user_home          = "/var/lib/postgresql"         # postgres OS user's home
+# archive_dir        = "/var/lib/postgresql/archive"
+# service            = "postgresql@17-main.service"
+#
+# Three distinct paths above:
+#   pg_install_prefix → where the binaries live (bin/pg_basebackup etc.)
+#   data_dir          → $PGDATA (PostgreSQL's data files)
+#   user_home         → the `postgres` OS user's home (where libpq finds
+#                       .postgresql/, .pcppass, .pgpass)
 
-[postgres.replication_tls]
-# ca_cert = "/etc/pg_agent/repl-ca.crt"
-# cert    = "/etc/pg_agent/repl-node.crt"
-# key     = "/etc/pg_agent/repl-node.key"
-# sslmode = "verify-full"
+[postgres.replication]
+# sslmode = "verify-full"   # default; pg-agent always emits sslmode= in
+                            # conninfo. Cert paths come from libpq's
+                            # defaults under ~postgres/.postgresql/.
 
 [pcp]
 # user           = "pgpool"
@@ -891,16 +896,17 @@ hostname = "server3"
 ```
 agent_port            = 9701
 unix_socket           = /run/pg_agentd/pg_agentd.sock
-state_dir             = <postgres.home>/pg_agent       (after pg defaults)
+state_dir                    = <postgres.user_home>/pg_agent  (after pg defaults)
 
-postgres.port         = 5432
-postgres.pghome       = /usr/lib/postgresql/17
-postgres.data_dir     = /var/lib/postgresql/17/main
-postgres.socket_dir   = /var/run/postgresql
-postgres.repl_user    = repl
-postgres.home         = /var/lib/postgresql
-postgres.archive_dir  = /var/lib/postgresql/archive
-postgres.service      = postgresql@17-main.service
+postgres.port                = 5432
+postgres.pg_install_prefix   = /usr/lib/postgresql/17        # contains bin/
+postgres.data_dir            = /var/lib/postgresql/17/main   # $PGDATA
+postgres.socket_dir          = /var/run/postgresql
+postgres.repl_user           = repl
+postgres.user_home           = /var/lib/postgresql           # postgres OS user
+postgres.archive_dir         = /var/lib/postgresql/archive
+postgres.service             = postgresql@17-main.service
+postgres.replication.sslmode = verify-full
 
 pcp.user              = pgpool
 pcp.port              = 9898
@@ -1186,7 +1192,7 @@ Created/repaired by `pg_agentd` at startup. Rules:
 $PGDATA/                             # no agent files — left to PostgreSQL
 ```
 
-`<state_dir>` defaults to `<postgres.home>/pg_agent` and is created with
+`<state_dir>` defaults to `<postgres.user_home>/pg_agent` and is created with
 mode `0700` by the daemon at startup.
 
 ### 10.4 systemd unit
@@ -1263,7 +1269,7 @@ construction is the same shape in Rust — `tokio::process::Command` with
 ### 11.1 `pg_basebackup` (Peer.Basebackup)
 
 ```
-<pghome>/bin/pg_basebackup
+<pg_install_prefix>/bin/pg_basebackup
   --pgdata    <data_dir>
   --dbname    <conninfo>          # built by ReplicationTLS::conninfo, dbname omitted
   --wal-method=stream
@@ -1285,7 +1291,7 @@ must not be running on this node (refused by `PeerServer::Basebackup` →
 ### 11.2 `pg_rewind` (Peer.Rewind)
 
 ```
-<pghome>/bin/pg_rewind
+<pg_install_prefix>/bin/pg_rewind
   --target-pgdata <data_dir>
   --source-server <conninfo with dbname=postgres>
   --no-password
@@ -1524,8 +1530,8 @@ Filesystem (always):
   with an md5 hash.
 - **pool_passwd** — `/etc/pgpool2/pool_passwd` contains entries for
   `pgpool` and `postgres`.
-- **Recovery tools** — `<pghome>/bin/pg_basebackup` and
-  `<pghome>/bin/pg_rewind` exist and are executable.
+- **Recovery tools** — `<pg_install_prefix>/bin/pg_basebackup` and
+  `<pg_install_prefix>/bin/pg_rewind` exist and are executable.
 
 Peer connectivity (skipped with a WARN if `--skip-peers` or
 `[tls]` unset — a loopback-only dev pool doesn't need mTLS):

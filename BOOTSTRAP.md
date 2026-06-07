@@ -218,7 +218,7 @@ touch this file (it's a pgpool concern).
 
   [postgres]
   port      = 5432
-  pghome    = "/usr/lib/postgresql/17"
+  pg_install_prefix = "/usr/lib/postgresql/17"
   data_dir  = "/var/lib/postgresql/17/main"
   archive_dir = "/var/lib/postgresql/archive"
   service   = "postgresql@17-main.service"

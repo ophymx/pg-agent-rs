@@ -178,7 +178,7 @@ pub trait StandbyOps: Send + Sync {
 /// subprocesses and writes recovery config directly into `pg_data_dir`.
 /// Construction is cheap; clone-via-Arc at the daemon's composition root.
 pub struct StandbyExec {
-    pub pg_home: PathBuf,
+    pub pg_install_prefix: PathBuf,
     pub pg_data_dir: PathBuf,
     pub replication: PgReplicationConfig,
     /// Path to the `pg_agentc` binary the post-basebackup hook-symlink
@@ -191,13 +191,13 @@ pub struct StandbyExec {
 
 impl StandbyExec {
     pub fn new(
-        pg_home: PathBuf,
+        pg_install_prefix: PathBuf,
         pg_data_dir: PathBuf,
         replication: PgReplicationConfig,
         pg_agentc_bin: PathBuf,
     ) -> Self {
         Self {
-            pg_home,
+            pg_install_prefix,
             pg_data_dir,
             replication,
             pg_agentc_bin,
@@ -205,11 +205,11 @@ impl StandbyExec {
     }
 
     fn basebackup_bin(&self) -> PathBuf {
-        self.pg_home.join("bin").join("pg_basebackup")
+        self.pg_install_prefix.join("bin").join("pg_basebackup")
     }
 
     fn rewind_bin(&self) -> PathBuf {
-        self.pg_home.join("bin").join("pg_rewind")
+        self.pg_install_prefix.join("bin").join("pg_rewind")
     }
 }
 
@@ -375,7 +375,7 @@ async fn run_pg_binary(
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!(
                 "{}: binary not found (install the matching PostgreSQL client \
-                 package or check that pghome={} is correct)",
+                 package or check that pg_install_prefix={} is correct)",
                 bin.display(),
                 bin.parent()
                     .and_then(|p| p.parent())
@@ -960,13 +960,13 @@ mod tests {
 
     // ----- basebackup post-step: hook symlink repair --------------------
 
-    /// Write a shell stub at `<pg_home>/bin/pg_basebackup` that exits 0
+    /// Write a shell stub at `<pg_install_prefix>/bin/pg_basebackup` that exits 0
     /// without actually replicating. Lets us drive `StandbyExec::basebackup`
     /// end-to-end and observe the post-step (hook-symlink repair) without
     /// a real PostgreSQL source.
-    fn install_basebackup_stub(pg_home: &Path) -> PathBuf {
+    fn install_basebackup_stub(pg_install_prefix: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
-        let bin_dir = pg_home.join("bin");
+        let bin_dir = pg_install_prefix.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let stub = bin_dir.join("pg_basebackup");
         // The real pg_basebackup writes into --pgdata; ours just exits 0.
@@ -980,8 +980,8 @@ mod tests {
     #[tokio::test]
     async fn basebackup_repairs_hook_symlinks_on_success() {
         let tmp = TempDir::new().unwrap();
-        let pg_home = tmp.path().join("pg_home");
-        install_basebackup_stub(&pg_home);
+        let pg_install_prefix = tmp.path().join("pg_install_prefix");
+        install_basebackup_stub(&pg_install_prefix);
 
         let pgdata = tmp.path().join("pgdata");
         std::fs::create_dir_all(&pgdata).unwrap();
@@ -992,7 +992,7 @@ mod tests {
         std::fs::write(&agentc_bin, "#!/bin/sh\nexit 0\n").unwrap();
 
         let exec = StandbyExec::new(
-            pg_home,
+            pg_install_prefix,
             pgdata.clone(),
             PgReplicationConfig::default(),
             agentc_bin.clone(),

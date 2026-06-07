@@ -38,8 +38,22 @@ pub const DEFAULT_PG_PORT: u16 = 5432;
 pub const DEFAULT_PCP_USER: &str = "pgpool";
 pub const DEFAULT_REPL_USER: &str = "repl";
 pub const DEFAULT_PG_VERSION: &str = "17";
-pub const DEFAULT_HOME_DIR: &str = "/var/lib/postgresql";
-pub const DEFAULT_PG_HOME: &str = "/usr/lib/postgresql/17";
+/// `postgres` OS user's home directory. Debian package convention. NOT
+/// the PG installation prefix and NOT `$PGDATA` — see
+/// [`DEFAULT_PG_INSTALL_PREFIX`] and [`DEFAULT_PG_DATA_DIR`] for those.
+/// The user home is where
+/// `.postgresql/`, `.pcppass`, and `.pgpass` live (libpq + pgpool
+/// search defaults), and where the agent's `state_dir` is derived from.
+pub const DEFAULT_POSTGRES_USER_HOME: &str = "/var/lib/postgresql";
+
+/// PostgreSQL **installation prefix** — contains `bin/`, `lib/`, etc.
+/// Same meaning as autoconf's `./configure --prefix`. pg-agent
+/// constructs `<pg_install_prefix>/bin/pg_basebackup` and
+/// `<pg_install_prefix>/bin/pg_rewind` from this. Equivalent to what
+/// `pg_config --bindir` reports minus the trailing `bin`. NOT the
+/// postgres user's home, NOT `$PGDATA`. Debian: `/usr/lib/postgresql/17`;
+/// Red Hat: typically `/usr/pgsql-17`.
+pub const DEFAULT_PG_INSTALL_PREFIX: &str = "/usr/lib/postgresql/17";
 pub const DEFAULT_PG_DATA_DIR: &str = "/var/lib/postgresql/17/main";
 pub const DEFAULT_ARCHIVE_DIR: &str = "/var/lib/postgresql/archive";
 pub const DEFAULT_PG_SOCKET_DIR: &str = "/var/run/postgresql";
@@ -164,20 +178,48 @@ impl NodeConfig {
     }
 }
 
+/// PostgreSQL section of `config.toml`. Three path fields with similar
+/// shapes — easy to confuse, so spelled out explicitly:
+///
+/// - **`pg_install_prefix`**: PostgreSQL **installation prefix**, e.g.
+///   `/usr/lib/postgresql/17`. Contains `bin/pg_basebackup`,
+///   `bin/pg_rewind`, etc. The agent constructs subprocess paths from
+///   this. Same meaning as autoconf's `--prefix`; equivalent to
+///   `dirname $(pg_config --bindir)`.
+///
+/// - **`user_home`**: The `postgres` **OS user's home directory**, e.g.
+///   `/var/lib/postgresql`. Where libpq and pgpool look for
+///   `.postgresql/postgresql.{crt,key}`, `.postgresql/root.crt`,
+///   `.pcppass`, and `.pgpass` by default. Only used by the agent to
+///   derive `state_dir`'s default — the rest is libpq's concern.
+///
+/// - **`data_dir`**: `$PGDATA`, e.g. `/var/lib/postgresql/17/main`.
+///   PostgreSQL's data files. The agent reads it for hook-symlink
+///   repair and writes `myrecovery.conf` here.
+///
+/// Three different paths, three different purposes. None is a parent
+/// or child of the others on a standard Debian install.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostgresConfig {
     #[serde(default)]
     pub port: Option<u16>,
-    #[serde(default)]
-    pub pghome: Option<PathBuf>,
+    /// PostgreSQL installation prefix (contains `bin/pg_basebackup`, etc.).
+    /// See [`PostgresConfig`] for the distinction vs `user_home` and
+    /// `data_dir`. Legacy alias `pghome` accepted for backward compat.
+    #[serde(default, alias = "pghome")]
+    pub pg_install_prefix: Option<PathBuf>,
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
     #[serde(default)]
     pub socket_dir: Option<PathBuf>,
     #[serde(default)]
     pub repl_user: Option<String>,
-    #[serde(default)]
-    pub home: Option<PathBuf>,
+    /// `postgres` OS user's home directory. Used only to derive
+    /// `state_dir`'s default; libpq finds `.pcppass` / `.pgpass` /
+    /// `.postgresql/` here on its own. See [`PostgresConfig`] for the
+    /// distinction vs `install_dir` and `data_dir`.
+    #[serde(default, alias = "home")]
+    pub user_home: Option<PathBuf>,
     #[serde(default)]
     pub archive_dir: Option<PathBuf>,
     #[serde(default)]
@@ -190,14 +232,16 @@ pub struct PostgresConfig {
 impl PostgresConfig {
     fn apply_defaults(&mut self) {
         self.port.get_or_insert(DEFAULT_PG_PORT);
-        self.pghome.get_or_insert_with(|| DEFAULT_PG_HOME.into());
+        self.pg_install_prefix
+            .get_or_insert_with(|| DEFAULT_PG_INSTALL_PREFIX.into());
         self.data_dir
             .get_or_insert_with(|| DEFAULT_PG_DATA_DIR.into());
         self.socket_dir
             .get_or_insert_with(|| DEFAULT_PG_SOCKET_DIR.into());
         self.repl_user
             .get_or_insert_with(|| DEFAULT_REPL_USER.to_string());
-        self.home.get_or_insert_with(|| DEFAULT_HOME_DIR.into());
+        self.user_home
+            .get_or_insert_with(|| DEFAULT_POSTGRES_USER_HOME.into());
         self.archive_dir
             .get_or_insert_with(|| DEFAULT_ARCHIVE_DIR.into());
         self.service
@@ -539,14 +583,14 @@ impl Config {
 
         self.postgres.apply_defaults();
 
-        // state_dir defaults to <postgres.home>/pg_agent — must happen
-        // after postgres defaults so .home is populated.
+        // state_dir defaults to <postgres.user_home>/pg_agent — must
+        // happen after postgres defaults so user_home is populated.
         if self.state_dir.is_none() {
             let home = self
                 .postgres
-                .home
+                .user_home
                 .clone()
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_HOME_DIR));
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_POSTGRES_USER_HOME));
             self.state_dir = Some(home.join("pg_agent"));
         }
 
@@ -1150,10 +1194,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_defaults_respects_explicit_home() {
+    fn apply_defaults_respects_explicit_user_home() {
         let mut cfg = Config {
             postgres: PostgresConfig {
-                home: Some("/srv/pg".into()),
+                user_home: Some("/srv/pg".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -1162,6 +1206,31 @@ mod tests {
         assert_eq!(
             cfg.state_dir.as_deref(),
             Some(Path::new("/srv/pg/pg_agent"))
+        );
+    }
+
+    #[test]
+    fn legacy_pghome_alias_still_parses() {
+        // Operators with config.toml from earlier versions had:
+        //   [postgres]
+        //   pghome = "/usr/lib/postgresql/17"
+        //   home   = "/var/lib/postgresql"
+        // serde aliases keep them working transparently. Test via raw
+        // toml::from_str so we don't trip resolve_local_node_id's
+        // hostname check (the test env's hostname won't be in the pool).
+        let toml = r#"
+            [postgres]
+            pghome = "/opt/pg/17"
+            home   = "/srv/pg"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.postgres.pg_install_prefix.as_deref(),
+            Some(Path::new("/opt/pg/17"))
+        );
+        assert_eq!(
+            cfg.postgres.user_home.as_deref(),
+            Some(Path::new("/srv/pg"))
         );
     }
 
