@@ -236,9 +236,12 @@ impl Agent {
             let peers = self.deps.peers.clone();
             let maint = self.opts.maintenance_store.clone();
             let wal = self.deps.wal.clone();
+            let replay = self.deps.replay.clone();
+            let pcp = self.deps.pcp.clone();
             let pool = self.opts.node_pool.clone();
+            let pg = self.opts.postgres.clone();
             js.spawn(async move {
-                LocalServer::new(me, db, peers, maint, wal, pool)
+                LocalServer::new(me, db, peers, maint, wal, replay, pcp, pool, pg)
                     .serve(listeners.unix, s)
                     .await
             });

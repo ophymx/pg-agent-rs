@@ -17,13 +17,17 @@
 //! orchestration shape that lands in its own commit.
 
 use crate::agent::NodeInfo;
-use crate::config::{NodeConfig, NodePool};
+use crate::config::{NodeConfig, NodePool, PostgresRuntime};
 use crate::errors::AgentError;
 use crate::localdb::LocalDb;
 use crate::maintenance::{
-    MaintenanceIntent as CoreIntent, MaintenanceStatus, MaintenanceStore, SkippedIntent,
+    MaintenanceIntent as CoreIntent, MaintenancePayload, MaintenanceStatus, MaintenanceStore,
+    SkippedIntent,
 };
+use crate::pcp::Pcp;
 use crate::peers::PeerRegistry;
+use crate::pgstandby::{BasebackupOpts, RewindOpts, WriteRecoveryConfOpts};
+use crate::replay_markers::ReplayMarkerStore;
 use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
@@ -41,7 +45,7 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Per-peer FetchWal deadline. Bounds the hook against a single
 /// partitioned peer wedging the entire fan-out. A WAL segment is 16 MiB,
@@ -55,19 +59,24 @@ pub struct LocalServer {
     peers: Arc<dyn PeerRegistry>,
     maint: Arc<dyn MaintenanceStore>,
     wal: Arc<dyn WalStore>,
+    replay: Arc<dyn ReplayMarkerStore>,
+    pcp: Arc<dyn Pcp>,
     node_pool: NodePool,
-    // TODO(v1): Arc<dyn StandbyOps>, Arc<dyn Pcp>, Arc<dyn ReplayMarkerStore>,
-    // PostgresRuntime — added as the remaining orchestration handlers land.
+    pg: PostgresRuntime,
 }
 
 impl LocalServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_info: Arc<dyn NodeInfo>,
         db: Arc<dyn LocalDb>,
         peers: Arc<dyn PeerRegistry>,
         maint: Arc<dyn MaintenanceStore>,
         wal: Arc<dyn WalStore>,
+        replay: Arc<dyn ReplayMarkerStore>,
+        pcp: Arc<dyn Pcp>,
         node_pool: NodePool,
+        pg: PostgresRuntime,
     ) -> Self {
         Self {
             node_info,
@@ -75,7 +84,10 @@ impl LocalServer {
             peers,
             maint,
             wal,
+            replay,
+            pcp,
             node_pool,
+            pg,
         }
     }
 
@@ -135,11 +147,223 @@ impl PgAgentLocal for LocalServer {
     async fn failover(&self, _req: Request<FailoverRequest>) -> Result<Response<OpResult>, Status> {
         Err(Status::unimplemented("failover"))
     }
+    /// `follow_primary_command` — pgpool runs this on the new primary
+    /// after a failover, telling each surviving standby to rebase onto
+    /// the new primary. Per-standby flow on this primary:
+    ///
+    /// 1. Idempotency: skip if `(detached_id, new_primary_id)` already
+    ///    has a replay marker. pgpool may re-fire after a partial
+    ///    success — without this the rewind/basebackup runs twice.
+    /// 2. Resolve detached + new_primary from the pool.
+    /// 3. Ask the detached peer for its status; if PG isn't running on
+    ///    it (deliberate shutdown / hardware failure), skip — the
+    ///    operator will reattach manually.
+    /// 4. `peer.stop()` on detached — pg_rewind / pg_basebackup refuse
+    ///    a running target.
+    /// 5. Local `db.checkpoint()` (so the slot we create immediately
+    ///    has a fresh restart_lsn).
+    /// 6. `db.create_slot(detached.slot_name())` on this primary.
+    /// 7. Try `peer.rewind()`. On failure fall back to
+    ///    `peer.basebackup()` — full clone.
+    /// 8. `peer.configure_standby()` writes recovery conf on detached.
+    /// 9. `peer.start()` brings the standby up.
+    /// 10. `pcp.attach_node(detached.id)` re-attaches to pgpool.
+    /// 11. Write the replay marker.
+    ///
+    /// If anything between (6) and (9) fails, drop the slot we just
+    /// created. If the drop itself fails, queue a maintenance intent
+    /// (the worker retries with backoff). After (10), the slot is in
+    /// use by the now-running standby — do NOT drop on `attach_node`
+    /// failure; the slot is correct, only pgpool's view is stale.
     async fn follow_primary(
         &self,
-        _req: Request<FollowPrimaryRequest>,
+        req: Request<FollowPrimaryRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("follow_primary"))
+        let req = req.into_inner();
+        let detached_ref = req
+            .detached
+            .ok_or_else(|| Status::invalid_argument("follow_primary: detached is required"))?;
+        let new_primary_ref = req
+            .new_primary
+            .ok_or_else(|| Status::invalid_argument("follow_primary: new_primary is required"))?;
+
+        let replay_key = format!(
+            "detached={},new_primary={}",
+            detached_ref.id, new_primary_ref.id
+        );
+        match self.replay.has("follow_primary", &replay_key).await {
+            Ok(true) => {
+                info!(%replay_key, "follow_primary: replay detected, skipping");
+                return Ok(Response::new(OpResult {
+                    ok: true,
+                    message: "follow_primary: already processed; skipping duplicate".into(),
+                }));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(internal(anyhow::anyhow!(
+                    "follow_primary: idempotency marker check: {e}"
+                )));
+            }
+        }
+
+        let detached = self
+            .node_pool
+            .resolve_node(&detached_ref)
+            .map_err(|e| Status::invalid_argument(format!("follow_primary: detached: {e}")))?;
+        let new_primary = self
+            .node_pool
+            .resolve_node(&new_primary_ref)
+            .map_err(|e| Status::invalid_argument(format!("follow_primary: new_primary: {e}")))?;
+        info!(
+            detached = %detached.hostname,
+            new_primary = %new_primary.hostname,
+            "follow_primary"
+        );
+
+        let peer = self.peers.client(detached).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "follow_primary: peer client for {}: {e}",
+                detached.hostname
+            ))
+        })?;
+
+        // SPEC §10: skip a deliberately-stopped detached node.
+        let status = peer.get_status().await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "follow_primary: get_status {}: {e}",
+                detached.hostname
+            ))
+        })?;
+        if !status.is_running {
+            info!(detached = %detached.hostname, "follow_primary: detached not running, skipping");
+            return Ok(Response::new(OpResult {
+                ok: true,
+                message: "detached node is stopped, skipping".into(),
+            }));
+        }
+
+        peer.stop().await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "follow_primary: stop {}: {e}",
+                detached.hostname
+            ))
+        })?;
+
+        // SPEC §2: checkpoint before slot creation so the slot's
+        // restart_lsn is at the current WAL position, not whatever was
+        // there when the primary was promoted.
+        self.db
+            .checkpoint()
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("follow_primary: checkpoint: {e}")))?;
+
+        let slot_name = detached.slot_name();
+        self.db.create_slot(&slot_name).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "follow_primary: create slot {slot_name}: {e}"
+            ))
+        })?;
+
+        // From here through `peer.start()`, any failure should drop the
+        // slot — it would otherwise pin WAL on this primary forever.
+        // After attach_node, the slot is in use by the standby; leave it.
+
+        // §7: prefer rewind, fall back to basebackup on any rewind failure.
+        let rewind_opts = RewindOpts {
+            primary_host: new_primary.hostname.clone(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+        };
+        let rewind_ok = match peer.rewind(rewind_opts).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    detached = %detached.hostname,
+                    err = %e,
+                    "follow_primary: rewind failed; falling back to basebackup"
+                );
+                false
+            }
+        };
+
+        if !rewind_ok {
+            let bb_opts = BasebackupOpts {
+                primary_host: new_primary.hostname.clone(),
+                primary_port: self.pg.port,
+                repl_user: self.pg.repl_user.clone(),
+                slot_name: slot_name.clone(),
+            };
+            if let Err(e) = peer.basebackup(bb_opts).await {
+                let err = anyhow::anyhow!("follow_primary: basebackup {}: {e}", detached.hostname);
+                self.cleanup_slot_after_failure(
+                    &slot_name,
+                    &new_primary.hostname,
+                    "follow_primary_basebackup_failed",
+                    &err,
+                )
+                .await;
+                return Err(internal(err));
+            }
+        }
+
+        let cfg_opts = WriteRecoveryConfOpts {
+            primary_host: new_primary.hostname.clone(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+            slot_name: slot_name.clone(),
+        };
+        if let Err(e) = peer.configure_standby(cfg_opts).await {
+            let err = anyhow::anyhow!(
+                "follow_primary: configure_standby {}: {e}",
+                detached.hostname
+            );
+            self.cleanup_slot_after_failure(
+                &slot_name,
+                &new_primary.hostname,
+                "follow_primary_configure_standby_failed",
+                &err,
+            )
+            .await;
+            return Err(internal(err));
+        }
+
+        if let Err(e) = peer.start().await {
+            let err = anyhow::anyhow!("follow_primary: start {}: {e}", detached.hostname);
+            self.cleanup_slot_after_failure(
+                &slot_name,
+                &new_primary.hostname,
+                "follow_primary_start_failed",
+                &err,
+            )
+            .await;
+            return Err(internal(err));
+        }
+
+        // SPEC §5: pcp_attach_node is FollowPrimary-only.
+        // From this point the slot is in use by the standby — don't drop
+        // on attach failure; only pgpool's view is wrong, slot is correct.
+        if let Err(e) = self.pcp.attach_node(detached.id).await {
+            return Err(internal(anyhow::anyhow!(
+                "follow_primary: pcp_attach_node {}: {e}",
+                detached.id
+            )));
+        }
+
+        if let Err(e) = self.replay.mark_done("follow_primary", &replay_key).await {
+            return Err(internal(anyhow::anyhow!(
+                "follow_primary: idempotency marker write: {e}"
+            )));
+        }
+        info!(
+            detached = %detached.hostname,
+            new_primary = %new_primary.hostname,
+            "follow_primary: complete"
+        );
+        Ok(Response::new(OpResult {
+            ok: true,
+            message: format!("follow_primary complete for {}", detached.hostname),
+        }))
     }
     async fn recovery_first_stage(
         &self,
@@ -373,6 +597,61 @@ enum FetchOutcome {
 }
 
 impl LocalServer {
+    /// Drop a slot that we created earlier in a failed orchestration.
+    /// If the drop succeeds, we're done. If it fails, queue a
+    /// maintenance intent so the worker retries with backoff — the
+    /// hook itself still returns the original error, not a
+    /// cleanup-side one.
+    ///
+    /// `cause` is the breadcrumb (`follow_primary_basebackup_failed`,
+    /// etc.) that ends up on the maintenance payload.
+    async fn cleanup_slot_after_failure(
+        &self,
+        slot_name: &str,
+        target_hostname: &str,
+        cause: &str,
+        original_err: &anyhow::Error,
+    ) {
+        info!(slot = %slot_name, "cleanup: dropping slot after failure");
+        match self.db.drop_slot(slot_name).await {
+            Ok(()) => {
+                debug!(slot = %slot_name, "cleanup: slot dropped");
+            }
+            Err(drop_err) => {
+                let payload = MaintenancePayload::DropSlotCleanup {
+                    slot_name: slot_name.to_string(),
+                    target_hostname: target_hostname.to_string(),
+                    cause: cause.to_string(),
+                    initial_error: drop_err.to_string(),
+                };
+                match self.maint.append(payload).await {
+                    Ok(intent) => {
+                        warn!(
+                            slot = %slot_name,
+                            target = %target_hostname,
+                            cause,
+                            intent_id = %intent.id,
+                            drop_err = %drop_err,
+                            original_err = %original_err,
+                            "cleanup: queued maintenance for failed drop_slot"
+                        );
+                    }
+                    Err(queue_err) => {
+                        warn!(
+                            slot = %slot_name,
+                            target = %target_hostname,
+                            cause,
+                            drop_err = %drop_err,
+                            queue_err = %queue_err,
+                            original_err = %original_err,
+                            "cleanup: drop_slot failed AND maintenance queue failed — slot is orphaned"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// One peer's worth of restore_wal: dial → FetchWal → write to
     /// `dest_path` via `WalStore::write_restore`. Bounded by
     /// `RESTORE_WAL_PER_PEER_TIMEOUT`; timeouts and connect failures are
@@ -550,6 +829,10 @@ mod tests {
     struct StubDb {
         in_recovery: AtomicBool,
         is_in_recovery_fails: AtomicBool,
+        checkpoint_calls: AtomicUsize,
+        created_slots: StdMutex<Vec<String>>,
+        dropped_slots: StdMutex<Vec<String>>,
+        drop_slot_fails: AtomicBool,
     }
 
     #[async_trait]
@@ -558,12 +841,18 @@ mod tests {
             Ok(())
         }
         async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.checkpoint_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn create_slot(&self, _: &str) -> anyhow::Result<()> {
+        async fn create_slot(&self, name: &str) -> anyhow::Result<()> {
+            self.created_slots.lock().unwrap().push(name.to_string());
             Ok(())
         }
-        async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+        async fn drop_slot(&self, name: &str) -> anyhow::Result<()> {
+            self.dropped_slots.lock().unwrap().push(name.to_string());
+            if self.drop_slot_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: drop_slot boom");
+            }
             Ok(())
         }
         async fn is_in_recovery(&self) -> anyhow::Result<bool> {
@@ -590,6 +879,67 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct StubReplay {
+        recorded: StdMutex<std::collections::HashSet<(String, String)>>,
+        has_fails: AtomicBool,
+        mark_fails: AtomicBool,
+    }
+
+    impl StubReplay {
+        fn mark(&self, op: &str, key: &str) {
+            self.recorded
+                .lock()
+                .unwrap()
+                .insert((op.to_string(), key.to_string()));
+        }
+    }
+
+    #[async_trait]
+    impl ReplayMarkerStore for StubReplay {
+        async fn has(&self, op: &str, key: &str) -> anyhow::Result<bool> {
+            if self.has_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: replay.has boom");
+            }
+            Ok(self
+                .recorded
+                .lock()
+                .unwrap()
+                .contains(&(op.to_string(), key.to_string())))
+        }
+        async fn mark_done(&self, op: &str, key: &str) -> anyhow::Result<()> {
+            if self.mark_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: replay.mark_done boom");
+            }
+            self.mark(op, key);
+            Ok(())
+        }
+        async fn sweep(&self, _: chrono::DateTime<Utc>) {}
+    }
+
+    #[derive(Default)]
+    struct StubPcp {
+        attach_calls: StdMutex<Vec<i32>>,
+        attach_fails: AtomicBool,
+    }
+
+    #[async_trait]
+    impl Pcp for StubPcp {
+        async fn attach_node(&self, node_id: i32) -> anyhow::Result<()> {
+            self.attach_calls.lock().unwrap().push(node_id);
+            if self.attach_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: pcp attach_node boom");
+            }
+            Ok(())
+        }
+        async fn node_count(&self) -> anyhow::Result<i32> {
+            Ok(0)
+        }
+        async fn node_info_all(&self) -> anyhow::Result<Vec<crate::pcp::NodeInfo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
     struct StubPeerClient {
         start_calls: AtomicUsize,
         start_fails: AtomicBool,
@@ -599,6 +949,18 @@ mod tests {
         fetch_wal_errors: AtomicBool,
         /// Hang fetch_wal indefinitely — exercises the per-peer timeout.
         fetch_wal_hangs: AtomicBool,
+        // FollowPrimary surface — counters + failure switches per method.
+        is_running: AtomicBool,
+        get_status_fails: AtomicBool,
+        stop_calls: AtomicUsize,
+        stop_fails: AtomicBool,
+        rewind_calls: AtomicUsize,
+        rewind_fails: AtomicBool,
+        basebackup_calls: AtomicUsize,
+        basebackup_fails: AtomicBool,
+        configure_standby_calls: AtomicUsize,
+        configure_standby_fails: AtomicBool,
+        configure_standby_opts: StdMutex<Vec<WriteRecoveryConfOpts>>,
     }
 
     impl StubPeerClient {
@@ -607,6 +969,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(name.to_string(), content);
+        }
+        fn mark_running(&self) -> &Self {
+            self.is_running.store(true, Ordering::SeqCst);
+            self
         }
     }
 
@@ -642,6 +1008,52 @@ mod tests {
             Ok(content.map(|c| {
                 Box::new(std::io::Cursor::new(c)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
             }))
+        }
+        async fn get_status(&self) -> anyhow::Result<NodeStatus> {
+            if self.get_status_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer get_status boom");
+            }
+            let running = self.is_running.load(Ordering::SeqCst);
+            Ok(NodeStatus {
+                is_running: running,
+                is_in_recovery: false,
+                is_ready: false,
+                replication_lag_bytes: 0,
+                replication_state: String::new(),
+                is_postgres_running: running,
+                is_pgpool_running: true,
+                is_postgres_status_ok: true,
+                is_pgpool_status_ok: true,
+            })
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            if self.stop_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer stop boom");
+            }
+            Ok(())
+        }
+        async fn rewind(&self, _: RewindOpts) -> anyhow::Result<()> {
+            self.rewind_calls.fetch_add(1, Ordering::SeqCst);
+            if self.rewind_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer rewind boom");
+            }
+            Ok(())
+        }
+        async fn basebackup(&self, _: BasebackupOpts) -> anyhow::Result<()> {
+            self.basebackup_calls.fetch_add(1, Ordering::SeqCst);
+            if self.basebackup_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer basebackup boom");
+            }
+            Ok(())
+        }
+        async fn configure_standby(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()> {
+            self.configure_standby_calls.fetch_add(1, Ordering::SeqCst);
+            self.configure_standby_opts.lock().unwrap().push(opts);
+            if self.configure_standby_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer configure_standby boom");
+            }
+            Ok(())
         }
     }
 
@@ -704,8 +1116,19 @@ mod tests {
 
     #[async_trait]
     impl MaintenanceStore for StubMaint {
-        async fn append(&self, _: MaintenancePayload) -> anyhow::Result<CoreIntent> {
-            anyhow::bail!("stub")
+        async fn append(&self, payload: MaintenancePayload) -> anyhow::Result<CoreIntent> {
+            let intent = CoreIntent {
+                id: format!("stub-{}", self.intents.lock().unwrap().len()),
+                status: MaintenanceStatus::Pending,
+                payload,
+                attempts: 0,
+                last_error: String::new(),
+                created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                updated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                next_retry_at: None,
+            };
+            self.intents.lock().unwrap().push(intent.clone());
+            Ok(intent)
         }
         async fn list_pending(&self) -> anyhow::Result<Vec<CoreIntent>> {
             Ok(self
@@ -829,6 +1252,14 @@ mod tests {
         }
     }
 
+    fn make_pg() -> PostgresRuntime {
+        PostgresRuntime {
+            port: 5432,
+            data_dir: std::path::PathBuf::from("/var/lib/postgresql/17/main"),
+            repl_user: "repl".into(),
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn make_server() -> (
         LocalServer,
@@ -836,20 +1267,27 @@ mod tests {
         Arc<StubPeers>,
         Arc<StubMaint>,
         Arc<StubWal>,
+        Arc<StubReplay>,
+        Arc<StubPcp>,
     ) {
         let db = Arc::new(StubDb::default());
         let peers = Arc::new(StubPeers::default());
         let maint = Arc::new(StubMaint::default());
         let wal = Arc::new(StubWal::default());
+        let replay = Arc::new(StubReplay::default());
+        let pcp = Arc::new(StubPcp::default());
         let server = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
             peers.clone(),
             maint.clone(),
             wal.clone(),
+            replay.clone(),
+            pcp.clone(),
             make_pool(),
+            make_pg(),
         );
-        (server, db, peers, maint, wal)
+        (server, db, peers, maint, wal, replay, pcp)
     }
 
     fn pending_intent(id: &str) -> CoreIntent {
@@ -912,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_calls_peer_start() {
-        let (s, _db, peers, _maint, _wal) = make_server();
+        let (s, _db, peers, _maint, _wal, _replay, _pcp) = make_server();
         let resp = s
             .remote_start(Request::new(RemoteStartRequest {
                 target: Some(NodeRef {
@@ -931,7 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_refuses_when_local_is_replica() {
-        let (s, db, peers, _maint, _wal) = make_server();
+        let (s, db, peers, _maint, _wal, _replay, _pcp) = make_server();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .remote_start(Request::new(RemoteStartRequest {
@@ -952,7 +1390,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_propagates_peer_error_as_internal() {
-        let (s, _db, peers, _maint, _wal) = make_server();
+        let (s, _db, peers, _maint, _wal, _replay, _pcp) = make_server();
         peers
             .default_client
             .start_fails
@@ -1003,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_no_filter_returns_all() {
-        let (s, _db, _peers, maint, _wal) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp) = make_server();
         maint.insert(pending_intent("a"));
         let mut done_intent = pending_intent("b");
         done_intent.status = MaintenanceStatus::Done;
@@ -1019,7 +1457,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_filters_by_status() {
-        let (s, _db, _peers, maint, _wal) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp) = make_server();
         maint.insert(pending_intent("pending-1"));
         let mut done_intent = pending_intent("done-1");
         done_intent.status = MaintenanceStatus::Done;
@@ -1051,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_surfaces_skipped() {
-        let (s, _db, _peers, maint, _wal) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp) = make_server();
         maint.skipped.lock().unwrap().push(SkippedIntent {
             path: "/tmp/corrupt.json".into(),
             error: "bad json".into(),
@@ -1067,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_maintenance_returns_existing_intent() {
-        let (s, _db, _peers, maint, _wal) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp) = make_server();
         maint.insert(pending_intent("alpha"));
         let resp = s
             .get_maintenance(Request::new(GetMaintenanceRequest { id: "alpha".into() }))
@@ -1102,7 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_maintenance_reschedules_pending_intent() {
-        let (s, _db, _peers, maint, _wal) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp) = make_server();
         maint.insert(pending_intent("alpha"));
         let resp = s
             .retry_maintenance(Request::new(RetryMaintenanceRequest { id: "alpha".into() }))
@@ -1117,7 +1555,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_maintenance_refuses_non_pending_intent() {
-        let (s, _db, _peers, maint, _wal) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp) = make_server();
         let mut done = pending_intent("alpha");
         done.status = MaintenanceStatus::Done;
         maint.insert(done);
@@ -1188,13 +1626,18 @@ mod tests {
         let peers = Arc::new(StubPeers::default());
         let maint = Arc::new(StubMaint::default());
         let wal = Arc::new(StubWal::default());
+        let replay = Arc::new(StubReplay::default());
+        let pcp = Arc::new(StubPcp::default());
         let server = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
             peers.clone(),
             maint.clone(),
             wal.clone(),
+            replay,
+            pcp,
             make_pool_3(),
+            make_pg(),
         );
         (server, db, peers, maint, wal)
     }
@@ -1234,7 +1677,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_wal_fetches_from_first_peer_with_segment() {
-        let (s, _db, peers, _maint, wal) = make_server();
+        let (s, _db, peers, _maint, wal, _replay, _pcp) = make_server();
         // Default client has the segment.
         let content = b"WAL_BYTES".to_vec();
         peers
@@ -1303,7 +1746,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_wal_dest_outside_pgdata_is_fatal() {
-        let (s, _db, peers, _maint, wal) = make_server();
+        let (s, _db, peers, _maint, wal, _replay, _pcp) = make_server();
         peers
             .default_client
             .stage_wal("000000010000000000000001", b"_".to_vec());
@@ -1336,6 +1779,241 @@ mod tests {
             .into_inner();
         assert!(resp.ok);
         assert!(resp.message.contains("peer2.local"));
+    }
+
+    // ----- follow_primary -------------------------------------------------
+
+    /// Map a node id from `make_pool()` to the pool's hostname. id=0 →
+    /// "local" (this primary). Tests using id=99 trigger the unknown-node
+    /// rejection path on purpose.
+    fn pool_hostname(id: i32) -> String {
+        match id {
+            0 => "local".to_string(),
+            _ => format!("peer{id}.local"),
+        }
+    }
+
+    fn follow_primary_req(detached: i32, new_primary: i32) -> FollowPrimaryRequest {
+        FollowPrimaryRequest {
+            detached: Some(NodeRef {
+                id: detached,
+                hostname: pool_hostname(detached),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            new_primary: Some(NodeRef {
+                id: new_primary,
+                hostname: pool_hostname(new_primary),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            old_main: None,
+            old_primary: None,
+        }
+    }
+
+    /// Three-node setup with peer1 as the "detached" target. peer1's
+    /// stub client starts marked as running (the happy-path precondition).
+    #[allow(clippy::type_complexity)]
+    fn make_follow_setup() -> (
+        LocalServer,
+        Arc<StubDb>,
+        Arc<StubPeers>,
+        Arc<StubMaint>,
+        Arc<StubReplay>,
+        Arc<StubPcp>,
+        Arc<StubPeerClient>,
+    ) {
+        let (s, db, peers, maint, _wal, replay, pcp) = make_server();
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running();
+        peers.override_client(1, detached_client.clone());
+        (s, db, peers, maint, replay, pcp, detached_client)
+    }
+
+    #[tokio::test]
+    async fn follow_primary_happy_path_with_rewind() {
+        let (s, db, _peers, _maint, replay, pcp, detached) = make_follow_setup();
+        let resp = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        // Sequence: get_status → stop → checkpoint → create_slot →
+        // rewind (succeeds) → configure_standby → start → attach_node →
+        // mark_done.
+        assert_eq!(detached.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*db.created_slots.lock().unwrap(), vec!["node1".to_string()]);
+        assert_eq!(detached.rewind_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached.basebackup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(detached.configure_standby_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+        // Replay marker was written.
+        assert!(replay
+            .has("follow_primary", "detached=1,new_primary=0")
+            .await
+            .unwrap());
+        // No slot drop happened.
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn follow_primary_falls_back_to_basebackup_when_rewind_fails() {
+        let (s, _db, _peers, _maint, _replay, _pcp, detached) = make_follow_setup();
+        detached.rewind_fails.store(true, Ordering::SeqCst);
+        let resp = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(detached.rewind_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached.basebackup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn follow_primary_skips_when_replay_marker_present() {
+        let (s, db, _peers, _maint, replay, _pcp, detached) = make_follow_setup();
+        replay.mark("follow_primary", "detached=1,new_primary=0");
+        let resp = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("already processed"));
+        // Nothing on the peer touched.
+        assert_eq!(detached.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn follow_primary_skips_when_detached_not_running() {
+        let (s, db, peers, _maint, replay, _pcp, _det) = make_follow_setup();
+        // Replace detached client with one that reports not-running.
+        let detached_off = Arc::new(StubPeerClient::default()); // is_running defaults to false
+        peers.override_client(1, detached_off.clone());
+
+        let resp = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("stopped"));
+        // Past stop / checkpoint untouched; the replay marker is NOT set
+        // (operator may bring the node back up later and re-fire the hook).
+        assert_eq!(detached_off.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
+        assert!(!replay
+            .has("follow_primary", "detached=1,new_primary=0")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn follow_primary_rejects_missing_detached() {
+        let (s, ..) = make_server();
+        let mut req = follow_primary_req(1, 0);
+        req.detached = None;
+        let err = s.follow_primary(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn follow_primary_rejects_unknown_detached() {
+        let (s, ..) = make_server();
+        let req = follow_primary_req(99, 0);
+        let err = s.follow_primary(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn follow_primary_basebackup_failure_drops_slot() {
+        let (s, db, _peers, _maint, replay, _pcp, detached) = make_follow_setup();
+        detached.rewind_fails.store(true, Ordering::SeqCst);
+        detached.basebackup_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("basebackup"));
+
+        // Slot was dropped during cleanup.
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        // No replay marker on failure.
+        assert!(!replay
+            .has("follow_primary", "detached=1,new_primary=0")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn follow_primary_start_failure_drops_slot() {
+        let (s, db, _peers, _maint, _replay, _pcp, detached) = make_follow_setup();
+        detached.start_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("start"));
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn follow_primary_attach_failure_does_not_drop_slot() {
+        let (s, db, _peers, _maint, replay, pcp, _det) = make_follow_setup();
+        pcp.attach_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("pcp_attach_node"));
+        // Slot stays — the now-running standby is using it.
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+        // No replay marker either; pgpool may retry attach later.
+        assert!(!replay
+            .has("follow_primary", "detached=1,new_primary=0")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn follow_primary_drop_slot_failure_queues_maintenance() {
+        let (s, db, _peers, maint, _replay, _pcp, detached) = make_follow_setup();
+        // Force basebackup to fail (so we hit cleanup) AND drop_slot
+        // itself to fail (so the maintenance fallback kicks in).
+        detached.rewind_fails.store(true, Ordering::SeqCst);
+        detached.basebackup_fails.store(true, Ordering::SeqCst);
+        db.drop_slot_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .follow_primary(Request::new(follow_primary_req(1, 0)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+
+        // drop_slot was attempted (and failed) — maintenance intent queued.
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        let intents = maint.intents.lock().unwrap();
+        assert_eq!(intents.len(), 1);
+        match &intents[0].payload {
+            MaintenancePayload::DropSlotCleanup {
+                slot_name, cause, ..
+            } => {
+                assert_eq!(slot_name, "node1");
+                assert!(cause.contains("basebackup_failed"));
+            }
+        }
     }
 
     #[test]

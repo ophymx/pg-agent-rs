@@ -18,10 +18,12 @@
 
 use crate::certreload::{CertReloader, ReloadingClientCertResolver};
 use crate::config::NodeConfig;
+use crate::pgstandby::{BasebackupOpts, RewindOpts, WriteRecoveryConfOpts};
 use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
-    pg_agent_peer_client::PgAgentPeerClient, DropSlotRequest, FetchWalRequest, NodeConfigRequest,
-    NodeConfigResponse, StartRequest,
+    pg_agent_peer_client::PgAgentPeerClient, BasebackupRequest, ConfigureStandbyRequest,
+    DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse,
+    NodeStatus, OpProgress, RewindRequest, StartRequest, StopRequest,
 };
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -93,8 +95,29 @@ pub trait PeerClient: Send + Sync {
         wal_file: &str,
     ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>;
 
-    // TODO(v1): stop/reload/promote/create_slot/configure_standby/
-    // basebackup/rewind/reload_pgpool/remove_vip/get_status.
+    /// Mirror of `PgAgentLocal::GetStatus` — read the peer's runtime view.
+    /// Used by `FollowPrimary` to skip a deliberately-stopped detached
+    /// node and (eventually) by preflight + `pg_agentctl cluster status`.
+    async fn get_status(&self) -> anyhow::Result<NodeStatus>;
+
+    /// Stop PostgreSQL on the peer via its `Systemd::stop_postgres`.
+    async fn stop(&self) -> anyhow::Result<()>;
+
+    /// Drive `pg_rewind` on the peer against the given primary. The
+    /// peer streams `OpProgress`; this method drains the stream and
+    /// returns `Ok(())` only after a `phase = "done"` frame. Anything
+    /// else (stream error, EOF without "done") surfaces as `Err`.
+    async fn rewind(&self, opts: RewindOpts) -> anyhow::Result<()>;
+
+    /// Drive `pg_basebackup` on the peer. Same stream-drain semantics
+    /// as `rewind` — `Ok(())` iff a `phase = "done"` frame arrives.
+    async fn basebackup(&self, opts: BasebackupOpts) -> anyhow::Result<()>;
+
+    /// Write `recovery.conf` (or equivalent) on the peer so it can
+    /// follow `opts.primary_host` as a streaming standby.
+    async fn configure_standby(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()>;
+
+    // TODO(v1): reload/promote/create_slot/reload_pgpool/remove_vip.
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +398,109 @@ impl PeerClient for PeerChannel {
             }
             Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
             Err(s) => Err(anyhow::anyhow!("peer fetch_wal: {s}")),
+        }
+    }
+
+    async fn get_status(&self) -> anyhow::Result<NodeStatus> {
+        let mut client = self.inner.clone();
+        Ok(client
+            .get_status(GetStatusRequest {})
+            .await
+            .map_err(|s| anyhow::anyhow!("peer get_status: {s}"))?
+            .into_inner())
+    }
+
+    async fn stop(&self) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .stop(StopRequest {})
+            .await
+            .map_err(|s| anyhow::anyhow!("peer stop: {s}"))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer stop: {}", resp.message);
+        }
+        Ok(())
+    }
+
+    async fn rewind(&self, opts: RewindOpts) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let req = RewindRequest {
+            primary_host: opts.primary_host,
+            primary_port: i32::from(opts.primary_port),
+            repl_user: opts.repl_user,
+        };
+        let stream = client
+            .rewind(req)
+            .await
+            .map_err(|s| anyhow::anyhow!("peer rewind: {s}"))?
+            .into_inner();
+        drain_progress_stream("peer rewind", stream).await
+    }
+
+    async fn basebackup(&self, opts: BasebackupOpts) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let req = BasebackupRequest {
+            primary_host: opts.primary_host,
+            primary_port: i32::from(opts.primary_port),
+            repl_user: opts.repl_user,
+            slot_name: opts.slot_name,
+        };
+        let stream = client
+            .basebackup(req)
+            .await
+            .map_err(|s| anyhow::anyhow!("peer basebackup: {s}"))?
+            .into_inner();
+        drain_progress_stream("peer basebackup", stream).await
+    }
+
+    async fn configure_standby(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let req = ConfigureStandbyRequest {
+            primary_host: opts.primary_host,
+            primary_port: i32::from(opts.primary_port),
+            repl_user: opts.repl_user,
+            slot_name: opts.slot_name,
+        };
+        let resp = client
+            .configure_standby(req)
+            .await
+            .map_err(|s| anyhow::anyhow!("peer configure_standby: {s}"))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer configure_standby: {}", resp.message);
+        }
+        Ok(())
+    }
+}
+
+/// Drain a server-streaming `OpProgress` until a `phase == "done"` frame
+/// arrives or the stream errors / EOFs early. Intermediate events are
+/// logged at debug level — the caller doesn't need them.
+async fn drain_progress_stream(
+    operation: &'static str,
+    mut stream: tonic::Streaming<OpProgress>,
+) -> anyhow::Result<()> {
+    loop {
+        match stream.message().await {
+            Ok(Some(prog)) => {
+                debug!(
+                    %operation,
+                    phase = %prog.phase,
+                    bytes_done = prog.bytes_done,
+                    bytes_total = prog.bytes_total,
+                    "{operation}: progress"
+                );
+                if prog.phase == "done" {
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                anyhow::bail!("{operation}: stream ended without 'done' phase");
+            }
+            Err(s) => {
+                anyhow::bail!("{operation}: stream error: {s}");
+            }
         }
     }
 }
