@@ -611,41 +611,72 @@ mark-after-success model trades that for simplicity, which is the right
 call for our threat model (re-fires after success are far more common
 than re-fires during execution).
 
-### 5.13 Maintenance queue (durable drop-slot retries)
+### 5.13 Maintenance queue (durable retry of failed cleanups)
 
-A failed peer `DropSlot` after a successful failover / follow_primary /
-recovery_1st_stage **must not** propagate as an RPC error to pgpool. The
-slot is queued via `MaintenanceStore.append("drop_slot_cleanup", payload)`
-and retried on a 30s sweep tick. Payload:
+**Scope today: failed `DropSlot` retry only.** The queue's only
+production use is recovering from a peer (or local) `DropSlot` call that
+failed *after* the primary success of a Failover / FollowPrimary /
+RecoveryFirstStage — leaving an orphan replication slot that pins WAL on
+the primary and eventually fills the disk. The hook RPC must still return
+`ok=true` to pgpool (the cluster's authoritative side already succeeded);
+the cleanup goes here.
 
-```json
-{
-  "slot_name": "node2",
-  "target_hostname": "server3",
-  "cause": "rpc_error|standby_down_local_drop_error|follow_primary_cleanup_drop_error|recovery_1st_stage_cleanup_drop_error",
-  "last_error": "<error>"
+The design accommodates additional intent types but adding one is a
+**deliberate choice**, not a default. Plausible future candidates
+(`pcp_attach_node` retry, `peer Start` retry, `ReloadPgpool` retry) stay
+"bubble up as error" until a real operational need surfaces. Resist the
+temptation to start enqueueing every possible failure mode.
+
+**Payload is a typed Rust enum**, not an opaque JSON blob:
+
+```rust
+#[serde(tag = "op", rename_all = "snake_case")]
+enum MaintenancePayload {
+    DropSlotCleanup {
+        slot_name: String,        // e.g. "node2"
+        target_hostname: String,  // node hosting the slot
+        cause: &'static str,      // code-level reason; one of:
+                                  //   "rpc_error"
+                                  //   "standby_down_local_drop_error"
+                                  //   "follow_primary_cleanup_drop_error"
+                                  //   "recovery_1st_stage_cleanup_drop_error"
+        initial_error: String,    // error message at enqueue time
+    },
 }
 ```
 
-Worker behaviour:
+Adding a new variant forces the worker's `match` to handle it (compile
+error if missing) — the polymorphism stays type-safe end to end with no
+runtime "unsupported op" branch.
 
-- Sweep interval: 30s.
-- Per-op timeout: 30s (so one wedged peer can't stall the whole sweep).
-- Per-intent attempt budget: 5. On exhaustion → `MarkAbandoned`.
-- Backoff: 30s base, ×2 each attempt, capped at 10 min.
-- `NextRetryAt` is honoured — operator-forced retries use `Reschedule(now)`
-  without consuming an attempt slot.
-- Storage layout: one JSON file per intent under `<state_dir>/maintenance/`.
-  Filename = intent id = `<unix_nano>-<sanitised_op>-<seq>.json`. Writes are
-  atomic via temp+rename in the same directory.
-- Terminal intents (done/abandoned) are pruned by `list_pending` once they
-  exceed retention (the daemon configures this at 24h).
-- Obsolete ops `rewind_restore_replslot` and
-  `rewind_delete_quarantine_slots` (from older Go versions) are silently
-  `MarkDone`'d so an upgrade doesn't show old intents as failing.
+**Worker behaviour:**
 
-The same worker also calls `replay_marker_store.sweep(now)` on the same
-cadence.
+- Sweep interval: 30 s.
+- Per-op timeout: 30 s (so one wedged peer can't stall the whole sweep).
+- Per-intent attempt budget: **5 retries** (the initial fail-then-enqueue
+  isn't counted). On exhaustion → `MarkAbandoned`.
+- Backoff: 30 s base, ×2 each attempt, capped at 10 min — so a struggling
+  intent waits 30 s → 60 s → 2 min → 4 min between attempts, abandoning
+  ~8 min after first retry.
+- `NextRetryAt` is honoured — operator-forced retries use
+  `reschedule(now)` without consuming an attempt slot.
+- Dispatch: the worker resolves `target_hostname` against the `NodePool`;
+  local target → `LocalDb::drop_slot`, remote → `PeerClient::drop_slot`.
+- Storage: one JSON file per intent under `<state_dir>/maintenance/`,
+  named `<unix_nano>-<sanitised_op>-<seq>.json`. Writes are atomic via
+  temp + rename in the same directory.
+- Terminal intents (done/abandoned) are pruned by `list_pending` once
+  they exceed retention (default 24 h).
+
+The same worker also calls `replay_marker_store.sweep(now)` on every
+tick — one timer, two janitor jobs.
+
+**Deliberately *not* present** (vs. the Go version): the silent
+migration of `rewind_restore_replslot` / `rewind_delete_quarantine_slots`
+intents. Those op strings were leftovers from a removed feature in the
+Go implementation; there is no installed base for pg-agent-rs, so an
+intent file with an unknown op surfaces as an error rather than being
+quietly retired.
 
 ### 5.14 Best-effort cleanup contexts
 

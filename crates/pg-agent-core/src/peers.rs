@@ -26,12 +26,21 @@ pub trait PeerRegistry: Send + Sync {
 /// What a peer agent does for us. Mirrors `PgAgentPeer` RPC by RPC; the
 /// streaming RPCs (Basebackup, Rewind, FetchWal) expose `mpsc::Receiver`
 /// to keep the handler code transport-agnostic.
+///
+/// Methods are added as use cases need them — currently only
+/// `drop_slot` (consumed by the maintenance worker's slot-cleanup retry
+/// path). When the full `LocalServer` lands the rest of the
+/// `PgAgentPeer` surface will follow.
 #[async_trait]
 pub trait PeerClient: Send + Sync {
-    // TODO(v1): mirror the proto surface. Keep async fn signatures small
-    // and let the impl translate to tonic. Streaming RPCs should return
-    // `impl Stream<Item = …>` or `mpsc::Receiver` so handlers don't import
-    // tonic types.
+    /// `pg_drop_replication_slot($1)` on the target peer's PostgreSQL.
+    /// 42710 / "does not exist" should still surface as an error here —
+    /// the caller (maintenance worker) decides retry vs. abandon.
+    async fn drop_slot(&self, slot_name: &str) -> anyhow::Result<()>;
+
+    // TODO(v1): start/stop/reload/promote/create_slot/configure_standby/
+    // basebackup/rewind/fetch_wal/reload_pgpool/remove_vip/get_status/
+    // get_node_config.
 }
 
 // TODO(v1):
