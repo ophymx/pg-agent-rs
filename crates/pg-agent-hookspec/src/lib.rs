@@ -37,6 +37,20 @@ pub const HOOK_RESTORE_WAL: &str = "restore-wal";
 /// pointing at `pg_agentc`.
 pub const PGDATA_SYMLINK_HOOKS: &[&str] = &[HOOK_RECOVERY_1ST_STAGE, HOOK_PGPOOL_REMOTE_START];
 
+/// Every hook name the dispatcher accepts. Single source of truth for
+/// `pg_agentc`'s up-front validation — a typo at the `pgpool.conf` level
+/// (`failovr` instead of `failover`) is rejected with a clear error
+/// instead of attempting a no-op dispatch.
+pub const HOOK_NAMES: &[&str] = &[
+    HOOK_FAILOVER,
+    HOOK_FOLLOW_PRIMARY,
+    HOOK_RECOVERY_1ST_STAGE,
+    HOOK_PGPOOL_REMOTE_START,
+    HOOK_ESCALATION,
+    HOOK_DE_ESCALATION,
+    HOOK_RESTORE_WAL,
+];
+
 // ---------------------------------------------------------------------------
 // Token enums
 // ---------------------------------------------------------------------------
@@ -380,6 +394,43 @@ mod tests {
     #[test]
     fn restore_command_renders() {
         assert_eq!(restore_command(), "pg_agentc restore-wal %f %p");
+    }
+
+    #[test]
+    fn hook_names_contains_every_hook_constant_exactly_once() {
+        // Listed constants the dispatcher in pg_agentc cares about. If
+        // a new HOOK_* is added but not registered in HOOK_NAMES,
+        // pg_agentc would reject it as unknown; conversely, an entry
+        // here that doesn't match a const is dead weight. Lock both
+        // sides down.
+        let expected = [
+            HOOK_FAILOVER,
+            HOOK_FOLLOW_PRIMARY,
+            HOOK_RECOVERY_1ST_STAGE,
+            HOOK_PGPOOL_REMOTE_START,
+            HOOK_ESCALATION,
+            HOOK_DE_ESCALATION,
+            HOOK_RESTORE_WAL,
+        ];
+        assert_eq!(HOOK_NAMES.len(), expected.len(), "HOOK_NAMES length drift");
+        for name in expected {
+            assert!(HOOK_NAMES.contains(&name), "HOOK_NAMES missing {name:?}");
+        }
+        // No duplicates.
+        let mut sorted: Vec<&str> = HOOK_NAMES.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), HOOK_NAMES.len(), "HOOK_NAMES has duplicates");
+    }
+
+    #[test]
+    fn pgdata_symlink_hooks_is_a_subset_of_hook_names() {
+        for h in PGDATA_SYMLINK_HOOKS {
+            assert!(
+                HOOK_NAMES.contains(h),
+                "PGDATA_SYMLINK_HOOKS entry {h:?} not in HOOK_NAMES"
+            );
+        }
     }
 
     #[test]

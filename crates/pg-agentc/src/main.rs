@@ -39,19 +39,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 const STATUS_SUBCOMMAND: &str = "status";
 
-/// Every hook + subcommand the dispatcher recognises. Checked up front so
-/// unknown hooks fail with a clear message instead of a "can't connect"
-/// error when the daemon isn't reachable.
-const KNOWN_HOOKS: &[&str] = &[
-    hookspec::HOOK_FAILOVER,
-    hookspec::HOOK_FOLLOW_PRIMARY,
-    hookspec::HOOK_RECOVERY_1ST_STAGE,
-    hookspec::HOOK_PGPOOL_REMOTE_START,
-    hookspec::HOOK_ESCALATION,
-    hookspec::HOOK_DE_ESCALATION,
-    hookspec::HOOK_RESTORE_WAL,
-    STATUS_SUBCOMMAND,
-];
+/// True iff `name` is a hook (sourced from [`hookspec::HOOK_NAMES`]) or
+/// the local `status` subcommand. Checked up front so unknown hooks
+/// fail with a clear message instead of a "can't connect" error when
+/// the daemon isn't reachable.
+fn is_known_command(name: &str) -> bool {
+    name == STATUS_SUBCOMMAND || hookspec::HOOK_NAMES.contains(&name)
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -74,16 +68,15 @@ async fn dispatch() -> Result<ExitCode> {
 
     // Symlink invocation under $PGDATA — argv[0] basename IS the hook name,
     // and pgpool's positional args start at argv[1] (no hook-name prefix).
-    let (hook, args): (String, &[String]) = if argv0 == hookspec::HOOK_RECOVERY_1ST_STAGE
-        || argv0 == hookspec::HOOK_PGPOOL_REMOTE_START
-    {
-        (argv0, &argv[1..])
-    } else if argv.len() >= 2 {
-        (argv[1].clone(), &argv[2..])
-    } else {
-        print_help();
-        return Ok(ExitCode::from(2));
-    };
+    let (hook, args): (String, &[String]) =
+        if hookspec::PGDATA_SYMLINK_HOOKS.contains(&argv0.as_str()) {
+            (argv0, &argv[1..])
+        } else if argv.len() >= 2 {
+            (argv[1].clone(), &argv[2..])
+        } else {
+            print_help();
+            return Ok(ExitCode::from(2));
+        };
 
     // Synthetic top-level commands handled before dialing the socket.
     match hook.as_str() {
@@ -108,7 +101,7 @@ async fn dispatch() -> Result<ExitCode> {
     // Validate the hook name before dialing — otherwise a typo at the
     // pgpool.conf level (e.g. `pg_agentc failovr ...`) would surface as a
     // misleading transport error if pg_agentd happens to be down.
-    if !KNOWN_HOOKS.contains(&hook.as_str()) {
+    if !is_known_command(&hook) {
         eprintln!("pg_agentc: unknown hook: {hook:?} (try 'pg_agentc help')");
         return Ok(ExitCode::from(2));
     }
