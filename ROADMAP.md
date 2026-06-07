@@ -216,6 +216,42 @@ in v1.x and v2 should not foreclose them.
   scope to build in-tree, but the REST surface should be designed
   assuming someone will eventually ship one.
 
+- **Distro-agnostic deployment** — today's defaults bake in the Debian
+  package layout (`/usr/lib/postgresql/17`, `/var/lib/postgresql`,
+  `postgresql@17-main.service`, `pgpool2.service`,
+  `/etc/pgpool2/pgpool_node_id`). RHEL/Rocky/Alma puts the same files
+  in different places (`/usr/pgsql-17`, `/var/lib/pgsql`,
+  `postgresql-17.service`, `pgpool-II.service`,
+  `/etc/pgpool-II/pgpool_node_id`). Today: an operator on a non-Debian
+  distro overrides every path field in `config.toml` — feasible but
+  error-prone, and BOOTSTRAP.md reads as Debian-only.
+  Work to do:
+  1. **Distro profiles** — ship a `distro = "debian" | "rhel"` knob (or
+     auto-detect from `/etc/os-release`) that selects a default set
+     for `pg_install_prefix`, `user_home`, `data_dir`, `service`,
+     `pcp.pgpool_service`, `DEFAULT_PGPOOL_NODE_ID_FILE`. Operator
+     overrides still win per-field.
+  2. **`.rpm` packaging** alongside the `.deb`. Same
+     `dh_installsystemd --no-enable` / "restart-if-running on upgrade"
+     posture, but expressed as `%post`/`%postun` scriptlets.
+  3. **`ensure_hook_symlinks` discovery** — currently looks for
+     `pg_agentc` as a sibling of `pg_agentd` (Debian: both in
+     `/usr/bin`). On RHEL the layout may be the same, but verify and
+     codify; the PATH fallback already covers oddballs.
+  4. **BOOTSTRAP "distro matrix"** appendix listing the path-pair
+     differences between supported distros, plus a "this is what
+     Ansible writes differently per OS family" inventory snippet.
+  5. **CI matrix** — run the test suite on a RHEL-flavoured container
+     too, just to catch path / service-name assumptions that creep
+     into tests.
+
+  Not v1 because it's pure portability — no new behaviour, just
+  reach. But foreclosing this would mean baking RHEL out of the
+  product permanently, so we keep design choices distro-neutral
+  (e.g., never hardcode `/etc/pgpool2/` in code outside the
+  `DEFAULT_*` consts; never assume `postgresql@*-main` instance
+  naming in subprocess args).
+
 ---
 
 ## Non-goals (explicit)
