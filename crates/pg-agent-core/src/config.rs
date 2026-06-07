@@ -47,6 +47,12 @@ pub const DEFAULT_PG_SOCKET_DIR: &str = "/var/run/postgresql";
 pub const DEFAULT_PG_SERVICE: &str = "postgresql@17-main.service";
 pub const DEFAULT_PGPOOL_SERVICE: &str = "pgpool2.service";
 
+/// Default path pgpool writes its node id to on Debian. Used as the
+/// implicit fallback by [`Config::resolve_local_node_id`] so the agent
+/// and pgpool share a single source of truth without the operator
+/// having to set `node_id_file` explicitly on every node.
+pub const DEFAULT_PGPOOL_NODE_ID_FILE: &str = "/etc/pgpool2/pgpool_node_id";
+
 // ---------------------------------------------------------------------------
 // Env var names
 // ---------------------------------------------------------------------------
@@ -642,16 +648,30 @@ impl Config {
     ///
     /// 1. `node_id` field in `config.toml`
     /// 2. `node_id_file` field — file containing the integer
-    /// 3. `<state_dir>/node_id` — mirrors pgpool's `pgpool_node_id` convention
+    /// 3. `/etc/pgpool2/pgpool_node_id` if present — pgpool's own file,
+    ///    so a single Ansible step writes one file both tools read
     /// 4. Hostname fallback — `gethostname()` matched against `[[pool]].hostname`
     ///
     /// Sources 1 and 2 error if they point at an id not in the pool —
-    /// that's unambiguously a configuration mistake. Sources 3 and 4 are
-    /// best-effort; if none match, `local_node_id` stays at `-1` and
-    /// [`Config::validate`] will surface the failure.
+    /// that's unambiguously a configuration mistake. Sources 3 and 4
+    /// are best-effort; if the file is absent we fall through, if it's
+    /// present but unparseable we surface that. When all four miss,
+    /// `local_node_id` stays at `-1` and [`Config::validate`] surfaces
+    /// the failure as `NoLocalNode`.
     ///
     /// Must be called **after** [`apply_defaults`](Self::apply_defaults).
     pub fn resolve_local_node_id(&mut self) -> Result<(), AgentError> {
+        self.resolve_local_node_id_with_pgpool_file(Path::new(DEFAULT_PGPOOL_NODE_ID_FILE))
+    }
+
+    /// `resolve_local_node_id` with an overridable pgpool-file path.
+    /// Production always passes [`DEFAULT_PGPOOL_NODE_ID_FILE`]; tests
+    /// drive synthetic tmpdir paths through this entry point so the
+    /// step-3 probe is deterministic in any environment.
+    pub fn resolve_local_node_id_with_pgpool_file(
+        &mut self,
+        pgpool_file: &Path,
+    ) -> Result<(), AgentError> {
         self.local_node_id = -1;
 
         // 1. Explicit node_id in config.
@@ -665,33 +685,16 @@ impl Config {
             return self.set_local_node_by_id(id, &format!("node_id_file {}", p.display()));
         }
 
-        // 3. <state_dir>/node_id — created by ansible on every node so
-        //    pgpool and pg_agent agree on the local id without a custom
-        //    config.toml per host.
-        if let Some(state_dir) = self.state_dir.as_ref() {
-            let default_id_file = state_dir.join("node_id");
-            match fs::read_to_string(&default_id_file) {
-                Ok(s) => {
-                    let id = s
-                        .trim()
-                        .parse::<i32>()
-                        .map_err(|e| AgentError::NodeIdFile {
-                            path: default_id_file.clone(),
-                            message: format!("parse: {e}"),
-                        })?;
-                    return self.set_local_node_by_id(
-                        id,
-                        &format!("node_id file {}", default_id_file.display()),
-                    );
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(AgentError::NodeIdFile {
-                        path: default_id_file,
-                        message: e.to_string(),
-                    });
-                }
-            }
+        // 3. pgpool's own pgpool_node_id file — share a single source
+        //    of truth between pg_agent and pgpool. Ansible writes this
+        //    file once per node; both tools read from it. Missing →
+        //    fall through to hostname match; present-but-broken →
+        //    surface to the operator.
+        if let Some(id) = try_read_node_id_file(pgpool_file)? {
+            return self.set_local_node_by_id(
+                id,
+                &format!("pgpool_node_id file {}", pgpool_file.display()),
+            );
         }
 
         // 4. Hostname fallback. Errors here are non-fatal — validate()
@@ -888,6 +891,28 @@ fn read_node_id_file(path: &Path) -> Result<i32, AgentError> {
         })
 }
 
+/// `read_node_id_file` variant that distinguishes "file missing" (returns
+/// `Ok(None)`) from "file present but broken" (returns `Err`). Used by
+/// the optional pgpool-file fallback so we can fall through cleanly when
+/// pgpool isn't deployed.
+fn try_read_node_id_file(path: &Path) -> Result<Option<i32>, AgentError> {
+    match fs::read_to_string(path) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|e| AgentError::NodeIdFile {
+                path: path.to_path_buf(),
+                message: format!("parse: {e}"),
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(AgentError::NodeIdFile {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        }),
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -984,6 +1009,111 @@ mod tests {
             matches!(err, AgentError::LocalNodeMissingFromPool { id: 99, .. }),
             "got {err:?}"
         );
+    }
+
+    // ----- resolve_local_node_id step 3 (pgpool_node_id file) -----------
+
+    fn pool_cfg(members: &[(i32, &str)]) -> Config {
+        let mut cfg = Config {
+            pool: members
+                .iter()
+                .map(|(id, host)| NodeConfig {
+                    id: *id,
+                    hostname: (*host).to_string(),
+                })
+                .collect(),
+            ..Config::default()
+        };
+        cfg.apply_defaults();
+        cfg
+    }
+
+    #[test]
+    fn resolve_node_id_uses_pgpool_file_when_no_explicit_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pgpool_file = tmp.path().join("pgpool_node_id");
+        std::fs::write(&pgpool_file, "1\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "primary"), (1, "standby")]);
+        cfg.resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .unwrap();
+        assert_eq!(cfg.local_node_id, 1);
+    }
+
+    #[test]
+    fn resolve_node_id_pgpool_file_falls_through_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does_not_exist");
+
+        // Provide a hostname-matching pool entry so step 4 catches.
+        let host = nix::unistd::gethostname()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut cfg = pool_cfg(&[(0, &host), (1, "other")]);
+        cfg.resolve_local_node_id_with_pgpool_file(&missing)
+            .unwrap();
+        assert_eq!(cfg.local_node_id, 0, "hostname fallback should fire");
+    }
+
+    #[test]
+    fn resolve_node_id_pgpool_file_with_bad_contents_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pgpool_file = tmp.path().join("pgpool_node_id");
+        std::fs::write(&pgpool_file, "not-a-number\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
+        let err = cfg
+            .resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::NodeIdFile { ref message, .. } if message.starts_with("parse:")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_node_id_pgpool_file_with_unknown_id_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pgpool_file = tmp.path().join("pgpool_node_id");
+        std::fs::write(&pgpool_file, "99\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
+        let err = cfg
+            .resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::LocalNodeMissingFromPool { id: 99, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_node_id_explicit_node_id_wins_over_pgpool_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pgpool_file = tmp.path().join("pgpool_node_id");
+        std::fs::write(&pgpool_file, "1\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
+        cfg.node_id = Some(0);
+        cfg.resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .unwrap();
+        assert_eq!(cfg.local_node_id, 0, "explicit node_id should win");
+    }
+
+    #[test]
+    fn resolve_node_id_explicit_file_wins_over_pgpool_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pgpool_file = tmp.path().join("pgpool_node_id");
+        std::fs::write(&pgpool_file, "1\n").unwrap();
+        let custom_file = tmp.path().join("custom_id");
+        std::fs::write(&custom_file, "0\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
+        cfg.node_id_file = Some(custom_file);
+        cfg.resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .unwrap();
+        assert_eq!(cfg.local_node_id, 0);
     }
 
     #[test]

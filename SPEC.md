@@ -915,12 +915,17 @@ In priority order, first hit wins:
 
 1. `node_id` field at the root of `config.toml`.
 2. `node_id_file` field — file containing the integer.
-3. `<state_dir>/node_id` — same convention as pgpool's `pgpool_node_id`.
+3. `/etc/pgpool2/pgpool_node_id` if present — pgpool's own node-id file.
+   Sharing this file between pg_agent and pgpool means one Ansible step
+   writes one file both tools read; the two can never drift.
 4. Hostname fallback: `os::hostname()` matched against `[[pool]].hostname`.
 
 Sources 1 and 2 are errors if they point at an id that isn't in the pool.
-Sources 3 and 4 are best-effort; if none match, the daemon fails startup
-with a "local node not found" error.
+Source 3 is "missing → fall through, present-but-broken → error" — an
+absent file means pgpool isn't deployed (or `pg_agent` is running
+standalone), but a malformed one is a configuration mistake. Source 4 is
+best-effort. If none match, the daemon fails startup with a "local node
+not found" error.
 
 ### 8.5 Peer listen address
 
