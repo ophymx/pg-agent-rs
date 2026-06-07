@@ -20,7 +20,8 @@ use crate::certreload::{CertReloader, ReloadingClientCertResolver};
 use crate::config::NodeConfig;
 use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
-    pg_agent_peer_client::PgAgentPeerClient, DropSlotRequest, NodeConfigRequest, NodeConfigResponse,
+    pg_agent_peer_client::PgAgentPeerClient, DropSlotRequest, NodeConfigRequest,
+    NodeConfigResponse, StartRequest,
 };
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -56,6 +57,8 @@ pub trait PeerRegistry: Send + Sync {
 /// - `drop_slot` — consumed by the maintenance worker's slot-cleanup retry
 /// - `get_node_config` — used by preflight to probe peer reachability +
 ///   identity
+/// - `start` — `RemoteStart` (LocalServer hook) calls this on the target
+///   peer to bring its PostgreSQL up
 #[async_trait]
 pub trait PeerClient: Send + Sync {
     /// `pg_drop_replication_slot($1)` on the target peer's PostgreSQL.
@@ -69,7 +72,13 @@ pub trait PeerClient: Send + Sync {
     /// misconfigured link.
     async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse>;
 
-    // TODO(v1): start/stop/reload/promote/create_slot/configure_standby/
+    /// Start PostgreSQL on the peer via its `Systemd::start_postgres`.
+    /// Used by `LocalServer::RemoteStart` (the `pgpool_remote_start`
+    /// hook). Surface non-`ok` `OpResult` as `Err` so the caller doesn't
+    /// have to inspect the payload.
+    async fn start(&self) -> anyhow::Result<()>;
+
+    // TODO(v1): stop/reload/promote/create_slot/configure_standby/
     // basebackup/rewind/fetch_wal/reload_pgpool/remove_vip/get_status.
 }
 
@@ -312,6 +321,19 @@ impl PeerClient for PeerChannel {
             .map_err(|s| anyhow::anyhow!("peer get_node_config: {s}"))?
             .into_inner();
         Ok(resp)
+    }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .start(StartRequest {})
+            .await
+            .map_err(|s| anyhow::anyhow!("peer start: {s}"))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer start: {}", resp.message);
+        }
+        Ok(())
     }
 }
 

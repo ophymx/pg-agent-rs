@@ -232,7 +232,15 @@ impl Agent {
         {
             let me: Arc<dyn NodeInfo> = self.clone();
             let s = shutdown.clone();
-            js.spawn(async move { LocalServer::new(me).serve(listeners.unix, s).await });
+            let db = self.deps.db.clone();
+            let peers = self.deps.peers.clone();
+            let maint = self.opts.maintenance_store.clone();
+            let pool = self.opts.node_pool.clone();
+            js.spawn(async move {
+                LocalServer::new(me, db, peers, maint, pool)
+                    .serve(listeners.unix, s)
+                    .await
+            });
         }
 
         // PeerServer (mTLS gRPC). Build the inbound TLS config from the
