@@ -26,7 +26,7 @@ use crate::{
     maintenance::{MaintenanceStore, MaintenanceWorker, DEFAULT_SWEEP_INTERVAL},
     pcp::Pcp,
     peers::PeerRegistry,
-    peerserver::PeerServer,
+    peerserver::{PeerServer, PeerTlsConfig},
     pgstandby::StandbyOps,
     replay_markers::ReplayMarkerStore,
     sdnotify,
@@ -167,6 +167,25 @@ impl Agent {
         Arc::new(Self { deps, opts })
     }
 
+    /// Project the inbound peer mTLS config: bundle the cert reloader
+    /// with the SAN allowlist derived from `NodePool::members`. Returns
+    /// `None` when TLS isn't configured — the peer server then takes the
+    /// dev-mode plain-TCP path (only valid when there are no remote peers).
+    fn build_peer_tls_config(&self) -> Option<PeerTlsConfig> {
+        let reloader = self.opts.cert_reloader.clone()?;
+        let allowed_peer_sans = self
+            .opts
+            .node_pool
+            .members
+            .iter()
+            .map(|n| n.hostname.clone())
+            .collect();
+        Some(PeerTlsConfig {
+            reloader,
+            allowed_peer_sans,
+        })
+    }
+
     /// Brings up every subsystem, calls `sd_notify(READY=1)`, then awaits
     /// either a shutdown signal (via `shutdown.cancel()`) or the first
     /// subsystem failure. On either path, fires `sd_notify(STOPPING=1)`,
@@ -216,12 +235,13 @@ impl Agent {
             js.spawn(async move { LocalServer::new(me).serve(listeners.unix, s).await });
         }
 
-        // PeerServer (mTLS gRPC).
+        // PeerServer (mTLS gRPC). Build the inbound TLS config from the
+        // cert reloader + pool SAN allowlist; `None` is dev-mode plain TCP.
         {
             let me: Arc<dyn NodeInfo> = self.clone();
             let s = shutdown.clone();
-            let reloader = self.opts.cert_reloader.clone();
-            js.spawn(async move { PeerServer::new(me).serve(listeners.peer, reloader, s).await });
+            let tls = self.build_peer_tls_config();
+            js.spawn(async move { PeerServer::new(me).serve(listeners.peer, tls, s).await });
         }
 
         // MaintenanceWorker (no listener; ticks on sweep_every).

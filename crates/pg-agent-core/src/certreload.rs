@@ -244,7 +244,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// Extract DNS + IP subject-alternative-names from a DER-encoded X.509
 /// cert. Used by preflight (does our cert cover every peer hostname?)
 /// and the inbound peer mTLS SAN allowlist enforcement.
-fn extract_sans(der: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
+pub(crate) fn extract_sans(der: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
     use x509_parser::extensions::GeneralName;
     use x509_parser::prelude::FromDer;
     use x509_parser::prelude::X509Certificate;
