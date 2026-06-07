@@ -310,7 +310,7 @@ following Go interfaces to Rust traits, every method `async fn` returning
 | `StandbyOps`       | subprocess + filesystem            | `basebackup(opts, progress_cb)`, `rewind(opts, progress_cb)`, `write_recovery_conf(opts)` |
 | `Pcp`              | `pcp_attach_node` / `pcp_node_count` subprocess | `attach_node(id)`, `node_count() -> int` |
 | `Systemd`          | zbus to `systemd1`                 | `start_postgres()`, `stop_postgres()`, `status_postgres()`, `status_pgpool()`, `reload_or_restart_postgres()`, `reload_or_restart_pgpool()` |
-| `ReplayMarkerStore` | dotfiles under `$PGDATA`          | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
+| `ReplayMarkerStore` | JSON files under `<state_dir>/replay/` | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
 | `MaintenanceStore` | one JSON file per intent under `<state_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
 
@@ -367,21 +367,24 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
 1. If `new_main.id == -1` → no candidates available. Log critical error,
    return `OpResult { ok=false, message="no standby candidates available" }`.
    Do **not** error the RPC.
-2. Compute idempotency replay key:
-   `detached={id},new_main={id},old_primary={id}`. If
-   `replay.has("failover", key)` → return ok with "already processed".
-3. Resolve `detached`, `new_main`, `old_primary` from topology
+2. Resolve `detached`, `new_main`, `old_primary` from topology
    (hostname-authoritative — see §8.2).
-4. **Standby down** (`detached.id != old_primary.id`):
+3. **Standby down** (`detached.id != old_primary.id`):
    - Drop the slot locally with a best-effort cleanup context (30s timeout,
      decoupled from the hook ctx).
    - On error: enqueue `drop_slot_cleanup` maintenance intent; still return
      `ok=true` with a descriptive message.
-   - `replay.mark_done(...)`.
-5. **Primary down** (`detached.id == old_primary.id`):
+4. **Primary down** (`detached.id == old_primary.id`):
    - `peers[new_main].Promote()`.
    - `peers[new_main].DropSlot(detached.slot_name)`.
    - On DropSlot failure: enqueue maintenance intent; still mark done.
+
+> No replay marker for `Failover` — every operation in this flow is
+> naturally near-idempotent: `pg_promote()` on an already-primary fails
+> harmlessly, slot drops have 42710-ignore baked in (and failure routes
+> to the maintenance queue rather than re-running). The worst a re-fire
+> does is generate a few lines of warn-level log noise. See §5.12 for
+> the rationale on which hooks earn a replay marker.
 
 The slot name is always `node{id}` (e.g. `node2`).
 
@@ -570,18 +573,43 @@ into libpq's conninfo and redirect a basebackup to an attacker host.
 
 ### 5.12 Replay markers (idempotency)
 
-`Failover`, `FollowPrimary`, `RecoveryFirstStage` each derive a stable key
-from their request and check `replay_marker_store.has(op, key)` before
-doing any work. On success they `mark_done(op, key)`. Markers are stored as
-dotfiles under `$PGDATA`:
+**Scope:** only `FollowPrimary` and `RecoveryFirstStage` carry replay
+markers. Both flows run `pg_basebackup` (conditionally for `FollowPrimary`,
+unconditionally for `RecoveryFirstStage`), which **wipes `$PGDATA` before
+streaming the primary's data**. Re-running a fully-completed flow would
+clobber the healthy standby's data dir with a fresh basebackup. The marker
+makes the second invocation a fast no-op.
 
-```
-.pg_agent_idem_<op>_<sha256(op|key) hex>.done
-```
+`Failover` deliberately has no marker — its operations are
+naturally-near-idempotent (see §5.1's note).
 
-Content is the RFC3339Nano UTC timestamp of completion. The maintenance
-worker sweeps markers older than 24h (`DefaultReplayMarkerRetention`).
-`op` is sanitised to `[a-z0-9_-]` only.
+**Stored under `<state_dir>/replay/`** (NOT under `$PGDATA`). Operators
+inspecting `$PGDATA` should see PostgreSQL's files, not agent bookkeeping.
+The agent's own state lives in `<state_dir>` by design.
+
+**Filename:** `<sanitised_op>_<sha256(op|key) hex>.json`
+**Content:** `{"op": "...", "key": "...", "completed_at": "RFC3339Nano UTC"}`
+
+`op` is sanitised to `[a-z0-9_-]` for the filename prefix; the SHA-256 of
+`op|key` keeps the name a fixed length regardless of how long the caller's
+key gets. JSON content (rather than a bare timestamp) makes each marker
+self-describing — `cat <state_dir>/replay/*.json | jq` is a working
+incident-review tool with no other infrastructure.
+
+**Retention:** the maintenance worker sweeps markers whose `completed_at`
+is older than 24h (`DefaultReplayMarkerRetention`), on the same 30s tick.
+A bad file (read error, JSON parse error) is logged and kept — a single
+corrupt marker must not block the sweep, and operator intervention beats
+silent deletion.
+
+**What the marker does NOT protect:** in-progress re-entry. If a flow is
+running concurrently with a retry, both attempts race. The second will
+typically fail (e.g. basebackup refuses a non-empty target, or
+`peers[detached].Stop()` makes the target unhealthy mid-flow). Fully
+preventing in-progress re-entry would require a distributed lock; the
+mark-after-success model trades that for simplicity, which is the right
+call for our threat model (re-fires after success are far more common
+than re-fires during execution).
 
 ### 5.13 Maintenance queue (durable drop-slot retries)
 
@@ -1005,12 +1033,13 @@ Created/repaired by `pg_agentd` at startup. Rules:
 
 ```
 <state_dir>/
-├── node_id                # optional — see §8.4
-└── maintenance/
-    └── <intent-id>.json   # one per intent, atomic temp+rename writes
+├── node_id                          # optional — see §8.4
+├── maintenance/
+│   └── <intent-id>.json             # one per intent, atomic temp+rename
+└── replay/
+    └── <op>_<sha256>.json           # idempotency markers (see §5.12)
 
-$PGDATA/
-└── .pg_agent_idem_<op>_<sha256>.done   # replay markers (dotfiles)
+$PGDATA/                             # no agent files — left to PostgreSQL
 ```
 
 `<state_dir>` defaults to `<postgres.home>/pg_agent` and is created with
