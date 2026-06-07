@@ -252,6 +252,37 @@ in v1.x and v2 should not foreclose them.
   `DEFAULT_*` consts; never assume `postgresql@*-main` instance
   naming in subprocess args).
 
+- **VIP failover via pgpool watchdog `delegate_IP`** — support
+  deployments that put pgpool's watchdog VIP in front of the cluster
+  instead of HAProxy. v1 assumes HAProxy is the L4 entry point and
+  treats `Escalation` / `DeEscalation` as no-ops (SPEC §5.5, §18); to
+  serve operators who'd rather lean on pgpool's built-in watchdog
+  (no separate LB to provision, simpler topology on a small cluster),
+  those two hooks need to actually do something.
+  Work to do:
+  1. **Wire `Escalation` / `DeEscalation`** to bring up / tear down
+     the configured `delegate_IP` on the local interface
+     (`ip addr add` / `ip addr del` + a gratuitous-ARP burst). Today
+     both RPCs return ok with no side effect.
+  2. **Config** — `[watchdog] delegate_ip = "10.0.0.42/24"` +
+     `interface = "eth0"`, opt-in. When unset, behaviour matches v1
+     (no-op, HAProxy-fronted deployment).
+  3. **Preflight** — assert `CAP_NET_ADMIN` on the daemon (or
+     `setcap cap_net_admin+ep` on the binary), the configured
+     interface exists, and the address isn't already bound to a
+     different host.
+  4. **`cluster status`** — show which node currently holds the VIP
+     (sourced from `ip addr show`) and flag divergence from the
+     watchdog's view of leadership as a hard ERR.
+  5. **SPEC update** — promote §5.5 / §18 from "no-op, reserved" to
+     a documented mode toggle; revise §3 topology table to show the
+     VIP row when configured.
+
+  Not v1 because HAProxy is the supported entry point today and
+  watchdog leader election is a separate failure surface to debug.
+  Keeping the RPC names (`Escalation` / `DeEscalation`) intact in v1
+  ensures the wire format doesn't need to change to land this later.
+
 ---
 
 ## Non-goals (explicit)
