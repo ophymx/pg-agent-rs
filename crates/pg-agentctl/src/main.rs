@@ -122,11 +122,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             print_hooks(cli.json);
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::CheckHooks { path: _ } => {
-            // TODO(v1): parse pgpool.conf, validate every entry against
-            // hookspec::pgpool_hooks().
-            Ok(ExitCode::from(2))
-        }
+        Cmd::CheckHooks { path } => check_hooks(&path, cli.json),
         Cmd::GenPgpool { write, config } => {
             gen_pgpool(config, write, cli.socket.as_deref(), cli.json).await
         }
@@ -572,6 +568,122 @@ fn print_intent_human(i: &pg_agent_proto::pgagentpb::MaintenanceIntent) {
     }
 }
 
+/// Parse `pgpool.conf` enough to extract single-quoted directive values.
+///
+/// Matches lines of the form `key = 'value'`, ignoring `#` comments
+/// (the SPEC §13 contract). Last-write-wins on duplicate keys, matching
+/// pgpool's own resolution.
+fn parse_pgpool_conf(text: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for raw in text.lines() {
+        // Trim leading whitespace and skip comments.
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Strip trailing `# comment` (best-effort — pgpool's own parser
+        // is more lenient, but this is fine for the canonical lines we
+        // care about, which never embed `#` in the quoted value).
+        let line = match line.find('#') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let Some(eq) = line.find('=') else {
+            continue;
+        };
+        let key = line[..eq].trim().to_string();
+        let value_raw = line[eq + 1..].trim();
+        // Single-quoted value: strip exactly one leading and one
+        // trailing quote. Otherwise treat the whole rest as the value.
+        let value =
+            if value_raw.starts_with('\'') && value_raw.ends_with('\'') && value_raw.len() >= 2 {
+                value_raw[1..value_raw.len() - 1].to_string()
+            } else {
+                value_raw.to_string()
+            };
+        out.insert(key, value);
+    }
+    out
+}
+
+fn check_hooks(path: &std::path::Path, json: bool) -> anyhow::Result<ExitCode> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let parsed = parse_pgpool_conf(&text);
+
+    #[derive(Debug)]
+    struct Row {
+        key: &'static str,
+        want: String,
+        got: Option<String>,
+        ok: bool,
+    }
+
+    let rows: Vec<Row> = hookspec::pgpool_hooks()
+        .into_iter()
+        .map(|h| {
+            let got = parsed.get(h.key).cloned();
+            let ok = got.as_deref() == Some(h.value.as_str());
+            Row {
+                key: h.key,
+                want: h.value,
+                got,
+                ok,
+            }
+        })
+        .collect();
+
+    let all_ok = rows.iter().all(|r| r.ok);
+
+    if json {
+        let payload = serde_json::json!({
+            "ok":   all_ok,
+            "path": path.display().to_string(),
+            "rows": rows.iter().map(|r| serde_json::json!({
+                "key":  r.key,
+                "want": r.want,
+                "got":  r.got,
+                "ok":   r.ok,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let name_width = rows.iter().map(|r| r.key.len()).max().unwrap_or(0);
+        for r in &rows {
+            let tag = if r.ok { "OK " } else { "ERR" };
+            match (&r.got, r.ok) {
+                (Some(_), true) => {
+                    println!("{tag}  {:<width$}", r.key, width = name_width)
+                }
+                (Some(got), false) => println!(
+                    "{tag}  {:<width$}  got {got:?}, want {want:?}",
+                    r.key,
+                    got = got,
+                    want = r.want,
+                    width = name_width
+                ),
+                (None, _) => println!(
+                    "{tag}  {:<width$}  missing (want {want:?})",
+                    r.key,
+                    want = r.want,
+                    width = name_width
+                ),
+            }
+        }
+        println!();
+        if all_ok {
+            println!("check-hooks: all directives match");
+        } else {
+            println!("check-hooks: drift detected");
+        }
+    }
+
+    if all_ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
 fn init_logging() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -611,6 +723,68 @@ mod tests {
         assert!(out.contains("backend_port1 = 5433"));
         assert!(out.contains("failover_command"));
         assert!(out.contains("recovery_1st_stage_command"));
+    }
+
+    #[test]
+    fn parse_pgpool_conf_extracts_quoted_values() {
+        let s = "\
+# leading comment
+failover_command = 'pg_agentc failover %d %h %p %P %r %R'
+# blank line below
+
+backend_port0 = 5432  # trailing comment
+quoted_with_spaces = '  spaces inside  '
+        ";
+        let m = parse_pgpool_conf(s);
+        assert_eq!(
+            m.get("failover_command").map(String::as_str),
+            Some("pg_agentc failover %d %h %p %P %r %R")
+        );
+        assert_eq!(m.get("backend_port0").map(String::as_str), Some("5432"));
+        assert_eq!(
+            m.get("quoted_with_spaces").map(String::as_str),
+            Some("  spaces inside  ")
+        );
+    }
+
+    #[test]
+    fn check_hooks_reports_drift_when_value_mismatched() {
+        // Build a pgpool.conf where every directive is present except
+        // failover_command, which has been munged. Expect non-zero exit.
+        let mut text = String::new();
+        for h in hookspec::pgpool_hooks() {
+            if h.key == "failover_command" {
+                text.push_str("failover_command = 'WRONG'\n");
+            } else {
+                text.push_str(&format!("{} = '{}'\n", h.key, h.value));
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("pgpool.conf");
+        std::fs::write(&p, text).unwrap();
+        let code = check_hooks(&p, false).unwrap();
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "expected FAILURE exit"
+        );
+    }
+
+    #[test]
+    fn check_hooks_succeeds_on_canonical_block() {
+        let mut text = String::new();
+        for h in hookspec::pgpool_hooks() {
+            text.push_str(&format!("{} = '{}'\n", h.key, h.value));
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("pgpool.conf");
+        std::fs::write(&p, text).unwrap();
+        let code = check_hooks(&p, false).unwrap();
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "expected SUCCESS exit"
+        );
     }
 
     #[test]
