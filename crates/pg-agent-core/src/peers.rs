@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
     pg_agent_peer_client::PgAgentPeerClient, BasebackupRequest, ConfigureStandbyRequest,
     DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse,
-    NodeStatus, OpProgress, RewindRequest, StartRequest, StopRequest,
+    NodeStatus, OpProgress, PromoteRequest, RewindRequest, StartRequest, StopRequest,
 };
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -117,7 +117,11 @@ pub trait PeerClient: Send + Sync {
     /// follow `opts.primary_host` as a streaming standby.
     async fn configure_standby(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()>;
 
-    // TODO(v1): reload/promote/create_slot/reload_pgpool/remove_vip.
+    /// Trigger `pg_promote()` on the peer. Used by `LocalServer::Failover`
+    /// to promote the chosen new main after the primary goes down.
+    async fn promote(&self) -> anyhow::Result<()>;
+
+    // TODO(v1): reload/create_slot/reload_pgpool/remove_vip.
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +473,19 @@ impl PeerClient for PeerChannel {
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer configure_standby: {}", resp.message);
+        }
+        Ok(())
+    }
+
+    async fn promote(&self) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .promote(PromoteRequest {})
+            .await
+            .map_err(|s| anyhow::anyhow!("peer promote: {s}"))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer promote: {}", resp.message);
         }
         Ok(())
     }

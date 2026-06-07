@@ -144,8 +144,148 @@ impl PgAgentLocal for LocalServer {
 
     // ----- hook orchestration (TODO(v1)) ------------------------------------
 
-    async fn failover(&self, _req: Request<FailoverRequest>) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("failover"))
+    /// `failover_command` — pgpool fires this on a surviving node when
+    /// a backend goes down. Two branches:
+    ///
+    /// **Standby down** (`detached.id != old_primary.id`): we're the
+    /// primary; drop the detached standby's replication slot from our
+    /// local PG. No promotion involved.
+    ///
+    /// **Primary down** (`detached.id == old_primary.id`): the detached
+    /// node IS the failed primary. Dial `new_main` (the chosen
+    /// successor), tell it to `Promote()`, then drop the old primary's
+    /// slot on the newly-promoted node.
+    ///
+    /// Either branch returns `Ok` (with replay marker written) even
+    /// when the slot drop itself fails — the drop is queued to
+    /// maintenance for retry. pgpool doesn't need to re-fire the hook
+    /// just because a slot cleanup got hung up.
+    ///
+    /// The one early-out without a marker: `new_main.id == -1` means
+    /// pgpool found no standby candidates. We return `OpResult { ok =
+    /// false }` (not a gRPC error) so pgpool can retry once a
+    /// candidate exists.
+    async fn failover(&self, req: Request<FailoverRequest>) -> Result<Response<OpResult>, Status> {
+        let req = req.into_inner();
+        let detached_ref = req
+            .detached
+            .ok_or_else(|| Status::invalid_argument("failover: detached is required"))?;
+        let new_main_ref = req
+            .new_main
+            .ok_or_else(|| Status::invalid_argument("failover: new_main is required"))?;
+        let old_primary_ref = req
+            .old_primary
+            .ok_or_else(|| Status::invalid_argument("failover: old_primary is required"))?;
+
+        // SPEC §8: -1 is pgpool's "no candidates" sentinel.
+        if new_main_ref.id == -1 {
+            warn!("failover: no standby candidates available (new_main.id == -1)");
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: "no standby candidates available".into(),
+            }));
+        }
+
+        let replay_key = format!(
+            "detached={},new_main={},old_primary={}",
+            detached_ref.id, new_main_ref.id, old_primary_ref.id
+        );
+        match self.replay.has("failover", &replay_key).await {
+            Ok(true) => {
+                info!(%replay_key, "failover: replay detected, skipping");
+                return Ok(Response::new(OpResult {
+                    ok: true,
+                    message: "failover: already processed; skipping duplicate".into(),
+                }));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(internal(anyhow::anyhow!(
+                    "failover: idempotency marker check: {e}"
+                )));
+            }
+        }
+
+        let detached = self
+            .node_pool
+            .resolve_node(&detached_ref)
+            .map_err(|e| Status::invalid_argument(format!("failover: detached: {e}")))?;
+        let new_main = self
+            .node_pool
+            .resolve_node(&new_main_ref)
+            .map_err(|e| Status::invalid_argument(format!("failover: new_main: {e}")))?;
+        let old_primary = self
+            .node_pool
+            .resolve_node(&old_primary_ref)
+            .map_err(|e| Status::invalid_argument(format!("failover: old_primary: {e}")))?;
+        info!(
+            detached = %detached.hostname,
+            new_main = %new_main.hostname,
+            old_primary = %old_primary.hostname,
+            "failover"
+        );
+
+        let slot_name = detached.slot_name();
+
+        if detached.id != old_primary.id {
+            // §1: standby down. We're the primary; drop the slot locally.
+            info!(
+                detached = %detached.hostname,
+                slot = %slot_name,
+                "failover: standby down, dropping replication slot"
+            );
+            let message = match self.db.drop_slot(&slot_name).await {
+                Ok(()) => format!("standby failover: slot {slot_name} dropped"),
+                Err(drop_err) => {
+                    self.queue_drop_slot_cleanup(
+                        &slot_name,
+                        &old_primary.hostname,
+                        "standby_down_local_drop_error",
+                        &drop_err,
+                    )
+                    .await
+                }
+            };
+            return self
+                .write_replay_marker_then_ok("failover", &replay_key, message)
+                .await;
+        }
+
+        // Primary down — promote new main, then drop old primary's slot
+        // on the newly promoted node.
+        info!(
+            new_main = %new_main.hostname,
+            "failover: primary down, promoting new main"
+        );
+
+        let peer = self.peers.client(new_main).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "failover: peer client for {}: {e}",
+                new_main.hostname
+            ))
+        })?;
+
+        if let Err(e) = peer.promote().await {
+            return Err(internal(anyhow::anyhow!(
+                "failover: promote {}: {e}",
+                new_main.hostname
+            )));
+        }
+
+        info!(
+            slot = %slot_name,
+            on = %new_main.hostname,
+            "failover: dropping old primary's replication slot on new primary"
+        );
+        let message = match peer.drop_slot(&slot_name).await {
+            Ok(()) => "primary failover: promoted and slot dropped".to_string(),
+            Err(drop_err) => {
+                self.queue_drop_slot_cleanup(&slot_name, &new_main.hostname, "rpc_error", &drop_err)
+                    .await
+            }
+        };
+        self.write_replay_marker_then_ok("failover", &replay_key, message)
+            .await
     }
     /// `follow_primary_command` — pgpool runs this on the new primary
     /// after a failover, telling each surviving standby to rebase onto
@@ -597,6 +737,73 @@ enum FetchOutcome {
 }
 
 impl LocalServer {
+    /// Queue a `DropSlotCleanup` maintenance intent after a slot drop
+    /// failed in `failover` / `follow_primary`. Returns the human-
+    /// readable message to bake into the hook's `OpResult`. The
+    /// message always reads "succeeded queue" — if the queue itself
+    /// failed, that's a tail-recursive error logged here, and the
+    /// message still reports it so an operator sees both halves.
+    async fn queue_drop_slot_cleanup(
+        &self,
+        slot_name: &str,
+        target_hostname: &str,
+        cause: &str,
+        drop_err: &anyhow::Error,
+    ) -> String {
+        let payload = MaintenancePayload::DropSlotCleanup {
+            slot_name: slot_name.to_string(),
+            target_hostname: target_hostname.to_string(),
+            cause: cause.to_string(),
+            initial_error: drop_err.to_string(),
+        };
+        match self.maint.append(payload).await {
+            Ok(intent) => {
+                warn!(
+                    slot = %slot_name,
+                    target = %target_hostname,
+                    cause,
+                    intent_id = %intent.id,
+                    drop_err = %drop_err,
+                    "cleanup: queued maintenance for failed drop_slot"
+                );
+                format!(
+                    "drop slot {slot_name} on {target_hostname} failed, queued maintenance cleanup"
+                )
+            }
+            Err(queue_err) => {
+                warn!(
+                    slot = %slot_name,
+                    target = %target_hostname,
+                    cause,
+                    drop_err = %drop_err,
+                    queue_err = %queue_err,
+                    "cleanup: drop_slot failed AND maintenance queue failed — slot is orphaned"
+                );
+                format!(
+                    "drop slot {slot_name} on {target_hostname} failed; maintenance enqueue also failed"
+                )
+            }
+        }
+    }
+
+    /// Write the replay marker then return an `Ok(OpResult)` with the
+    /// given message. Failure to write the marker surfaces as Internal —
+    /// without it pgpool may re-fire the whole hook on a retry, undoing
+    /// what we just did. See SPEC §17.
+    async fn write_replay_marker_then_ok(
+        &self,
+        op: &str,
+        key: &str,
+        message: String,
+    ) -> Result<Response<OpResult>, Status> {
+        if let Err(e) = self.replay.mark_done(op, key).await {
+            return Err(internal(anyhow::anyhow!(
+                "{op}: idempotency marker write: {e}"
+            )));
+        }
+        Ok(Response::new(OpResult { ok: true, message }))
+    }
+
     /// Drop a slot that we created earlier in a failed orchestration.
     /// If the drop succeeds, we're done. If it fails, queue a
     /// maintenance intent so the worker retries with backoff — the
@@ -961,6 +1168,11 @@ mod tests {
         configure_standby_calls: AtomicUsize,
         configure_standby_fails: AtomicBool,
         configure_standby_opts: StdMutex<Vec<WriteRecoveryConfOpts>>,
+        // Failover surface.
+        promote_calls: AtomicUsize,
+        promote_fails: AtomicBool,
+        drop_slot_calls: StdMutex<Vec<String>>,
+        drop_slot_fails: AtomicBool,
     }
 
     impl StubPeerClient {
@@ -978,7 +1190,11 @@ mod tests {
 
     #[async_trait]
     impl PeerClient for StubPeerClient {
-        async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+        async fn drop_slot(&self, name: &str) -> anyhow::Result<()> {
+            self.drop_slot_calls.lock().unwrap().push(name.to_string());
+            if self.drop_slot_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer drop_slot boom");
+            }
             Ok(())
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -1052,6 +1268,13 @@ mod tests {
             self.configure_standby_opts.lock().unwrap().push(opts);
             if self.configure_standby_fails.load(Ordering::SeqCst) {
                 anyhow::bail!("stub peer configure_standby boom");
+            }
+            Ok(())
+        }
+        async fn promote(&self) -> anyhow::Result<()> {
+            self.promote_calls.fetch_add(1, Ordering::SeqCst);
+            if self.promote_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer promote boom");
             }
             Ok(())
         }
@@ -1579,16 +1802,213 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    // ----- unimplemented still ------------------------------------------
+    // ----- failover -----------------------------------------------------
+
+    fn failover_req(detached: i32, new_main: i32, old_primary: i32) -> FailoverRequest {
+        FailoverRequest {
+            detached: Some(NodeRef {
+                id: detached,
+                hostname: pool_hostname(detached),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            new_main: Some(NodeRef {
+                id: new_main,
+                hostname: if new_main >= 0 {
+                    pool_hostname(new_main)
+                } else {
+                    String::new()
+                },
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            old_primary: Some(NodeRef {
+                id: old_primary,
+                hostname: pool_hostname(old_primary),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            old_main: None,
+        }
+    }
 
     #[tokio::test]
-    async fn failover_returns_unimplemented() {
-        let (s, ..) = make_server();
+    async fn failover_no_candidates_returns_ok_false_without_marker() {
+        let (s, _db, _peers, _maint, _wal, replay, _pcp) = make_server();
+        // new_main.id == -1 — pgpool's no-candidate sentinel.
+        let resp = s
+            .failover(Request::new(failover_req(1, -1, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("no standby candidates"));
+        // No replay marker — pgpool may retry once a candidate exists.
+        assert!(!replay.has("failover", "any").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_standby_down_drops_slot_locally() {
+        // detached=1 (peer1), new_main=0 (us, the primary), old_primary=0.
+        // Since detached.id != old_primary.id, this is the standby-down
+        // branch: we drop the slot locally and don't dial a peer.
+        let (s, db, _peers, _maint, _wal, replay, _pcp) = make_server();
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("slot node1 dropped"));
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        assert!(replay
+            .has("failover", "detached=1,new_main=0,old_primary=0")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_standby_down_local_drop_failure_queues_maintenance() {
+        let (s, db, _peers, maint, _wal, replay, _pcp) = make_server();
+        db.drop_slot_fails.store(true, Ordering::SeqCst);
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        // Hook still returns Ok — pgpool doesn't retry on slot-cleanup.
+        assert!(resp.ok);
+        assert!(resp.message.contains("queued maintenance"));
+        {
+            let intents = maint.intents.lock().unwrap();
+            assert_eq!(intents.len(), 1);
+            match &intents[0].payload {
+                MaintenancePayload::DropSlotCleanup { cause, .. } => {
+                    assert_eq!(cause, "standby_down_local_drop_error");
+                }
+            }
+        }
+        // Marker IS written — the hook completed (just with a queued cleanup).
+        assert!(replay
+            .has("failover", "detached=1,new_main=0,old_primary=0")
+            .await
+            .unwrap());
+    }
+
+    /// Two-peer pool where peer1 acts as the new main. detached=peer1
+    /// and old_primary=peer1 simulates "the primary went down and we're
+    /// running on the *other* standby that's becoming new_main". The
+    /// pool's local node (id 0) is the new_main target — so we override
+    /// id=0's peer client. (`peers.client()` is called for new_main.)
+    #[tokio::test]
+    async fn failover_primary_down_promotes_and_drops_slot() {
+        let (s, db, peers, _maint, _wal, replay, _pcp) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        peers.override_client(0, new_main_client.clone());
+
+        // detached=1 (the failed primary), new_main=0, old_primary=1.
+        // detached.id == old_primary.id → primary-down branch.
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("promoted and slot dropped"));
+        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *new_main_client.drop_slot_calls.lock().unwrap(),
+            vec!["node1".to_string()]
+        );
+        // Local drop_slot was NOT called — drop happens on the peer.
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+        assert!(replay
+            .has("failover", "detached=1,new_main=0,old_primary=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_primary_down_promote_failure_is_internal_no_marker() {
+        let (s, _db, peers, _maint, _wal, replay, _pcp) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        new_main_client.promote_fails.store(true, Ordering::SeqCst);
+        peers.override_client(0, new_main_client.clone());
+
         let err = s
-            .failover(Request::new(FailoverRequest::default()))
+            .failover(Request::new(failover_req(1, 0, 1)))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("promote"));
+        // No marker — pgpool re-fires the hook so we can retry promote.
+        assert!(!replay
+            .has("failover", "detached=1,new_main=0,old_primary=1")
+            .await
+            .unwrap());
+        // No drop_slot since promote failed.
+        assert!(new_main_client.drop_slot_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failover_primary_down_drop_slot_failure_queues_maintenance() {
+        let (s, _db, peers, maint, _wal, replay, _pcp) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        new_main_client
+            .drop_slot_fails
+            .store(true, Ordering::SeqCst);
+        peers.override_client(0, new_main_client.clone());
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        // Hook returns Ok — promote succeeded, drop cleanup queued.
+        assert!(resp.ok);
+        assert!(resp.message.contains("queued maintenance"));
+        {
+            let intents = maint.intents.lock().unwrap();
+            assert_eq!(intents.len(), 1);
+            match &intents[0].payload {
+                MaintenancePayload::DropSlotCleanup { cause, .. } => {
+                    assert_eq!(cause, "rpc_error");
+                }
+            }
+        }
+        // Marker IS written — promote succeeded; only slot cleanup is async.
+        assert!(replay
+            .has("failover", "detached=1,new_main=0,old_primary=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_skips_when_replay_marker_present() {
+        let (s, db, peers, _maint, _wal, replay, _pcp) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        peers.override_client(0, new_main_client.clone());
+        replay.mark("failover", "detached=1,new_main=0,old_primary=1");
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("already processed"));
+        // No downstream calls happened.
+        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failover_rejects_missing_refs() {
+        let (s, ..) = make_server();
+        let mut req = failover_req(1, 0, 0);
+        req.detached = None;
+        let err = s.failover(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     // ----- restore_wal ---------------------------------------------------
