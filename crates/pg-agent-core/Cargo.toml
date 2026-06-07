@@ -14,7 +14,7 @@ pg-agent-hookspec = { workspace = true }
 
 # Async + IO
 tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "signal", "sync", "time"] }
-tokio-util   = { workspace = true }
+tokio-util   = { workspace = true, features = ["io"] }
 tokio-stream = { workspace = true, features = ["net"] }
 async-trait  = { workspace = true }
 bytes        = { workspace = true }

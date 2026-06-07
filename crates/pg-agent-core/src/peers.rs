@@ -20,7 +20,7 @@ use crate::certreload::{CertReloader, ReloadingClientCertResolver};
 use crate::config::NodeConfig;
 use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
-    pg_agent_peer_client::PgAgentPeerClient, DropSlotRequest, NodeConfigRequest,
+    pg_agent_peer_client::PgAgentPeerClient, DropSlotRequest, FetchWalRequest, NodeConfigRequest,
     NodeConfigResponse, StartRequest,
 };
 use rustls::pki_types::ServerName;
@@ -78,8 +78,23 @@ pub trait PeerClient: Send + Sync {
     /// have to inspect the payload.
     async fn start(&self) -> anyhow::Result<()>;
 
+    /// Stream a WAL segment from the peer's archive. Returns
+    ///   - `Ok(Some(reader))` — segment found; the reader streams the
+    ///     contents (one tonic `WalChunk` per buffered read).
+    ///   - `Ok(None)` — segment not on this peer (`Status::NotFound`).
+    ///     Callers in `LocalServer::RestoreWal` skip to the next peer.
+    ///   - `Err(_)` — anything else (RPC error, transport, bad name).
+    ///
+    /// The `Option` shape collapses the NotFound vs other-error
+    /// distinction at the trait layer so the caller doesn't have to
+    /// introspect a tonic Status.
+    async fn fetch_wal(
+        &self,
+        wal_file: &str,
+    ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>;
+
     // TODO(v1): stop/reload/promote/create_slot/configure_standby/
-    // basebackup/rewind/fetch_wal/reload_pgpool/remove_vip/get_status.
+    // basebackup/rewind/reload_pgpool/remove_vip/get_status.
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +349,33 @@ impl PeerClient for PeerChannel {
             anyhow::bail!("peer start: {}", resp.message);
         }
         Ok(())
+    }
+
+    async fn fetch_wal(
+        &self,
+        wal_file: &str,
+    ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+        use futures_util::TryStreamExt;
+        let mut client = self.inner.clone();
+        let req = FetchWalRequest {
+            wal_file: wal_file.to_string(),
+        };
+        match client.fetch_wal(req).await {
+            Ok(resp) => {
+                let stream = resp.into_inner();
+                // Map gRPC stream items to bytes::Bytes (Buf) + io::Error
+                // for tokio_util::io::StreamReader. Errors mid-stream
+                // surface to the caller (write_restore) as io::Error.
+                let bytes_stream = stream
+                    .map_ok(|chunk| bytes::Bytes::from(chunk.data))
+                    .map_err(|s| std::io::Error::other(s.to_string()));
+                Ok(Some(Box::new(tokio_util::io::StreamReader::new(
+                    bytes_stream,
+                ))))
+            }
+            Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
+            Err(s) => Err(anyhow::anyhow!("peer fetch_wal: {s}")),
+        }
     }
 }
 

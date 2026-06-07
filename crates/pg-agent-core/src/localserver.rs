@@ -17,12 +17,14 @@
 //! orchestration shape that lands in its own commit.
 
 use crate::agent::NodeInfo;
-use crate::config::NodePool;
+use crate::config::{NodeConfig, NodePool};
+use crate::errors::AgentError;
 use crate::localdb::LocalDb;
 use crate::maintenance::{
     MaintenanceIntent as CoreIntent, MaintenanceStatus, MaintenanceStore, SkippedIntent,
 };
 use crate::peers::PeerRegistry;
+use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
@@ -32,22 +34,30 @@ use pg_agent_proto::pgagentpb::{
     NodeConfigResponse, NodeStatus, OpResult, RecoveryRequest, RemoteStartRequest,
     RestoreWalRequest, RetryMaintenanceRequest, SkippedMaintenanceIntent,
 };
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, warn};
 
+/// Per-peer FetchWal deadline. Bounds the hook against a single
+/// partitioned peer wedging the entire fan-out. A WAL segment is 16 MiB,
+/// so 30 s is wide slack for handshake + transfer on a healthy LAN while
+/// still letting an unresponsive peer fail fast.
+const RESTORE_WAL_PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct LocalServer {
     node_info: Arc<dyn NodeInfo>,
     db: Arc<dyn LocalDb>,
     peers: Arc<dyn PeerRegistry>,
     maint: Arc<dyn MaintenanceStore>,
+    wal: Arc<dyn WalStore>,
     node_pool: NodePool,
-    // TODO(v1): Arc<dyn StandbyOps>, Arc<dyn WalStore>, Arc<dyn Pcp>,
-    // Arc<dyn ReplayMarkerStore>, PostgresRuntime — added as the
-    // remaining orchestration handlers land.
+    // TODO(v1): Arc<dyn StandbyOps>, Arc<dyn Pcp>, Arc<dyn ReplayMarkerStore>,
+    // PostgresRuntime — added as the remaining orchestration handlers land.
 }
 
 impl LocalServer {
@@ -56,6 +66,7 @@ impl LocalServer {
         db: Arc<dyn LocalDb>,
         peers: Arc<dyn PeerRegistry>,
         maint: Arc<dyn MaintenanceStore>,
+        wal: Arc<dyn WalStore>,
         node_pool: NodePool,
     ) -> Self {
         Self {
@@ -63,6 +74,7 @@ impl LocalServer {
             db,
             peers,
             maint,
+            wal,
             node_pool,
         }
     }
@@ -135,11 +147,67 @@ impl PgAgentLocal for LocalServer {
     ) -> Result<Response<OpResult>, Status> {
         Err(Status::unimplemented("recovery_first_stage"))
     }
+    /// `restore_command` — PostgreSQL calls `pg_agentc restore-wal %f %p`
+    /// when a WAL segment is missing from its local pg_wal. We fan out
+    /// across the pool in declaration order, returning the first peer's
+    /// content that fits in `dest_path`. Per-peer attempts are bounded
+    /// by `RESTORE_WAL_PER_PEER_TIMEOUT` (private const) so a single
+    /// partitioned peer can't wedge the whole hook.
+    ///
+    /// `DestOutsidePgData` is fatal — it's a config / caller bug and
+    /// every peer would fail the same way. NotFound on a peer is "try
+    /// next". Generic peer errors are logged and treated as TryNext so
+    /// transient failures don't bring down PG's restore loop.
     async fn restore_wal(
         &self,
-        _req: Request<RestoreWalRequest>,
+        req: Request<RestoreWalRequest>,
     ) -> Result<Response<OpResult>, Status> {
-        Err(Status::unimplemented("restore_wal"))
+        let req = req.into_inner();
+        if req.wal_file.is_empty() {
+            return Err(Status::invalid_argument(
+                "restore_wal: wal_file is required",
+            ));
+        }
+        if req.dest_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "restore_wal: dest_path is required",
+            ));
+        }
+        info!(wal_file = %req.wal_file, dest_path = %req.dest_path, "restore_wal");
+
+        let local = self
+            .node_pool
+            .local_node()
+            .map_err(|e| internal(anyhow::anyhow!("restore_wal: resolve local node: {e}")))?;
+        let local_id = local.id;
+
+        for node in &self.node_pool.members {
+            if node.id == local_id {
+                continue;
+            }
+            match self
+                .try_fetch_wal_from_peer(node, &req.wal_file, &req.dest_path)
+                .await
+            {
+                FetchOutcome::Fetched => {
+                    info!(wal_file = %req.wal_file, peer = %node.hostname, "restore_wal: fetched");
+                    return Ok(Response::new(OpResult {
+                        ok: true,
+                        message: format!("restored {} from {}", req.wal_file, node.hostname),
+                    }));
+                }
+                FetchOutcome::TryNext => continue,
+                FetchOutcome::Fatal(s) => return Err(s),
+            }
+        }
+
+        // Exhausted the pool — no peer had it. PG's restore_command
+        // contract: non-zero exit signals "segment unavailable", which
+        // pauses replay and retries. Maps cleanly to NotFound here.
+        Err(Status::not_found(format!(
+            "restore_wal: {} not found on any peer",
+            req.wal_file
+        )))
     }
     async fn cluster_init(
         &self,
@@ -290,6 +358,71 @@ impl PgAgentLocal for LocalServer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Outcome of a single peer's WAL-fetch attempt within RestoreWal.
+#[allow(clippy::large_enum_variant)]
+enum FetchOutcome {
+    /// Peer had the segment and `write_restore` succeeded.
+    Fetched,
+    /// Peer didn't have it / was unreachable / errored mid-stream.
+    /// Loop continues to the next peer.
+    TryNext,
+    /// Caller-shaped failure (`dest_path` outside pgdata). Every peer
+    /// would fail the same way, so abort immediately.
+    Fatal(Status),
+}
+
+impl LocalServer {
+    /// One peer's worth of restore_wal: dial → FetchWal → write to
+    /// `dest_path` via `WalStore::write_restore`. Bounded by
+    /// `RESTORE_WAL_PER_PEER_TIMEOUT`; timeouts and connect failures are
+    /// logged and folded into `TryNext` so a single bad peer doesn't
+    /// abort the loop.
+    async fn try_fetch_wal_from_peer(
+        &self,
+        node: &NodeConfig,
+        wal_file: &str,
+        dest_path: &str,
+    ) -> FetchOutcome {
+        let attempt = async {
+            let peer = match self.peers.client(node).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(?e, peer = %node.hostname, "restore_wal: peer unavailable");
+                    return FetchOutcome::TryNext;
+                }
+            };
+            let reader = match peer.fetch_wal(wal_file).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    info!(peer = %node.hostname, %wal_file, "restore_wal: segment not on peer");
+                    return FetchOutcome::TryNext;
+                }
+                Err(e) => {
+                    warn!(?e, peer = %node.hostname, "restore_wal: fetch RPC failed");
+                    return FetchOutcome::TryNext;
+                }
+            };
+            match self.wal.write_restore(Path::new(dest_path), reader).await {
+                Ok(()) => FetchOutcome::Fetched,
+                Err(AgentError::DestOutsidePgData) => FetchOutcome::Fatal(
+                    Status::invalid_argument("restore_wal: dest_path outside pg_data_dir"),
+                ),
+                Err(e) => {
+                    warn!(?e, peer = %node.hostname, "restore_wal: write_restore failed");
+                    FetchOutcome::TryNext
+                }
+            }
+        };
+        match tokio::time::timeout(RESTORE_WAL_PER_PEER_TIMEOUT, attempt).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                warn!(peer = %node.hostname, "restore_wal: per-peer timeout");
+                FetchOutcome::TryNext
+            }
+        }
+    }
+}
 
 fn internal(e: anyhow::Error) -> Status {
     Status::internal(e.to_string())
@@ -460,6 +593,21 @@ mod tests {
     struct StubPeerClient {
         start_calls: AtomicUsize,
         start_fails: AtomicBool,
+        /// Map wal_file → content the peer "has" in its archive.
+        wal_content: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
+        /// Make fetch_wal err out (transport/RPC failure shape).
+        fetch_wal_errors: AtomicBool,
+        /// Hang fetch_wal indefinitely — exercises the per-peer timeout.
+        fetch_wal_hangs: AtomicBool,
+    }
+
+    impl StubPeerClient {
+        fn stage_wal(&self, name: &str, content: Vec<u8>) {
+            self.wal_content
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), content);
+        }
     }
 
     #[async_trait]
@@ -480,21 +628,61 @@ mod tests {
             }
             Ok(())
         }
+        async fn fetch_wal(
+            &self,
+            wal_file: &str,
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+            if self.fetch_wal_hangs.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.fetch_wal_errors.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer fetch_wal boom");
+            }
+            let content = self.wal_content.lock().unwrap().get(wal_file).cloned();
+            Ok(content.map(|c| {
+                Box::new(std::io::Cursor::new(c)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+            }))
+        }
     }
 
     #[derive(Default)]
     struct StubPeers {
-        client: Arc<StubPeerClient>,
+        /// Returned for any node that lacks an override.
+        default_client: Arc<StubPeerClient>,
+        /// Per-node-id override; lets tests put different staged content
+        /// on different peers (used by restore_wal fan-out tests).
+        overrides: StdMutex<std::collections::HashMap<i32, Arc<StubPeerClient>>>,
+        /// Node ids whose `client()` call returns Err (simulates an
+        /// unreachable / partitioned peer).
+        unreachable: StdMutex<std::collections::HashSet<i32>>,
+        /// Global failure switch (legacy of remote_start tests).
         fail_client: AtomicBool,
+    }
+
+    impl StubPeers {
+        fn override_client(&self, node_id: i32, client: Arc<StubPeerClient>) {
+            self.overrides.lock().unwrap().insert(node_id, client);
+        }
+        fn mark_unreachable(&self, node_id: i32) {
+            self.unreachable.lock().unwrap().insert(node_id);
+        }
     }
 
     #[async_trait]
     impl PeerRegistry for StubPeers {
-        async fn client(&self, _: &NodeConfig) -> anyhow::Result<Arc<dyn PeerClient>> {
+        async fn client(&self, node: &NodeConfig) -> anyhow::Result<Arc<dyn PeerClient>> {
             if self.fail_client.load(Ordering::SeqCst) {
                 anyhow::bail!("stub: peer client unreachable");
             }
-            Ok(self.client.clone() as Arc<dyn PeerClient>)
+            if self.unreachable.lock().unwrap().contains(&node.id) {
+                anyhow::bail!("stub: peer {} unreachable", node.id);
+            }
+            let overrides = self.overrides.lock().unwrap();
+            Ok(overrides
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_else(|| self.default_client.clone())
+                as Arc<dyn PeerClient>)
         }
         async fn close(&self) -> anyhow::Result<()> {
             Ok(())
@@ -580,6 +768,49 @@ mod tests {
         }
     }
 
+    /// WalStore stub that records `write_restore` calls and can be made
+    /// to return any of the three failure modes restore_wal cares about
+    /// (`DestOutsidePgData` — fatal; anything else — `TryNext`).
+    #[derive(Default)]
+    struct StubWal {
+        written: StdMutex<Vec<(std::path::PathBuf, Vec<u8>)>>,
+        dest_outside_pgdata: AtomicBool,
+        write_errors: AtomicBool,
+    }
+
+    #[async_trait]
+    impl WalStore for StubWal {
+        async fn open_archive(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, AgentError> {
+            // LocalServer doesn't call open_archive — only the inbound
+            // PeerServer.FetchWal does, and that path is exercised in
+            // peerserver tests.
+            Err(AgentError::WalNotFound("stub: not used here".into()))
+        }
+        async fn write_restore(
+            &self,
+            dest_path: &Path,
+            mut src: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        ) -> Result<(), AgentError> {
+            if self.dest_outside_pgdata.load(Ordering::SeqCst) {
+                return Err(AgentError::DestOutsidePgData);
+            }
+            if self.write_errors.load(Ordering::SeqCst) {
+                return Err(AgentError::WalNotFound("stub: write_restore boom".into()));
+            }
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            src.read_to_end(&mut bytes).await.map_err(AgentError::Io)?;
+            self.written
+                .lock()
+                .unwrap()
+                .push((dest_path.to_path_buf(), bytes));
+            Ok(())
+        }
+    }
+
     // ----- builders ----------------------------------------------------
 
     fn make_pool() -> NodePool {
@@ -599,18 +830,26 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    fn make_server() -> (LocalServer, Arc<StubDb>, Arc<StubPeers>, Arc<StubMaint>) {
+    fn make_server() -> (
+        LocalServer,
+        Arc<StubDb>,
+        Arc<StubPeers>,
+        Arc<StubMaint>,
+        Arc<StubWal>,
+    ) {
         let db = Arc::new(StubDb::default());
         let peers = Arc::new(StubPeers::default());
         let maint = Arc::new(StubMaint::default());
+        let wal = Arc::new(StubWal::default());
         let server = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
             peers.clone(),
             maint.clone(),
+            wal.clone(),
             make_pool(),
         );
-        (server, db, peers, maint)
+        (server, db, peers, maint, wal)
     }
 
     fn pending_intent(id: &str) -> CoreIntent {
@@ -673,7 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_calls_peer_start() {
-        let (s, _db, peers, _maint) = make_server();
+        let (s, _db, peers, _maint, _wal) = make_server();
         let resp = s
             .remote_start(Request::new(RemoteStartRequest {
                 target: Some(NodeRef {
@@ -687,12 +926,12 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp.ok);
-        assert_eq!(peers.client.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(peers.default_client.start_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn remote_start_refuses_when_local_is_replica() {
-        let (s, db, peers, _maint) = make_server();
+        let (s, db, peers, _maint, _wal) = make_server();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .remote_start(Request::new(RemoteStartRequest {
@@ -708,13 +947,16 @@ mod tests {
             .into_inner();
         assert!(!resp.ok);
         assert!(resp.message.contains("not the primary"));
-        assert_eq!(peers.client.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peers.default_client.start_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn remote_start_propagates_peer_error_as_internal() {
-        let (s, _db, peers, _maint) = make_server();
-        peers.client.start_fails.store(true, Ordering::SeqCst);
+        let (s, _db, peers, _maint, _wal) = make_server();
+        peers
+            .default_client
+            .start_fails
+            .store(true, Ordering::SeqCst);
         let err = s
             .remote_start(Request::new(RemoteStartRequest {
                 target: Some(NodeRef {
@@ -761,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_no_filter_returns_all() {
-        let (s, _db, _peers, maint) = make_server();
+        let (s, _db, _peers, maint, _wal) = make_server();
         maint.insert(pending_intent("a"));
         let mut done_intent = pending_intent("b");
         done_intent.status = MaintenanceStatus::Done;
@@ -777,7 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_filters_by_status() {
-        let (s, _db, _peers, maint) = make_server();
+        let (s, _db, _peers, maint, _wal) = make_server();
         maint.insert(pending_intent("pending-1"));
         let mut done_intent = pending_intent("done-1");
         done_intent.status = MaintenanceStatus::Done;
@@ -809,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_surfaces_skipped() {
-        let (s, _db, _peers, maint) = make_server();
+        let (s, _db, _peers, maint, _wal) = make_server();
         maint.skipped.lock().unwrap().push(SkippedIntent {
             path: "/tmp/corrupt.json".into(),
             error: "bad json".into(),
@@ -825,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_maintenance_returns_existing_intent() {
-        let (s, _db, _peers, maint) = make_server();
+        let (s, _db, _peers, maint, _wal) = make_server();
         maint.insert(pending_intent("alpha"));
         let resp = s
             .get_maintenance(Request::new(GetMaintenanceRequest { id: "alpha".into() }))
@@ -860,7 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_maintenance_reschedules_pending_intent() {
-        let (s, _db, _peers, maint) = make_server();
+        let (s, _db, _peers, maint, _wal) = make_server();
         maint.insert(pending_intent("alpha"));
         let resp = s
             .retry_maintenance(Request::new(RetryMaintenanceRequest { id: "alpha".into() }))
@@ -875,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_maintenance_refuses_non_pending_intent() {
-        let (s, _db, _peers, maint) = make_server();
+        let (s, _db, _peers, maint, _wal) = make_server();
         let mut done = pending_intent("alpha");
         done.status = MaintenanceStatus::Done;
         maint.insert(done);
@@ -911,14 +1153,189 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
+    // ----- restore_wal ---------------------------------------------------
+
+    /// Three-node pool: local + peer1 + peer2 — supports fan-out tests.
+    fn make_pool_3() -> NodePool {
+        NodePool {
+            members: vec![
+                NodeConfig {
+                    id: 0,
+                    hostname: "local".into(),
+                },
+                NodeConfig {
+                    id: 1,
+                    hostname: "peer1.local".into(),
+                },
+                NodeConfig {
+                    id: 2,
+                    hostname: "peer2.local".into(),
+                },
+            ],
+            local_node_id: 0,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn make_server_3() -> (
+        LocalServer,
+        Arc<StubDb>,
+        Arc<StubPeers>,
+        Arc<StubMaint>,
+        Arc<StubWal>,
+    ) {
+        let db = Arc::new(StubDb::default());
+        let peers = Arc::new(StubPeers::default());
+        let maint = Arc::new(StubMaint::default());
+        let wal = Arc::new(StubWal::default());
+        let server = LocalServer::new(
+            Arc::new(FakeNodeInfo),
+            db.clone(),
+            peers.clone(),
+            maint.clone(),
+            wal.clone(),
+            make_pool_3(),
+        );
+        (server, db, peers, maint, wal)
+    }
+
+    fn valid_restore_req() -> RestoreWalRequest {
+        RestoreWalRequest {
+            wal_file: "000000010000000000000001".into(),
+            dest_path: "/var/lib/postgresql/17/main/pg_wal/000000010000000000000001".into(),
+        }
+    }
+
     #[tokio::test]
-    async fn restore_wal_returns_unimplemented() {
+    async fn restore_wal_rejects_empty_wal_file() {
         let (s, ..) = make_server();
         let err = s
-            .restore_wal(Request::new(RestoreWalRequest::default()))
+            .restore_wal(Request::new(RestoreWalRequest {
+                wal_file: String::new(),
+                dest_path: "/d".into(),
+            }))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn restore_wal_rejects_empty_dest_path() {
+        let (s, ..) = make_server();
+        let err = s
+            .restore_wal(Request::new(RestoreWalRequest {
+                wal_file: "wal".into(),
+                dest_path: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn restore_wal_fetches_from_first_peer_with_segment() {
+        let (s, _db, peers, _maint, wal) = make_server();
+        // Default client has the segment.
+        let content = b"WAL_BYTES".to_vec();
+        peers
+            .default_client
+            .stage_wal("000000010000000000000001", content.clone());
+
+        let resp = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("peer1.local"));
+
+        let written = wal.written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].1, content);
+    }
+
+    #[tokio::test]
+    async fn restore_wal_skips_to_next_peer_when_segment_missing() {
+        let (s, _db, peers, _maint, wal) = make_server_3();
+        // peer1 (default) has nothing staged. peer2 has the segment.
+        let peer2_client = Arc::new(StubPeerClient::default());
+        peer2_client.stage_wal("000000010000000000000001", b"GOT_IT".to_vec());
+        peers.override_client(2, peer2_client);
+
+        let resp = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("peer2.local"));
+        assert_eq!(wal.written.lock().unwrap()[0].1, b"GOT_IT");
+    }
+
+    #[tokio::test]
+    async fn restore_wal_skips_unreachable_peer() {
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        peers.mark_unreachable(1);
+        let peer2_client = Arc::new(StubPeerClient::default());
+        peer2_client.stage_wal("000000010000000000000001", b"GOT_IT".to_vec());
+        peers.override_client(2, peer2_client);
+
+        let resp = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("peer2.local"));
+    }
+
+    #[tokio::test]
+    async fn restore_wal_returns_not_found_when_no_peer_has_segment() {
+        let (s, _db, _peers, _maint, _wal) = make_server_3();
+        // Default + no overrides → nobody has it staged.
+        let err = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(err.message().contains("not found on any peer"));
+    }
+
+    #[tokio::test]
+    async fn restore_wal_dest_outside_pgdata_is_fatal() {
+        let (s, _db, peers, _maint, wal) = make_server();
+        peers
+            .default_client
+            .stage_wal("000000010000000000000001", b"_".to_vec());
+        wal.dest_outside_pgdata.store(true, Ordering::SeqCst);
+
+        let err = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("outside pg_data_dir"));
+    }
+
+    #[tokio::test]
+    async fn restore_wal_propagates_peer_rpc_error_as_try_next() {
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        // peer1 errors on fetch_wal; peer2 has the segment.
+        peers
+            .default_client
+            .fetch_wal_errors
+            .store(true, Ordering::SeqCst);
+        let peer2_client = Arc::new(StubPeerClient::default());
+        peer2_client.stage_wal("000000010000000000000001", b"_".to_vec());
+        peers.override_client(2, peer2_client);
+
+        let resp = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("peer2.local"));
     }
 
     #[test]

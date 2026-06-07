@@ -235,9 +235,10 @@ impl Agent {
             let db = self.deps.db.clone();
             let peers = self.deps.peers.clone();
             let maint = self.opts.maintenance_store.clone();
+            let wal = self.deps.wal.clone();
             let pool = self.opts.node_pool.clone();
             js.spawn(async move {
-                LocalServer::new(me, db, peers, maint, pool)
+                LocalServer::new(me, db, peers, maint, wal, pool)
                     .serve(listeners.unix, s)
                     .await
             });
