@@ -1448,6 +1448,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
+ "tokio-stream",
  "tokio-util",
  "toml",
  "tonic",
@@ -1512,6 +1513,7 @@ name = "pg-agentd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "pg-agent-core",
  "sd-notify",

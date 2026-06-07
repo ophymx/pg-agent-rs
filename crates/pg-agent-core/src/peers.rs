@@ -48,3 +48,26 @@ pub trait PeerClient: Send + Sync {
 //   - PeerPool that lazily dials each peer and caches the tonic::Channel,
 //     with the 12 h MaxConnectionAge equivalent.
 //   - verify_peer_san() callback for inbound mTLS SAN allowlist check.
+
+// ---------------------------------------------------------------------------
+// NoOpPeerRegistry — placeholder until PeerPool lands
+// ---------------------------------------------------------------------------
+
+/// Placeholder [`PeerRegistry`] that refuses every `client()` call. Lets the
+/// daemon start when `PeerPool` is not yet implemented; the maintenance
+/// worker will exhaust retries on any cross-node intent and mark it
+/// abandoned (acceptable until peer dialing actually works). Tests can also
+/// use this when they don't need cross-peer behavior.
+///
+/// TODO(v1): replace with `PeerPool` everywhere it is constructed.
+pub struct NoOpPeerRegistry;
+
+#[async_trait]
+impl PeerRegistry for NoOpPeerRegistry {
+    async fn client(&self, _node: &NodeConfig) -> anyhow::Result<Arc<dyn PeerClient>> {
+        anyhow::bail!("peer registry not yet implemented (NoOpPeerRegistry)")
+    }
+    async fn close(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}

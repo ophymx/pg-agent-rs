@@ -1,10 +1,33 @@
 //! pg_agentd — coordinator daemon. See SPEC §12 for the lifecycle.
+//!
+//! `main` is the composition root: load + project config, construct the
+//! [`AgentDeps`] trait objects, bind every listener, install the signal
+//! handlers, then hand off to [`Agent::serve`]. The serve method is the
+//! one that calls `sd_notify::ready()` — by the time it does, every
+//! listener fd already exists in the kernel (the bind-before-notify race
+//! is closed structurally via [`Listeners::bind`]).
 
 use clap::Parser;
-use pg_agent_core::config::DEFAULT_CONFIG_FILE;
+use pg_agent_core::{
+    agent::{Agent, AgentDeps, Listeners, Options},
+    certreload::CertReloader,
+    config::{Config, DEFAULT_CONFIG_FILE},
+    errors::AgentError,
+    localdb::PgLocalDb,
+    maintenance::{FileMaintenanceStore, DEFAULT_SWEEP_INTERVAL},
+    pcp::PcpCli,
+    peers::NoOpPeerRegistry,
+    pgstandby::StandbyExec,
+    replay_markers::{FileReplayMarkerStore, DEFAULT_RETENTION},
+    systemd::DbusSystemd,
+    walstore::FileWalStore,
+};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tracing::error;
+use std::sync::Arc;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 /// pg_agentd — pg_agent's coordinator daemon.
 #[derive(Debug, Parser)]
@@ -28,8 +51,6 @@ struct Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_logging();
-    let _cli = Cli::parse();
-
     if let Err(err) = run().await {
         error!(?err, "fatal");
         return ExitCode::FAILURE;
@@ -38,17 +59,165 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // TODO(v1): load config, apply env + CLI overrides, build CertReloader,
-    // wire AgentDeps (LocalDb / PeerPool / PgStandbyExec / PcpCli /
-    // DbusSystemd / FileReplayMarkerStore / FileWalStore /
-    // FileMaintenanceStore), construct Agent, repair $PGDATA hook symlinks,
-    // install SIGHUP cert-reload task, install SIGINT/SIGTERM shutdown
-    // task, Agent::serve(token).await.
-    //
-    // sd_notify("READY=1") fires inside Agent::serve once both listeners
-    // are bound.
-    let _ = DEFAULT_CONFIG_FILE;
+    let cli = Cli::parse();
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
+
+    // Config: load + env + CLI overrides + defaults + resolve local id + validate.
+    let mut config = Config::load(&config_path)?;
+    config.apply_env_overrides();
+    if let Some(socket) = cli.socket.clone() {
+        config.unix_socket = Some(socket.to_string_lossy().into_owned());
+    }
+    config.dev_mode = cli.dev;
+    config.apply_defaults();
+    config.resolve_local_node_id()?;
+    config.validate()?;
+    info!(
+        path = %config_path.display(),
+        node_id = config.local_node_id,
+        "config loaded"
+    );
+
+    // Projections used by Agent.
+    let serve = config.to_serve_settings();
+    let node_pool = config.to_node_pool();
+    let postgres = config.to_postgres_runtime();
+
+    // Cert reloader (Optional — only when TLS is configured).
+    let cert_reloader = if serve.tls_configured {
+        Some(Arc::new(CertReloader::new(serve.tls.clone())?))
+    } else {
+        None
+    };
+
+    // Build dependencies.
+    let sd = Arc::new(
+        DbusSystemd::new(
+            config.postgres.service.clone().unwrap(),
+            config.pcp.pgpool_service.clone().unwrap(),
+        )
+        .await?,
+    );
+
+    let db = Arc::new(
+        PgLocalDb::connect(config.postgres.socket_dir.clone().unwrap(), postgres.port).await?,
+    );
+
+    let pcp = Arc::new(PcpCli::new(&config.pcp));
+
+    let standby = Arc::new(StandbyExec::new(
+        config.postgres.pghome.clone().unwrap(),
+        postgres.data_dir.clone(),
+        config.postgres.replication_tls.clone(),
+    ));
+
+    // State directories under <state_dir>/{replay,maintenance}/.
+    let state_dir = config.state_dir.clone().unwrap();
+    let replay_dir = state_dir.join("replay");
+    let maintenance_dir = state_dir.join("maintenance");
+    create_state_subdirs(&[&replay_dir, &maintenance_dir]).await?;
+
+    let replay = Arc::new(FileReplayMarkerStore::new(replay_dir, DEFAULT_RETENTION));
+    let wal = Arc::new(FileWalStore::new(
+        postgres.data_dir.clone(),
+        config.postgres.archive_dir.clone().unwrap(),
+    ));
+    let maintenance_store = Arc::new(FileMaintenanceStore::new(
+        maintenance_dir,
+        chrono::Duration::days(7),
+    ));
+
+    // PeerPool is not yet implemented — see [`pg_agent_core::peers`] TODO.
+    // Until it lands, MaintenanceWorker will exhaust retries on any
+    // cross-node intent; acceptable in dev / single-node deployments.
+    let peers = Arc::new(NoOpPeerRegistry);
+
+    let deps = AgentDeps {
+        db,
+        peers,
+        standby,
+        pcp,
+        sd,
+        replay,
+        wal,
+    };
+
+    let opts = Options {
+        serve: serve.clone(),
+        node_pool,
+        postgres,
+        maintenance_store,
+        maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
+        cert_reloader: cert_reloader.clone(),
+    };
+
+    // Bind listeners synchronously — every fd exists once this returns.
+    let listeners = Listeners::bind(&serve)
+        .await
+        .map_err(|e: AgentError| anyhow::anyhow!("bind listeners: {e}"))?;
+
+    let shutdown = CancellationToken::new();
+    install_shutdown_handler(shutdown.clone())?;
+    if let Some(r) = cert_reloader {
+        install_sighup_reload(r);
+    }
+
+    let agent = Agent::new(deps, opts);
+    agent.serve(listeners, shutdown).await
+}
+
+async fn create_state_subdirs(dirs: &[&PathBuf]) -> anyhow::Result<()> {
+    for d in dirs {
+        tokio::fs::create_dir_all(d)
+            .await
+            .map_err(|e| anyhow::anyhow!("create state dir {}: {e}", d.display()))?;
+    }
     Ok(())
+}
+
+/// SIGINT + SIGTERM → `shutdown.cancel()`. Spawned task lives for the
+/// lifetime of the process; cancelling the token also closes the signal
+/// streams (drop on the spawned async block).
+fn install_shutdown_handler(shutdown: CancellationToken) -> anyhow::Result<()> {
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|e| anyhow::anyhow!("install SIGINT handler: {e}"))?;
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|e| anyhow::anyhow!("install SIGTERM handler: {e}"))?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigint.recv() => info!("received SIGINT"),
+            _ = sigterm.recv() => info!("received SIGTERM"),
+        }
+        shutdown.cancel();
+    });
+    Ok(())
+}
+
+/// SIGHUP → [`CertReloader::reload`]. Each SIGHUP atomically swaps the
+/// active cert bundle; new connections pick up the new material, in-flight
+/// ones drain on the old. Per SPEC §7 the reload window is bounded by the
+/// 12 h peer-connection age cap, so a SIGHUP propagates everywhere within
+/// ~12 h without us tearing down healthy channels.
+fn install_sighup_reload(reloader: Arc<CertReloader>) {
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(?e, "install SIGHUP handler failed; cert reload disabled");
+                return;
+            }
+        };
+        while hup.recv().await.is_some() {
+            match reloader.reload() {
+                Ok(true) => info!("cert reload: new material picked up"),
+                Ok(false) => info!("cert reload: no change on disk"),
+                Err(e) => warn!(?e, "cert reload: failed; keeping previous bundle"),
+            }
+        }
+    });
 }
 
 fn init_logging() {
