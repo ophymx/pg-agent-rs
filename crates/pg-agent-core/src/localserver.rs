@@ -32,11 +32,11 @@ use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
-    ClusterInitRequest, ClusterInitResponse, EscalationRequest, FailoverRequest,
-    FollowPrimaryRequest, GetMaintenanceRequest, GetStatusRequest, ListMaintenanceRequest,
-    ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
-    NodeConfigResponse, NodeStatus, OpResult, RecoveryRequest, RemoteStartRequest,
-    RestoreWalRequest, RetryMaintenanceRequest, SkippedMaintenanceIntent,
+    ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, EscalationRequest,
+    FailoverRequest, FollowPrimaryRequest, GetMaintenanceRequest, GetStatusRequest,
+    ListMaintenanceRequest, ListMaintenanceResponse, MaintenanceIntent as ProtoIntent,
+    NodeConfigRequest, NodeConfigResponse, NodeStatus, OpResult, RecoveryRequest,
+    RemoteStartRequest, RestoreWalRequest, RetryMaintenanceRequest, SkippedMaintenanceIntent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -737,11 +737,101 @@ impl PgAgentLocal for LocalServer {
             req.wal_file
         )))
     }
+    /// `pg_agentctl cluster init` — operator one-shot bootstrap. Must
+    /// run on the chosen primary. Ensures `repl_user` exists, then for
+    /// each non-local pool entry (or just the `only_node_id` if set):
+    /// create_slot → stop → basebackup → configure_standby → start.
+    /// Per-standby failures are collected; the overall response.ok is
+    /// false if any standby failed.
+    ///
+    /// Each per-standby failure path drops the slot we just created
+    /// (consistent with FollowPrimary/RecoveryFirstStage); if the drop
+    /// itself fails, a `DropSlotCleanup` maintenance intent is queued.
+    /// SPEC §5.7 spells out the cleanup rule.
+    ///
+    /// Does NOT call `pcp_attach_node` — pgpool isn't running yet
+    /// during initial bootstrap. Adding-to-a-running-cluster is the
+    /// future `pg_agentctl cluster attach <id>` command.
     async fn cluster_init(
         &self,
-        _req: Request<ClusterInitRequest>,
+        req: Request<ClusterInitRequest>,
     ) -> Result<Response<ClusterInitResponse>, Status> {
-        Err(Status::unimplemented("cluster_init"))
+        let req = req.into_inner();
+
+        // SPEC §5.7 invariant: must run on the primary.
+        let in_recovery =
+            self.db.is_in_recovery().await.map_err(|e| {
+                internal(anyhow::anyhow!("cluster_init: check primary status: {e}"))
+            })?;
+        if in_recovery {
+            return Ok(Response::new(ClusterInitResponse {
+                ok: false,
+                message: "cluster_init: local node is not the primary (in recovery)".into(),
+                repl_user: self.pg.repl_user.clone(),
+                standbys: Vec::new(),
+            }));
+        }
+
+        let primary = self
+            .node_pool
+            .local_node()
+            .map_err(|e| internal(anyhow::anyhow!("cluster_init: resolve local node: {e}")))?;
+        let primary_hostname = primary.hostname.clone();
+        let primary_id = primary.id;
+
+        info!(role = %self.pg.repl_user, "cluster_init: ensuring replication role");
+        self.db
+            .create_replication_role(&self.pg.repl_user)
+            .await
+            .map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "cluster_init: create replication role {:?}: {e}",
+                    self.pg.repl_user
+                ))
+            })?;
+
+        let mut results: Vec<ClusterInitStandbyResult> = Vec::new();
+        let mut failures = 0usize;
+        for node in &self.node_pool.members {
+            if node.id == primary_id {
+                continue;
+            }
+            if let Some(only) = req.only_node_id {
+                if only != node.id {
+                    continue;
+                }
+            }
+            let res = self.init_standby(node, &primary_hostname).await;
+            if !res.ok {
+                failures += 1;
+            }
+            results.push(res);
+        }
+
+        let (ok, message) = match (results.len(), failures) {
+            (0, _) => (
+                true,
+                format!(
+                    "cluster_init: replication role {} ensured; no standby nodes selected",
+                    self.pg.repl_user
+                ),
+            ),
+            (total, 0) => (
+                true,
+                format!("cluster_init complete: {total} standby(s) initialised"),
+            ),
+            (total, n) => (
+                false,
+                format!("cluster_init: {n} of {total} standby(s) failed"),
+            ),
+        };
+
+        Ok(Response::new(ClusterInitResponse {
+            ok,
+            message,
+            repl_user: self.pg.repl_user.clone(),
+            standbys: results,
+        }))
     }
 
     // ----- simple hooks ---------------------------------------------------
@@ -968,6 +1058,92 @@ impl LocalServer {
         Ok(Response::new(OpResult { ok: true, message }))
     }
 
+    /// Per-standby init for `ClusterInit`. Returns a
+    /// `ClusterInitStandbyResult` for the response array; never
+    /// propagates errors as gRPC failures (cluster_init aggregates
+    /// per-standby outcomes). On any failure between `create_slot` and
+    /// `start`, the slot is dropped via the shared
+    /// `cleanup_slot_after_failure` helper — failed cleanups queue a
+    /// `DropSlotCleanup` maintenance intent. SPEC §5.7.
+    async fn init_standby(
+        &self,
+        standby: &NodeConfig,
+        primary_hostname: &str,
+    ) -> ClusterInitStandbyResult {
+        let slot_name = standby.slot_name();
+        info!(
+            standby = %standby.hostname,
+            node_id = standby.id,
+            slot = %slot_name,
+            "cluster_init: initialising standby"
+        );
+
+        // Step 1: create slot locally. No slot to clean up if this fails.
+        if let Err(e) = self.db.create_slot(&slot_name).await {
+            return standby_result(standby, false, format!("create slot {slot_name}: {e}"));
+        }
+
+        // Helper: stage failed → clean up slot (best-effort) → return result.
+        // Closure-with-async is finicky around lifetimes, so a plain match
+        // ladder reads better than abstracting. Each arm: cleanup, format
+        // the message, return the standby result.
+        macro_rules! fail_with_cleanup {
+            ($stage:expr, $err:expr) => {{
+                let stage: &'static str = $stage;
+                let err: anyhow::Error = $err;
+                let msg = format!("{stage}: {err}");
+                self.cleanup_slot_after_failure(
+                    &slot_name,
+                    primary_hostname,
+                    &format!("cluster_init_{stage}_failed"),
+                    &err,
+                )
+                .await;
+                return standby_result(standby, false, msg);
+            }};
+        }
+
+        // Step 2: dial peer.
+        let peer = match self.peers.client(standby).await {
+            Ok(p) => p,
+            Err(e) => fail_with_cleanup!("peer_client", anyhow::anyhow!("{e}")),
+        };
+
+        // Step 3: peer.stop() — defensive; basebackup refuses non-empty pgdata.
+        if let Err(e) = peer.stop().await {
+            fail_with_cleanup!("stop", anyhow::anyhow!("{e}"));
+        }
+
+        // Step 4: peer.basebackup() — streams primary into standby's $PGDATA.
+        let bb_opts = BasebackupOpts {
+            primary_host: primary_hostname.to_string(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+            slot_name: slot_name.clone(),
+        };
+        if let Err(e) = peer.basebackup(bb_opts).await {
+            fail_with_cleanup!("basebackup", anyhow::anyhow!("{e}"));
+        }
+
+        // Step 5: peer.configure_standby() — write myrecovery.conf on top.
+        let cfg_opts = WriteRecoveryConfOpts {
+            primary_host: primary_hostname.to_string(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+            slot_name: slot_name.clone(),
+        };
+        if let Err(e) = peer.configure_standby(cfg_opts).await {
+            fail_with_cleanup!("configure_standby", anyhow::anyhow!("{e}"));
+        }
+
+        // Step 6: peer.start() — bring up as streaming replica.
+        if let Err(e) = peer.start().await {
+            fail_with_cleanup!("start", anyhow::anyhow!("{e}"));
+        }
+
+        standby_result(standby, true, "initialised".into())
+    }
+
     /// Drop a slot that we created earlier in a failed orchestration.
     /// If the drop succeeds, we're done. If it fails, queue a
     /// maintenance intent so the worker retries with backoff — the
@@ -1076,6 +1252,15 @@ impl LocalServer {
 
 fn internal(e: anyhow::Error) -> Status {
     Status::internal(e.to_string())
+}
+
+fn standby_result(node: &NodeConfig, ok: bool, message: String) -> ClusterInitStandbyResult {
+    ClusterInitStandbyResult {
+        node_id: node.id,
+        hostname: node.hostname.clone(),
+        ok,
+        message,
+    }
 }
 
 fn ok() -> OpResult {
@@ -1204,6 +1389,8 @@ mod tests {
         created_slots: StdMutex<Vec<String>>,
         dropped_slots: StdMutex<Vec<String>>,
         drop_slot_fails: AtomicBool,
+        created_repl_roles: StdMutex<Vec<String>>,
+        create_repl_role_fails: AtomicBool,
     }
 
     #[async_trait]
@@ -1244,7 +1431,14 @@ mod tests {
         async fn role_exists(&self, _: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
-        async fn create_replication_role(&self, _: &str) -> anyhow::Result<()> {
+        async fn create_replication_role(&self, name: &str) -> anyhow::Result<()> {
+            self.created_repl_roles
+                .lock()
+                .unwrap()
+                .push(name.to_string());
+            if self.create_repl_role_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: create_replication_role boom");
+            }
             Ok(())
         }
     }
@@ -2755,6 +2949,242 @@ mod tests {
                 assert!(cause.contains("basebackup_failed"));
             }
         }
+    }
+
+    // ----- cluster_init ---------------------------------------------------
+
+    /// 3-node pool with peer1 + peer2 as standbys for cluster_init fan-out.
+    /// Both standby clients are mounted as overrides so tests can drive
+    /// their per-method failure switches independently.
+    #[allow(clippy::type_complexity)]
+    fn make_cluster_init_setup() -> (
+        LocalServer,
+        Arc<StubDb>,
+        Arc<StubPeers>,
+        Arc<StubMaint>,
+        Arc<StubPeerClient>,
+        Arc<StubPeerClient>,
+    ) {
+        let db = Arc::new(StubDb::default());
+        let peers = Arc::new(StubPeers::default());
+        let maint = Arc::new(StubMaint::default());
+        let wal = Arc::new(StubWal::default());
+        let replay = Arc::new(StubReplay::default());
+        let pcp = Arc::new(StubPcp::default());
+        let server = LocalServer::new(
+            Arc::new(FakeNodeInfo),
+            db.clone(),
+            peers.clone(),
+            maint.clone(),
+            wal,
+            replay,
+            pcp,
+            make_pool_3(),
+            make_pg(),
+        );
+        let peer1 = Arc::new(StubPeerClient::default());
+        let peer2 = Arc::new(StubPeerClient::default());
+        peers.override_client(1, peer1.clone());
+        peers.override_client(2, peer2.clone());
+        (server, db, peers, maint, peer1, peer2)
+    }
+
+    #[tokio::test]
+    async fn cluster_init_happy_path_initialises_all_standbys() {
+        let (s, db, _peers, _maint, peer1, peer2) = make_cluster_init_setup();
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest { only_node_id: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(resp.repl_user, "repl");
+        assert_eq!(resp.standbys.len(), 2);
+        for r in &resp.standbys {
+            assert!(r.ok, "standby {} failed: {}", r.node_id, r.message);
+            assert_eq!(r.message, "initialised");
+        }
+        // Sequence per standby: create_slot → stop → basebackup →
+        // configure_standby → start. No pcp_attach.
+        assert_eq!(
+            *db.created_repl_roles.lock().unwrap(),
+            vec!["repl".to_string()]
+        );
+        let created = db.created_slots.lock().unwrap().clone();
+        assert!(created.contains(&"node1".to_string()));
+        assert!(created.contains(&"node2".to_string()));
+        assert_eq!(peer1.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(peer1.basebackup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(peer1.configure_standby_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(peer1.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(peer2.start_calls.load(Ordering::SeqCst), 1);
+        // No slot drops.
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_init_refuses_when_local_is_replica() {
+        let (s, db, _peers, _maint, peer1, _peer2) = make_cluster_init_setup();
+        db.in_recovery.store(true, Ordering::SeqCst);
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("not the primary"));
+        assert_eq!(resp.standbys.len(), 0);
+        // Nothing touched.
+        assert!(db.created_repl_roles.lock().unwrap().is_empty());
+        assert_eq!(peer1.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_init_only_node_id_targets_one_standby() {
+        let (s, db, _peers, _maint, peer1, peer2) = make_cluster_init_setup();
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest {
+                only_node_id: Some(2),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(resp.standbys.len(), 1);
+        assert_eq!(resp.standbys[0].node_id, 2);
+        // peer1 untouched, peer2 fully driven.
+        assert_eq!(peer1.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer2.start_calls.load(Ordering::SeqCst), 1);
+        // Only one slot created.
+        assert_eq!(*db.created_slots.lock().unwrap(), vec!["node2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cluster_init_partial_failure_aggregates() {
+        let (s, db, _peers, _maint, peer1, peer2) = make_cluster_init_setup();
+        // peer2 basebackup fails; peer1 succeeds.
+        peer2.basebackup_fails.store(true, Ordering::SeqCst);
+
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest { only_node_id: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("1 of 2 standby(s) failed"));
+        // Order in standbys[] follows pool declaration order.
+        let by_id: std::collections::HashMap<i32, &ClusterInitStandbyResult> =
+            resp.standbys.iter().map(|r| (r.node_id, r)).collect();
+        assert!(by_id[&1].ok, "peer1 should have succeeded");
+        assert!(!by_id[&2].ok, "peer2 should have failed");
+        assert!(by_id[&2].message.contains("basebackup"));
+        // peer2's slot was dropped during cleanup.
+        let dropped = db.dropped_slots.lock().unwrap();
+        assert!(dropped.contains(&"node2".to_string()));
+        // peer1's slot stays.
+        assert!(!dropped.contains(&"node1".to_string()));
+        // peer1 fully driven.
+        assert_eq!(peer1.start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cluster_init_create_repl_role_failure_is_fatal() {
+        let (s, db, _peers, _maint, _peer1, _peer2) = make_cluster_init_setup();
+        db.create_repl_role_fails.store(true, Ordering::SeqCst);
+
+        let err = s
+            .cluster_init(Request::new(ClusterInitRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("create replication role"));
+    }
+
+    #[tokio::test]
+    async fn cluster_init_stop_failure_drops_slot() {
+        let (s, db, _peers, _maint, peer1, _peer2) = make_cluster_init_setup();
+        peer1.stop_fails.store(true, Ordering::SeqCst);
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest {
+                only_node_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(!resp.standbys[0].ok);
+        assert!(resp.standbys[0].message.contains("stop"));
+        // Slot dropped.
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        // Downstream not reached.
+        assert_eq!(peer1.basebackup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_init_drop_slot_cleanup_failure_queues_maintenance() {
+        let (s, db, _peers, maint, peer1, _peer2) = make_cluster_init_setup();
+        peer1.basebackup_fails.store(true, Ordering::SeqCst);
+        db.drop_slot_fails.store(true, Ordering::SeqCst);
+
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest {
+                only_node_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        // drop_slot was attempted (and failed) → maintenance intent appended.
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+        let intents = maint.intents.lock().unwrap();
+        assert_eq!(intents.len(), 1);
+        match &intents[0].payload {
+            MaintenancePayload::DropSlotCleanup { cause, .. } => {
+                assert!(cause.contains("basebackup_failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_init_local_only_pool_emits_no_standby_results() {
+        // Single-node pool: just the primary, no peers to init.
+        let db = Arc::new(StubDb::default());
+        let peers = Arc::new(StubPeers::default());
+        let maint = Arc::new(StubMaint::default());
+        let wal = Arc::new(StubWal::default());
+        let replay = Arc::new(StubReplay::default());
+        let pcp = Arc::new(StubPcp::default());
+        let single_pool = NodePool {
+            members: vec![NodeConfig {
+                id: 0,
+                hostname: "local".into(),
+            }],
+            local_node_id: 0,
+        };
+        let s = LocalServer::new(
+            Arc::new(FakeNodeInfo),
+            db.clone(),
+            peers,
+            maint,
+            wal,
+            replay,
+            pcp,
+            single_pool,
+            make_pg(),
+        );
+        let resp = s
+            .cluster_init(Request::new(ClusterInitRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("no standby nodes selected"));
+        assert_eq!(resp.standbys.len(), 0);
+        // Repl role still ensured.
+        assert_eq!(
+            *db.created_repl_roles.lock().unwrap(),
+            vec!["repl".to_string()]
+        );
     }
 
     #[test]
