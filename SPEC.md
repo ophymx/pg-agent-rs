@@ -490,8 +490,20 @@ chosen primary.
    - `peers[node].Start()`
 4. Collect per-node results; overall ok iff every standby succeeded.
 
-Authentication uses replication client certs (`[postgres.replication_tls]`),
-so the request carries no password.
+Cleanup rule: drop the slot on any per-standby failure between
+`create_slot` and `start`. If the drop itself fails, append a
+`DropSlotCleanup` maintenance intent and continue to the next
+standby. Same pattern as `FollowPrimary` and `RecoveryFirstStage` —
+slots that survive a half-completed flow pin WAL on the primary
+indefinitely.
+
+**No** `pcp_attach_node` — pgpool isn't running yet during initial
+bootstrap, and adding-to-a-running-cluster is the future
+`pg_agentctl cluster attach <id>` command (see ROADMAP v1.x).
+
+Authentication uses replication client certs (`[postgres.replication]`
++ libpq's `~postgres/.postgresql/` defaults), so the request carries
+no password.
 
 ### 5.8 Peer RPC handlers (what a peer does for someone else)
 
@@ -922,7 +934,7 @@ healthz.port          = 9702
 - `pool` must be non-empty.
 - Node ids must be unique and ≥ 0; hostnames must be unique.
 - Local node id must resolve (see §8.4) and be present in the pool.
-- `[postgres.replication_tls]` is all-or-nothing; sslmode and cert paths
+- `[postgres.replication]` is all-or-nothing; sslmode and cert paths
   validated as in §5.10.
 
 ### 8.4 Local-node id resolution
@@ -1558,7 +1570,7 @@ DB-backed (skipped with a WARN if `--skip-db` or DB unreachable):
 
 - **Settings**: `wal_log_hints = on`, `hot_standby = on`,
   `max_replication_slots ≥ pool size`, `max_wal_senders ≥ pool size`.
-- **TLS / pg_hba**: if `[postgres.replication_tls]` is configured, verify
+- **TLS / pg_hba**: if `[postgres.replication]` is configured, verify
   `listen_addresses` includes non-loopback, `ssl=on`, server certs exist,
   and the SSL CA on the primary trusts the configured replication client
   cert; verify `pg_hba.conf` has `hostssl replication <repl_user> … cert

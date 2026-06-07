@@ -67,6 +67,15 @@ schedule a switchover" from blocking adoption.
   *Why now:* operations need a planned, reversible-up-to-the-cutover path —
   emergency failover is a different code path with different invariants.
 
+- **`pg_agentctl cluster attach <id>`** *(S)* — wrap `pcp_attach_node`
+  with the pgpool-reload and gen-pgpool refresh so "add a new
+  standby to a running cluster" is one command end-to-end. Today
+  the flow is `cluster init --only-node-id <id>` → manual
+  `pcp_attach_node` → manual `gen-pgpool --write` + pgpool reload;
+  `cluster attach` collapses the trailing two manual steps.
+  *Why now:* the only remaining manual step in the add-standby
+  workflow; pure ergonomics, no new state.
+
 - **Per-node tags in `config.toml`** *(S)* — surface and respect
   `nofailover = true`, `noloadbalance = true`, `clonefrom = true`.
   Failover skips nofailover nodes when picking a candidate (returning to

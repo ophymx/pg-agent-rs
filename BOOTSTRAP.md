@@ -406,20 +406,32 @@ Every node should report `is_postgres_running=true`,
 `is_pgpool_running=true`, and on standbys
 `is_in_recovery=true, replication_state=streaming`.
 
-### 3.3 Create app database + users (operator's concern)
+### 3.3 Create app database + users via Ansible
 
-```
-psql -h <haproxy> -p 9999 -U postgres postgres <<EOF
-  CREATE DATABASE app;
-  CREATE ROLE app_user LOGIN PASSWORD '...';
-  GRANT CONNECT ON DATABASE app TO app_user;
-EOF
+Declare app users + databases in the Ansible inventory (or
+playbook-level vars / vault), then re-run the playbook with the
+new entries:
+
+```yaml
+# inventory: group_vars/databases.yml
+postgres_databases:
+  - name: app
+postgres_users:
+  - name: app_user
+    db: app
+    password: "{{ vault_app_user_password }}"
 ```
 
-The app user's MD5 hash also needs to be in `/etc/pgpool2/pool_passwd`
-on every pgpool host — Ansible put it there in Phase 1.4. If the app
-user is created after-the-fact, the operator re-runs the Ansible
-playbook (or appends to pool_passwd by hand and reloads pgpool).
+Ansible's `postgres` role does three things in one pass:
+1. `CREATE DATABASE` + `CREATE ROLE … LOGIN PASSWORD` on the cluster
+2. Writes the md5 of the password into
+   `/etc/pgpool2/pool_passwd` on every pgpool host
+3. Reloads `pgpool2.service` (or restarts if `pool_passwd` semantics
+   require it on that pgpool version)
+
+Don't `CREATE ROLE` from `psql` by hand — `pool_passwd` ends up
+stale on the pgpool side and connections refuse for a reason that's
+non-obvious from PG's perspective. See [resolved decisions](#resolved-design-decisions) above.
 
 ### 3.4 Point applications at HAProxy
 
@@ -522,42 +534,81 @@ lives in `~postgres/.pgpass` and is Ansible's responsibility.
 
 ---
 
-## Open questions
+## Resolved design decisions
 
-Things I'm not 100% sure about — let's resolve before implementing ClusterInit.
+### `peer.stop()` on a never-started standby — works as a no-op
 
-1. **`peer.stop()` on a standby that's never been started.** The
-   systemd unit may exist but report "inactive (dead)". Calling
-   `systemctl stop` on it is a no-op; we should make sure
-   `DbusSystemd::stop_postgres` tolerates that. Currently the systemd
-   handler waits for a `JobRemoved` signal — would it fire for a
-   no-op stop?
+systemd's `StopUnit` D-Bus call accepts an already-inactive unit: the
+job is submitted, processed as a no-op, and `JobRemoved` fires with
+`result = "done"`. Our `DbusSystemd::stop_postgres` is wired exactly
+for that — `job_result_ok("done") → true → Ok(())`. No code change.
 
-2. **`pg_basebackup` against a primary whose `pg_hba.conf` doesn't
-   yet permit the connection.** The basebackup will fail with
-   `pg_basebackup: error: connection to server failed`. Worth a
-   preflight item: "pg_hba on the chosen primary permits the
-   configured peer hosts." Already on the preflight list?
+Precondition: the unit must EXIST. The Debian `postgresql-17`
+package's `pg_createcluster 17 main` step creates the templated unit
+instance, so on a standard install the unit is present even before
+its first start. If the cluster was never created (e.g., manual
+install without `pg_createcluster`), `StopUnit` returns "Unit not
+loaded" — surfaced as a clear startup error.
 
-3. **App user creation timing.** If `pool_passwd` lacks the app user
-   at the time pgpool starts, pgpool refuses connections from that
-   user. Should we recommend Ansible pre-populate `pool_passwd` with
-   the expected app users (Phase 1.4) so step 3.3 only does the PG-
-   side `CREATE ROLE`? Or accept the two-step "create user → re-run
-   Ansible" dance?
+### `pg_basebackup` against a misconfigured `pg_hba.conf` — preflight catches it
 
-4. **`pcp_attach_node` in ClusterInit?** Currently we deliberately
-   don't call it — pgpool isn't running yet, so there's no PCP
-   endpoint to attach to. But if the operator runs ClusterInit
-   *after* pgpool is already up (e.g., adding a new standby), we'd
-   need to attach. The current Go impl matches SPEC §5.7: never
-   attaches. Adding a standby to a running cluster would need
-   `pg_agentctl cluster attach <id>` as a separate step. Acceptable?
+SPEC §14 already lists `pg_hba.conf` checks under "TLS / pg_hba":
 
-5. **Failure ordering: drop the slot if basebackup/configure/start
-   fails?** The other slot-creating flows (FollowPrimary,
-   RecoveryFirstStage) drop the slot on mid-flow failure. ClusterInit
-   currently doesn't — per SPEC §5.7 it just collects the failure in
-   the response. Inconsistent with the others; should we add the
-   same cleanup pattern, or is the operator-driven nature (you'll
-   re-run the command manually) reason to keep it simple?
+> verify `pg_hba.conf` has `hostssl replication <repl_user> … cert
+> clientcert=verify-full` (or equivalent).
+
+Running `pg_agentctl preflight` on every node before `cluster init`
+is Phase 1.8 of this doc; an `ERR` from that check stops the
+operator before basebackup gets a chance to fail less informatively.
+
+### App user creation — Ansible owns it, not psql
+
+Don't recommend the operator do `CREATE ROLE app_user PASSWORD ...`
+in psql by hand. Two reasons:
+
+1. The password also has to land in `/etc/pgpool2/pool_passwd` as
+   md5, and on every pgpool host. The psql path leaves `pool_passwd`
+   stale.
+2. Operators forget what they typed. Reproducing the cluster from
+   the Ansible inventory should always recover the same state.
+
+**Pattern:** declare app users in the Ansible inventory (or a
+secrets vault). Ansible's postgres role does both `CREATE ROLE` AND
+writes the md5 hash to `pool_passwd` AND reloads pgpool. The
+operator's only manual step is the inventory edit + Ansible run.
+
+Phase 3.3 above is shorthand for "re-run the Ansible playbook with
+the new app user in the inventory." Updated to say so.
+
+### `pcp_attach_node` in ClusterInit — deliberately omitted
+
+ClusterInit runs BEFORE pgpool starts (Phase 2 of this doc). There's
+no PCP endpoint to attach to. Matches SPEC §5.7 + §17 invariant #6
+(`pcp_attach_node` is `FollowPrimary`-only).
+
+**Adding a standby to a running cluster** is a separate use case
+covered by `pg_agentctl cluster init --only-node-id <id>` followed
+by a manual `pcp_attach_node` (or a future `pg_agentctl cluster
+attach <id>` wrapper — see [ROADMAP.md](ROADMAP.md) v1.x "Cluster
+control plane").
+
+### Slot cleanup on ClusterInit failure — drop, for consistency
+
+Earlier ambiguity: ClusterInit was operator-driven, so leaving
+slots around for forensic value might be OK. Resolved as: drop the
+slot on mid-flow failure, same pattern as `FollowPrimary` and
+`RecoveryFirstStage`. Three reasons:
+
+1. **WAL pinning.** A standby that never came up still ties up the
+   primary's WAL via the slot. The operator might not notice for
+   hours; meanwhile the primary's pg_wal grows unbounded.
+2. **Consistency.** All three slot-creating flows now follow the
+   same shape: drop on mid-flow failure, queue a `DropSlotCleanup`
+   maintenance intent if the drop itself fails. No special case.
+3. **Re-run idempotency.** `db.create_slot` is 42710-idempotent, so
+   re-running cluster init after a failure creates a fresh slot
+   regardless of whether the old one survived. Dropping costs
+   nothing; pinning WAL costs the operator real space.
+
+SPEC §5.7 to be updated to spell out the cleanup pattern when
+ClusterInit lands.
