@@ -2,7 +2,7 @@
 //! `TopologySnapshot`, `PostgresRuntime`). See SPEC §8.
 //!
 //! TODO(v1): implement load/validate/apply_env_overrides; node-id resolution
-//! (config field → file → `<agent_dir>/node_id` → hostname); peer-listen-addr
+//! (config field → file → `<state_dir>/node_id` → hostname); peer-listen-addr
 //! resolution; `has_remote_peers` (DNS lookup of every pool hostname);
 //! `[postgres.replication_tls]` validation.
 
@@ -62,7 +62,9 @@ pub struct Config {
     #[serde(default)]
     pub node_id_file: Option<PathBuf>,
     #[serde(default)]
-    pub agent_dir: Option<PathBuf>,
+    /// Root for agent-owned persistent state (maintenance queue, optional
+    /// node-id file). Matches the spirit of systemd's `StateDirectory=`.
+    pub state_dir: Option<PathBuf>,
 
     #[serde(default)]
     pub allow_insecure_remote_peer: bool,

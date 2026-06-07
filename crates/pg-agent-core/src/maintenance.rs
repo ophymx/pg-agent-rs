@@ -3,7 +3,7 @@
 //! recovery_1st_stage). The hook RPC returns ok and the cleanup goes here
 //! — surfacing it to pgpool would cause loops.
 //!
-//! Storage: one JSON file per intent under `<agent_dir>/maintenance/`, atomic
+//! Storage: one JSON file per intent under `<state_dir>/maintenance/`, atomic
 //! temp+rename writes. See SPEC §5.13 for sweep cadence, retry budget,
 //! backoff.
 

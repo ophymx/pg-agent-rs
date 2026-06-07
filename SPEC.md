@@ -312,7 +312,7 @@ following Go interfaces to Rust traits, every method `async fn` returning
 | `Systemd`          | zbus to `systemd1`                 | `start_postgres()`, `stop_postgres()`, `status_postgres()`, `status_pgpool()`, `reload_or_restart_postgres()`, `reload_or_restart_pgpool()` |
 | `ReplayMarkerStore` | dotfiles under `$PGDATA`          | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
-| `MaintenanceStore` | one JSON file per intent under `<agent_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
+| `MaintenanceStore` | one JSON file per intent under `<state_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
 
 A `NodeInfo` trait (`get_status`, `get_node_config`) is satisfied by
 `Agent` itself; `LocalServer` and `PeerServer` both delegate `GetStatus` /
@@ -607,7 +607,7 @@ Worker behaviour:
 - Backoff: 30s base, ×2 each attempt, capped at 10 min.
 - `NextRetryAt` is honoured — operator-forced retries use `Reschedule(now)`
   without consuming an attempt slot.
-- Storage layout: one JSON file per intent under `<agent_dir>/maintenance/`.
+- Storage layout: one JSON file per intent under `<state_dir>/maintenance/`.
   Filename = intent id = `<unix_nano>-<sanitised_op>-<seq>.json`. Writes are
   atomic via temp+rename in the same directory.
 - Terminal intents (done/abandoned) are pruned by `list_pending` once they
@@ -769,7 +769,7 @@ unix_socket = "/run/pg_agentd/pg_agentd.sock"     # local socket
 
 # node_id      = 0                                # explicit local node id
 # node_id_file = "/etc/pgpool2/pgpool_node_id"    # or via file
-# agent_dir    = "/var/lib/postgresql/pg_agent"   # state root
+# state_dir    = "/var/lib/postgresql/pg_agent"   # agent-owned persistent state
 
 # allow_insecure_remote_peer = false              # requires --dev to actually disable
 
@@ -820,7 +820,7 @@ hostname = "server3"
 ```
 agent_port            = 9701
 unix_socket           = /run/pg_agentd/pg_agentd.sock
-agent_dir             = <postgres.home>/pg_agent       (after pg defaults)
+state_dir             = <postgres.home>/pg_agent       (after pg defaults)
 
 postgres.port         = 5432
 postgres.pghome       = /usr/lib/postgresql/17
@@ -854,7 +854,7 @@ In priority order, first hit wins:
 
 1. `node_id` field at the root of `config.toml`.
 2. `node_id_file` field — file containing the integer.
-3. `<agent_dir>/node_id` — same convention as pgpool's `pgpool_node_id`.
+3. `<state_dir>/node_id` — same convention as pgpool's `pgpool_node_id`.
 4. Hostname fallback: `os::hostname()` matched against `[[pool]].hostname`.
 
 Sources 1 and 2 are errors if they point at an id that isn't in the pool.
@@ -1004,7 +1004,7 @@ Created/repaired by `pg_agentd` at startup. Rules:
 ### 10.3 Persistent state
 
 ```
-<agent_dir>/
+<state_dir>/
 ├── node_id                # optional — see §8.4
 └── maintenance/
     └── <intent-id>.json   # one per intent, atomic temp+rename writes
@@ -1013,7 +1013,7 @@ $PGDATA/
 └── .pg_agent_idem_<op>_<sha256>.done   # replay markers (dotfiles)
 ```
 
-`<agent_dir>` defaults to `<postgres.home>/pg_agent` and is created with
+`<state_dir>` defaults to `<postgres.home>/pg_agent` and is created with
 mode `0700` by the daemon at startup.
 
 ### 10.4 systemd unit
@@ -1159,7 +1159,7 @@ and sends a final `OpProgress { phase = "done" }` on success.
 1. Parse CLI flags (`--config`, `--socket`, `--dev`, `--version`).
 2. Load config (or fallback to `DefaultConfig` with a warning).
 3. Apply env overrides; apply CLI overrides; apply `--dev` rules.
-4. Create `<agent_dir>` and `<agent_dir>/maintenance` (mode `0700`).
+4. Create `<state_dir>` and `<state_dir>/maintenance` (mode `0700`).
 5. Compose runtime: `Topology`, `ServeSettings`, `PostgresRuntime`.
 6. Build `CertReloader` if TLS configured; fail fast if not and remote
    peers are present and `--dev` is not set.
@@ -1280,7 +1280,7 @@ fight the deployment tooling):
 Ansible's life harder):
 
 - Reading state from environment variables that aren't documented.
-- Writing to paths outside `<agent_dir>` / `$PGDATA` / `/run/pg_agentd/`
+- Writing to paths outside `<state_dir>` / `$PGDATA` / `/run/pg_agentd/`
   unless explicitly told to (e.g. `gen-pgpool --write <path>`).
 - Bundling its own service-management of pgpool / postgres beyond the
   D-Bus calls already specified.

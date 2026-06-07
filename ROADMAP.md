@@ -131,7 +131,7 @@ a different choice.
   ship it natively and it never drifts.
 
 - **Append-only on-disk event log** *(M)* — promote the in-memory ring
-  (v1.x) to a durable log under `<agent_dir>/events/`. Daily rotation,
+  (v1.x) to a durable log under `<state_dir>/events/`. Daily rotation,
   configurable retention. `pg_agentctl events --since 1h --cluster`
   reconstructs the global timeline. Closest analog: `kubectl events`;
   no HA tool currently does this well. *Why now:* this is the "what
@@ -156,7 +156,7 @@ a different choice.
 
 - **Audit log of admin actions** *(M)* — every mutation initiated via
   `pg_agentctl` is timestamped, signed by the issuing cert's CN, and
-  appended to a tamper-evident chain under `<agent_dir>/audit/`.
+  appended to a tamper-evident chain under `<state_dir>/audit/`.
   `pg_agentctl audit verify` walks the chain. *Why now:* compliance-grade
   for regulated environments; trivial to add early, costly to retrofit.
 
