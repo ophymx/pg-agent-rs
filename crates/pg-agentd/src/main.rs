@@ -19,6 +19,7 @@ use pg_agent_core::{
     peers::{PeerPool, PeerRegistry},
     pgstandby::StandbyExec,
     replay_markers::{FileReplayMarkerStore, DEFAULT_RETENTION},
+    symlinks::{ensure_hook_symlinks, find_pg_agentc},
     systemd::DbusSystemd,
     walstore::FileWalStore,
 };
@@ -108,10 +109,24 @@ async fn run() -> anyhow::Result<()> {
 
     let pcp = Arc::new(PcpCli::new(&config.pcp));
 
+    // Resolve `pg_agentc` once at startup: sibling of pg_agentd in the
+    // Debian package layout, else PATH fallback. Threaded through
+    // StandbyExec so the post-basebackup hook-symlink repair points at
+    // the same binary that the daemon-startup repair uses.
+    let pg_agentc_bin = find_pg_agentc().map_err(|e| anyhow::anyhow!("locate pg_agentc: {e}"))?;
+    info!(path = %pg_agentc_bin.display(), "pg_agentc located");
+
+    // Daemon-startup hook-symlink repair (SPEC §10.2 + §17). pgpool may
+    // exec these any time after pg_agentd.service activates, so the
+    // symlinks must exist before listeners come up.
+    ensure_hook_symlinks(&postgres.data_dir, &pg_agentc_bin)
+        .map_err(|e| anyhow::anyhow!("hook symlink setup: {e}"))?;
+
     let standby = Arc::new(StandbyExec::new(
         config.postgres.pghome.clone().unwrap(),
         postgres.data_dir.clone(),
         config.postgres.replication_tls.clone(),
+        pg_agentc_bin,
     ));
 
     // State directories under <state_dir>/{replay,maintenance}/.

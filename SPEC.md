@@ -1650,6 +1650,15 @@ cluster:
     state to `pg_agentc` is a design regression.
 15. **Cert reload is hot, but only `[tls]` is.** Other config changes need a
     full restart.
+16. **Hook symlinks repaired after every `pg_basebackup`.** Upstream
+    `pg_basebackup` silently skips non-tablespace symlinks (per the PG
+    docs: *"Other symbolic links and special device files are skipped"*).
+    The hook symlinks under `$PGDATA` (`recovery_1st_stage`,
+    `pgpool_remote_start`) are therefore lost during basebackup and must
+    be re-created before a subsequent promotion can fire its hooks. The
+    repair runs at the tail of `StandbyOps::basebackup` (same handler
+    that did the wipe — no chance for an orchestrator to forget). Rewind
+    modifies `$PGDATA` in place and does NOT need the repair.
 
 ---
 

@@ -28,6 +28,7 @@ pub mod pgstandby;
 pub mod preflight;
 pub mod replay_markers;
 pub mod sdnotify;
+pub mod symlinks;
 pub mod systemd;
 pub mod walstore;
 

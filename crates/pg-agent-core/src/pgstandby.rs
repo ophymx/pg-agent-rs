@@ -140,7 +140,19 @@ impl WriteRecoveryConfOpts {
 
 #[async_trait]
 pub trait StandbyOps: Send + Sync {
-    /// Clears `$PGDATA` contents first, then exec's `pg_basebackup`.
+    /// Clears `$PGDATA` contents first, then exec's `pg_basebackup`,
+    /// then re-creates the pgpool hook symlinks under `$PGDATA`. Per
+    /// upstream PostgreSQL docs, `pg_basebackup` silently skips
+    /// non-tablespace symlinks — so without the repair tail, the
+    /// freshly-rebuilt standby would have no `recovery_1st_stage` /
+    /// `pgpool_remote_start` symlinks and a later promotion would fire
+    /// hooks at missing paths.
+    ///
+    /// The repair lives here (not in a separate RPC) because the wipe
+    /// and repair are tightly coupled: they're the same code path on
+    /// the same node. `rewind` modifies `$PGDATA` in place and doesn't
+    /// affect the hook symlinks; it doesn't need to repair them.
+    ///
     /// **Caller must have verified PostgreSQL isn't running on this
     /// node** — otherwise we'd wipe a live datadir.
     async fn basebackup(
@@ -150,6 +162,8 @@ pub trait StandbyOps: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Clears `pg_replslot/*` before *and* after (see SPEC §17 invariant 5).
+    /// Does NOT touch hook symlinks — rewind modifies pgdata in place,
+    /// and the symlinks (being outside `pg_replslot/`) survive untouched.
     async fn rewind(&self, opts: RewindOpts, progress: Option<ProgressCb>) -> anyhow::Result<()>;
 
     /// Writes `$PGDATA/myrecovery.conf` + creates `$PGDATA/standby.signal`.
@@ -167,6 +181,12 @@ pub struct StandbyExec {
     pub pg_home: PathBuf,
     pub pg_data_dir: PathBuf,
     pub replication_tls: PgReplicationTlsConfig,
+    /// Path to the `pg_agentc` binary the post-basebackup hook-symlink
+    /// repair should point at. Threaded through from daemon main where
+    /// [`crate::symlinks::find_pg_agentc`] resolves it once at startup.
+    /// See [`StandbyOps::basebackup`] docs for why this lives on
+    /// `StandbyExec` rather than being orchestrated via a separate RPC.
+    pub pg_agentc_bin: PathBuf,
 }
 
 impl StandbyExec {
@@ -174,11 +194,13 @@ impl StandbyExec {
         pg_home: PathBuf,
         pg_data_dir: PathBuf,
         replication_tls: PgReplicationTlsConfig,
+        pg_agentc_bin: PathBuf,
     ) -> Self {
         Self {
             pg_home,
             pg_data_dir,
             replication_tls,
+            pg_agentc_bin,
         }
     }
 
@@ -246,6 +268,16 @@ impl StandbyOps for StandbyExec {
         run_pg_binary(&bin, &args, progress)
             .await
             .map_err(|e| anyhow::anyhow!("basebackup: {e}"))?;
+
+        // Post-basebackup pgdata repair. pg_basebackup silently skipped
+        // every non-tablespace symlink — re-create the pgpool hook
+        // entries so a later promotion of this node can fire its hooks.
+        // See SPEC §17 invariant: hook symlinks repaired after every
+        // basebackup. Failure here is fatal — the standby is unsafe to
+        // promote without working hook symlinks.
+        crate::symlinks::ensure_hook_symlinks(&self.pg_data_dir, &self.pg_agentc_bin)
+            .map_err(|e| anyhow::anyhow!("basebackup: repair hook symlinks: {e}"))?;
+
         info!(datadir = %self.pg_data_dir.display(), "basebackup: completed");
         Ok(())
     }
@@ -931,4 +963,73 @@ mod tests {
         atomic_write(&dest, b"v2", 0o640).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"v2");
     }
+
+    // ----- basebackup post-step: hook symlink repair --------------------
+
+    /// Write a shell stub at `<pg_home>/bin/pg_basebackup` that exits 0
+    /// without actually replicating. Lets us drive `StandbyExec::basebackup`
+    /// end-to-end and observe the post-step (hook-symlink repair) without
+    /// a real PostgreSQL source.
+    fn install_basebackup_stub(pg_home: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin_dir = pg_home.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let stub = bin_dir.join("pg_basebackup");
+        // The real pg_basebackup writes into --pgdata; ours just exits 0.
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+        stub
+    }
+
+    #[tokio::test]
+    async fn basebackup_repairs_hook_symlinks_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let pg_home = tmp.path().join("pg_home");
+        install_basebackup_stub(&pg_home);
+
+        let pgdata = tmp.path().join("pgdata");
+        std::fs::create_dir_all(&pgdata).unwrap();
+
+        // Fake `pg_agentc` binary. The repair tail creates symlinks
+        // under pgdata pointing at this.
+        let agentc_bin = tmp.path().join("pg_agentc");
+        std::fs::write(&agentc_bin, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let exec = StandbyExec::new(
+            pg_home,
+            pgdata.clone(),
+            PgReplicationTlsConfig::default(),
+            agentc_bin.clone(),
+        );
+
+        exec.basebackup(
+            BasebackupOpts {
+                primary_host: "127.0.0.1".into(),
+                primary_port: 5432,
+                repl_user: "repl".into(),
+                slot_name: "node1".into(),
+            },
+            None,
+        )
+        .await
+        .expect("stub basebackup should succeed");
+
+        // Both hook symlinks must now exist under pgdata pointing at
+        // pg_agentc. ensure_hook_symlinks' own tests cover the per-symlink
+        // rules; here we just verify the wiring fires.
+        for name in pg_agent_hookspec::PGDATA_SYMLINK_HOOKS {
+            let target = std::fs::read_link(pgdata.join(name))
+                .unwrap_or_else(|e| panic!("symlink {name} missing: {e}"));
+            assert_eq!(target, agentc_bin);
+        }
+    }
+
+    // Failure-propagation through `?` is trivial Rust — exercising it
+    // here would require pre-staging state that `clear_pgdata_contents`
+    // wouldn't wipe, which means mocking the wipe step. The symlinks
+    // module's own tests cover ensure_hook_symlinks' failure modes
+    // directly; the happy-path wiring test above is sufficient to
+    // verify the call site fires.
 }
