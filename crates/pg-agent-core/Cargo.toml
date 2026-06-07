@@ -62,3 +62,4 @@ chrono    = { workspace = true }
 rand      = { workspace = true }
 libc      = { workspace = true }
 nix       = { workspace = true }
+sd-notify = { workspace = true }

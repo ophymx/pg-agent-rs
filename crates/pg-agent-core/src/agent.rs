@@ -65,13 +65,30 @@ impl Agent {
     }
 
     /// Serve until `ctx` is cancelled. Brings up Unix socket + peer TCP +
-    /// healthz + maintenance worker; sends `READY=1` via sd_notify; on
-    /// shutdown sends `STOPPING=1` and gracefully drains.
+    /// healthz + maintenance worker; sends `READY=1` via [`crate::sdnotify::ready`];
+    /// on shutdown sends `STOPPING=1` via [`crate::sdnotify::stopping`] and
+    /// gracefully drains.
+    ///
+    /// # Startup ordering (race-critical)
+    ///
+    /// 1. **Bind** every listener synchronously — `UnixListener::bind`,
+    ///    `TcpListener::bind` for the peer mTLS port, `TcpListener::bind`
+    ///    for `/healthz`. If any bind fails, fail startup.
+    /// 2. **Spawn** the accept/serve loops on each bound listener.
+    /// 3. **Notify** systemd via [`crate::sdnotify::ready`].
+    /// 4. Wait for shutdown signal.
+    ///
+    /// The bind-before-notify ordering is mandatory: see the
+    /// [`crate::sdnotify`] module docs for the underlying race (pgpool2
+    /// starts the moment we say READY and immediately dials our Unix
+    /// socket — so the socket must exist by then).
     pub async fn serve(
         &self,
         _shutdown: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        // TODO(v1): bring up subsystems per SPEC §12.
+        // TODO(v1): bring up subsystems per SPEC §12 in the order
+        // documented above; bind synchronously, spawn accept loops,
+        // sd_notify::ready(), then wait for shutdown.
         Ok(())
     }
 }
