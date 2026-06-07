@@ -1,0 +1,101 @@
+# nfpm config for pg-agent-rs packages (.deb + .rpm).
+#
+# Build with:
+#   cargo build --release
+#   nfpm pkg --config packaging/nfpm.yaml --target dist/pg-agent-rs.deb --packager deb
+#   nfpm pkg --config packaging/nfpm.yaml --target dist/pg-agent-rs.rpm --packager rpm
+#
+# `version` is templated — substitute via `nfpm pkg -f packaging/nfpm.yaml`
+# combined with `--version $(awk ... Cargo.toml)` or pre-render with envsubst.
+# See packaging/README.md.
+
+name: "pg-agent-rs"
+arch: "amd64"
+platform: "linux"
+version: "${VERSION}"
+section: "admin"
+priority: "optional"
+maintainer: "pg-agent-rs contributors"
+description: |
+  Coordinator daemon for pgpool-II PostgreSQL clusters.
+
+  Ships three binaries:
+    - pg_agentd:  the long-running daemon (one per backend host)
+    - pg_agentc:  the hook client invoked by pgpool's pgpool_recovery
+                  C extension and by PostgreSQL's restore_command
+    - pg_agentctl: the operator CLI for cluster init / preflight /
+                   maintenance inspection
+
+vendor: "pg-agent-rs"
+homepage: "https://github.com/ophymx/pg-agent-rs"
+license: "MIT OR Apache-2.0"
+
+# Soft deps only. Most deployments have postgresql + pgpool already
+# (otherwise pg-agent has nothing to coordinate). Declaring as Recommends
+# lets `apt install pg-agent-rs` succeed on a fresh host while still
+# nudging operators toward the standard layout.
+recommends:
+  - postgresql-17
+  - pgpool2
+
+contents:
+  # Binaries — both Debian and RHEL put them in /usr/bin.
+  - src: ./target/release/pg_agentd
+    dst: /usr/bin/pg_agentd
+    file_info:
+      mode: 0755
+  - src: ./target/release/pg_agentc
+    dst: /usr/bin/pg_agentc
+    file_info:
+      mode: 0755
+  - src: ./target/release/pg_agentctl
+    dst: /usr/bin/pg_agentctl
+    file_info:
+      mode: 0755
+
+  # systemd unit — both distros accept /usr/lib/systemd/system/.
+  - src: ./packaging/pg_agentd.service
+    dst: /usr/lib/systemd/system/pg_agentd.service
+    file_info:
+      mode: 0644
+
+  # Sample config — operators (Ansible) drop a real one into /etc.
+  - src: ./packaging/config.toml.sample
+    dst: /usr/share/pg_agent/config.toml.sample
+    file_info:
+      mode: 0644
+
+  # Licenses.
+  - src: ./LICENSE-MIT
+    dst: /usr/share/doc/pg-agent-rs/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: ./LICENSE-APACHE
+    dst: /usr/share/doc/pg-agent-rs/LICENSE-APACHE
+    file_info:
+      mode: 0644
+
+  # Empty config dir — Ansible writes /etc/pg_agent/config.toml here.
+  - dst: /etc/pg_agent
+    type: dir
+    file_info:
+      mode: 0755
+
+# Bare-systemctl scriptlets — no deb-systemd-helper, no dh_*.
+# See packaging/README.md for the install / upgrade / removal matrix.
+scripts:
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh
+
+# Config files (mark as such so apt prompts on conflicting changes).
+# /etc/pg_agent/ itself is owned but we don't ship a default
+# config.toml — that's Ansible's job. The sample lives under
+# /usr/share/pg_agent/.
+
+deb:
+  fields:
+    Bugs: "https://github.com/ophymx/pg-agent-rs/issues"
+
+rpm:
+  group: "Applications/Databases"

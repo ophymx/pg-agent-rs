@@ -1,0 +1,79 @@
+# Sample /etc/pg_agent/config.toml. Copy this file to
+# /etc/pg_agent/config.toml and edit. Most fields default sensibly
+# for a Debian 17 install; uncomment only what you need to override.
+#
+# The agent does NOT auto-start on package install — `systemctl
+# enable --now pg_agentd.service` after the config below is in
+# place. See BOOTSTRAP.md.
+
+# --- agent surface ----------------------------------------------------
+
+# agent_port  = 9701
+# unix_socket = "/run/pg_agentd/pg_agentd.sock"
+# listen      = "0.0.0.0"          # peer mTLS listen address
+
+# `state_dir` defaults to <postgres.user_home>/pg_agent. Contains
+# replay markers and the maintenance queue.
+# state_dir = "/var/lib/postgresql/pg_agent"
+
+# --- local-node id ----------------------------------------------------
+
+# Three options, in priority order:
+#   1. Explicit:        node_id = 0
+#   2. File pointer:    node_id_file = "/path/to/file"
+#   3. Implicit:        /etc/pgpool2/pgpool_node_id (recommended — same
+#                       file pgpool reads, written once per host by
+#                       Ansible)
+#   4. Fallback:        hostname match against [[pool]].hostname
+
+# --- mTLS material (peer mesh) ----------------------------------------
+[tls]
+ca_cert = "/etc/pg_agent/tls/ca.crt"
+cert    = "/etc/pg_agent/tls/node.crt"
+key     = "/etc/pg_agent/tls/node.key"
+
+# --- pool membership --------------------------------------------------
+# One [[pool]] entry per node. Same content on every host; the agent
+# resolves the local node id from pgpool_node_id (preferred) or
+# hostname.
+[[pool]]
+id       = 0
+hostname = "pg1.example.com"
+
+[[pool]]
+id       = 1
+hostname = "pg2.example.com"
+
+[[pool]]
+id       = 2
+hostname = "pg3.example.com"
+
+# --- PostgreSQL -------------------------------------------------------
+[postgres]
+# port              = 5432
+# pg_install_prefix = "/usr/lib/postgresql/17"     # contains bin/
+# data_dir          = "/var/lib/postgresql/17/main"# $PGDATA
+# socket_dir        = "/var/run/postgresql"
+# repl_user         = "repl"
+# user_home         = "/var/lib/postgresql"        # postgres OS user
+# archive_dir       = "/var/lib/postgresql/archive"
+# service           = "postgresql@17-main.service"
+
+# Replication conninfo. sslmode defaults to verify-full. Cert paths
+# are libpq's job — drop them under ~postgres/.postgresql/ (see
+# BOOTSTRAP.md Phase 1.2).
+# [postgres.replication]
+# sslmode = "verify-full"
+
+# --- PCP --------------------------------------------------------------
+[pcp]
+# user           = "pgpool"
+# port           = 9898
+# pgpool_service = "pgpool2.service"
+# .pcppass lives in ~postgres/ (libpq default); no path field here.
+
+# --- /healthz ---------------------------------------------------------
+[healthz]
+# enabled = true
+# listen  = "0.0.0.0"
+# port    = 9702

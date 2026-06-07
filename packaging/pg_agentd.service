@@ -1,0 +1,33 @@
+[Unit]
+Description=pg-agent-rs coordinator daemon
+Documentation=https://github.com/ophymx/pg-agent-rs
+# Wait for the network + PostgreSQL before we even try to dial the
+# local Unix socket. pgpool2 orders AFTER us so the first failover
+# hook doesn't fire against a missing socket (SPEC §10.4 + §17
+# invariant 12).
+After=network.target postgresql.service
+Wants=network.target
+Before=pgpool2.service
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/pg_agentd
+RuntimeDirectory=pg_agentd
+RuntimeDirectoryMode=0755
+# The wrapping `sh -ec` only exists so PG_AGENTD_CONFIG can be
+# optionally injected via /etc/default/pg_agentd without listing
+# multiple ExecStart variants.
+ExecStart=/bin/sh -ec 'exec /usr/bin/pg_agentd ${PG_AGENTD_CONFIG:+--config "$PG_AGENTD_CONFIG"}'
+# SIGHUP triggers cert reload (SPEC §7).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+User=postgres
+Group=postgres
+# Don't auto-restart immediately on rapid failures — let systemd's
+# default rate-limit window apply.
+
+[Install]
+WantedBy=multi-user.target
