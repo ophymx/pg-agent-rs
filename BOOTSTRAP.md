@@ -284,64 +284,47 @@ doesn't touch this file (it's a pgpool concern).
 
 ### 1.5 pg-agent config
 
+The `.deb` ships an annotated sample at
+**`/usr/share/pg_agent/config.toml.sample`**. Render Ansible's
+template against that file (every field the daemon reads is listed
+there, with defaults called out), then write the rendered result
+to `/etc/pg_agent/config.toml`.
+
+The minimum every deployment needs:
+
 ```
-/etc/pg_agent/config.toml
-  agent_port  = 9701
-  unix_socket = "/run/pg_agentd/pg_agentd.sock"
-  state_dir   = "/var/lib/postgresql/pg_agent"
+# /etc/pg_agent/config.toml
 
-  # No node_id / node_id_file here — every node gets the SAME config.toml.
-  # The agent resolves local_node_id from /etc/pgpool2/pgpool_node_id
-  # (which Ansible writes per-host in Phase 1.4 — see below), so pg_agent
-  # and pgpool share one source of truth. Falls back to hostname match
-  # against [[pool]] if the pgpool file isn't present.
+[tls]
+ca_cert = "/etc/pg_agent/tls/ca.crt"
+cert    = "/etc/pg_agent/tls/node.crt"
+key     = "/etc/pg_agent/tls/node.key"
 
-  [tls]
-  ca_cert = "/etc/pg_agent/tls/ca.crt"
-  cert    = "/etc/pg_agent/tls/node.crt"
-  key     = "/etc/pg_agent/tls/node.key"
+[[pool]]
+id       = 0
+hostname = "pg1.example.com"
 
-  [[pool]]
-  id = 0
-  hostname = "pg1.example.com"
+[[pool]]
+id       = 1
+hostname = "pg2.example.com"
 
-  [[pool]]
-  id = 1
-  hostname = "pg2.example.com"
-
-  [[pool]]
-  id = 2
-  hostname = "pg3.example.com"
-
-  [postgres]
-  port      = 5432
-  pg_install_prefix = "/usr/lib/postgresql/17"
-  data_dir  = "/var/lib/postgresql/17/main"
-  archive_dir = "/var/lib/postgresql/archive"
-  service   = "postgresql@17-main.service"
-  repl_user = "repl"
-
-  # [postgres.replication] section is optional.
-  # sslmode defaults to "verify-full". Cert paths come from libpq's
-  # own search (~postgres/.postgresql/) — pg-agent does NOT name them.
-  # [postgres.replication]
-  # sslmode = "verify-full"
-
-  [pcp]
-  user     = "pgpool"
-  port     = 9898
-  pgpool_service = "pgpool2.service"
-  # No .pcppass field — pg-agent calls pcp_* binaries as the postgres
-  # user; libpq picks up ~postgres/.pcppass automatically.
-
-  [healthz]
-  enabled = true
-  listen  = "0.0.0.0"
-  port    = 9702
+[[pool]]
+id       = 2
+hostname = "pg3.example.com"
 ```
 
-The same config.toml goes on every node — the agent resolves
-`local_node_id` from hostname at startup.
+Everything else has a working default for the Debian PG 17 layout
+(`pg_install_prefix = /usr/lib/postgresql/17`, `data_dir =
+/var/lib/postgresql/17/main`, `service = postgresql@17-main.service`,
+`agent_port = 9701`, `healthz.port = 9702`, …). See the sample
+file for the full list, and override only what your host differs on.
+
+The same `config.toml` goes on every node — the agent resolves
+`local_node_id` by reading `/etc/pgpool2/pgpool_node_id` (the same
+file pgpool reads, written once per host by Ansible in Phase 1.4),
+falling back to hostname match against `[[pool]]` if the pgpool file
+isn't present. So **no `node_id` / `node_id_file` field** in this
+config in normal deployments.
 
 ### 1.6 Initialise the chosen primary's PG instance
 
