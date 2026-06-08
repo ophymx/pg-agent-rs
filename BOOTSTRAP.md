@@ -44,11 +44,20 @@ configuration files mentioned here are written by Ansible templates
 > `deb-systemd-invoke start 'pgpool2.service'`.
 
 ```
-# Mask pgpool BEFORE installing — order matters.
+# Mask pgpool BEFORE installing — order matters. (See "first-deploy-only"
+# note below — wrapping this unconditionally re-masks the unit underneath
+# the operator after Phase 3.1 and takes the cluster offline.)
 systemctl mask pgpool2.service
 
-apt install postgresql-17 pgpool2 pg-agent-rs haproxy
-useradd -r pgagent                              # optional shared group
+# `--no-install-recommends` + explicit list keeps Ansible from pulling
+# pgpool2 transitively (pg-agent-rs's Recommends: includes pgpool2) and
+# running its auto-start postinst before the mask is in place.
+apt install --no-install-recommends postgresql-17 pgpool2 pg-agent-rs haproxy
+
+# pg_agentd runs as User=postgres (matches libpq's default search paths
+# for ~/.pgpass, ~/.pcppass, ~/.pgpoolkey, and ~/.postgresql/). No
+# dedicated pgagent OS user.
+
 open firewall ports:
   5432   (PG, peer-mesh only)
   9999   (pgpool client port — behind HAProxy)
@@ -56,6 +65,22 @@ open firewall ports:
   9702   (pg-agent /healthz, plain HTTP, HAProxy only)
   9898   (PCP, loopback only)
 ```
+
+> **The `systemctl mask pgpool2.service` step is first-deploy-only.**
+> Running it unconditionally on every Ansible play will re-mask the
+> unit underneath the operator after they've completed Phase 3.1 (the
+> unmask + start), taking the cluster offline on the next redeploy.
+> Gate with a state check:
+>
+> ```
+> when: ansible_facts.services['pgpool2.service'].status in ['', 'masked']
+> # only mask if the unit is uninstalled (post-install hasn't run yet)
+> # or already masked. Skip on enabled / disabled / static.
+> ```
+>
+> The cleanest pattern is to read `systemctl is-enabled pgpool2.service`
+> in a `check_mode` task and gate the mask on its stdout — no
+> separate `cluster_init_done` flag to maintain across plays.
 
 PostgreSQL DOES auto-start at install (the `postgresql-17` package's
 postinst runs `pg_createcluster 17 main`, which initdb's + starts an
@@ -138,10 +163,15 @@ PGDATA in `/var/lib/postgresql/17/main/`):
 ```
 /etc/postgresql/17/main/pg_hba.conf
   local   all   postgres                          peer
-  local   all   all                               md5
+  local   all   all                               scram-sha-256
   hostssl replication  repl  <each-peer-cidr>     cert  clientcert=verify-full
-  hostssl all          all   <app-cidr>           md5
+  hostssl all          all   <app-cidr>           scram-sha-256
 ```
+
+PG 14+ defaults to `password_encryption = scram-sha-256`, so the
+backend stores SCRAM verifiers. Using `md5` in `pg_hba.conf` against
+SCRAM-stored passwords gives the user "no pg_hba.conf entry" /
+authentication-failed errors with no obvious thread to pull on.
 
 The key line for cluster operation is `hostssl replication repl … cert`
 — ClusterInit assumes `repl` can connect via mTLS to every other
@@ -325,6 +355,21 @@ on the chosen primary only:
 The Debian `postgresql-17` package may have done `pg_createcluster` at
 install time. If so, just ensure it's running.
 
+> **The Ansible idiom for this step is "stat `PG_VERSION` → run
+> `pg_createcluster` if missing."** That stays idempotent across
+> reruns without an operator step:
+>
+> ```yaml
+> - name: postgres cluster exists
+>   ansible.builtin.stat:
+>     path: /var/lib/postgresql/17/main/PG_VERSION
+>   register: pg_version_file
+>
+> - name: pg_createcluster 17 main
+>   ansible.builtin.command: pg_createcluster 17 main
+>   when: not pg_version_file.stat.exists
+> ```
+
 PG on the **standbys** is NOT started yet. Their `$PGDATA` is empty
 (or leftover from a previous attempt — ClusterInit will deal with that
 by stopping and re-basebackup'ing).
@@ -474,22 +519,29 @@ If pgpool is co-located with PG (the SPEC-assumed layout), every host
 in `[[pool]]` runs pgpool. HAProxy fronts them.
 
 This is the natural cut between "playbook 1: install + bootstrap"
-and "playbook 2: activate" if Ansible drives both phases. A
-`cluster_init_done: true` variable (set after the operator confirms
-step 2 succeeded) gates this unmask block, so the playbook is
-idempotent and re-runnable.
+and "playbook 2: activate" if Ansible drives both phases. The
+cleanest gate is the same `systemctl is-enabled pgpool2.service`
+check that gates the mask in Phase 1.1 — running this block when
+the unit reports `masked` is the unmask path, and running it again
+later (already `enabled`) is a no-op. No `cluster_init_done`
+inventory variable to maintain across plays.
 
 ### 3.2 Verify
 
 ```
-pg_agentctl cluster status     # not implemented yet — roadmap v1.x
-# meanwhile:
+pg_agentctl cluster status
+# or, equivalent JSON for Ansible:
+pg_agentctl --json cluster status
+
+# /healthz is the external-LB-facing probe — same data, plain HTTP:
 for node in pg1 pg2 pg3; do
   curl -s http://$node:9702/healthz | jq .
 done
 ```
 
-Every node should report `is_postgres_running=true`,
+`cluster status` should show one primary + (N-1) standbys, every
+row `reachable`, standbys with `streaming` and finite lag. `/healthz`
+on every node should report `is_postgres_running=true`,
 `is_pgpool_running=true`, and on standbys
 `is_in_recovery=true, replication_state=streaming`.
 
