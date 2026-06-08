@@ -121,7 +121,17 @@ pub trait PeerClient: Send + Sync {
     /// to promote the chosen new main after the primary goes down.
     async fn promote(&self) -> anyhow::Result<()>;
 
-    // TODO(v1): reload/create_slot/reload_pgpool/remove_vip.
+    // Deliberately absent: the `Reload`, `ReloadPgpool`, `CreateSlot`, and
+    // `RemoveVip` RPCs are reserved in pgagent_peer.proto for forward
+    // compatibility but not called by any v1 workflow:
+    //   - Reload / ReloadPgpool: every config reload in v1 is local
+    //     (systemd reload + SIGHUP on the node whose config changed).
+    //   - CreateSlot: outgoing slots are created on the primary's local
+    //     DB via `LocalDb::create_slot`; standby slots are owned by the
+    //     standby itself via `myrecovery.conf`.
+    //   - RemoveVip: SPEC §18 — HAProxy fronts the cluster; no VIP to
+    //     manage. (Future watchdog `delegate_IP` support tracked in
+    //     ROADMAP exploratory.)
 }
 
 // ---------------------------------------------------------------------------

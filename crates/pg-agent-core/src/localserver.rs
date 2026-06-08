@@ -4,17 +4,20 @@
 //! Auth is filesystem permissions: the socket is mode `0600 root:postgres`,
 //! so any caller with a connection is implicitly authorised.
 //!
-//! # Scope
+//! # Surface
 //!
-//! Implemented today: read-only RPCs (`GetStatus`, `GetNodeConfig`), the
-//! maintenance reads (`ListMaintenance`, `GetMaintenance`,
-//! `RetryMaintenance`), the trivial `Escalation` (deliberate no-op — no
-//! VIP), and `RemoteStart` (forwards `pgpool_remote_start` to the target
-//! peer's `Systemd::start_postgres`).
+//! - **Hook orchestration** — `Failover`, `FollowPrimary`,
+//!   `RecoveryFirstStage`, `RemoteStart`, `RestoreWal`, plus the
+//!   no-op `Escalation` (HAProxy fronts the cluster; no VIP to move).
+//! - **Reads** — `GetStatus`, `GetNodeConfig`.
+//! - **Cluster ops** — `ClusterInit`, `ClusterStatus`,
+//!   `GetPgpoolBackends`. Each is a single-shot fan-out the daemon
+//!   does on the CLI's behalf; `pg_agentctl` never dials peers itself.
+//! - **Maintenance queue** — `ListMaintenance`, `GetMaintenance`,
+//!   `RetryMaintenance`.
 //!
-//! Still `Status::unimplemented`: `Failover`, `FollowPrimary`,
-//! `RecoveryFirstStage`, `RestoreWal`, `ClusterInit`. Each is a separate
-//! orchestration shape that lands in its own commit.
+//! Every RPC validates its inputs against SPEC §3.3's regex set
+//! before touching the local DB or the peer pool.
 
 use crate::agent::NodeInfo;
 use crate::config::{NodeConfig, NodePool, PostgresRuntime};
@@ -144,7 +147,7 @@ impl PgAgentLocal for LocalServer {
             .map_err(internal)
     }
 
-    // ----- hook orchestration (TODO(v1)) ------------------------------------
+    // ----- hook orchestration -----------------------------------------------
 
     /// `failover_command` — pgpool fires this on a surviving node when
     /// a backend goes down. Two branches:
