@@ -87,6 +87,12 @@ pg-agent only reads them.
 
 pg-agent reads these paths explicitly (declared in its config.toml).
 
+> **Ansible must `mkdir /etc/pg_agent/tls`.** The `.deb` lays down
+> `/etc/pg_agent/` itself but **not** the `tls/` subdirectory.
+> Create it as `0700 postgres:postgres` before any cert-renewer
+> writes there; otherwise the renewer fails and the daemon's
+> `validate-env` ExecStartPre rejects the missing material.
+
 **PostgreSQL replication TLS — libpq defaults, NOT under /etc/pg_agent:**
 
 ```
@@ -154,14 +160,25 @@ agent's `[[pool]]` so both stay in sync):
   follow_primary_command = 'pg_agentc follow_primary ...'
   recovery_1st_stage_command = 'recovery_1st_stage'  # exec'd from $PGDATA
   wd_escalation_command  = 'pg_agentc escalation'
+  enable_pool_hba = on                   # required (see pool_hba.conf below)
+  pool_hba_file   = '/etc/pgpool2/pool_hba.conf'   # pin explicitly
+  pool_passwd     = 'pool_passwd'        # relative → /etc/pgpool2/pool_passwd
   ...
 
 /etc/pgpool2/pool_passwd
-  app_user:md5<hash>                # Ansible generates via pg_md5
-  pgpool:md5<hash>                  # for PCP
+  app_user:AES<base64>             # Ansible generates via pg_enc -k ...
+  pgpool:AES<base64>               # for PCP + sr_check
+
+/etc/pgpool2/pool_hba.conf         # NOT shipped by the .deb's stub
+  local   all   all                            trust
+  hostssl all   all   <peer-cidr>              scram-sha-256
+  hostssl all   all   <app-cidr>               scram-sha-256
 
 /etc/pgpool2/pcp.conf
   pgpool:md5<hash>                  # pcp admin user
+
+~postgres/.pgpoolkey                # AES decryption key for pool_passwd
+  <random 32-byte secret>           # mode 0600 postgres:postgres
 
 ~postgres/.pcppass                  # pg_agentd reads this via libpq default
   *:9898:pgpool:<plaintext>         # mode 0600 postgres:postgres
@@ -169,6 +186,56 @@ agent's `[[pool]]` so both stay in sync):
 /etc/pgpool2/pgpool_node_id         # per-host: the integer node id
   1                                 # mode 0644; matches [[pool]].id for THIS host
 ```
+
+#### `pool_passwd` must be AES (not md5)
+
+PostgreSQL 14+ defaults to `password_encryption = scram-sha-256`, so
+the backend stores SCRAM verifiers, not md5 hashes. SCRAM auth on the
+client←pgpool→backend path requires pgpool to know the **plaintext**
+password — md5 entries are one-way and pgpool can't recover the
+plaintext to do SCRAM downstream. Symptom of getting this wrong is
+`WARNING: could not get the password for user:pgpool` on every
+`sr_check` tick, followed by every backend being marked `down`.
+
+Generate entries with `pg_enc -k <keyfile> -u <user> <password>`. A
+valid line looks like `pgpool:AES<base64>...`, **not**
+`pgpool:md5<hex>...`.
+
+> **Render `pgpool.conf` BEFORE running `pg_enc`.** `pg_enc -f
+> pgpool.conf` reads the `pool_passwd = ...` directive out of the
+> config to learn where to write. If `pgpool.conf` doesn't exist yet
+> or points at the wrong path, `pg_enc` silently no-ops (exits 0 with
+> nothing written) — and an Ansible `creates:`-style gate on the
+> output file's existence then latches the failure across subsequent
+> deploys. After `pg_enc`, assert `pool_passwd` has the expected
+> number of lines before declaring the task `changed_when:` clean.
+
+#### `~postgres/.pgpoolkey` — NOT under /etc/pgpool2/
+
+pgpool reads the AES decryption key from `$HOME/.pgpoolkey` of the
+user it runs as. With the Debian unit's `User=postgres` that's
+`/var/lib/postgresql/.pgpoolkey` — **not** any path under
+`/etc/pgpool2/`. The "obvious" admin path doesn't work; symptom is
+`unable to decrypt password from pool_passwd` / `verify the valid
+pool_key exists` on every auth attempt.
+
+Mode `0600 postgres:postgres`; the same file goes on every node
+(Ansible's secrets vault is the source of truth). The `POOL_KEY` /
+`POOL_KEY_DIR` env vars are the alternative if the admin really wants
+the key under `/etc/`, but `~postgres/.pgpoolkey` is what the upstream
+package expects.
+
+#### `pool_hba.conf` — required when `enable_pool_hba = on`
+
+The Debian `pgpool2` `.deb`'s stub `pool_hba.conf` only covers
+loopback. With `enable_pool_hba = on` (a sane and recommended
+default), LAN clients hit `FATAL: client authentication failed,
+DETAIL: no pool_hba.conf entry for host "10.0.0.x"...`. Pin
+`pool_hba_file` in `pgpool.conf` so the deployment doesn't ride on
+the deb's compile-time default, and render a `pool_hba.conf` that
+matches the network the cluster actually serves.
+
+#### the rest
 
 `~postgres/.pcppass` is libpq/pgpool's default search location when
 the `postgres` user runs `pcp_*` commands — same convention as
@@ -182,8 +249,8 @@ already knows the id) means the two tools can never drift on "which
 backend am I?".
 
 `pool_passwd` is where pgpool's client auth state lives. Ansible
-populates it with the app user's hashed password. The agent doesn't
-touch this file (it's a pgpool concern).
+populates it with the app user's AES-encrypted password. The agent
+doesn't touch this file (it's a pgpool concern).
 
 ### 1.5 pg-agent config
 
@@ -266,6 +333,15 @@ by stopping and re-basebackup'ing).
 
 ```
 on every node:
+  # The polkit rule grants the postgres user the systemctl verbs the
+  # agent dispatches over D-Bus (start/stop/reload postgresql + pgpool2).
+  # The .deb does NOT ship this file — it's pure Ansible. See SPEC §10.5
+  # for the canonical content; the matching grant on pg_agentd's targets
+  # is what lets the agent's RemoteStart / Stop / Reload RPCs succeed
+  # without a setuid shim. validate-env (below) refuses to pass if the
+  # file is missing.
+  copy /etc/polkit-1/rules.d/50-pg-agent.rules   # mode 0644 root:root
+
   # Optional belt-and-braces — the unit also runs this as
   # ExecStartPre, so a broken env will fail-fast either way.
   pg_agentd validate-env --json   # → Ansible parses, fails the play on ERR
