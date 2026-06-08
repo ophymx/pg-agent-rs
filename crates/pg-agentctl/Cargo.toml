@@ -1,6 +1,6 @@
 [package]
 name        = "pg-agentctl"
-description = "pg_agentctl — operator-facing control tool for pg_agent: print-hooks, check-hooks, gen-pgpool, preflight, maintenance {list,show,retry}, cluster init/status/pause/switchover."
+description = "pg_agentctl — operator-facing control tool for pg_agent: print-hooks, check-hooks, gen-pgpool, maintenance {list,show,retry}, cluster init/status/pause/switchover."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

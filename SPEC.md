@@ -19,9 +19,9 @@ node (which also runs pgpool-II and HAProxy):
 
 | Binary        | Role | Loads config? | Talks to peers? |
 |---------------|------|---------------|-----------------|
-| `pg_agentd`   | Daemon. Owns local PostgreSQL operations + cluster coordination. Serves a Unix-socket RPC for local callers and an mTLS TCP RPC for peer agents. Plus a plain-HTTP `/healthz` listener (see §9.2 for why no TLS). | yes | yes |
+| `pg_agentd`   | Daemon (`pg_agentd serve`, the default). Owns local PostgreSQL operations + cluster coordination. Serves a Unix-socket RPC for local callers and an mTLS TCP RPC for peer agents. Plus a plain-HTTP `/healthz` listener (see §9.2 for why no TLS). Also `pg_agentd validate-env` (see §14). | yes | yes |
 | `pg_agentc`   | One-shot hook client. Marshals pgpool's positional argv into a single gRPC call on the local Unix socket, then exits. Also `pg_agentc status`. **No config. No node resolution. No PostgreSQL logic.** | no | no |
-| `pg_agentctl` | Operator CLI. `print-hooks`, `check-hooks`, `gen-pgpool`, `preflight`, `maintenance {list,show,retry}`, `cluster init`. May dial peer agents. | yes | yes |
+| `pg_agentctl` | Operator CLI. `print-hooks`, `check-hooks`, `gen-pgpool`, `maintenance {list,show,retry}`, `cluster {init,status}`. May dial peer agents. | yes | yes |
 
 The hook client must stay tiny — if it can reach the socket, it works. Every
 new piece of operator functionality goes in `pg_agentctl`, not `pg_agentc`.
@@ -1398,7 +1398,6 @@ and sends a final `OpProgress { phase = "done" }` on success.
 | `print-hooks`                                      | Emit canonical `pgpool.conf` and `postgresql.conf` hook lines. |
 | `check-hooks <pgpool.conf>`                        | Parse the given file (`key = 'value'` lines, single-quote stripping, `#` comment trimming). For every entry in the canonical list: missing/wrong → `ERR`, exact match → `OK`. Exit 0 iff all rows are `OK`. |
 | `gen-pgpool [--write <path>] [--config <path>]`    | Build `pg_agent.conf` include fragment by querying every pool member via `GetNodeConfig` (local via Unix socket, peers via mTLS) for live `pg_port` / `pg_data_dir`. Emits `backend_hostname{i} / backend_port{i} / backend_data_directory{i} / backend_flag{i} = ALLOW_TO_FAILOVER`, then the canonical hook block. Stdout by default; `--write` does atomic temp+rename. |
-| `preflight [--config <path>] [--skip-db]` | Run the localhost preflight checks (see §14). Exit 0 if no `ERR` rows. For peer-mesh validation, use `cluster status` after every daemon is up. |
 | `maintenance list [--status pending|done|abandoned]` | Tabular dump of `ListMaintenance`. Surfaces `Skipped` files to stderr. |
 | `maintenance show <id>`                            | `GetMaintenance(id)`; pretty-print fields and JSON payload. |
 | `maintenance retry <id>`                           | `RetryMaintenance(id)`. Refuses non-pending intents. |
@@ -1443,9 +1442,9 @@ fight the deployment tooling):
 
   ```
   pg_agentctl --json print-hooks       # for the `template` module
-  pg_agentctl --json preflight ...
   pg_agentctl --json maintenance list
   pg_agentctl --json cluster status
+  pg_agentd   validate-env --json      # localhost env validation (§14)
   ```
 
 - **No interactive prompts, ever.** Destructive commands take `--force`
@@ -1463,20 +1462,23 @@ fight the deployment tooling):
   `ExecReload=/bin/kill -HUP $MAINPID` makes the Ansible
   `ansible.builtin.service: state=reloaded` idiom Just Work.
 
-- **`preflight` is the universal post-deploy assertion.** Running it as a
-  task after every config change gives Ansible a single-call "is this node
-  ready?" probe. The JSON output is structured per-check so playbooks can
-  conditionally remediate (e.g. install the polkit rule iff that check is
-  `ERR`).
+- **`pg_agentd validate-env` is the universal post-deploy assertion.**
+  Running it as a task after every config change gives Ansible a
+  single-call "is this node ready?" probe. The JSON output is structured
+  per-check so playbooks can conditionally remediate (e.g. install the
+  polkit rule iff that check is `ERR`). The systemd unit also wires it
+  as `ExecStartPre=`, so the daemon refuses to start with a broken
+  environment — Ansible's explicit task is the early-warning gate, the
+  unit's `ExecStartPre=` is the safety net.
 
 **Recommended playbook shape:**
 
 ```yaml
-- name: pg-agent preflight
-  ansible.builtin.command: pg_agentctl --json preflight
-  register: preflight
+- name: pg-agent validate-env
+  ansible.builtin.command: pg_agentd validate-env --json
+  register: validate_env
   changed_when: false
-  failed_when: (preflight.stdout | from_json).has_errors
+  failed_when: (validate_env.stdout | from_json).has_errors
 
 - name: render pgpool include from live cluster
   ansible.builtin.command: pg_agentctl gen-pgpool --write /etc/pgpool2/pg_agent.conf
@@ -1519,20 +1521,28 @@ included here so the playbook author has the matching context):
 
 ---
 
-## 14. Preflight checks
+## 14. Environment validation (`pg_agentd validate-env`)
 
 Validates the **localhost** runtime environment has the prereqs `pg_agentd`
 assumes. Each check is independent and idempotent. Each emits a `Check {
 name, status: OK|WARN|ERR, detail }`. Run as the `postgres` user so the
 mode-`0600` files are readable.
 
-Preflight is scoped to localhost on purpose — it runs in Ansible's
-per-host loop and must pass on each node independently of the others'
-readiness. The network-level twin (peer mTLS reachability) lives in
-`pg_agentctl cluster status`, which runs once after every daemon is up.
-The two answer different questions: preflight asks "is this node set up
-correctly to participate in a cluster?"; `cluster status` asks "are the
-nodes that exist actually reaching each other?".
+Lives on the daemon binary (`pg_agentd validate-env`), not on
+`pg_agentctl`, because the daemon is the authority on what counts as a
+valid environment — same loader, same projections, no chance of drift
+between the validator and the consumer. Modeled after `nginx -t` /
+`sshd -t` / `caddy validate`: one binary owns the definition.
+
+Scoped to localhost on purpose — it runs in Ansible's per-host loop and
+must pass on each node independently of the others' readiness, and is
+wired into the systemd unit as `ExecStartPre=` so the daemon refuses
+to start with a broken environment. The network-level twin (peer mTLS
+reachability) lives in `pg_agentctl cluster status`, which runs once
+after every daemon is up. The two answer different questions:
+`validate-env` asks "is this node set up correctly to participate in
+a cluster?"; `cluster status` asks "are the nodes that exist actually
+reaching each other?".
 
 Filesystem (always):
 
@@ -1577,7 +1587,7 @@ OK    tls material: ca_cert
 WARN  tls material: expires in 21d
 ERR   pgpool_node_id: file says 0, config says 1
 …
-preflight: 1 error(s), 1 warning(s) — FAIL
+validate-env: 1 error(s), 1 warning(s) — FAIL
 ```
 
 ---

@@ -1,23 +1,33 @@
 //! pg_agentd — coordinator daemon. See SPEC §12 for the lifecycle.
 //!
-//! `main` is the composition root: load + project config, construct the
-//! [`AgentDeps`] trait objects, bind every listener, install the signal
-//! handlers, then hand off to [`Agent::serve`]. The serve method is the
-//! one that calls `sd_notify::ready()` — by the time it does, every
-//! listener fd already exists in the kernel (the bind-before-notify race
-//! is closed structurally via [`Listeners::bind`]).
+//! Two modes:
+//!
+//! - **`pg_agentd`** (no subcommand) or **`pg_agentd serve`** — run the
+//!   coordinator. `main` is the composition root: load + project config,
+//!   construct the [`AgentDeps`] trait objects, bind every listener,
+//!   install signal handlers, then hand off to [`Agent::serve`]. The
+//!   serve method is the one that calls `sd_notify::ready()` — by the
+//!   time it does, every listener fd already exists in the kernel (the
+//!   bind-before-notify race is closed structurally via
+//!   [`Listeners::bind`]).
+//!
+//! - **`pg_agentd validate-env`** — run the localhost preflight checks
+//!   (see SPEC §14) and exit. No listeners bound, no signal handlers,
+//!   no daemon. Intended for `ExecStartPre=` and Ansible deploy gates,
+//!   like `nginx -t`.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use pg_agent_core::{
     agent::{Agent, AgentDeps, Listeners, Options},
     certreload::CertReloader,
     config::{Config, DEFAULT_CONFIG_FILE},
     errors::AgentError,
-    localdb::PgLocalDb,
+    localdb::{LocalDb, PgLocalDb},
     maintenance::{FileMaintenanceStore, DEFAULT_SWEEP_INTERVAL},
     pcp::PcpCli,
     peers::{PeerPool, PeerRegistry},
     pgstandby::StandbyExec,
+    preflight,
     replay_markers::{FileReplayMarkerStore, DEFAULT_RETENTION},
     symlinks::{ensure_hook_symlinks, find_pg_agentc},
     systemd::DbusSystemd,
@@ -35,38 +45,73 @@ use tracing::{error, info, warn};
 #[command(name = "pg_agentd", version, about, long_about = None)]
 struct Cli {
     /// Path to config.toml (default: /etc/pg_agent/config.toml).
-    #[arg(long, env = "PG_AGENTD_CONFIG")]
+    #[arg(long, env = "PG_AGENTD_CONFIG", global = true)]
     config: Option<PathBuf>,
 
-    /// Override unix_socket path from config.
-    #[arg(long, env = "PG_AGENTD_SOCKET")]
+    /// Override unix_socket path from config. (Only honoured by `serve`.)
+    #[arg(long, env = "PG_AGENTD_SOCKET", global = true)]
     socket: Option<PathBuf>,
 
     /// Development mode: allow plaintext peer connections to non-loopback
     /// hostnames. The only escape hatch from mandatory mTLS — deliberately
-    /// CLI-only (no config-file knob).
-    #[arg(long)]
+    /// CLI-only (no config-file knob). (Only honoured by `serve`.)
+    #[arg(long, global = true)]
     dev: bool,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Run the coordinator daemon (default when no subcommand given).
+    Serve,
+
+    /// Validate the localhost environment (SPEC §14): TLS material,
+    /// pgpool_node_id consistency, libpq home defaults, recovery tools,
+    /// PostgreSQL tuning, roles, extension. Exits 0 if every check
+    /// passes with no ERRs. Designed for systemd `ExecStartPre=` and
+    /// Ansible deploy gates — the `nginx -t` equivalent.
+    ///
+    /// Mesh-level checks (peer mTLS reachability) live in
+    /// `pg_agentctl cluster status`, not here.
+    ValidateEnv {
+        /// Emit machine-readable JSON instead of the human report.
+        #[arg(long)]
+        json: bool,
+
+        /// Skip the local-DB checks (use during pre-bootstrap when PG
+        /// is not yet up).
+        #[arg(long)]
+        skip_db: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     init_logging();
-    if let Err(err) = run().await {
+    let cli = Cli::parse();
+    let result = match cli.cmd {
+        None | Some(Cmd::Serve) => run_serve(&cli).await,
+        Some(Cmd::ValidateEnv { json, skip_db }) => {
+            return validate_env(&cli, json, skip_db).await;
+        }
+    };
+    if let Err(err) = result {
         error!(?err, "fatal");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// Shared config-loading path. `serve` and `validate-env` both need the
+/// same projection so they validate the same thing.
+fn load_config(cli: &Cli) -> anyhow::Result<(Config, PathBuf)> {
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
 
-    // Config: load + env + CLI overrides + defaults + resolve local id + validate.
     let mut config = Config::load(&config_path)?;
     config.apply_env_overrides();
     if let Some(socket) = cli.socket.clone() {
@@ -76,6 +121,71 @@ async fn run() -> anyhow::Result<()> {
     config.apply_defaults();
     config.resolve_local_node_id()?;
     config.validate()?;
+    Ok((config, config_path))
+}
+
+async fn validate_env(cli: &Cli, json: bool, skip_db: bool) -> ExitCode {
+    let (config, config_path) = match load_config(cli) {
+        Ok(v) => v,
+        Err(err) => {
+            // Config-load failure is itself a validation failure —
+            // surface it on stderr and exit 1, matching nginx -t.
+            eprintln!("validate-env: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    info!(
+        path = %config_path.display(),
+        node_id = config.local_node_id,
+        "config loaded"
+    );
+
+    // Try to open a local DB connection unless explicitly skipped.
+    // Connect failure (PG not up yet, socket mismatch) is reported as
+    // a single WARN by the preflight body — the right shape for
+    // pre-bootstrap runs where PG may not be running yet.
+    let db: Option<Arc<dyn LocalDb>> = if skip_db {
+        None
+    } else {
+        let socket_dir = config
+            .postgres
+            .socket_dir
+            .clone()
+            .expect("apply_defaults sets socket_dir");
+        let port = config.postgres.port.expect("apply_defaults sets port");
+        match PgLocalDb::connect(&socket_dir, port).await {
+            Ok(db) => Some(Arc::new(db) as Arc<dyn LocalDb>),
+            Err(e) => {
+                eprintln!("warning: local DB unreachable ({e}); skipping DB-backed checks");
+                None
+            }
+        }
+    };
+
+    let report = preflight::preflight(&config, db).await;
+
+    if json {
+        match serde_json::to_string_pretty(&report.to_json()) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("validate-env: serialise report: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Err(e) = report.print(&mut std::io::stdout()) {
+        eprintln!("validate-env: write report: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if report.has_errors() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
+    let (config, config_path) = load_config(cli)?;
     info!(
         path = %config_path.display(),
         node_id = config.local_node_id,

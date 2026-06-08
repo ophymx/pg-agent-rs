@@ -111,9 +111,12 @@ impl PreflightReport {
         }
         writeln!(w)?;
         match (errs, warns) {
-            (0, 0) => writeln!(w, "preflight: all checks passed")?,
-            (0, _) => writeln!(w, "preflight: {warns} warning(s) — OK with warnings")?,
-            _ => writeln!(w, "preflight: {errs} error(s), {warns} warning(s) — FAIL")?,
+            (0, 0) => writeln!(w, "validate-env: all checks passed")?,
+            (0, _) => writeln!(w, "validate-env: {warns} warning(s) — OK with warnings")?,
+            _ => writeln!(
+                w,
+                "validate-env: {errs} error(s), {warns} warning(s) — FAIL"
+            )?,
         }
         Ok(())
     }

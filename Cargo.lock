@@ -1521,6 +1521,7 @@ dependencies = [
  "clap",
  "pg-agent-core",
  "sd-notify",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

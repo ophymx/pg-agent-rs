@@ -29,7 +29,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// decide whether to negotiate TLS itself, and our custom connector
 /// is the actual transport. Same trick as the peer pool's mTLS path
 /// (`pg-agent-core::peers`).
-#[allow(dead_code)] // wired up by subsequent commits (preflight, cluster init, …)
 pub async fn dial_local(socket: &Path) -> anyhow::Result<PgAgentLocalClient<Channel>> {
     // `Endpoint::from_static("http://[::]:50051")` works as a dummy
     // because the connector below ignores the URI completely. Any

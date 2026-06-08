@@ -262,15 +262,38 @@ PG on the **standbys** is NOT started yet. Their `$PGDATA` is empty
 (or leftover from a previous attempt — ClusterInit will deal with that
 by stopping and re-basebackup'ing).
 
-### 1.7 Start pg_agentd everywhere
+### 1.7 Validate env, then start pg_agentd everywhere
 
 ```
 on every node:
+  # Optional belt-and-braces — the unit also runs this as
+  # ExecStartPre, so a broken env will fail-fast either way.
+  pg_agentd validate-env --json   # → Ansible parses, fails the play on ERR
+
   # pg-agent's .deb deliberately does NOT auto-enable at install time.
   # Ansible writes config.toml first (steps 1.5 above), then turns the
   # service on.
   systemctl enable --now pg_agentd.service
 ```
+
+`pg_agentd validate-env` is the `nginx -t` equivalent: load + validate
+the same config the daemon would load, then walk SPEC §14's localhost
+checklist (TLS material readability, `pgpool_node_id` consistency,
+`.pcppass` perms, PostgreSQL running, `pg_hba.conf` has the repl
+entries we expect, `pgpool_recovery` extension installed, recovery
+tool binaries present). Exit 0 iff every row is `OK` or `WARN` — Ansible
+parses `--json` and fails the play on `has_errors`.
+
+Each node's validate-env passes on its own merits: there's no cross-node
+dependency at this stage. Cluster-wide mesh validation happens after
+Phase 2 via `pg_agentctl cluster status`.
+
+The systemd unit also runs `pg_agentd validate-env` as `ExecStartPre=`,
+so an environment that drifts after a config edit (or a `.deb` upgrade
+that lands new path defaults) refuses to start — journalctl gets the
+clear "validate-env: N error(s) — FAIL" line instead of a half-broken
+daemon. The Ansible task above is the early-warning gate; the
+`ExecStartPre=` is the safety net.
 
 The pg-agent Debian package is built with `dh_installsystemd
 --no-enable`, which means the postinst installs the unit file but
@@ -291,21 +314,6 @@ Each agent at boot:
 - Creates `state_dir/{replay,maintenance}/`
 - Binds Unix socket + peer TCP + healthz listeners
 - Calls `sd_notify(READY=1)` → systemd considers the service started
-
-### 1.8 Optional preflight
-
-```
-on every node:
-  pg_agentctl preflight
-```
-
-Per SPEC §14: localhost-scoped checks — TLS material readability,
-polkit rule, `.pcppass` permissions, PostgreSQL running, `pg_hba.conf`
-has the repl entries we expect, `pgpool_recovery` extension installed,
-recovery tool binaries present. Operator fixes anything that reports
-`ERR`. Each node's preflight passes on its own merits — there is no
-cross-node dependency at this stage (cluster-wide mesh validation
-happens after Phase 2 via `pg_agentctl cluster status`).
 
 This is the last gate before ClusterInit.
 
@@ -553,16 +561,17 @@ its first start. If the cluster was never created (e.g., manual
 install without `pg_createcluster`), `StopUnit` returns "Unit not
 loaded" — surfaced as a clear startup error.
 
-### `pg_basebackup` against a misconfigured `pg_hba.conf` — preflight catches it
+### `pg_basebackup` against a misconfigured `pg_hba.conf` — validate-env catches it
 
 SPEC §14 already lists `pg_hba.conf` checks under "TLS / pg_hba":
 
 > verify `pg_hba.conf` has `hostssl replication <repl_user> … cert
 > clientcert=verify-full` (or equivalent).
 
-Running `pg_agentctl preflight` on every node before `cluster init`
-is Phase 1.8 of this doc; an `ERR` from that check stops the
-operator before basebackup gets a chance to fail less informatively.
+`pg_agentd validate-env` (Phase 1.7) runs this check, plus the systemd
+unit's `ExecStartPre=` re-runs it on every start — an `ERR` from
+either path stops the deploy before basebackup gets a chance to fail
+less informatively.
 
 ### App user creation — Ansible owns it, not psql
 

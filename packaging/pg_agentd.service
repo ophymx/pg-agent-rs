@@ -14,6 +14,12 @@ Type=notify
 EnvironmentFile=-/etc/default/pg_agentd
 RuntimeDirectory=pg_agentd
 RuntimeDirectoryMode=0755
+# Refuse to start with a broken localhost environment (SPEC §14):
+# missing TLS material, wrong pgpool_node_id, recovery binaries
+# absent, wal_level too low, etc. Failure here surfaces in
+# journalctl as a clear "validate-env: N error(s) — FAIL" line,
+# the nginx -t / sshd -t equivalent.
+ExecStartPre=/bin/sh -ec 'exec /usr/bin/pg_agentd ${PG_AGENTD_CONFIG:+--config "$PG_AGENTD_CONFIG"} validate-env'
 # The wrapping `sh -ec` only exists so PG_AGENTD_CONFIG can be
 # optionally injected via /etc/default/pg_agentd without listing
 # multiple ExecStart variants.

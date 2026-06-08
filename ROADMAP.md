@@ -25,9 +25,11 @@ section exists so the rest of the roadmap has a clear "from" to its "to".
 - Durable maintenance queue for failed slot cleanups (file-backed, atomic
   writes, capped retries with exponential backoff).
 - Hook idempotency via on-disk replay markers, swept on a cadence.
-- `pg_agentctl preflight` — **localhost-only** checks (TLS, polkit,
+- `pg_agentd validate-env` — **localhost-only** checks (TLS, polkit,
   `.pcppass`, PostgreSQL tuning, roles, extensions, `pg_hba.conf` — every
-  silent-failure mode we know about that lives on this node).
+  silent-failure mode we know about that lives on this node). Wired
+  as `ExecStartPre=` so the daemon refuses to start with a broken env;
+  Ansible runs it explicitly as a deploy gate. The `nginx -t` shape.
 - `pg_agentctl cluster status` — fan-out `GetStatus`, render a topology
   table. Also serves as the mesh-level reachability check that used to
   live in preflight.
