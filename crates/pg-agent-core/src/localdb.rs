@@ -112,7 +112,7 @@ impl LocalDb for PgLocalDb {
         let conn = self.get_conn().await?;
         conn.execute("SELECT pg_promote()", &[])
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_promote: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("localdb: pg_promote: {}", describe_pg(&e)))?;
         Ok(())
     }
 
@@ -120,7 +120,7 @@ impl LocalDb for PgLocalDb {
         let conn = self.get_conn().await?;
         conn.execute("CHECKPOINT", &[])
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: CHECKPOINT: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("localdb: CHECKPOINT: {}", describe_pg(&e)))?;
         Ok(())
     }
 
@@ -137,7 +137,8 @@ impl LocalDb for PgLocalDb {
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(
-                "localdb: pg_create_physical_replication_slot({name:?}): {e}"
+                "localdb: pg_create_physical_replication_slot({name:?}): {}",
+                describe_pg(&e)
             )),
         }
     }
@@ -146,7 +147,12 @@ impl LocalDb for PgLocalDb {
         let conn = self.get_conn().await?;
         conn.execute("SELECT pg_drop_replication_slot($1)", &[&name])
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_drop_replication_slot({name:?}): {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "localdb: pg_drop_replication_slot({name:?}): {}",
+                    describe_pg(&e)
+                )
+            })?;
         Ok(())
     }
 
@@ -155,7 +161,7 @@ impl LocalDb for PgLocalDb {
         let row = conn
             .query_one("SELECT pg_is_in_recovery()", &[])
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?;
         Ok(row.get::<_, bool>(0))
     }
 
@@ -164,22 +170,27 @@ impl LocalDb for PgLocalDb {
         let in_recovery: bool = conn
             .query_one("SELECT pg_is_in_recovery()", &[])
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {e}"))?
+            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?
             .get(0);
         if !in_recovery {
             // Primary — no receiver, no lag to report.
             return Ok(ReplicationLag::default());
         }
 
+        // `pg_wal_lsn_diff` returns `numeric`; without the explicit
+        // `::bigint` cast tokio-postgres can't deserialize column 0
+        // into `i64` and panics inside `.get(0)`. The diff is always
+        // bytes-of-WAL which fits comfortably in i64.
         let bytes: i64 = conn
             .query_one(
                 "SELECT coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), \
-                 pg_last_wal_replay_lsn()), 0)",
+                 pg_last_wal_replay_lsn())::bigint, 0::bigint)",
                 &[],
             )
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_wal_lsn_diff: {e}"))?
-            .get(0);
+            .map_err(|e| anyhow::anyhow!("localdb: pg_wal_lsn_diff: {}", describe_pg(&e)))?
+            .try_get(0)
+            .map_err(|e| anyhow::anyhow!("localdb: pg_wal_lsn_diff: decode i64: {e}"))?;
 
         // pg_stat_wal_receiver may have zero rows if the receiver isn't
         // connected — return the lag value with state="" rather than
@@ -190,7 +201,7 @@ impl LocalDb for PgLocalDb {
                 &[],
             )
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_stat_wal_receiver: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("localdb: pg_stat_wal_receiver: {}", describe_pg(&e)))?;
         let state: String = state_row.map(|r| r.get(0)).unwrap_or_default();
 
         Ok(ReplicationLag { bytes, state })
@@ -203,7 +214,9 @@ impl LocalDb for PgLocalDb {
         let row = conn
             .query_one("SELECT current_setting($1, true)", &[&name])
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: current_setting({name:?}): {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("localdb: current_setting({name:?}): {}", describe_pg(&e))
+            })?;
         let v: Option<String> = row.get(0);
         Ok(v.unwrap_or_default())
     }
@@ -216,7 +229,9 @@ impl LocalDb for PgLocalDb {
                 &[&name],
             )
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: extension_exists({name:?}): {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("localdb: extension_exists({name:?}): {}", describe_pg(&e))
+            })?;
         Ok(row.get(0))
     }
 
@@ -228,7 +243,7 @@ impl LocalDb for PgLocalDb {
                 &[&name],
             )
             .await
-            .map_err(|e| anyhow::anyhow!("localdb: role_exists({name:?}): {e}"))?;
+            .map_err(|e| anyhow::anyhow!("localdb: role_exists({name:?}): {}", describe_pg(&e)))?;
         Ok(row.get(0))
     }
 
@@ -255,7 +270,10 @@ impl LocalDb for PgLocalDb {
                 // tuning beyond ClusterInit's bootstrap.)
                 Ok(())
             }
-            Err(e) => Err(anyhow::anyhow!("localdb: CREATE ROLE {name:?}: {e}")),
+            Err(e) => Err(anyhow::anyhow!(
+                "localdb: CREATE ROLE {name:?}: {}",
+                describe_pg(&e)
+            )),
         }
     }
 }
@@ -307,6 +325,37 @@ fn is_duplicate_object(err: &tokio_postgres::Error) -> bool {
     err.as_db_error()
         .map(|db| db.code() == &SqlState::DUPLICATE_OBJECT)
         .unwrap_or(false)
+}
+
+/// Format a `tokio_postgres::Error` with useful context.
+///
+/// `tokio_postgres::Error`'s `Display` impl categorises (returns "db error",
+/// "tls error", "error connecting to server", …) instead of describing —
+/// the real SQLSTATE + message live on the wrapped `DbError`. For
+/// server-side errors we emit `SQLSTATE: message` (e.g.
+/// `55000: replication slot "node1" is active for PID 12345`). For
+/// transport / protocol errors we walk the `source()` chain.
+fn describe_pg(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut s = format!("{}: {}", db.code().code(), db.message());
+        if let Some(detail) = db.detail() {
+            s.push_str(" — ");
+            s.push_str(detail);
+        }
+        if let Some(hint) = db.hint() {
+            s.push_str(" (hint: ");
+            s.push_str(hint);
+            s.push(')');
+        }
+        return s;
+    }
+    let mut parts = vec![e.to_string()];
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        parts.push(s.to_string());
+        src = s.source();
+    }
+    parts.join(": ")
 }
 
 // ===========================================================================
