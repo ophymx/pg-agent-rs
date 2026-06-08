@@ -32,11 +32,12 @@ use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
-    ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, EscalationRequest,
-    FailoverRequest, FollowPrimaryRequest, GetMaintenanceRequest, GetStatusRequest,
-    ListMaintenanceRequest, ListMaintenanceResponse, MaintenanceIntent as ProtoIntent,
-    NodeConfigRequest, NodeConfigResponse, NodeStatus, OpResult, RecoveryRequest,
-    RemoteStartRequest, RestoreWalRequest, RetryMaintenanceRequest, SkippedMaintenanceIntent,
+    ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, ClusterStatusEntry,
+    ClusterStatusRequest, ClusterStatusResponse, EscalationRequest, FailoverRequest,
+    FollowPrimaryRequest, GetMaintenanceRequest, GetStatusRequest, ListMaintenanceRequest,
+    ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
+    NodeConfigResponse, NodeStatus, OpResult, RecoveryRequest, RemoteStartRequest,
+    RestoreWalRequest, RetryMaintenanceRequest, SkippedMaintenanceIntent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -831,6 +832,88 @@ impl PgAgentLocal for LocalServer {
             message,
             repl_user: self.pg.repl_user.clone(),
             standbys: results,
+        }))
+    }
+
+    /// `cluster status` — fan-out `GetStatus` to every pool member and
+    /// return one row per node. The local node uses the in-process
+    /// `NodeInfo`; peers dial via the daemon's existing `PeerPool`
+    /// (mTLS, cached connections, cert reload). Routing through the
+    /// daemon keeps `pg_agentctl` from needing TLS material on disk
+    /// and makes the daemon the single owner of peer connectivity.
+    ///
+    /// Per-node failure is captured as `reachable=false` with the
+    /// error description in `error`; the RPC itself always succeeds.
+    /// Exit-code semantics (any-node-down → caller fails) live in
+    /// `pg_agentctl`'s renderer; the daemon's job is just to report.
+    async fn cluster_status(
+        &self,
+        _req: Request<ClusterStatusRequest>,
+    ) -> Result<Response<ClusterStatusResponse>, Status> {
+        let mut entries: Vec<ClusterStatusEntry> = Vec::with_capacity(self.node_pool.members.len());
+        let mut all_reachable = true;
+
+        for node in &self.node_pool.members {
+            let entry = if self.node_pool.is_local(node) {
+                match self.node_info.get_status().await {
+                    Ok(status) => ClusterStatusEntry {
+                        node_id: node.id,
+                        hostname: node.hostname.clone(),
+                        reachable: true,
+                        error: String::new(),
+                        status: Some(status),
+                    },
+                    Err(e) => {
+                        all_reachable = false;
+                        ClusterStatusEntry {
+                            node_id: node.id,
+                            hostname: node.hostname.clone(),
+                            reachable: false,
+                            error: format!("local get_status: {e}"),
+                            status: None,
+                        }
+                    }
+                }
+            } else {
+                match self.peers.client(node).await {
+                    Ok(peer) => match peer.get_status().await {
+                        Ok(status) => ClusterStatusEntry {
+                            node_id: node.id,
+                            hostname: node.hostname.clone(),
+                            reachable: true,
+                            error: String::new(),
+                            status: Some(status),
+                        },
+                        Err(e) => {
+                            all_reachable = false;
+                            ClusterStatusEntry {
+                                node_id: node.id,
+                                hostname: node.hostname.clone(),
+                                reachable: false,
+                                error: format!("get_status: {e}"),
+                                status: None,
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        all_reachable = false;
+                        ClusterStatusEntry {
+                            node_id: node.id,
+                            hostname: node.hostname.clone(),
+                            reachable: false,
+                            error: format!("dial peer: {e}"),
+                            status: None,
+                        }
+                    }
+                }
+            };
+            entries.push(entry);
+        }
+        entries.sort_by_key(|e| e.node_id);
+
+        Ok(Response::new(ClusterStatusResponse {
+            all_reachable,
+            nodes: entries,
         }))
     }
 

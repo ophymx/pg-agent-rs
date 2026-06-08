@@ -1402,13 +1402,15 @@ and sends a final `OpProgress { phase = "done" }` on success.
 | `maintenance show <id>`                            | `GetMaintenance(id)`; pretty-print fields and JSON payload. |
 | `maintenance retry <id>`                           | `RetryMaintenance(id)`. Refuses non-pending intents. |
 | `cluster init [--only-node <id>] [--config <path>]` | `ClusterInit({only_node_id})`. Long deadline — overridable via `PG_AGENTCTL_TIMEOUT`. |
-| `cluster status [--config <path>]`                 | Fan-out `GetStatus` to every pool member (local via Unix socket, peers via mTLS) and render a topology table: id, hostname, role (primary/standby), PG state, pgpool state, lag bytes, replication state, last-seen. Also serves as the mesh-level mTLS reachability check that preflight doesn't cover. Exit 0 iff every node responded successfully. |
+| `cluster status [--config <path>]`                 | Call `ClusterStatus` on the local daemon, which fans out `GetStatus` to every pool member via its PeerPool. Render the response as a topology table: id, hostname, role (primary/standby), PG state, pgpool state, lag bytes, replication state. Also serves as the mesh-level mTLS reachability check that `validate-env` doesn't cover. Exit 0 iff every node responded successfully. |
 | `help` / `version`                                 | as usual |
 
-For RPCs that dial peers (`gen-pgpool`, `cluster init`, `cluster status`)
-the CLI builds its own `PeerPool` from config (it does not go through
-the local daemon). Maintenance + the local-node query in `gen-pgpool` /
-`cluster status` go through the Unix socket.
+For RPCs that dial peers (`gen-pgpool`, `cluster init`) the CLI
+builds its own `PeerPool` from config. `cluster status` routes
+through the local daemon — the daemon owns the PeerPool, the cert
+material, and the fan-out, so the CLI doesn't need TLS material on
+disk. Maintenance + the local-node query in `gen-pgpool` go through
+the Unix socket.
 
 ### 13.1 Ansible integration
 

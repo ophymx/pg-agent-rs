@@ -87,8 +87,14 @@ enum ClusterCmd {
         #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
+    /// Fan-out GetStatus to every pool member; render a topology table.
+    /// Also serves as the mesh-level mTLS reachability check that
+    /// `pg_agentd validate-env` doesn't cover.
+    Status {
+        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
     // v1.x roadmap items (placeholders so the surface is reserved):
-    // Status     — fan-out GetStatus to every peer
     // Pause      — set cluster paused=true via shared-state RPC
     // Resume     — clear pause flag
     // Switchover — planned promotion
@@ -122,6 +128,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Cluster { cmd } => match cmd {
             ClusterCmd::Init { only_node, config } => {
                 cluster_init(config, only_node, cli.socket.as_deref(), cli.json).await
+            }
+            ClusterCmd::Status { config } => {
+                cluster_status(config, cli.socket.as_deref(), cli.json).await
             }
         },
     }
@@ -211,6 +220,253 @@ async fn cluster_init(
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::FAILURE)
+    }
+}
+
+async fn cluster_status(
+    config_path: PathBuf,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::ClusterStatusRequest;
+
+    // Thin dialer: the daemon owns the fan-out, the PeerPool, the cert
+    // material. The CLI doesn't need TLS material on disk — just the
+    // socket. See SPEC §13.
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .cluster_status(ClusterStatusRequest {})
+        .await
+        .map_err(|s| anyhow::anyhow!("ClusterStatus RPC failed: {s}"))?
+        .into_inner();
+
+    let rows: Vec<StatusRow> = resp.nodes.into_iter().map(StatusRow::from_proto).collect();
+
+    if json {
+        let payload = serde_json::json!({
+            "all_reachable": resp.all_reachable,
+            "nodes": rows.iter().map(status_row_to_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_status_table(&rows, &mut std::io::stdout())?;
+    }
+
+    if resp.all_reachable {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+#[derive(Debug)]
+struct StatusRow {
+    id: i32,
+    hostname: String,
+    result: Result<pg_agent_proto::pgagentpb::NodeStatus, String>,
+}
+
+impl StatusRow {
+    fn from_proto(e: pg_agent_proto::pgagentpb::ClusterStatusEntry) -> Self {
+        let result = if e.reachable {
+            // `status` should always be Some when `reachable` is true; if
+            // a future daemon version sends an inconsistent message, fail
+            // closed by treating it as unreachable.
+            match e.status {
+                Some(s) => Ok(s),
+                None => Err("daemon: reachable=true but status missing".into()),
+            }
+        } else {
+            Err(e.error)
+        };
+        Self {
+            id: e.node_id,
+            hostname: e.hostname,
+            result,
+        }
+    }
+}
+
+fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    // Fixed columns; widths grow with content. Eight columns + a final
+    // optional "ERR" trailer that only appears on the unreachable
+    // summary line below the table.
+    let headers = [
+        "ID",
+        "HOSTNAME",
+        "ROLE",
+        "PG",
+        "PGPOOL",
+        "READY",
+        "LAG",
+        "REPL_STATE",
+    ];
+
+    let mut cells: Vec<[String; 8]> = Vec::with_capacity(rows.len());
+    for r in rows {
+        cells.push(match &r.result {
+            Ok(s) => format_status_cells(r.id, &r.hostname, s),
+            Err(_) => format_unreachable_cells(r.id, &r.hostname),
+        });
+    }
+
+    let mut widths = headers.map(|h| h.len());
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.len());
+        }
+    }
+
+    fn write_row(
+        w: &mut dyn std::io::Write,
+        row: &[String; 8],
+        widths: &[usize; 8],
+    ) -> std::io::Result<()> {
+        for (i, c) in row.iter().enumerate() {
+            if i > 0 {
+                write!(w, "  ")?;
+            }
+            // Right-align the numeric ID + LAG columns; left-align the rest.
+            if i == 0 || i == 6 {
+                write!(w, "{:>width$}", c, width = widths[i])?;
+            } else {
+                write!(w, "{:<width$}", c, width = widths[i])?;
+            }
+        }
+        writeln!(w)
+    }
+
+    let header_row: [String; 8] = headers.map(String::from);
+    write_row(w, &header_row, &widths)?;
+    for row in &cells {
+        write_row(w, row, &widths)?;
+    }
+
+    let unreachable: Vec<&StatusRow> = rows.iter().filter(|r| r.result.is_err()).collect();
+    if !unreachable.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "unreachable nodes:")?;
+        for r in &unreachable {
+            let err = r.result.as_ref().err().unwrap();
+            writeln!(w, "  {} {}: {}", r.id, r.hostname, err)?;
+        }
+    }
+    Ok(())
+}
+
+fn format_status_cells(
+    id: i32,
+    hostname: &str,
+    s: &pg_agent_proto::pgagentpb::NodeStatus,
+) -> [String; 8] {
+    let role = if s.is_in_recovery {
+        "standby"
+    } else {
+        "primary"
+    };
+    let pg = service_state(s.is_postgres_running, s.is_postgres_status_ok);
+    let pgpool = service_state(s.is_pgpool_running, s.is_pgpool_status_ok);
+    let ready = if s.is_ready { "yes" } else { "no" };
+    let lag = if s.is_in_recovery {
+        format_lag_bytes(s.replication_lag_bytes)
+    } else {
+        "-".into()
+    };
+    let repl_state = if s.is_in_recovery {
+        if s.replication_state.is_empty() {
+            "unknown".into()
+        } else {
+            s.replication_state.clone()
+        }
+    } else {
+        "-".into()
+    };
+    [
+        id.to_string(),
+        hostname.to_string(),
+        role.into(),
+        pg.into(),
+        pgpool.into(),
+        ready.into(),
+        lag,
+        repl_state,
+    ]
+}
+
+fn format_unreachable_cells(id: i32, hostname: &str) -> [String; 8] {
+    [
+        id.to_string(),
+        hostname.to_string(),
+        "—".into(),
+        "—".into(),
+        "—".into(),
+        "—".into(),
+        "—".into(),
+        "—".into(),
+    ]
+}
+
+/// PG/pgpool service-state cell value. Mirrors `pg_agentc status`'s
+/// `service_state` so operators see the same vocabulary in both tools.
+fn service_state(running: bool, status_ok: bool) -> &'static str {
+    if !status_ok {
+        "unknown"
+    } else if running {
+        "running"
+    } else {
+        "stopped"
+    }
+}
+
+/// Human-readable byte count: "0", "512 B", "1.2 KiB", "3.4 MiB", "1.1 GiB".
+/// Negative inputs are treated as 0 — the proto field is i64 but bytes
+/// behind a primary's flush LSN can't actually go negative.
+fn format_lag_bytes(n: i64) -> String {
+    if n <= 0 {
+        return "0".into();
+    }
+    let n = n as f64;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if n < KIB {
+        format!("{n:.0} B")
+    } else if n < MIB {
+        format!("{:.1} KiB", n / KIB)
+    } else if n < GIB {
+        format!("{:.1} MiB", n / MIB)
+    } else {
+        format!("{:.2} GiB", n / GIB)
+    }
+}
+
+fn status_row_to_json(r: &StatusRow) -> serde_json::Value {
+    match &r.result {
+        Ok(s) => serde_json::json!({
+            "id":        r.id,
+            "hostname":  r.hostname,
+            "reachable": true,
+            "error":     serde_json::Value::Null,
+            "status": {
+                "is_running":                  s.is_running,
+                "is_in_recovery":              s.is_in_recovery,
+                "is_ready":                    s.is_ready,
+                "replication_lag_bytes":       s.replication_lag_bytes,
+                "replication_state":           s.replication_state,
+                "is_postgres_running":         s.is_postgres_running,
+                "is_postgres_status_ok":       s.is_postgres_status_ok,
+                "is_pgpool_running":           s.is_pgpool_running,
+                "is_pgpool_status_ok":         s.is_pgpool_status_ok,
+            },
+        }),
+        Err(e) => serde_json::json!({
+            "id":        r.id,
+            "hostname":  r.hostname,
+            "reachable": false,
+            "error":     e,
+            "status":    serde_json::Value::Null,
+        }),
     }
 }
 
@@ -740,5 +996,103 @@ quoted_with_spaces = '  spaces inside  '
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftover.is_empty(), "stray tempfile: {leftover:?}");
+    }
+
+    fn ns(
+        in_recovery: bool,
+        running: bool,
+        ready: bool,
+        lag: i64,
+        repl_state: &str,
+    ) -> pg_agent_proto::pgagentpb::NodeStatus {
+        pg_agent_proto::pgagentpb::NodeStatus {
+            is_running: running,
+            is_in_recovery: in_recovery,
+            is_ready: ready,
+            replication_lag_bytes: lag,
+            replication_state: repl_state.into(),
+            is_postgres_running: running,
+            is_pgpool_running: running,
+            is_postgres_status_ok: true,
+            is_pgpool_status_ok: true,
+        }
+    }
+
+    #[test]
+    fn format_lag_bytes_renders_unit_scale() {
+        assert_eq!(format_lag_bytes(0), "0");
+        assert_eq!(format_lag_bytes(-1), "0");
+        assert_eq!(format_lag_bytes(512), "512 B");
+        assert_eq!(format_lag_bytes(2048), "2.0 KiB");
+        assert_eq!(format_lag_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(format_lag_bytes(2 * 1024 * 1024 * 1024), "2.00 GiB");
+    }
+
+    #[test]
+    fn service_state_words() {
+        assert_eq!(service_state(true, true), "running");
+        assert_eq!(service_state(false, true), "stopped");
+        assert_eq!(service_state(true, false), "unknown");
+    }
+
+    #[test]
+    fn print_status_table_renders_mixed_reachability() {
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0.local".into(),
+                result: Ok(ns(false, true, true, 0, "")),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1.local".into(),
+                result: Ok(ns(true, true, true, 1536, "streaming")),
+            },
+            StatusRow {
+                id: 2,
+                hostname: "pg2.local".into(),
+                result: Err("dial peer: connect refused".into()),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("HOSTNAME"));
+        assert!(s.contains("primary"));
+        assert!(s.contains("standby"));
+        assert!(s.contains("streaming"));
+        assert!(s.contains("1.5 KiB"));
+        assert!(s.contains("unreachable nodes:"));
+        assert!(s.contains("connect refused"));
+    }
+
+    #[test]
+    fn status_row_to_json_shape_primary_and_unreachable() {
+        let primary = StatusRow {
+            id: 0,
+            hostname: "pg0".into(),
+            result: Ok(ns(false, true, true, 0, "")),
+        };
+        let down = StatusRow {
+            id: 2,
+            hostname: "pg2".into(),
+            result: Err("dial peer: refused".into()),
+        };
+
+        let j0 = status_row_to_json(&primary);
+        assert_eq!(j0["reachable"], serde_json::Value::Bool(true));
+        assert_eq!(j0["error"], serde_json::Value::Null);
+        assert_eq!(
+            j0["status"]["is_in_recovery"],
+            serde_json::Value::Bool(false)
+        );
+
+        let j2 = status_row_to_json(&down);
+        assert_eq!(j2["reachable"], serde_json::Value::Bool(false));
+        assert_eq!(j2["status"], serde_json::Value::Null);
+        assert_eq!(
+            j2["error"],
+            serde_json::Value::String("dial peer: refused".into())
+        );
     }
 }

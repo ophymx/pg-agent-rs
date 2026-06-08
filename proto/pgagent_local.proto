@@ -104,6 +104,25 @@ message ClusterInitResponse {
   repeated ClusterInitStandbyResult standbys  = 4;
 }
 
+message ClusterStatusRequest {}
+
+// One row per pool member. `reachable=false` means the daemon couldn't
+// reach the peer (or itself, for the local entry); `error` carries the
+// human-readable reason; `status` is the empty default in that case and
+// callers should ignore it.
+message ClusterStatusEntry {
+  int32      node_id   = 1;
+  string     hostname  = 2;
+  bool       reachable = 3;
+  string     error     = 4;
+  NodeStatus status    = 5;
+}
+
+message ClusterStatusResponse {
+  bool                        all_reachable = 1;
+  repeated ClusterStatusEntry nodes         = 2;
+}
+
 service PgAgentLocal {
   rpc Failover         (FailoverRequest)         returns (OpResult);
   rpc FollowPrimary    (FollowPrimaryRequest)    returns (OpResult);
@@ -119,6 +138,7 @@ service PgAgentLocal {
   rpc GetNodeConfig    (NodeConfigRequest)       returns (NodeConfigResponse);
 
   rpc ClusterInit      (ClusterInitRequest)      returns (ClusterInitResponse);
+  rpc ClusterStatus    (ClusterStatusRequest)    returns (ClusterStatusResponse);
 
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);
   rpc GetMaintenance   (GetMaintenanceRequest)   returns (MaintenanceIntent);
