@@ -351,5 +351,14 @@ fn install_sighup_reload(reloader: Arc<CertReloader>) {
 fn init_logging() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    // Stderr — not stdout. `validate-env --json` writes its JSON
+    // report to stdout, and operators pipe it into jq / Ansible
+    // `from_json`; a stray tracing line would corrupt the parse.
+    // For `serve`, journald captures stderr the same as stdout, so
+    // there's no operational difference.
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
