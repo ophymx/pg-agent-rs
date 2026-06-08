@@ -90,6 +90,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_logging();
+    install_rustls_provider();
     let cli = Cli::parse();
     let result = match cli.cmd {
         None | Some(Cmd::Serve) => run_serve(&cli).await,
@@ -346,6 +347,28 @@ fn install_sighup_reload(reloader: Arc<CertReloader>) {
             }
         }
     });
+}
+
+/// Pin the process-global rustls `CryptoProvider` to `ring`, matching the
+/// `rustls = { features = ["ring"] }` workspace dep. Without this, any
+/// transitive dependency that also pulls `aws-lc-rs` into the binary
+/// (e.g. via tonic's TLS feature defaults) leaves
+/// `CryptoProvider::get_default()` unable to pick one and the first
+/// rustls call panics with "Could not automatically determine the
+/// process-level CryptoProvider…". The CertReloader / PeerPool tests
+/// already do the same install_default; production needs it too.
+///
+/// Idempotent in spirit: a second install attempt would return `Err`
+/// because a default is already set, but we never call this twice.
+fn install_rustls_provider() {
+    if let Err(_existing) = rustls::crypto::ring::default_provider().install_default() {
+        // A provider was already installed by something earlier in this
+        // process. Should not happen for `pg_agentd`, but treat it as
+        // a no-op rather than a fatal — the only consequence is that
+        // this binary will end up using whichever provider was
+        // installed first.
+        warn!("rustls crypto provider already installed; leaving the existing one in place");
+    }
 }
 
 fn init_logging() {

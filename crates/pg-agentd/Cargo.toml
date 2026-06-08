@@ -18,6 +18,7 @@ pg-agent-core = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "fs"] }
 tokio-util         = { workspace = true }
 clap               = { workspace = true }
+rustls             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
