@@ -575,7 +575,45 @@ non-obvious from PG's perspective. See [resolved decisions](#resolved-design-dec
 ### 3.4 Point applications at HAProxy
 
 The app's connection string targets HAProxy's frontend (port 5432 →
-HAProxy → pgpool:9999 → PG). Out of scope.
+HAProxy → pgpool:9999 → PG). Worked example so operators don't have
+to derive the two load-bearing constraints from first principles:
+
+```
+# /etc/haproxy/haproxy.cfg
+frontend pg_in
+  bind *:5432
+  mode tcp
+  default_backend pg_pool
+
+backend pg_pool
+  mode tcp
+  balance roundrobin
+  # /healthz on 9702 is the agent's probe — plain HTTP, NOT for routing
+  # (pgpool stays the routing layer; this just keeps backends out of
+  # rotation when their agent is unreachable). For real wire-protocol
+  # routing health, use `option pgsql-check user pgpool` instead.
+  option httpchk GET /healthz
+  http-check expect status 200
+
+  server db0 db0.example.com:9999 check port 9702
+  server db1 db1.example.com:9999 check port 9702
+  server db2 db2.example.com:9999 check port 9702
+```
+
+Two load-bearing constraints (SPEC §13.1):
+
+1. **No PROXY protocol** on the backend (`send-proxy`, `send-proxy-v2`).
+   Pgpool doesn't parse PROXY headers; bytes get treated as garbage
+   protocol and connections drop.
+
+2. **No backend TLS** on the `server` line (no `ssl verify required`,
+   no `ca-file`, no `sni`). Pgpool terminates TLS for the client
+   itself (postgres-protocol SSL upgrade); stacking haproxy↔pgpool
+   TLS on top means the client's `ClientHello` arrives encrypted
+   inside the haproxy tunnel and pgpool drops it as garbage. Symptom
+   is `server closed the connection unexpectedly` with **nothing**
+   useful in either log and a green health check throughout — no
+   thread to pull on. HAProxy must stay a pure L4 forwarder.
 
 ---
 
@@ -585,8 +623,9 @@ HAProxy → pgpool:9999 → PG). Out of scope.
 |---|---|---|---|---|
 | `postgres` (PG superuser) | initdb default | `pg_createcluster` (Debian package) | `local … peer` in `pg_hba.conf` | n/a (peer auth from `postgres` OS user) |
 | `repl` (PG replication role) | replication / basebackup / rewind | **ClusterInit** (`db.create_replication_role`) | mTLS client cert (`hostssl replication repl … cert`) | `~postgres/.postgresql/` (libpq default) |
-| Pgpool admin (`pgpool`) | PCP commands (`pcp_attach_node`) | Ansible | md5 in `pcp.conf` | `~postgres/.pcppass` (libpq default) |
-| App user(s) | application traffic | **Operator** (psql) | md5 in `pg_hba.conf` + `pool_passwd` | `/etc/pgpool2/pool_passwd` (Ansible-managed) |
+| Pgpool admin (`pgpool`) | PCP commands (`pcp_attach_node`) | Ansible | md5 in `pcp.conf` (PCP's own format) | `~postgres/.pcppass` (libpq default) |
+| Pgpool `pgpool` user — backend auth | `sr_check`, `health_check` against backends | Ansible | AES in `pool_passwd` (decrypted with `~postgres/.pgpoolkey`) → SCRAM to PG | `/etc/pgpool2/pool_passwd` (Ansible-managed via `pg_enc`) |
+| App user(s) | application traffic | **Operator** (psql) | scram-sha-256 in `pg_hba.conf` + AES in `pool_passwd` | `/etc/pgpool2/pool_passwd` (Ansible-managed via `pg_enc`) |
 | pg-agent peer mesh | inter-node RPC | Ansible (mints from CA) | mTLS client cert + SAN allowlist | `/etc/pg_agent/tls/` |
 
 **Three CAs, in principle, all separate:**
@@ -624,6 +663,44 @@ management. Three separate CAs is unusual but supported.
 - Setting / rotating app user passwords.
 - Configuring HAProxy backends.
 - Pointing applications at the front-end.
+
+---
+
+## Ansible patterns worth knowing
+
+Operational gotchas collected from real deploys — none are bugs in
+pg-agent itself; all are about how Ansible interacts with the
+surrounding services.
+
+### Cleanup deletions go in `post_tasks`, not `pre_tasks`
+
+If the Ansible play uses a cert-renewer (vault-cert-agent, certbot,
+etc.) that watches its output files and reloads haproxy / pgpool on
+change, mid-play deletions race the rerender. Concretely: a
+`pre_tasks` step that removes an orphan CA file referenced by the
+on-disk haproxy.cfg will trigger the renewer-driven reload against
+the still-old config, and haproxy exits with
+`Couldn't open the ca-file '…' (No such file or directory)` —
+with no other useful diagnostic in either log.
+
+Move cleanup deletions to `post_tasks` so they run after the role
+has rerendered the config that referenced them. Safer pattern: only
+delete files the role can re-derive from inventory on the next
+play.
+
+### Don't gate `pg_enc` on the output file's mere existence
+
+`pg_enc -f /etc/pgpool2/pgpool.conf -u <user> <password>` exits 0
+even when nothing was written (e.g., it parsed `pool_passwd =`
+out of the config and the file resolves somewhere the playbook
+isn't expecting, or the entry already exists). An Ansible
+`creates: /etc/pgpool2/pool_passwd` gate then latches the failure:
+every subsequent deploy sees the empty file, skips regen, and
+pgpool silently fails every auth.
+
+Assert the row count instead. After running `pg_enc`, fail the
+task if `wc -l < /etc/pgpool2/pool_passwd` doesn't match the
+inventory's expected user list.
 
 ---
 

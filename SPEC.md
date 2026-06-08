@@ -1522,6 +1522,19 @@ included here so the playbook author has the matching context):
   user pgpool` (a real wire-protocol probe). Don't use the agent's
   `/healthz` for routing — pgpool is the role-aware routing layer in
   this architecture (see §1.1 and §9.1).
+- **Do NOT terminate TLS at HAProxy** (no `ssl verify required` /
+  `ca-file` / `sni` on the backend `server` line). Pgpool terminates
+  TLS for the client itself (postgres-protocol SSL upgrade): stacking
+  haproxy↔pgpool TLS on top means the client's TLS-upgrade
+  `ClientHello` arrives inside the haproxy-managed TLS tunnel as
+  encrypted application data, pgpool reads it as garbage protocol,
+  and drops the connection. Symptom is `server closed the connection
+  unexpectedly` from the client with **nothing** useful in either
+  pgpool's or haproxy's log and a green health check the whole time
+  — there's no thread for the operator to pull on. The correct
+  posture is `mode tcp` + a plain `server` line; certificate
+  verification happens at the client↔pgpool layer end-to-end through
+  the L4 tunnel.
 
 ---
 
