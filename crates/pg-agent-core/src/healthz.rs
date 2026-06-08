@@ -328,14 +328,18 @@ async fn probe_pgpool(pcp: &dyn Pcp, probe_timeout: Duration) -> PgpoolProbe {
     let nodes = match tokio::time::timeout(probe_timeout, pcp.node_info_all()).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
-            warn!(?e, "healthsnap: pcp_node_info -a failed");
+            // Fires every healthsnap tick (~1s) when pgpool isn't
+            // running — common during cluster_init and after a
+            // legitimate pgpool stop. Operators discover the state
+            // via /healthz; the per-tick log line was just noise.
+            debug!(?e, "healthsnap: pcp_node_info -a failed");
             return PgpoolProbe {
                 reachable: false,
                 backends: vec![],
             };
         }
         Err(_) => {
-            warn!(
+            debug!(
                 timeout_ms = probe_timeout.as_millis() as u64,
                 "healthsnap: pcp_node_info -a timed out"
             );

@@ -154,6 +154,15 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// rewind) override via their own context.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-call deadline for unary RPCs that block on systemctl + PG state:
+/// `Start`, `Stop`, `Promote`. Post-basebackup recovery can hold a
+/// fresh standby in "starting" for a couple of minutes before the
+/// notify-style postgresql unit reports `active`, and the systemd
+/// `StartUnit` D-Bus call doesn't return until then. Five minutes is
+/// comfortable headroom without being so long that a wedged peer goes
+/// unnoticed.
+pub const LONG_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// HTTP/2 keepalive: ping every 60 s once the channel is idle. Cheap
 /// liveness signal that surfaces a partition before it bites a real RPC.
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -377,8 +386,10 @@ impl PeerClient for PeerChannel {
 
     async fn start(&self) -> anyhow::Result<()> {
         let mut client = self.inner.clone();
+        let mut req = tonic::Request::new(StartRequest {});
+        req.set_timeout(LONG_RPC_TIMEOUT);
         let resp = client
-            .start(StartRequest {})
+            .start(req)
             .await
             .map_err(|s| anyhow::anyhow!("peer start: {s}"))?
             .into_inner();
@@ -426,8 +437,10 @@ impl PeerClient for PeerChannel {
 
     async fn stop(&self) -> anyhow::Result<()> {
         let mut client = self.inner.clone();
+        let mut req = tonic::Request::new(StopRequest {});
+        req.set_timeout(LONG_RPC_TIMEOUT);
         let resp = client
-            .stop(StopRequest {})
+            .stop(req)
             .await
             .map_err(|s| anyhow::anyhow!("peer stop: {s}"))?
             .into_inner();
@@ -489,8 +502,10 @@ impl PeerClient for PeerChannel {
 
     async fn promote(&self) -> anyhow::Result<()> {
         let mut client = self.inner.clone();
+        let mut req = tonic::Request::new(PromoteRequest {});
+        req.set_timeout(LONG_RPC_TIMEOUT);
         let resp = client
-            .promote(PromoteRequest {})
+            .promote(req)
             .await
             .map_err(|s| anyhow::anyhow!("peer promote: {s}"))?
             .into_inner();
