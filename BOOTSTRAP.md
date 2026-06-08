@@ -299,10 +299,13 @@ on every node:
   pg_agentctl preflight
 ```
 
-Per SPEC §14: checks TLS material readability, polkit rule, .pcppass
-permissions, pool reachability via the peer mTLS mesh, PostgreSQL
-running, pg_hba.conf has the repl entries we expect, etc. Operator
-fixes anything that reports `ERR`.
+Per SPEC §14: localhost-scoped checks — TLS material readability,
+polkit rule, `.pcppass` permissions, PostgreSQL running, `pg_hba.conf`
+has the repl entries we expect, `pgpool_recovery` extension installed,
+recovery tool binaries present. Operator fixes anything that reports
+`ERR`. Each node's preflight passes on its own merits — there is no
+cross-node dependency at this stage (cluster-wide mesh validation
+happens after Phase 2 via `pg_agentctl cluster status`).
 
 This is the last gate before ClusterInit.
 

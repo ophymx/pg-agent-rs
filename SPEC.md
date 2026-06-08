@@ -1330,7 +1330,7 @@ line per backend, 11 space-separated fields per `pcp-node-info.html`
 role, actual role, replication delay, replication state, sync state)
 followed by a `last_status_change` timestamp the agent currently
 discards. This is what `/healthz` consumes (see §9) and what
-`pg_agentctl cluster status` will use (ROADMAP v1.x).
+`pg_agentctl cluster status` will use.
 
 `pcp_node_count` returns the count of backends defined in `pgpool.conf`
 (not the count currently up — per upstream docs). Kept in the `Pcp`
@@ -1398,16 +1398,18 @@ and sends a final `OpProgress { phase = "done" }` on success.
 | `print-hooks`                                      | Emit canonical `pgpool.conf` and `postgresql.conf` hook lines. |
 | `check-hooks <pgpool.conf>`                        | Parse the given file (`key = 'value'` lines, single-quote stripping, `#` comment trimming). For every entry in the canonical list: missing/wrong → `ERR`, exact match → `OK`. Exit 0 iff all rows are `OK`. |
 | `gen-pgpool [--write <path>] [--config <path>]`    | Build `pg_agent.conf` include fragment by querying every pool member via `GetNodeConfig` (local via Unix socket, peers via mTLS) for live `pg_port` / `pg_data_dir`. Emits `backend_hostname{i} / backend_port{i} / backend_data_directory{i} / backend_flag{i} = ALLOW_TO_FAILOVER`, then the canonical hook block. Stdout by default; `--write` does atomic temp+rename. |
-| `preflight [--config <path>] [--skip-db] [--skip-peers]` | Run the preflight checks (see §14). Exit 0 if no `ERR` rows. `--skip-peers` is useful during multi-node deployments where you're running preflight on each node before the others are up. |
+| `preflight [--config <path>] [--skip-db]` | Run the localhost preflight checks (see §14). Exit 0 if no `ERR` rows. For peer-mesh validation, use `cluster status` after every daemon is up. |
 | `maintenance list [--status pending|done|abandoned]` | Tabular dump of `ListMaintenance`. Surfaces `Skipped` files to stderr. |
 | `maintenance show <id>`                            | `GetMaintenance(id)`; pretty-print fields and JSON payload. |
 | `maintenance retry <id>`                           | `RetryMaintenance(id)`. Refuses non-pending intents. |
 | `cluster init [--only-node <id>] [--config <path>]` | `ClusterInit({only_node_id})`. Long deadline — overridable via `PG_AGENTCTL_TIMEOUT`. |
+| `cluster status [--config <path>]`                 | Fan-out `GetStatus` to every pool member (local via Unix socket, peers via mTLS) and render a topology table: id, hostname, role (primary/standby), PG state, pgpool state, lag bytes, replication state, last-seen. Also serves as the mesh-level mTLS reachability check that preflight doesn't cover. Exit 0 iff every node responded successfully. |
 | `help` / `version`                                 | as usual |
 
-For RPCs that dial peers (`gen-pgpool`, `cluster init`) the CLI builds its
-own `PeerPool` from config (it does not go through the local daemon).
-Maintenance + `gen-pgpool`'s local-node query go through the Unix socket.
+For RPCs that dial peers (`gen-pgpool`, `cluster init`, `cluster status`)
+the CLI builds its own `PeerPool` from config (it does not go through
+the local daemon). Maintenance + the local-node query in `gen-pgpool` /
+`cluster status` go through the Unix socket.
 
 ### 13.1 Ansible integration
 
@@ -1443,7 +1445,7 @@ fight the deployment tooling):
   pg_agentctl --json print-hooks       # for the `template` module
   pg_agentctl --json preflight ...
   pg_agentctl --json maintenance list
-  pg_agentctl --json cluster status    # v1.x
+  pg_agentctl --json cluster status
   ```
 
 - **No interactive prompts, ever.** Destructive commands take `--force`
@@ -1519,10 +1521,18 @@ included here so the playbook author has the matching context):
 
 ## 14. Preflight checks
 
-Validates the runtime environment has the prereqs `pg_agentd` assumes.
-Each check is independent and idempotent. Each emits a `Check { name,
-status: OK|WARN|ERR, detail }`. Run as the `postgres` user so the
+Validates the **localhost** runtime environment has the prereqs `pg_agentd`
+assumes. Each check is independent and idempotent. Each emits a `Check {
+name, status: OK|WARN|ERR, detail }`. Run as the `postgres` user so the
 mode-`0600` files are readable.
+
+Preflight is scoped to localhost on purpose — it runs in Ansible's
+per-host loop and must pass on each node independently of the others'
+readiness. The network-level twin (peer mTLS reachability) lives in
+`pg_agentctl cluster status`, which runs once after every daemon is up.
+The two answer different questions: preflight asks "is this node set up
+correctly to participate in a cluster?"; `cluster status` asks "are the
+nodes that exist actually reaching each other?".
 
 Filesystem (always):
 
@@ -1544,27 +1554,6 @@ Filesystem (always):
   `pgpool` and `postgres`.
 - **Recovery tools** — `<pg_install_prefix>/bin/pg_basebackup` and
   `<pg_install_prefix>/bin/pg_rewind` exist and are executable.
-
-Peer connectivity (skipped with a WARN if `--skip-peers` or
-`[tls]` unset — a loopback-only dev pool doesn't need mTLS):
-
-- **Peer mTLS reachability** (one row per non-local pool entry).
-  TCP-connects to `<peer_hostname>:agent_port`, performs a full mTLS
-  handshake using our cert material, then issues a
-  `PgAgentPeer.GetStatus` call. ERR with a category if any step fails:
-  - *connect refused / timeout* → peer agent down, or firewall blocked
-  - *TLS handshake* → cert chain mismatch, CA divergence, expired cert,
-    SAN allowlist rejection of our identity by the peer
-  - *RPC error* → tonic layer broken on the peer, agent process wedged
-  This is the **network-level twin of the local "TLS material" check**:
-  "TLS material" verifies our cert is valid in our own eyes; this
-  verifies every peer agrees. **The reason this matters:** failover
-  orchestration runs single-leader on the pgpool watchdog leader (see
-  §1.1 — only the leader's pg_agentd RPCs into peer agents to
-  coordinate). A broken mTLS link between two nodes only surfaces
-  during a real failover when the leader tries to dial a peer it can't
-  reach — *exactly* when you want it not to surface. Preflight catches
-  it ahead of time.
 
 DB-backed (skipped with a WARN if `--skip-db` or DB unreachable):
 

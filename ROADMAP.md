@@ -25,8 +25,12 @@ section exists so the rest of the roadmap has a clear "from" to its "to".
 - Durable maintenance queue for failed slot cleanups (file-backed, atomic
   writes, capped retries with exponential backoff).
 - Hook idempotency via on-disk replay markers, swept on a cadence.
-- `pg_agentctl preflight` (TLS, polkit, .pcppass, PostgreSQL tuning, roles,
-  extensions, pg_hba — every silent-failure mode we know about).
+- `pg_agentctl preflight` — **localhost-only** checks (TLS, polkit,
+  `.pcppass`, PostgreSQL tuning, roles, extensions, `pg_hba.conf` — every
+  silent-failure mode we know about that lives on this node).
+- `pg_agentctl cluster status` — fan-out `GetStatus`, render a topology
+  table. Also serves as the mesh-level reachability check that used to
+  live in preflight.
 - `/healthz` plain-HTTP listener with snapshot-based readiness for HAProxy.
 - `pg_agentctl cluster init` one-shot bootstrap from a chosen primary.
 - Strict input validation (regex on every value reaching libpq / subprocess
@@ -34,7 +38,8 @@ section exists so the rest of the roadmap has a clear "from" to its "to".
 
 What this gets you: a cluster that operates correctly without bash, ssh, or
 hand-rolled hook scripts. What it does **not** get you: any operator-facing
-ergonomics beyond `pg_agentc status` and `pg_agentctl maintenance list`.
+ergonomics beyond `pg_agentc status`, `pg_agentctl cluster status`, and
+`pg_agentctl maintenance list`.
 
 ---
 
@@ -45,12 +50,6 @@ immediately miss. Tackling them early prevents "this is great, but I can't
 schedule a switchover" from blocking adoption.
 
 ### Cluster control plane
-
-- **`pg_agentctl cluster status`** *(S)* — fan-out `GetStatus` to every peer,
-  render a topology table (id, hostname, role, lag, slot, pg state, pgpool
-  state, last-seen, maintenance-queue depth). One command, full cluster.
-  *Why now:* this is the single biggest day-1 ergonomics win and is purely
-  local plumbing — no new state, no new RPC.
 
 - **`pg_agentctl cluster pause [--reason …]` / `cluster resume`** *(M)* —
   maintenance mode. A boolean in shared cluster state (see "Shared state"

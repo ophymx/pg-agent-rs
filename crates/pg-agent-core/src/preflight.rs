@@ -3,15 +3,19 @@
 //! `pg_agentctl preflight` and from Ansible (parseable output,
 //! deterministic exit code).
 //!
-//! See SPEC §14 for the full check list. Three buckets:
+//! **Scope: localhost only.** Two buckets per SPEC §14:
 //!
 //! 1. **Filesystem** — TLS material, pgpool_node_id, libpq home defaults
 //!    (`.pcppass`, `.postgresql/`), recovery tools. Always run.
 //! 2. **DB-backed** — settings, roles, extension. Skipped (WARN) when the
 //!    caller couldn't open a local DB connection.
-//! 3. **Peer connectivity** — mTLS dial + `GetStatus` per non-local peer.
-//!    Skipped (WARN) when TLS isn't configured or `skip_peers` is true.
-//!    Not yet wired here — TODO when `PeerPool` is exposed from preflight.
+//!
+//! Peer-mesh validation (the network-level twin of "TLS material is
+//! valid in our own eyes") lives in `pg_agentctl cluster status` instead.
+//! Mixing it in here forced a chicken-and-egg in Ansible's per-host loop:
+//! node A's preflight couldn't pass until node B's daemon was up, and
+//! vice-versa. Splitting localhost-correctness from mesh-correctness
+//! lets each node's preflight pass on its own merits.
 
 use crate::config::{Config, DEFAULT_PGPOOL_NODE_ID_FILE};
 use crate::localdb::LocalDb;
@@ -128,14 +132,14 @@ impl PreflightReport {
     }
 }
 
-/// Run every check in a deterministic order. DB-backed checks are
-/// skipped with WARN if `db` is None; peer-reachability checks are
-/// skipped with WARN if `skip_peers` is true (peer wiring TBD).
-pub async fn preflight(
-    cfg: &Config,
-    db: Option<Arc<dyn LocalDb>>,
-    skip_peers: bool,
-) -> PreflightReport {
+/// Run every localhost check in a deterministic order. DB-backed checks
+/// are skipped with a single WARN row if `db` is None — pass `Some(db)`
+/// when the local PG socket is reachable.
+///
+/// For mesh-level validation (peer mTLS reachability), use
+/// `pg_agentctl cluster status` after every daemon is up — see the
+/// module-level doc for the rationale.
+pub async fn preflight(cfg: &Config, db: Option<Arc<dyn LocalDb>>) -> PreflightReport {
     let mut r = PreflightReport::default();
 
     // ---- filesystem checks ---------------------------------------------
@@ -155,26 +159,6 @@ pub async fn preflight(
             "db connection",
             "skipped (no local DB connection — pass without --skip-db when PG is up)",
         )),
-    }
-
-    // ---- peer connectivity ---------------------------------------------
-    if skip_peers {
-        r.checks
-            .push(Check::warn("peer connectivity", "skipped (--skip-peers)"));
-    } else if !cfg.tls.is_configured() {
-        r.checks.push(Check::warn(
-            "peer connectivity",
-            "skipped (no [tls] block configured)",
-        ));
-    } else {
-        // TODO(v1): dial every non-local pool entry via PeerPool and
-        // call GetStatus. Requires factoring PeerPool out of the
-        // daemon construction path so the CLI can build one without
-        // standing up the full Agent. Tracked separately.
-        r.checks.push(Check::warn(
-            "peer connectivity",
-            "not yet implemented (TODO: dial peers via mTLS)",
-        ));
     }
 
     r
@@ -507,18 +491,18 @@ mod tests {
     async fn preflight_no_db_warns_on_db_section() {
         let tmp = TempDir::new().unwrap();
         let cfg = make_cfg(&tmp);
-        let r = preflight(&cfg, None, true).await;
+        let r = preflight(&cfg, None).await;
         assert!(
             r.checks
                 .iter()
                 .any(|c| c.name == "db connection" && c.status == CheckStatus::Warn),
             "expected db connection WARN"
         );
+        // Mesh-level validation lives in `pg_agentctl cluster status`,
+        // not here — preflight is localhost-scoped.
         assert!(
-            r.checks
-                .iter()
-                .any(|c| c.name == "peer connectivity" && c.status == CheckStatus::Warn),
-            "expected peer connectivity WARN with skip_peers=true"
+            !r.checks.iter().any(|c| c.name.contains("peer")),
+            "preflight should not emit any peer-* rows"
         );
     }
 
@@ -531,7 +515,7 @@ mod tests {
             cert: Some(tmp.path().join("absent-cert")),
             key: Some(tmp.path().join("absent-key")),
         };
-        let r = preflight(&cfg, None, true).await;
+        let r = preflight(&cfg, None).await;
         let tls_errs: Vec<_> = r
             .checks
             .iter()
@@ -566,7 +550,7 @@ mod tests {
             key: Some(key),
         };
 
-        let r = preflight(&cfg, None, true).await;
+        let r = preflight(&cfg, None).await;
         let tls_errs: Vec<_> = r
             .checks
             .iter()
@@ -595,7 +579,7 @@ mod tests {
             key: Some(key),
         };
 
-        let r = preflight(&cfg, None, true).await;
+        let r = preflight(&cfg, None).await;
         assert!(r
             .checks
             .iter()
@@ -606,7 +590,7 @@ mod tests {
     async fn recovery_tools_err_when_missing() {
         let tmp = TempDir::new().unwrap();
         let cfg = make_cfg(&tmp);
-        let r = preflight(&cfg, None, true).await;
+        let r = preflight(&cfg, None).await;
         let errs: Vec<_> = r
             .checks
             .iter()
@@ -631,7 +615,7 @@ mod tests {
             fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let r = preflight(&cfg, None, true).await;
+        let r = preflight(&cfg, None).await;
         let errs: Vec<_> = r
             .checks
             .iter()

@@ -197,7 +197,7 @@ async fn preflight(config_path: PathBuf, skip_db: bool, json: bool) -> anyhow::R
         }
     };
 
-    let report = pg_agent_core::preflight::preflight(&cfg, db, false).await;
+    let report = pg_agent_core::preflight::preflight(&cfg, db).await;
 
     if json {
         println!(
