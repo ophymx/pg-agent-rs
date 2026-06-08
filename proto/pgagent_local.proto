@@ -123,6 +123,25 @@ message ClusterStatusResponse {
   repeated ClusterStatusEntry nodes         = 2;
 }
 
+message GetPgpoolBackendsRequest {}
+
+// One row per pool member. Mirrors `ClusterStatusEntry`'s per-node
+// error capture: a single unreachable peer doesn't fail the whole
+// RPC — callers decide whether to refuse to render a partial config.
+message PgpoolBackendEntry {
+  int32  node_id   = 1;
+  string hostname  = 2;
+  bool   reachable = 3;
+  string error     = 4;
+  int32  pg_port   = 5; // valid only when reachable
+  string pg_data   = 6; // valid only when reachable
+}
+
+message GetPgpoolBackendsResponse {
+  bool                        all_reachable = 1;
+  repeated PgpoolBackendEntry backends      = 2;
+}
+
 service PgAgentLocal {
   rpc Failover         (FailoverRequest)         returns (OpResult);
   rpc FollowPrimary    (FollowPrimaryRequest)    returns (OpResult);
@@ -137,8 +156,9 @@ service PgAgentLocal {
   rpc GetStatus        (GetStatusRequest)        returns (NodeStatus);
   rpc GetNodeConfig    (NodeConfigRequest)       returns (NodeConfigResponse);
 
-  rpc ClusterInit      (ClusterInitRequest)      returns (ClusterInitResponse);
-  rpc ClusterStatus    (ClusterStatusRequest)    returns (ClusterStatusResponse);
+  rpc ClusterInit       (ClusterInitRequest)       returns (ClusterInitResponse);
+  rpc ClusterStatus     (ClusterStatusRequest)     returns (ClusterStatusResponse);
+  rpc GetPgpoolBackends (GetPgpoolBackendsRequest) returns (GetPgpoolBackendsResponse);
 
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);
   rpc GetMaintenance   (GetMaintenanceRequest)   returns (MaintenanceIntent);

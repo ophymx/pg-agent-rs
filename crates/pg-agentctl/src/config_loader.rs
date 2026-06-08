@@ -1,11 +1,8 @@
-//! Tiny config-loading helpers shared by every subcommand that needs
-//! more than just the socket path or the hookspec constants.
-//!
-//! Kept separate from `pg_agent_core::config::Config::load` so that
-//! [`resolve_socket_path`] can short-circuit without doing a full
-//! load when the operator passes `--socket` explicitly — the agent
-//! might not be on the same host as the operator's workstation, and
-//! requiring a valid `config.toml` just to dial would be hostile.
+//! Socket-path resolver shared by every subcommand that dials the
+//! local daemon. Every subcommand now routes through `pg_agentd` over
+//! the Unix socket, so this is the only piece of "config" the CLI
+//! still has to read — and even that is optional (`--socket` overrides
+//! any file, and a missing config falls through to the default).
 
 use anyhow::Context;
 use pg_agent_core::config::{Config, DEFAULT_UNIX_SOCKET};
@@ -17,11 +14,9 @@ use std::path::{Path, PathBuf};
 /// 2. `unix_socket` field from `config.toml` (if `config_path` exists)
 /// 3. [`DEFAULT_UNIX_SOCKET`]
 ///
-/// Returns `Ok(None)` if step 2 is requested but the config file is
-/// missing — caller can decide whether to error or fall through to
-/// the default. Returns `Err` only on a config that exists but won't
-/// parse (the operator wants to know).
-#[allow(dead_code)] // wired up by subsequent commits
+/// Returns `Err` only on a config that exists but won't parse — the
+/// operator should be told. A missing config file is fine; we fall
+/// through to the default socket location.
 pub fn resolve_socket_path(
     cli_socket: Option<&Path>,
     config_path: &Path,
@@ -37,11 +32,4 @@ pub fn resolve_socket_path(
         }
     }
     Ok(PathBuf::from(DEFAULT_UNIX_SOCKET))
-}
-
-/// Load + validate config. Thin wrapper that gives every subcommand
-/// the same error-context shape.
-#[allow(dead_code)] // wired up by subsequent commits
-pub fn load_config(path: &Path) -> anyhow::Result<Config> {
-    Config::load(path).with_context(|| format!("load config {}", path.display()))
 }

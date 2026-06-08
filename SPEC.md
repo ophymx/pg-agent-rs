@@ -1397,7 +1397,7 @@ and sends a final `OpProgress { phase = "done" }` on success.
 |----------------------------------------------------|-----------|
 | `print-hooks`                                      | Emit canonical `pgpool.conf` and `postgresql.conf` hook lines. |
 | `check-hooks <pgpool.conf>`                        | Parse the given file (`key = 'value'` lines, single-quote stripping, `#` comment trimming). For every entry in the canonical list: missing/wrong → `ERR`, exact match → `OK`. Exit 0 iff all rows are `OK`. |
-| `gen-pgpool [--write <path>] [--config <path>]`    | Build `pg_agent.conf` include fragment by querying every pool member via `GetNodeConfig` (local via Unix socket, peers via mTLS) for live `pg_port` / `pg_data_dir`. Emits `backend_hostname{i} / backend_port{i} / backend_data_directory{i} / backend_flag{i} = ALLOW_TO_FAILOVER`, then the canonical hook block. Stdout by default; `--write` does atomic temp+rename. |
+| `gen-pgpool [--write <path>] [--config <path>]`    | Call `GetPgpoolBackends` on the local daemon, which fans out `GetNodeConfig` to every pool member via its PeerPool. Render `backend_hostname{i} / backend_port{i} / backend_data_directory{i} / backend_flag{i} = ALLOW_TO_FAILOVER` plus the canonical hook block. Stdout by default; `--write` does atomic temp+rename. Refuses to render if any node is unreachable — better a clear error than a silently-mis-sized pool. |
 | `maintenance list [--status pending|done|abandoned]` | Tabular dump of `ListMaintenance`. Surfaces `Skipped` files to stderr. |
 | `maintenance show <id>`                            | `GetMaintenance(id)`; pretty-print fields and JSON payload. |
 | `maintenance retry <id>`                           | `RetryMaintenance(id)`. Refuses non-pending intents. |
@@ -1405,12 +1405,14 @@ and sends a final `OpProgress { phase = "done" }` on success.
 | `cluster status [--config <path>]`                 | Call `ClusterStatus` on the local daemon, which fans out `GetStatus` to every pool member via its PeerPool. Render the response as a topology table: id, hostname, role (primary/standby), PG state, pgpool state, lag bytes, replication state. Also serves as the mesh-level mTLS reachability check that `validate-env` doesn't cover. Exit 0 iff every node responded successfully. |
 | `help` / `version`                                 | as usual |
 
-For RPCs that dial peers (`gen-pgpool`, `cluster init`) the CLI
-builds its own `PeerPool` from config. `cluster status` routes
-through the local daemon — the daemon owns the PeerPool, the cert
-material, and the fan-out, so the CLI doesn't need TLS material on
-disk. Maintenance + the local-node query in `gen-pgpool` go through
-the Unix socket.
+**Every** `pg_agentctl` subcommand routes through the local daemon
+over the Unix socket. The daemon owns the `PeerPool`, the cert
+material, and any fan-out; the CLI never imports `PeerPool` /
+`CertReloader` / TLS material. `cluster init`, `cluster status`, and
+`gen-pgpool` each map to a single daemon RPC; the daemon does the
+peer dialing on the CLI's behalf. Operators can run the CLI from a
+workstation that has socket access (via SSH) without any TLS
+material on disk.
 
 ### 13.1 Ansible integration
 

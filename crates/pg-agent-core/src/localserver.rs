@@ -34,10 +34,11 @@ use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
     ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, ClusterStatusEntry,
     ClusterStatusRequest, ClusterStatusResponse, EscalationRequest, FailoverRequest,
-    FollowPrimaryRequest, GetMaintenanceRequest, GetStatusRequest, ListMaintenanceRequest,
-    ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
-    NodeConfigResponse, NodeStatus, OpResult, RecoveryRequest, RemoteStartRequest,
-    RestoreWalRequest, RetryMaintenanceRequest, SkippedMaintenanceIntent,
+    FollowPrimaryRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
+    GetPgpoolBackendsResponse, GetStatusRequest, ListMaintenanceRequest, ListMaintenanceResponse,
+    MaintenanceIntent as ProtoIntent, NodeConfigRequest, NodeConfigResponse, NodeStatus, OpResult,
+    PgpoolBackendEntry, RecoveryRequest, RemoteStartRequest, RestoreWalRequest,
+    RetryMaintenanceRequest, SkippedMaintenanceIntent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -914,6 +915,67 @@ impl PgAgentLocal for LocalServer {
         Ok(Response::new(ClusterStatusResponse {
             all_reachable,
             nodes: entries,
+        }))
+    }
+
+    /// Backend data for rendering pgpool.conf's per-backend block
+    /// (`backend_hostname{i}` / `backend_port{i}` / `backend_data_directory{i}`).
+    /// Local node answered in-process via `NodeInfo`; peers dialed via
+    /// the daemon's `PeerPool`. Per-node errors surface as
+    /// `reachable=false` rows — the CLI decides whether to refuse to
+    /// render a partial config.
+    async fn get_pgpool_backends(
+        &self,
+        _req: Request<GetPgpoolBackendsRequest>,
+    ) -> Result<Response<GetPgpoolBackendsResponse>, Status> {
+        let mut backends: Vec<PgpoolBackendEntry> =
+            Vec::with_capacity(self.node_pool.members.len());
+        let mut all_reachable = true;
+
+        for node in &self.node_pool.members {
+            let cfg_result = if self.node_pool.is_local(node) {
+                self.node_info
+                    .get_node_config()
+                    .await
+                    .map_err(|e| format!("local get_node_config: {e}"))
+            } else {
+                match self.peers.client(node).await {
+                    Ok(peer) => peer
+                        .get_node_config()
+                        .await
+                        .map_err(|e| format!("get_node_config: {e}")),
+                    Err(e) => Err(format!("dial peer: {e}")),
+                }
+            };
+
+            let entry = match cfg_result {
+                Ok(c) => PgpoolBackendEntry {
+                    node_id: node.id,
+                    hostname: node.hostname.clone(),
+                    reachable: true,
+                    error: String::new(),
+                    pg_port: c.pg_port,
+                    pg_data: c.pg_data_dir,
+                },
+                Err(e) => {
+                    all_reachable = false;
+                    PgpoolBackendEntry {
+                        node_id: node.id,
+                        hostname: node.hostname.clone(),
+                        reachable: false,
+                        error: e,
+                        pg_port: 0,
+                        pg_data: String::new(),
+                    }
+                }
+            };
+            backends.push(entry);
+        }
+        backends.sort_by_key(|b| b.node_id);
+
+        Ok(Response::new(GetPgpoolBackendsResponse {
+            all_reachable,
+            backends,
         }))
     }
 

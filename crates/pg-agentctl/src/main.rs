@@ -476,63 +476,47 @@ async fn gen_pgpool(
     cli_socket: Option<&std::path::Path>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    use pg_agent_core::certreload::CertReloader;
-    use pg_agent_core::peers::{PeerPool, PeerRegistry};
-    use pg_agent_proto::pgagentpb::NodeConfigRequest;
-    use std::sync::Arc;
+    use pg_agent_proto::pgagentpb::GetPgpoolBackendsRequest;
 
-    let cfg = config_loader::load_config(&config_path)?;
-
-    // Local node goes through the Unix socket; peers through the mTLS
-    // peer pool we build right here. The CLI doesn't share the
-    // daemon's pool — see SPEC §13 ("the CLI builds its own PeerPool
-    // from config").
+    // Thin dialer: the daemon owns the fan-out, the PeerPool, the cert
+    // material. The CLI doesn't need TLS material on disk — just the
+    // socket. Same shape as `cluster status`.
     let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .get_pgpool_backends(GetPgpoolBackendsRequest {})
+        .await
+        .map_err(|s| anyhow::anyhow!("GetPgpoolBackends RPC failed: {s}"))?
+        .into_inner();
 
-    // Build a PeerPool if there is any remote node to dial; skip the
-    // CertReloader otherwise so single-node deployments don't need TLS
-    // material on disk just to run gen-pgpool.
-    let has_remote = cfg.pool.iter().any(|n| n.id != cfg.local_node_id);
-    let peer_pool: Option<Arc<PeerPool>> = if has_remote {
-        if cfg.tls.is_configured() {
-            let reloader = Arc::new(CertReloader::new(cfg.tls.clone())?);
-            Some(PeerPool::new(reloader, cfg.agent_port.unwrap_or(0))?)
-        } else if cfg.dev_mode {
-            Some(PeerPool::new_dev(cfg.agent_port.unwrap_or(0)))
-        } else {
-            anyhow::bail!(
-                "remote pool members configured but [tls] is not — set ca_cert/cert/key \
-                 or run with --dev for a single-node test"
-            );
-        }
-    } else {
-        None
-    };
-
-    let mut rows: Vec<BackendRow> = Vec::with_capacity(cfg.pool.len());
-    for node in &cfg.pool {
-        let (port, data_dir) = if node.id == cfg.local_node_id {
-            let mut local = client::dial_local(&socket).await?;
-            let resp = local
-                .get_node_config(NodeConfigRequest {})
-                .await
-                .map_err(|s| anyhow::anyhow!("GetNodeConfig (local) failed: {s}"))?
-                .into_inner();
-            (resp.pg_port, resp.pg_data_dir)
-        } else {
-            let pool = peer_pool.as_ref().expect("has_remote => peer_pool is Some");
-            let client = pool.client(node).await?;
-            let resp = client.get_node_config().await?;
-            (resp.pg_port, resp.pg_data_dir)
-        };
-        rows.push(BackendRow {
-            id: node.id,
-            hostname: node.hostname.clone(),
-            port,
-            data_dir,
-        });
+    // Refuse to render a partial pgpool.conf. The daemon reports per-
+    // node so we can list every unreachable peer in the error, but a
+    // missing backend row would silently mis-size the pool — better to
+    // fail loudly and let the operator fix the underlying reachability.
+    if !resp.all_reachable {
+        let bad: Vec<String> = resp
+            .backends
+            .iter()
+            .filter(|b| !b.reachable)
+            .map(|b| format!("{} ({}): {}", b.node_id, b.hostname, b.error))
+            .collect();
+        anyhow::bail!(
+            "refusing to render: {} unreachable node(s):\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
     }
-    rows.sort_by_key(|r| r.id);
+
+    let rows: Vec<BackendRow> = resp
+        .backends
+        .iter()
+        .map(|b| BackendRow {
+            id: b.node_id,
+            hostname: b.hostname.clone(),
+            port: b.pg_port,
+            data_dir: b.pg_data.clone(),
+        })
+        .collect();
 
     let fragment = render_pgpool_fragment(&rows);
 
