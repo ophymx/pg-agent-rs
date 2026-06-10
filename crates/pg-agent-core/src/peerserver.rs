@@ -534,6 +534,7 @@ impl PgAgentPeer for PeerServer {
 
         let standby = self.standby.clone();
         Ok(Response::new(spawn_progress_stream(
+            "Basebackup",
             "streaming",
             move |tx| async move { standby.basebackup(opts, Some(progress_cb(tx))).await },
         )))
@@ -557,6 +558,7 @@ impl PgAgentPeer for PeerServer {
 
         let standby = self.standby.clone();
         Ok(Response::new(spawn_progress_stream(
+            "Rewind",
             "rewinding",
             move |tx| async move { standby.rewind(opts, Some(progress_cb(tx))).await },
         )))
@@ -660,10 +662,22 @@ fn progress_cb(tx: tokio::sync::mpsc::Sender<Result<OpProgress, Status>>) -> Pro
 
 /// Spawn the subprocess driver, route its progress events into a tonic
 /// stream, and tack on a final `phase = "done"` (or an Internal error)
-/// once it returns. `intermediate_phase` is the label emitted by the
-/// progress callback — `"streaming"` for basebackup, `"rewinding"` for
-/// rewind. The final phase is always `"done"`.
-fn spawn_progress_stream<F, Fut>(intermediate_phase: &'static str, f: F) -> ProgressStream
+/// once it returns. `op_label` is the RPC name for log breadcrumbs
+/// (`"Basebackup"` / `"Rewind"`); `intermediate_phase` is the wire
+/// field on intermediate progress events (`"streaming"` / `"rewinding"`).
+/// The final phase is always `"done"`.
+///
+/// The completion / failure log lines are local to the node where the
+/// subprocess actually ran. The orchestrator on the other end of the
+/// stream already sees the error in its tonic response, but the worker
+/// side would otherwise have no breadcrumb at all — and the worker is
+/// where the operator is most likely to look first. See
+/// docs/incidents/2026-06-10-post-maintenance.md §1.
+fn spawn_progress_stream<F, Fut>(
+    op_label: &'static str,
+    intermediate_phase: &'static str,
+    f: F,
+) -> ProgressStream
 where
     F: FnOnce(tokio::sync::mpsc::Sender<Result<OpProgress, Status>>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -673,13 +687,19 @@ where
     tokio::spawn(async move {
         let result = f(driver_tx).await;
         let final_msg = match result {
-            Ok(()) => Ok(OpProgress {
-                phase: "done".to_string(),
-                bytes_done: 0,
-                bytes_total: 0,
-                message: String::new(),
-            }),
-            Err(e) => Err(Status::internal(format!("{intermediate_phase}: {e}"))),
+            Ok(()) => {
+                info!(op = op_label, "peer streaming op: completed");
+                Ok(OpProgress {
+                    phase: "done".to_string(),
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    message: String::new(),
+                })
+            }
+            Err(e) => {
+                warn!(op = op_label, err = %e, "peer streaming op: failed");
+                Err(Status::internal(format!("{intermediate_phase}: {e}")))
+            }
         };
         let _ = tx.send(final_msg).await;
     });
