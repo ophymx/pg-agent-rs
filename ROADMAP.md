@@ -84,6 +84,46 @@ schedule a switchover" from blocking adoption.
   `backend_flag` for noloadbalance.
   *Why now:* universal Patroni feature; users have muscle memory for it.
 
+### Recovery and reconciliation
+
+The flow that takes a broken or stale standby back to a healthy
+streaming state. Today this is mostly pgpool-driven and assumes the
+operator's environment is intact at the moment they need it most.
+
+- **`pg_agentctl cluster recover --target <id>`** *(S)* — first-class
+  reclone command. Dials the local daemon, which (on the current
+  primary) drives the same `recovery_1st_stage` orchestration pgpool
+  would have via `pcp_recovery_node`. Operator never has to debug
+  `~postgres/.pcppass` mid-incident — the daemon owns the PCP creds
+  and the typed RPC already exists (`PgAgentLocal.RecoveryFirstStage`).
+  Fails loudly with "run this on `<primary hostname>`" when the local
+  daemon isn't the primary. *Why now:* today the only operator lever
+  is `pcp_recovery_node`, which means recovery is gated on PCP-auth
+  config being intact — exactly when it's most likely to be a yak.
+
+- **Phantom-primary detection at startup** *(M)* — before opening
+  `/healthz` ready or announcing to pgpool, the agent queries peers
+  for their timeline. If any peer reports a higher timeline than the
+  local one, the agent refuses to come up as primary — either stops
+  PG and surfaces a degraded state, or auto-demotes via the standard
+  `follow_primary` flow. Bootstrap subtlety: handle "no peers
+  reachable at startup" without deadlocking (timeout + conservative
+  default — refuse to assert primary role unless at least one peer
+  agrees). *Why now:* a primary that was offline through a failover
+  and then came back has no reconciliation path that verifies "am I
+  still the primary?" — postgres just resumes whatever role its data
+  dir was in. Today the only signal the cluster has the wrong shape
+  is the operator running `cluster status` and noticing.
+
+- **`restore_wal` follows the current primary** *(S)* — today
+  `crates/pg-agent-core/src/walstore.rs` fetches archive WAL from
+  whichever peer the configuration named at startup. After a
+  promotion the *new* primary is the source of truth; the old one
+  may be offline or stale. The fetch should consult live cluster
+  state (peer pool / pgpool view), not a static peer ref. *Why now:*
+  any standby trying to catch up across a promotion will hammer the
+  old primary until the operator restarts it or rewrites config.
+
 ### Shared cluster state (the foundation switchover and pause need)
 
 Patroni gets free shared state from the DCS. We chose to avoid that
@@ -116,6 +156,17 @@ dependency, so we need a lightweight equivalent:
   --cluster` fans out and merges by timestamp. *Why now:* post-mortem
   today means tailing journalctl on three boxes; this collapses it to one
   command, no persistence cost.
+
+- **`cluster status` warns on multi-timeline primaries** *(S)* — when
+  the fan-out shows two nodes reporting role `primary` and they
+  disagree on timeline (one TL1, one TL2), print a `WARN: stale
+  primary on node <id> (TL<n>, current cluster is TL<m>)` line under
+  the table. Cheaper than the startup-detection item in "Recovery and
+  reconciliation" above and gives the operator a fast signal even
+  before that lands. *Why now:* diagnosing this state by hand means
+  per-node `pg_controldata` + `pg_waldump` comparison; `cluster
+  status` already fans out `GetStatus` and has everything it needs
+  to flag the divergence automatically.
 
 - **REST surface on the `/healthz` listener** *(M)* — extend to `/cluster`
   (current state), `/events?since=…`, `/config` (active runtime config),
