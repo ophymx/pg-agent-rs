@@ -360,7 +360,15 @@ fn format_status_cells(
     hostname: &str,
     s: &pg_agent_proto::pgagentpb::NodeStatus,
 ) -> [String; 8] {
-    let role = if s.is_in_recovery {
+    // `is_in_recovery` is only meaningful when we actually reached
+    // postgres. When PG is stopped or the systemd probe failed, the
+    // proto field is the agent's default `false` — printing "primary"
+    // for those would mask a down node as a real primary (and on a
+    // split-brain triage screen that's the worst possible default).
+    let pg_known = s.is_postgres_status_ok && s.is_postgres_running;
+    let role = if !pg_known {
+        "unknown"
+    } else if s.is_in_recovery {
         "standby"
     } else {
         "primary"
@@ -368,12 +376,12 @@ fn format_status_cells(
     let pg = service_state(s.is_postgres_running, s.is_postgres_status_ok);
     let pgpool = service_state(s.is_pgpool_running, s.is_pgpool_status_ok);
     let ready = if s.is_ready { "yes" } else { "no" };
-    let lag = if s.is_in_recovery {
+    let lag = if pg_known && s.is_in_recovery {
         format_lag_bytes(s.replication_lag_bytes)
     } else {
         "-".into()
     };
-    let repl_state = if s.is_in_recovery {
+    let repl_state = if pg_known && s.is_in_recovery {
         if s.replication_state.is_empty() {
             "unknown".into()
         } else {
@@ -1048,6 +1056,54 @@ quoted_with_spaces = '  spaces inside  '
         assert!(s.contains("1.5 KiB"));
         assert!(s.contains("unreachable nodes:"));
         assert!(s.contains("connect refused"));
+    }
+
+    #[test]
+    fn format_status_cells_role_is_unknown_when_pg_is_down() {
+        // Reachable peer, systemd probe succeeded, postgres NOT running.
+        // The `is_in_recovery` field is the agent's default `false`
+        // (the local query couldn't run), so naive role inference would
+        // say "primary". Must show "unknown" instead — otherwise a
+        // split-brain triage screen counts the down node as a primary.
+        let status = pg_agent_proto::pgagentpb::NodeStatus {
+            is_running: false,
+            is_in_recovery: false,
+            is_ready: false,
+            replication_lag_bytes: 0,
+            replication_state: String::new(),
+            is_postgres_running: false,
+            is_pgpool_running: true,
+            is_postgres_status_ok: true,
+            is_pgpool_status_ok: true,
+        };
+        let cells = format_status_cells(2, "pg2.local", &status);
+        assert_eq!(cells[2], "unknown", "role must not default to primary");
+        assert_eq!(cells[3], "stopped", "pg cell still reports stopped");
+        assert_eq!(cells[5], "no", "ready=no");
+        assert_eq!(cells[6], "-", "lag is `-` when role is unknown");
+        assert_eq!(cells[7], "-", "repl_state is `-` when role is unknown");
+    }
+
+    #[test]
+    fn format_status_cells_role_is_unknown_when_pg_status_probe_failed() {
+        // systemd probe itself failed (is_postgres_status_ok=false).
+        // We can't claim the node is "stopped" either — but we definitely
+        // can't claim it's a primary.
+        let status = pg_agent_proto::pgagentpb::NodeStatus {
+            is_running: false,
+            is_in_recovery: false,
+            is_ready: false,
+            replication_lag_bytes: 0,
+            replication_state: String::new(),
+            is_postgres_running: false,
+            is_pgpool_running: false,
+            is_postgres_status_ok: false,
+            is_pgpool_status_ok: false,
+        };
+        let cells = format_status_cells(3, "pg3.local", &status);
+        assert_eq!(cells[2], "unknown");
+        assert_eq!(cells[3], "unknown");
+        assert_eq!(cells[4], "unknown");
     }
 
     #[test]
