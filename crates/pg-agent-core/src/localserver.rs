@@ -35,12 +35,12 @@ use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
-    ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, ClusterStatusEntry,
-    ClusterStatusRequest, ClusterStatusResponse, EscalationRequest, FailoverRequest,
-    FollowPrimaryRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
+    ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, ClusterRecoverRequest,
+    ClusterStatusEntry, ClusterStatusRequest, ClusterStatusResponse, EscalationRequest,
+    FailoverRequest, FollowPrimaryRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
     GetPgpoolBackendsResponse, GetStatusRequest, ListMaintenanceRequest, ListMaintenanceResponse,
-    MaintenanceIntent as ProtoIntent, NodeConfigRequest, NodeConfigResponse, NodeStatus, OpResult,
-    PgpoolBackendEntry, RecoveryRequest, RemoteStartRequest, RestoreWalRequest,
+    MaintenanceIntent as ProtoIntent, NodeConfigRequest, NodeConfigResponse, NodeRef, NodeStatus,
+    OpResult, PgpoolBackendEntry, RecoveryRequest, RemoteStartRequest, RestoreWalRequest,
     RetryMaintenanceRequest, SkippedMaintenanceIntent,
 };
 use std::path::Path;
@@ -837,6 +837,86 @@ impl PgAgentLocal for LocalServer {
             repl_user: self.pg.repl_user.clone(),
             standbys: results,
         }))
+    }
+
+    /// `pg_agentctl cluster recover --target <id>` — operator-initiated
+    /// standby reclone. Same orchestration as pgpool's
+    /// `recovery_1st_stage_command` hook (which routes through
+    /// `pg_agentc recovery1`); different front door so the operator
+    /// doesn't need to debug PCP auth (`~postgres/.pcppass`) to
+    /// trigger a rebuild — the daemon already owns those credentials.
+    ///
+    /// Refuses on a node that's in recovery: a standby can't reclone
+    /// another standby, and the error message names the operation so
+    /// the caller can redirect.
+    ///
+    /// Resolves the local node as primary (its config-sourced
+    /// `NodeConfig` — same source of truth as `cluster init`) and the
+    /// target by pool id, then delegates to `recovery_first_stage`.
+    /// Idempotency-marker behaviour is inherited — if a successful
+    /// recovery has already been recorded for the same `(primary,
+    /// standby)` pair within the retention window, the call returns
+    /// `ok=true, message="…already processed…"` and does no work. The
+    /// operator can re-run after retention sweeps the marker, or delete
+    /// the marker file directly under `<state_dir>/replay/`.
+    async fn cluster_recover(
+        &self,
+        req: Request<ClusterRecoverRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        let req = req.into_inner();
+
+        let in_recovery =
+            self.db.is_in_recovery().await.map_err(|e| {
+                internal(anyhow::anyhow!("cluster_recover: check primary status: {e}"))
+            })?;
+        if in_recovery {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: "cluster_recover: local node is not the primary (in recovery); \
+                          run this on the current primary"
+                    .into(),
+            }));
+        }
+
+        let primary = self
+            .node_pool
+            .local_node()
+            .map_err(|e| internal(anyhow::anyhow!("cluster_recover: resolve local node: {e}")))?;
+
+        let standby = self.node_pool.node_by_id(req.target_node_id).map_err(|e| {
+            Status::invalid_argument(format!(
+                "cluster_recover: target node {}: {e}",
+                req.target_node_id
+            ))
+        })?;
+
+        if self.node_pool.is_local(standby) {
+            return Err(Status::invalid_argument(
+                "cluster_recover: target is the local node — reclone target must be a peer",
+            ));
+        }
+
+        info!(
+            target = %standby.hostname,
+            primary = %primary.hostname,
+            "cluster_recover: delegating to recovery_first_stage"
+        );
+
+        let inner_req = RecoveryRequest {
+            primary: Some(NodeRef {
+                id: primary.id,
+                hostname: primary.hostname.clone(),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+            standby: Some(NodeRef {
+                id: standby.id,
+                hostname: standby.hostname.clone(),
+                pg_port: 0,
+                pg_data: String::new(),
+            }),
+        };
+        self.recovery_first_stage(Request::new(inner_req)).await
     }
 
     /// `cluster status` — fan-out `GetStatus` to every pool member and
@@ -2672,6 +2752,79 @@ mod tests {
                 assert!(cause.contains("basebackup_failed"));
             }
         }
+    }
+
+    // ----- cluster_recover -----------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_recover_delegates_to_recovery_first_stage() {
+        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("recovery complete"));
+        // Same downstream effects as a direct recovery_first_stage call.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*db.created_slots.lock().unwrap(), vec!["node1".to_string()]);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.configure_standby_calls.load(Ordering::SeqCst), 1);
+        assert!(replay
+            .has("recovery_1st_stage", "primary=0,standby=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_refuses_when_local_is_replica() {
+        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        db.in_recovery.store(true, Ordering::SeqCst);
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("not the primary"));
+        // Nothing downstream touched.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_rejects_unknown_target_id() {
+        let (s, ..) = make_recovery_setup();
+        let err = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 99,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("target node 99"));
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_rejects_local_node_as_target() {
+        // Local is node 0; asking to reclone it from itself is nonsense.
+        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        let err = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("target is the local node"));
+        // No work happened.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
     }
 
     // ----- restore_wal ---------------------------------------------------

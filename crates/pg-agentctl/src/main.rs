@@ -94,6 +94,18 @@ enum ClusterCmd {
         #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
+    /// Reclone a target standby from this primary. Same orchestration
+    /// as pgpool's recovery_1st_stage_command hook; different front
+    /// door (routes through the local daemon, which owns PCP creds).
+    /// Must be invoked on the current primary; will refuse cleanly if
+    /// the local node is in recovery.
+    Recover {
+        /// Pool id of the standby to reclone.
+        #[arg(long)]
+        target: i32,
+        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
     // v1.x roadmap items (placeholders so the surface is reserved):
     // Pause      — set cluster paused=true via shared-state RPC
     // Resume     — clear pause flag
@@ -131,6 +143,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             ClusterCmd::Status { config } => {
                 cluster_status(config, cli.socket.as_deref(), cli.json).await
+            }
+            ClusterCmd::Recover { target, config } => {
+                cluster_recover(config, target, cli.socket.as_deref(), cli.json).await
             }
         },
     }
@@ -254,6 +269,52 @@ async fn cluster_status(
     }
 
     if resp.all_reachable {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// `cluster recover --target <id>` — ask the local daemon to drive a
+/// `recovery_1st_stage` against the named pool member. The daemon is
+/// the only side that needs PCP credentials / mTLS material; the CLI
+/// is a thin dialer. Same shape as `cluster init` / `cluster status`.
+async fn cluster_recover(
+    config_path: PathBuf,
+    target: i32,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::ClusterRecoverRequest;
+
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .cluster_recover(ClusterRecoverRequest {
+            target_node_id: target,
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("ClusterRecover RPC failed: {s}"))?
+        .into_inner();
+
+    if json {
+        let payload = serde_json::json!({
+            "ok":      resp.ok,
+            "message": resp.message,
+            "target":  target,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if resp.ok {
+        if resp.message.is_empty() {
+            println!("OK (node {target})");
+        } else {
+            println!("OK: {}", resp.message);
+        }
+    } else {
+        eprintln!("cluster recover: {}", resp.message);
+    }
+
+    if resp.ok {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::FAILURE)

@@ -123,6 +123,12 @@ message ClusterStatusResponse {
   repeated ClusterStatusEntry nodes         = 2;
 }
 
+message ClusterRecoverRequest {
+  // pgpool node id of the standby to reclone from this primary.
+  // The daemon resolves the primary itself (must be the local node).
+  int32 target_node_id = 1;
+}
+
 message GetPgpoolBackendsRequest {}
 
 // One row per pool member. Mirrors `ClusterStatusEntry`'s per-node
@@ -158,6 +164,11 @@ service PgAgentLocal {
 
   rpc ClusterInit       (ClusterInitRequest)       returns (ClusterInitResponse);
   rpc ClusterStatus     (ClusterStatusRequest)     returns (ClusterStatusResponse);
+  // Operator-initiated standby reclone — delegates to RecoveryFirstStage
+  // with the local node as primary. Distinct front door from pgpool's
+  // recovery_1st_stage_command hook (which routes through `pg_agentc
+  // recovery1`); same orchestration, no PCP creds required.
+  rpc ClusterRecover    (ClusterRecoverRequest)    returns (OpResult);
   rpc GetPgpoolBackends (GetPgpoolBackendsRequest) returns (GetPgpoolBackendsResponse);
 
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);
