@@ -442,15 +442,42 @@ impl Agent {
         info!("pg_agentd: serving");
 
         // Wait for shutdown OR first subsystem to exit.
+        //
+        // Race-correctness: when SIGTERM arrives, BOTH arms can become
+        // ready essentially simultaneously — the signal handler cancels
+        // the token, AND each subsystem (which is listening on the same
+        // token in its own loop) starts returning `Ok(())` cleanly.
+        // `tokio::select!` picks among ready arms at random, so the
+        // `join_next` arm can fire instead of `shutdown.cancelled()`.
+        // The `Ok(Ok(()))` branch must therefore distinguish "subsystem
+        // exited while shutdown was already in progress" (expected) from
+        // "subsystem exited cold" (the failure mode this watch arm
+        // exists to catch). Without the `is_cancelled()` check, every
+        // SIGTERM has a non-trivial chance of surfacing as a spurious
+        // `status=1/FAILURE` exit and getting bounced by
+        // `Restart=on-failure`. See the 2026-06-11 incident: parallel
+        // `pg-agent-rs` apt restarts cascaded into a split-brain
+        // because the spurious restarts gave pgpool's `failover_command`
+        // a window to fire.
         let outcome: anyhow::Result<()> = tokio::select! {
             _ = shutdown.cancelled() => {
                 info!("pg_agentd: shutdown signal received");
                 Ok(())
             }
             Some(res) = js.join_next() => match res {
-                Ok(Ok(())) => Err(anyhow::anyhow!(
-                    "subsystem exited unexpectedly before shutdown"
-                )),
+                Ok(Ok(())) => {
+                    if shutdown.is_cancelled() {
+                        info!(
+                            "pg_agentd: subsystem returned after shutdown signal — \
+                             graceful drain"
+                        );
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "subsystem exited unexpectedly before shutdown"
+                        ))
+                    }
+                }
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(e.into()),
             }
@@ -1512,6 +1539,79 @@ mod tests {
             .expect("serve did not exit within 2s of shutdown")
             .unwrap();
         assert!(res.is_ok(), "serve returned {res:?}");
+    }
+
+    /// Regression for the 2026-06-11 shutdown race: `tokio::select!`
+    /// between `shutdown.cancelled()` and `js.join_next()` could fire
+    /// the `join_next` arm even when shutdown was already in progress,
+    /// returning `Err("subsystem exited unexpectedly")` and triggering
+    /// systemd's `Restart=on-failure`. The fix checks
+    /// `shutdown.is_cancelled()` inside the `Ok(Ok(()))` match arm.
+    /// To maximise the chance of catching any regression in the
+    /// select arms, this test cancels with zero sleep (subsystems will
+    /// race serve() to the select) and loops several times.
+    #[tokio::test]
+    async fn serve_returns_ok_under_sigterm_race() {
+        for iter in 0..16 {
+            let tmp = tempfile::tempdir().unwrap();
+            let sock = tmp.path().join("pg_agentd.sock");
+            let serve = ServeSettings {
+                unix_socket: sock.to_string_lossy().into_owned(),
+                agent_port: 0,
+                peer_listen_addr: "127.0.0.1:0".into(),
+                tls: crate::config::TlsConfig::default(),
+                tls_configured: false,
+                has_remote_peers: false,
+                dev_mode: true,
+                healthz: HealthzSettings {
+                    enabled: true,
+                    listen_addr: "127.0.0.1:0".into(),
+                },
+            };
+            let listeners = Listeners::bind(&serve).await.unwrap();
+            let pg = PostgresRuntime {
+                port: 5432,
+                data_dir: PathBuf::from("/var/lib/postgresql/17/main"),
+                repl_user: "repl_user".into(),
+            };
+            let pool = NodePool {
+                members: vec![crate::config::NodeConfig {
+                    id: 0,
+                    hostname: "localhost".into(),
+                }],
+                local_node_id: 0,
+            };
+            let agent = Agent::new(
+                make_deps(Arc::new(StubDb::default()), Arc::new(StubSd::default())),
+                Options {
+                    serve,
+                    node_pool: pool,
+                    postgres: pg,
+                    maintenance_store: Arc::new(StubMaint),
+                    maintenance_sweep_interval: Duration::from_secs(30),
+                    phantom_check_required_peers:
+                        crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+                    supervisor_pgpool_enabled:
+                        crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                    cert_reloader: None,
+                },
+            );
+            let shutdown = CancellationToken::new();
+            let s = shutdown.clone();
+            let handle = tokio::spawn(async move { agent.serve(listeners, s).await });
+            // No sleep — the subsystems and the outer select! both
+            // race to observe the cancellation.
+            shutdown.cancel();
+            let res = tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("serve did not exit within 2s of shutdown")
+                .unwrap();
+            assert!(
+                res.is_ok(),
+                "serve returned {res:?} on iteration {iter} — \
+                 race regression: subsystem-exit arm fired during shutdown"
+            );
+        }
     }
 
     #[tokio::test]

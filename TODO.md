@@ -25,16 +25,17 @@ Two related issues around handoff's replication-slot management on the new prima
 
 ### Design: pre-execution cluster-state validation pattern
 
-(Generalisation of review HIGH #6 — pgpool may pick a different `new_main` than the handoff target — to the broader principle.)
+(Generalisation of review HIGH #6 to the broader principle. **Confirmed in production:** on 2026-06-11, pgpool's `failover_command` announced `detached=db1, new_main=db0` after db1's pg_agentd briefly restarted due to the shutdown race above. db1 was actually still primary and healthy — pgpool's quorum just couldn't reach the daemon during the restart window. Our handler trusted pgpool and promoted db0, creating split-brain.)
 
-- **Where:** every cluster-state-changing RPC handler (`failover`, `follow_primary`, `cluster_recover`, `cluster_handoff`, future switchover/pause/resume). Today each handler has ad-hoc preflight checks; some are comprehensive (`cluster_handoff`'s six refusal cases) and some assume the caller did the right thing (`failover` trusts pgpool's `new_main` pick).
-- **Symptom:** when the cluster state has shifted between when the command was *decided* (operator typed `cluster recover`, pgpool noticed primary down) and when the handler runs, the handler can act on stale assumptions. Examples: pgpool fires `failover_command` after a handoff just completed (handoff's old primary is now a standby; failover tries to drop the standby's active slot → "slot active" errors and a stuck maintenance intent). Or: operator runs `cluster recover --target N` against a target that pgpool already auto-attached after a different cluster event.
+- **Where:** every cluster-state-changing RPC handler (`failover`, `follow_primary`, `cluster_recover`, `cluster_handoff`, future switchover/pause/resume). Today each handler has ad-hoc preflight checks; some are comprehensive (`cluster_handoff`'s six refusal cases) and some assume the caller did the right thing (`failover` trusts pgpool's `new_main` pick without verifying the announced `detached` is actually down).
+- **Concrete failover hole:** when pgpool announces `detached=X, new_main=Y, old_primary=X` with `X == old_primary`, the handler MUST verify that X is actually down before promoting Y. Check `peer.get_status(detached)` and refuse if `is_postgres_running && !is_in_recovery` — the supposed "failed" primary is alive and well, so pgpool's announcement is wrong and promoting Y would create split-brain. This single check would have prevented the 2026-06-11 incident.
 - **Fix sketch:** lift a shared `validate_cluster_preconditions(intent: ClusterIntent) -> Result<(), ValidationError>` that every state-changing handler calls before the destructive phases. The intent describes what's about to happen (target, expected current state, etc.) and the validator checks invariants:
   - local node's role matches the intent's expectation of it (primary vs standby)
   - target's reachability + role match (e.g. recover expects standby-down-or-broken; handoff expects healthy standby; failover expects standby-about-to-promote)
+  - **`detached` is actually down** when the intent says so (the missing check above)
   - no conflicting in-flight orchestration (already done structurally via `inflight.list(InProgress)` in 0.6.0; this generalises to "no recent terminal orchestration that this command would conflict with")
   - slot state consistency (e.g. failover dropping a slot expects the slot to NOT be active)
-- **Why now:** every command added past 0.6.0 will re-invent its own preflight. A shared validator means the consistency story is consistent across handlers and one place to look when something refuses.
+- **Why now:** every command added past 0.6.0 will re-invent its own preflight. A shared validator means the consistency story is consistent across handlers and one place to look when something refuses. The 2026-06-11 split-brain wouldn't have happened with the `detached`-is-actually-down check alone.
 
 ## Deferred (acknowledged, low priority, listed so they don't get lost)
 
