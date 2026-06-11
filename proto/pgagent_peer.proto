@@ -18,6 +18,7 @@ message StartRequest {}
 message StopRequest {}
 message ReloadRequest {}
 message ReloadPgpoolRequest {}
+message StartPgpoolRequest {}
 message PromoteRequest {}
 
 message CreateSlotRequest { string slot_name = 1; }
@@ -61,6 +62,11 @@ service PgAgentPeer {
   rpc Stop             (StopRequest)             returns (OpResult);
   rpc Reload           (ReloadRequest)           returns (OpResult);
   rpc ReloadPgpool     (ReloadPgpoolRequest)     returns (OpResult);
+  // StartUnit on the peer's pgpool2.service. Used by `cluster_recover`
+  // after recovery_first_stage to bring pgpool back up on the freshly
+  // re-cloned target. Idempotent — starting an already-active unit is
+  // a no-op.
+  rpc StartPgpool      (StartPgpoolRequest)      returns (OpResult);
   rpc Promote          (PromoteRequest)          returns (OpResult);
   rpc CreateSlot       (CreateSlotRequest)       returns (OpResult);
   rpc DropSlot         (DropSlotRequest)         returns (OpResult);

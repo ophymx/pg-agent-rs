@@ -968,7 +968,79 @@ impl PgAgentLocal for LocalServer {
                 pg_data: String::new(),
             }),
         };
-        self.recovery_first_stage(Request::new(inner_req)).await
+        let rec_resp = self
+            .recovery_first_stage(Request::new(inner_req))
+            .await?
+            .into_inner();
+        if !rec_resp.ok {
+            // recovery_first_stage handled cleanup; just surface.
+            return Ok(Response::new(rec_resp));
+        }
+
+        // Post-recovery: bring the target back online.
+        //
+        // pgpool's own pcp_recovery_node flow would drive these via
+        // recovery_2nd_stage + pgpool_remote_start; cluster_recover
+        // doesn't go through pgpool so they don't happen automatically.
+        // Operator otherwise has to ssh to the target, `systemctl start
+        // postgresql`, then back to a pgpool-running host and
+        // `pcp_attach_node`. That's three nodes worth of yak-shave in
+        // the middle of recovery — fold it into one RPC.
+        //
+        // Each post-step is best-effort: a failure does NOT roll back
+        // recovery_first_stage (it already succeeded) and does NOT
+        // fail the whole RPC, because the operator can retry these
+        // steps independently. The final message reports which steps
+        // worked.
+        let mut post_status = Vec::with_capacity(3);
+
+        info!(target = %standby.hostname, "cluster_recover: starting postgres on target");
+        match peer.start().await {
+            Ok(()) => post_status.push("postgres started".to_string()),
+            Err(e) => {
+                warn!(
+                    target = %standby.hostname,
+                    ?e,
+                    "cluster_recover: peer start (postgres) failed"
+                );
+                post_status.push(format!("postgres start failed: {e}"));
+            }
+        }
+
+        info!(target = %standby.hostname, "cluster_recover: starting pgpool on target");
+        match peer.start_pgpool().await {
+            Ok(()) => post_status.push("pgpool started".to_string()),
+            Err(e) => {
+                warn!(
+                    target = %standby.hostname,
+                    ?e,
+                    "cluster_recover: peer start_pgpool failed (target's local supervisor will retry)"
+                );
+                post_status.push(format!("pgpool start failed: {e}"));
+            }
+        }
+
+        info!(target_id = standby.id, "cluster_recover: pgpool attach_node");
+        match self.pcp.attach_node(standby.id).await {
+            Ok(()) => post_status.push(format!("attached node {} in pgpool", standby.id)),
+            Err(e) => {
+                warn!(
+                    target_id = standby.id,
+                    ?e,
+                    "cluster_recover: pcp attach_node failed; operator may need pcp_attach_node manually"
+                );
+                post_status.push(format!("pgpool attach failed: {e}"));
+            }
+        }
+
+        Ok(Response::new(OpResult {
+            ok: true,
+            message: format!(
+                "recovery complete for {}; {}",
+                standby.hostname,
+                post_status.join("; ")
+            ),
+        }))
     }
 
     /// `cluster status` — fan-out `GetStatus` to every pool member and
@@ -1792,6 +1864,8 @@ mod tests {
     struct StubPeerClient {
         start_calls: AtomicUsize,
         start_fails: AtomicBool,
+        start_pgpool_calls: AtomicUsize,
+        start_pgpool_fails: AtomicBool,
         /// Map wal_file → content the peer "has" in its archive.
         wal_content: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
         /// Make fetch_wal err out (transport/RPC failure shape).
@@ -1849,6 +1923,13 @@ mod tests {
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             if self.start_fails.load(Ordering::SeqCst) {
                 anyhow::bail!("stub peer start boom");
+            }
+            Ok(())
+        }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            self.start_pgpool_calls.fetch_add(1, Ordering::SeqCst);
+            if self.start_pgpool_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub peer start_pgpool boom");
             }
             Ok(())
         }
@@ -2675,7 +2756,8 @@ mod tests {
 
     /// Default setup: local node (id 0) is the primary; peer1 (id 1) is
     /// the standby being recovered. Returns the StubPeerClient that
-    /// represents peer1 so tests can configure it.
+    /// represents peer1 so tests can configure it, plus the StubPcp so
+    /// cluster_recover assertions can inspect attach_node calls.
     #[allow(clippy::type_complexity)]
     fn make_recovery_setup() -> (
         LocalServer,
@@ -2684,16 +2766,17 @@ mod tests {
         Arc<StubMaint>,
         Arc<StubReplay>,
         Arc<StubPeerClient>,
+        Arc<StubPcp>,
     ) {
-        let (s, db, peers, maint, _wal, replay, _pcp) = make_server();
+        let (s, db, peers, maint, _wal, replay, pcp) = make_server();
         let standby_client = Arc::new(StubPeerClient::default());
         peers.override_client(1, standby_client.clone());
-        (s, db, peers, maint, replay, standby_client)
+        (s, db, peers, maint, replay, standby_client, pcp)
     }
 
     #[tokio::test]
     async fn recovery_first_stage_happy_path() {
-        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp) = make_recovery_setup();
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
             .await
@@ -2718,7 +2801,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_skips_when_replay_marker_present() {
-        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp) = make_recovery_setup();
         replay.mark("recovery_1st_stage", "primary=0,standby=1");
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
@@ -2755,7 +2838,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_basebackup_failure_drops_slot() {
-        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp) = make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
 
         let err = s
@@ -2774,7 +2857,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_configure_standby_failure_drops_slot() {
-        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp) = make_recovery_setup();
         standby
             .configure_standby_fails
             .store(true, Ordering::SeqCst);
@@ -2790,7 +2873,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_drop_slot_failure_queues_maintenance() {
-        let (s, db, _peers, maint, _replay, standby) = make_recovery_setup();
+        let (s, db, _peers, maint, _replay, standby, _pcp) = make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
         db.drop_slot_fails.store(true, Ordering::SeqCst);
 
@@ -2815,7 +2898,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_delegates_to_recovery_first_stage() {
-        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, pcp) = make_recovery_setup();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 1,
@@ -2835,11 +2918,69 @@ mod tests {
             .has("recovery_1st_stage", "primary=0,standby=1")
             .await
             .unwrap());
+        // Post-recovery: PG started on target, pgpool started on target,
+        // node attached in pgpool.
+        assert_eq!(standby.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.start_pgpool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+        // Message echoes the post-recovery progress.
+        assert!(resp.message.contains("postgres started"));
+        assert!(resp.message.contains("pgpool started"));
+        assert!(resp.message.contains("attached node 1"));
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_continues_when_post_steps_fail() {
+        // recovery_first_stage succeeds; peer.start fails; pgpool start
+        // fails; pcp attach fails. We must still return ok=true (the
+        // recovery itself was destructive enough that rolling back is
+        // worse than surfacing partial completion to the operator) and
+        // report each failure in the message.
+        let (s, _db, _peers, _maint, _replay, standby, pcp) = make_recovery_setup();
+        standby.start_fails.store(true, Ordering::SeqCst);
+        standby.start_pgpool_fails.store(true, Ordering::SeqCst);
+        pcp.attach_fails.store(true, Ordering::SeqCst);
+
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "recovery_1st_stage succeeded; post-step failures must not fail the RPC");
+        assert!(resp.message.contains("postgres start failed"));
+        assert!(resp.message.contains("pgpool start failed"));
+        assert!(resp.message.contains("pgpool attach failed"));
+        // All three were attempted (best-effort, no short-circuit on failure).
+        assert_eq!(standby.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.start_pgpool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_skips_post_steps_when_recovery_fails() {
+        // recovery_first_stage hits basebackup failure → propagates Err.
+        // Post-recovery steps must NOT run — there's nothing to start.
+        let (s, _db, _peers, _maint, _replay, standby, pcp) = make_recovery_setup();
+        standby.basebackup_fails.store(true, Ordering::SeqCst);
+        let err = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(standby.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.start_pgpool_calls.load(Ordering::SeqCst), 0);
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn cluster_recover_refuses_when_local_is_replica() {
-        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp) = make_recovery_setup();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -2873,7 +3014,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_recover_rejects_local_node_as_target() {
         // Local is node 0; asking to reclone it from itself is nonsense.
-        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp) = make_recovery_setup();
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 0,
@@ -2893,7 +3034,7 @@ mod tests {
         // Operator forgot --stop-target-pg; target reports PG running.
         // We must refuse cleanly here, not let recovery_first_stage run
         // headlong into the deeper basebackup safety check.
-        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp) = make_recovery_setup();
         standby.mark_running(); // is_postgres_running=true on the peer's get_status
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -2918,7 +3059,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_stops_target_pg_when_flag_set() {
-        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp) = make_recovery_setup();
         standby.mark_running();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -2944,7 +3085,7 @@ mod tests {
         // Flag set, but target already reports PG stopped → no peer.stop
         // (idempotent, but skipping avoids the systemd D-Bus round-trip
         // for no reason).
-        let (s, _db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, _pcp) = make_recovery_setup();
         // standby.is_running default false; do not mark_running().
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {

@@ -40,7 +40,7 @@ use pg_agent_proto::pgagentpb::{
     BasebackupRequest, ConfigureStandbyRequest, CreateSlotRequest, DropSlotRequest,
     FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse, NodeStatus,
     OpProgress, OpResult, PromoteRequest, ReloadPgpoolRequest, ReloadRequest, RemoveVipRequest,
-    RewindRequest, StartRequest, StopRequest, WalChunk,
+    RewindRequest, StartPgpoolRequest, StartRequest, StopRequest, WalChunk,
 };
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -412,6 +412,15 @@ impl PgAgentPeer for PeerServer {
     ) -> Result<Response<OpResult>, Status> {
         info!("peer: ReloadPgpool");
         self.sd.reload_or_restart_pgpool().await.map_err(internal)?;
+        Ok(Response::new(ok()))
+    }
+
+    async fn start_pgpool(
+        &self,
+        _req: Request<StartPgpoolRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        info!("peer: StartPgpool");
+        self.sd.start_pgpool().await.map_err(internal)?;
         Ok(Response::new(ok()))
     }
 

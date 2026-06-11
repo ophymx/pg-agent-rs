@@ -958,6 +958,9 @@ mod tests {
         async fn start(&self) -> anyhow::Result<()> {
             unreachable!()
         }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
         async fn stop(&self) -> anyhow::Result<()> {
             unreachable!()
         }

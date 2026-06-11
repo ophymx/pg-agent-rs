@@ -23,7 +23,8 @@ use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
     pg_agent_peer_client::PgAgentPeerClient, BasebackupRequest, ConfigureStandbyRequest,
     DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse,
-    NodeStatus, OpProgress, PromoteRequest, RewindRequest, StartRequest, StopRequest,
+    NodeStatus, OpProgress, PromoteRequest, RewindRequest, StartPgpoolRequest, StartRequest,
+    StopRequest,
 };
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -79,6 +80,12 @@ pub trait PeerClient: Send + Sync {
     /// hook). Surface non-`ok` `OpResult` as `Err` so the caller doesn't
     /// have to inspect the payload.
     async fn start(&self) -> anyhow::Result<()>;
+
+    /// StartUnit on the peer's `pgpool2.service` via its
+    /// `Systemd::start_pgpool`. Used by `LocalServer::ClusterRecover`
+    /// after recovery_first_stage to bring pgpool back up on the
+    /// freshly re-cloned target. Idempotent.
+    async fn start_pgpool(&self) -> anyhow::Result<()>;
 
     /// Stream a WAL segment from the peer's archive. Returns
     ///   - `Ok(Some(reader))` — segment found; the reader streams the
@@ -395,6 +402,21 @@ impl PeerClient for PeerChannel {
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer start: {}", resp.message);
+        }
+        Ok(())
+    }
+
+    async fn start_pgpool(&self) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let mut req = tonic::Request::new(StartPgpoolRequest {});
+        req.set_timeout(LONG_RPC_TIMEOUT);
+        let resp = client
+            .start_pgpool(req)
+            .await
+            .map_err(|s| anyhow::anyhow!("peer start_pgpool: {}", s.message()))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer start_pgpool: {}", resp.message);
         }
         Ok(())
     }
