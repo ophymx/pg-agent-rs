@@ -1374,20 +1374,62 @@ impl PgAgentLocal for LocalServer {
                 ),
             }));
         }
-        if target_status.replication_lag_bytes > crate::config::MAX_HANDOFF_LAG_BYTES
-            && !req.allow_lag
-        {
-            return Ok(Response::new(OpResult {
-                ok: false,
-                message: format!(
-                    "cluster_handoff: target {} replication lag {} bytes exceeds threshold {} \
-                     (one WAL segment); rerun with --allow-lag to override (will accept data loss \
-                     for writes between the standby's replay LSN and the primary's current LSN)",
-                    target.hostname,
-                    target_status.replication_lag_bytes,
-                    crate::config::MAX_HANDOFF_LAG_BYTES
-                ),
-            }));
+        // Lag pre-check: are we about to silently lose writes by
+        // promoting a target that's behind us?
+        //
+        // The wire field `replication_lag_bytes` measures the
+        // standby's *replay-vs-receive* (how far PG's recovery is
+        // behind WAL it has already pulled from us). That number is
+        // ZERO when the WAL receiver is disconnected — exactly the
+        // failure mode we need to catch — so we can't trust it for
+        // the "is target caught up to local primary?" question.
+        //
+        // The correct measure is `local.current_wal_lsn -
+        // target.last_wal_replay_lsn`. NodeStatus.current_wal_lsn
+        // already returns `pg_current_wal_lsn()` when populated from
+        // a primary and `pg_last_wal_replay_lsn()` when populated
+        // from a standby (added in 0.4.0 for the split-brain LEAD
+        // marker) — so we already have both halves on the wire.
+        if !req.allow_lag {
+            let local_lsn = self.db.current_wal_lsn().await.map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "cluster_handoff: local current_wal_lsn: {e}"
+                ))
+            })?;
+            let target_replay_lsn = target_status.current_wal_lsn;
+            // 0 from either side means the probe failed or the peer is
+            // a pre-feature build; we can't safely measure lag in
+            // either case. Make the operator opt in via --allow-lag.
+            if local_lsn == 0 || target_replay_lsn == 0 {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "cluster_handoff: cannot measure lag — local current_wal_lsn={} \
+                         target last_replay_lsn={} (a 0 value means the LSN probe failed \
+                         or the peer is on a pre-0.4.0 build); rerun with --allow-lag to \
+                         override (will accept unknown data loss)",
+                        local_lsn, target_replay_lsn
+                    ),
+                }));
+            }
+            let lag = local_lsn.saturating_sub(target_replay_lsn);
+            if lag > crate::config::MAX_HANDOFF_LAG_BYTES as u64 {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "cluster_handoff: target {} is {} bytes behind local primary \
+                         (local LSN {:X}/{:08X}, target replay LSN {:X}/{:08X}); exceeds \
+                         threshold {} bytes (one WAL segment); rerun with --allow-lag to \
+                         override (will accept data loss for writes between the standby's \
+                         replay LSN and the primary's current LSN)",
+                        target.hostname,
+                        lag,
+                        local_lsn >> 32, local_lsn as u32,
+                        target_replay_lsn >> 32, target_replay_lsn as u32,
+                        crate::config::MAX_HANDOFF_LAG_BYTES
+                    ),
+                }));
+            }
         }
 
         // ----- Begin journal entry (single-flight gate) ---------------
@@ -2660,6 +2702,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
+    /// Plausible non-zero WAL position used to satisfy the handoff lag
+    /// check's "cannot measure lag" guard (0 from either side is
+    /// treated as "probe failed / pre-feature peer"). Tests that
+    /// exercise lag behaviour pick offsets relative to this.
+    const BASE_LSN: u64 = 0x1_0000_0000;
+
     // ----- FakeNodeInfo ----------------------------------------------------
 
     struct FakeNodeInfo;
@@ -2701,6 +2749,10 @@ mod tests {
         drop_slot_fails: AtomicBool,
         created_repl_roles: StdMutex<Vec<String>>,
         create_repl_role_fails: AtomicBool,
+        /// Local PG's `pg_current_wal_lsn()` value. Tests set this to a
+        /// non-zero value when exercising the handoff lag check so the
+        /// "cannot measure lag" guard doesn't trip.
+        current_wal_lsn: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait]
@@ -2733,7 +2785,7 @@ mod tests {
             Ok(0)
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
-            Ok(0)
+            Ok(self.current_wal_lsn.load(Ordering::SeqCst))
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             Ok(ReplicationLag::default())
@@ -2992,6 +3044,10 @@ mod tests {
         is_running: AtomicBool,
         is_in_recovery: AtomicBool,
         replication_lag_bytes: AtomicI64,
+        /// Peer's `current_wal_lsn` (on a standby = `pg_last_wal_replay_lsn()`).
+        /// Used by the handoff lag check after 0.6.1; tests set this
+        /// to a non-zero value to bypass the "cannot measure lag" guard.
+        current_wal_lsn: std::sync::atomic::AtomicU64,
         get_status_fails: AtomicBool,
         stop_calls: AtomicUsize,
         stop_fails: AtomicBool,
@@ -3029,6 +3085,11 @@ mod tests {
         }
         fn set_lag(&self, bytes: i64) -> &Self {
             self.replication_lag_bytes.store(bytes, Ordering::SeqCst);
+            self
+        }
+        /// Standby's `pg_last_wal_replay_lsn()` as a 64-bit value.
+        fn set_replay_lsn(&self, lsn: u64) -> &Self {
+            self.current_wal_lsn.store(lsn, Ordering::SeqCst);
             self
         }
     }
@@ -3094,6 +3155,7 @@ mod tests {
             let running = self.is_running.load(Ordering::SeqCst);
             let in_recovery = self.is_in_recovery.load(Ordering::SeqCst);
             let lag = self.replication_lag_bytes.load(Ordering::SeqCst);
+            let lsn = self.current_wal_lsn.load(Ordering::SeqCst);
             Ok(NodeStatus {
                 is_running: running,
                 is_in_recovery: in_recovery,
@@ -3105,7 +3167,7 @@ mod tests {
                 is_postgres_status_ok: true,
                 is_pgpool_status_ok: true,
                 timeline_id: 0,
-                current_wal_lsn: 0,
+                current_wal_lsn: lsn,
             })
         }
         async fn stop(&self) -> anyhow::Result<()> {
@@ -4350,9 +4412,11 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_happy_path() {
-        let (s, _db, _peers, _maint, _replay, peer, pcp, sd, standby, inflight) =
+        let (s, db, _peers, _maint, _replay, peer, pcp, sd, standby, inflight) =
             make_recovery_setup();
-        peer.mark_standby().set_lag(0);
+        // Both sides synced at BASE_LSN → lag = 0; gate passes.
+        db.current_wal_lsn.store(BASE_LSN, Ordering::SeqCst);
+        peer.mark_standby().set_lag(0).set_replay_lsn(BASE_LSN);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
                 target_node_id: 1,
@@ -4475,9 +4539,12 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_refuses_when_lag_exceeds_threshold() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
-        peer.mark_standby()
-            .set_lag(crate::config::MAX_HANDOFF_LAG_BYTES + 1);
+        let (s, db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) =
+            make_recovery_setup();
+        // Local primary is 16 MiB + 1 ahead of target's replay LSN.
+        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
+        db.current_wal_lsn.store(BASE_LSN + max + 1, Ordering::SeqCst);
+        peer.mark_standby().set_replay_lsn(BASE_LSN);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
                 target_node_id: 1,
@@ -4492,14 +4559,100 @@ mod tests {
             "expected --allow-lag hint, got: {}",
             resp.message
         );
+        assert!(
+            resp.message.contains("bytes behind local primary"),
+            "expected accurate primary→standby framing, got: {}",
+            resp.message
+        );
         assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
+    async fn cluster_handoff_catches_silent_lag_when_receive_lsn_is_stale() {
+        // The motivating bug: a standby whose WAL receiver has been
+        // disconnected reports replication_lag_bytes=0 (replay caught
+        // up to what was received) but is missing every primary write
+        // since the disconnect. The OLD check (which used
+        // replication_lag_bytes) would have accepted the handoff and
+        // silently lost data. The NEW check compares
+        // `local.current_wal_lsn` to `target.current_wal_lsn`
+        // (=last_replay_lsn on a standby), so it sees the truth.
+        let (s, db, _peers, _maint, _replay, peer, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
+        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
+        // Primary has written far ahead.
+        db.current_wal_lsn
+            .store(BASE_LSN + max + 1024, Ordering::SeqCst);
+        // Target reports zero replication_lag_bytes (receiver was
+        // disconnected; replay caught up to its stale receive_lsn) but
+        // its actual replay LSN is far behind local.
+        peer.mark_standby().set_lag(0).set_replay_lsn(BASE_LSN);
+        let resp = s
+            .cluster_handoff(Request::new(ClusterHandoffRequest {
+                target_node_id: 1,
+                allow_lag: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok, "old behaviour would have accepted this silently");
+        assert!(
+            resp.message.contains("bytes behind local primary"),
+            "expected the new framing in the refusal: {}",
+            resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_handoff_refuses_when_lsn_probe_unknown() {
+        // local.current_wal_lsn=0 OR target.current_wal_lsn=0 means
+        // the LSN data isn't trustworthy — refuse rather than guess.
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
+        peer.mark_standby(); // do NOT set_replay_lsn
+        let resp = s
+            .cluster_handoff(Request::new(ClusterHandoffRequest {
+                target_node_id: 1,
+                allow_lag: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("cannot measure lag"),
+            "expected 'cannot measure lag' refusal, got: {}",
+            resp.message
+        );
+        assert!(resp.message.contains("--allow-lag"));
+    }
+
+    #[tokio::test]
+    async fn cluster_handoff_unknown_lsns_with_allow_lag_proceed() {
+        // Operator's "I know what I'm doing" escape hatch: even with
+        // both LSNs unknown, --allow-lag lets the handoff proceed.
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) =
+            make_recovery_setup();
+        peer.mark_standby();
+        let resp = s
+            .cluster_handoff(Request::new(ClusterHandoffRequest {
+                target_node_id: 1,
+                allow_lag: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn cluster_handoff_proceeds_with_high_lag_when_flag_set() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
-        peer.mark_standby()
-            .set_lag(crate::config::MAX_HANDOFF_LAG_BYTES + 1);
+        let (s, db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) =
+            make_recovery_setup();
+        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
+        db.current_wal_lsn.store(BASE_LSN + max + 1, Ordering::SeqCst);
+        peer.mark_standby().set_replay_lsn(BASE_LSN);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
                 target_node_id: 1,
@@ -4515,8 +4668,10 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_falls_back_to_basebackup_when_rewind_fails() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, standby, _inflight) = make_recovery_setup();
-        peer.mark_standby();
+        let (s, db, _peers, _maint, _replay, peer, _pcp, _sd, standby, _inflight) =
+            make_recovery_setup();
+        db.current_wal_lsn.store(BASE_LSN, Ordering::SeqCst);
+        peer.mark_standby().set_replay_lsn(BASE_LSN);
         standby.rewind_fails.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -4534,8 +4689,10 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_drops_slot_when_both_data_copies_fail() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, standby, _inflight) = make_recovery_setup();
-        peer.mark_standby();
+        let (s, db, _peers, _maint, _replay, peer, _pcp, _sd, standby, _inflight) =
+            make_recovery_setup();
+        db.current_wal_lsn.store(BASE_LSN, Ordering::SeqCst);
+        peer.mark_standby().set_replay_lsn(BASE_LSN);
         standby.rewind_fails.store(true, Ordering::SeqCst);
         standby.basebackup_fails.store(true, Ordering::SeqCst);
         let resp = s
@@ -4641,8 +4798,10 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_attach_failure_does_not_fail_rpc() {
-        let (s, _db, _peers, _maint, _replay, peer, pcp, _sd, _standby, _inflight) = make_recovery_setup();
-        peer.mark_standby();
+        let (s, db, _peers, _maint, _replay, peer, pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
+        db.current_wal_lsn.store(BASE_LSN, Ordering::SeqCst);
+        peer.mark_standby().set_replay_lsn(BASE_LSN);
         pcp.attach_fails.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {

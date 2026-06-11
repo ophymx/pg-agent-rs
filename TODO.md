@@ -1,0 +1,63 @@
+# TODO
+
+Open work that surfaced during recent feature shipping but isn't yet
+scheduled. Items roughly in priority order within each section.
+
+## Active
+
+### Slot lifecycle: drop/create boundary cases
+
+Two related issues around handoff's replication-slot management on the new primary. Both have narrow trigger conditions but the fixes are small and defensive.
+
+**(a) Both-paths-fail drops the slot before recovery can use it**
+
+- **Where:** `crates/pg-agent-core/src/localserver.rs` cluster_handoff `if let Err(bb_err)` branch.
+- **Symptom:** when rewind AND basebackup both fail, the handler drops the slot on the new primary as cleanup. But $PGDATA is empty (basebackup wiped it) AND the new primary now has no slot pinning its WAL. By the time the operator runs `cluster recover --target N --stop-target-pg`, segments needed for a cheap rebuild may have been recycled.
+- **Likelihood:** both data-copy paths failing is uncommon (usually a shared cause: disk/network), but the worst-case time-to-recovery makes the cleanup hurtful.
+- **Fix sketch:** keep the slot until cluster recover completes (or operator-confirms via `ops abandon`). The slot pin is doing useful work even when handoff has given up.
+
+**(b) `create_slot` idempotency masks stale `restart_lsn`**
+
+- **Where:** `crates/pg-agent-core/src/peerserver.rs:435-447`, `localdb.rs:147-164`.
+- **Symptom:** server-side `create_slot` treats SQLSTATE 42710 (duplicate_object) as success without touching the existing slot. If a prior failed handoff left a slot with an old `restart_lsn`, a re-run silently reuses it. If rewind succeeds (doesn't use the slot during copy), local later streams via `primary_slot_name='nodeX'` pointing at a slot whose `restart_lsn` predates available WAL on the new primary → "requested WAL segment has already been removed."
+- **Likelihood:** narrow path — requires a prior handoff to have failed *after* create_slot succeeded *but before* the local node started streaming, then a re-run where rewind succeeds (basebackup would have implicitly refreshed the slot). Possible but unusual.
+- **Fix sketch:** drop-then-create in the RPC (always reset `restart_lsn` to current), OR have the caller inspect the existing slot's `restart_lsn` and decide whether to drop. (a) and (b) compose: if the RPC owns the lifecycle correctly, both stop being problems.
+
+### Design: pre-execution cluster-state validation pattern
+
+(Generalisation of review HIGH #6 — pgpool may pick a different `new_main` than the handoff target — to the broader principle.)
+
+- **Where:** every cluster-state-changing RPC handler (`failover`, `follow_primary`, `cluster_recover`, `cluster_handoff`, future switchover/pause/resume). Today each handler has ad-hoc preflight checks; some are comprehensive (`cluster_handoff`'s six refusal cases) and some assume the caller did the right thing (`failover` trusts pgpool's `new_main` pick).
+- **Symptom:** when the cluster state has shifted between when the command was *decided* (operator typed `cluster recover`, pgpool noticed primary down) and when the handler runs, the handler can act on stale assumptions. Examples: pgpool fires `failover_command` after a handoff just completed (handoff's old primary is now a standby; failover tries to drop the standby's active slot → "slot active" errors and a stuck maintenance intent). Or: operator runs `cluster recover --target N` against a target that pgpool already auto-attached after a different cluster event.
+- **Fix sketch:** lift a shared `validate_cluster_preconditions(intent: ClusterIntent) -> Result<(), ValidationError>` that every state-changing handler calls before the destructive phases. The intent describes what's about to happen (target, expected current state, etc.) and the validator checks invariants:
+  - local node's role matches the intent's expectation of it (primary vs standby)
+  - target's reachability + role match (e.g. recover expects standby-down-or-broken; handoff expects healthy standby; failover expects standby-about-to-promote)
+  - no conflicting in-flight orchestration (already done structurally via `inflight.list(InProgress)` in 0.6.0; this generalises to "no recent terminal orchestration that this command would conflict with")
+  - slot state consistency (e.g. failover dropping a slot expects the slot to NOT be active)
+- **Why now:** every command added past 0.6.0 will re-invent its own preflight. A shared validator means the consistency story is consistent across handlers and one place to look when something refuses.
+
+## Deferred (acknowledged, low priority, listed so they don't get lost)
+
+### Ctrl-C during basebackup wipes $PGDATA
+
+- `crates/pg-agent-core/src/localserver.rs` cluster_handoff rewind→basebackup branch, `pgstandby.rs` basebackup driver. Tonic drops the server-side request future on client disconnect → `Command::kill_on_drop(true)` SIGKILLs the basebackup subprocess → $PGDATA is empty (clear_pgdata_contents ran first), no journal phase advancement past `local_stopped`. Real failure mode, but requires the operator to actively cancel a long destructive operation that the documentation tells them to leave alone. 0.6.0's inflight journal makes the stuck state visible (`pg_agentctl ops list`) and `cluster recover --target N --stop-target-pg` is the documented recovery. Fix would be detaching orchestration from the gRPC request lifetime (spawn the destructive phases in a task that survives client disconnect) — non-trivial and only buys protection against an unforced operator error.
+
+### `MAX_HANDOFF_LAG_BYTES = 16 MiB` is hardcoded
+
+- `crates/pg-agent-core/src/config.rs:425`. Described as "one WAL segment" but PG's `wal_segment_size` is set at initdb time from 1 MiB to 1 GiB. Fix: query `current_setting('wal_segment_size')` at startup, store the effective threshold. Cosmetic on default clusters; only matters on tuned deployments.
+
+### Replay marker 24h TTL surprises long-gap re-runs (non-handoff ops)
+
+- `crates/pg-agent-core/src/replay_markers.rs`. Handoff moved to `inflight_ops` (7d retention) in 0.6.0. `failover`, `recovery_first_stage`, `cluster_recover` still use 24h replay markers — an operator who re-runs `cluster recover --target N` 25 hours after a successful run will trigger the destructive reclone again. Mitigated by each handler's own state checks (basebackup refuses non-empty pgdata, slot create is duplicate-OK, etc.) so the failure mode is soft. Fix: bump retention to 7 days to match inflight_ops, or migrate these handlers to `inflight_ops` too if the contract grows phased state.
+
+### `slot_name` captured at orchestration start (hypothetical)
+
+- `crates/pg-agent-core/src/localserver.rs` cluster_handoff slot creation. `local.slot_name()` is `node{id}`. The `NodePool` is snapshotted at daemon startup and isn't reassigned at runtime — so this is a documented constraint rather than a bug. Worth noting before adding any "reload pool" path: a handoff that creates a slot under one local id then writes recovery_conf referring to a different id would silently break.
+
+## Roadmap items surfaced (planning, not coding)
+
+These came up multiple times during the recent feature work as "v2 / future" but aren't tracked elsewhere yet.
+
+- **Maintenance-mode pause/resume.** Cluster-wide flag that disables reactive failover + pgpool-driven hooks so the operator can do planned work without races. Closes "operator stops pgpool for maintenance, pg-agent's supervisor restarts it" friction. Pairs with auto-resume gating.
+- **Auto-resume on startup (opt-in).** `[startup] auto_resume_inflight_ops = true` so a crashed daemon picks up where it left off after a clean restart instead of waiting for operator-typed `ops resume <id>`. Gated off by default until verify-then-resume has cluster-trial mileage.
+- **Cluster-state RPC + gossip plane.** Already on `ROADMAP.md` ("Shared cluster state (the foundation switchover and pause need)"). The per-daemon `inflight_ops` journal closes local race windows; cross-node coordination still depends on pgpool's hooks. Switchover/pause as proper features want cluster-wide consensus on "is anything in flight."
