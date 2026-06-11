@@ -311,6 +311,7 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         maintenance_store,
         maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
         phantom_check_required_peers: config.startup.effective_required_peers(),
+        supervisor_pgpool_enabled: config.supervisor.effective_pgpool_enabled(),
         cert_reloader: cert_reloader.clone(),
     };
 

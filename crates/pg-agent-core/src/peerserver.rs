@@ -804,6 +804,9 @@ mod tests {
             self.stop_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn status_postgres(&self) -> anyhow::Result<bool> {
             Ok(false)
         }
@@ -1278,6 +1281,9 @@ mod tests {
                 Ok(())
             }
             async fn stop_postgres(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn start_pgpool(&self) -> anyhow::Result<()> {
                 Ok(())
             }
             async fn status_postgres(&self) -> anyhow::Result<bool> {

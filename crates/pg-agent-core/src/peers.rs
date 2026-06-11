@@ -687,6 +687,9 @@ mod tests {
         async fn stop_postgres(&self) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn status_postgres(&self) -> anyhow::Result<bool> {
             Ok(false)
         }

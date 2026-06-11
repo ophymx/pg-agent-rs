@@ -95,3 +95,19 @@ hostname = "pg3.example.com"
 # stop PG locally; set to 0 to disable the quorum gate.
 # [startup]
 # phantom_check_required_peers = 1
+
+# --- local-service supervisor -----------------------------------------
+# When enabled (default), pg_agentd ensures `pgpool2.service` is running
+# — once at startup (after the phantom-primary check resolves to
+# Confirmed or NotApplicable) and continuously thereafter, rate-limited
+# (~5 s tick, ≥30 s between start attempts, give up after 10 consecutive
+# failures and wait for an operator). The supervisor is intentionally
+# NOT spawned for phantom verdicts; a node whose role hasn't been
+# validated against the cluster must not have pgpool routing at it.
+#
+# Disable if you manage pgpool's lifecycle externally. There is no
+# maintenance-mode toggle yet; a sustained operator stop is handled by
+# stopping pg_agentd itself.
+# [supervisor]
+# pgpool = true
+

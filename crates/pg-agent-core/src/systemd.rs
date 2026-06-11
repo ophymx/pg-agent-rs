@@ -58,6 +58,13 @@ pub trait Systemd: Send + Sync {
     async fn start_postgres(&self) -> anyhow::Result<()>;
     async fn stop_postgres(&self) -> anyhow::Result<()>;
 
+    /// StartUnit on pgpool2.service — idempotent (no-op on an already-active
+    /// unit). Used by `PgpoolSupervisor` to bring pgpool back after a crash
+    /// without going through `reload_or_restart_pgpool`, which on an active
+    /// unit would re-execute (kicking active connections) — not what we
+    /// want from a supervisor that just wants "is it up".
+    async fn start_pgpool(&self) -> anyhow::Result<()>;
+
     /// True if the unit's ActiveState is one of `active`/`activating`/`reloading`.
     async fn status_postgres(&self) -> anyhow::Result<bool>;
     async fn status_pgpool(&self) -> anyhow::Result<bool>;
@@ -226,6 +233,13 @@ impl Systemd for DbusSystemd {
     async fn stop_postgres(&self) -> anyhow::Result<()> {
         self.run_unit_op("stop", &self.pg_service, || {
             self.proxy.stop_unit(&self.pg_service, "replace")
+        })
+        .await
+    }
+
+    async fn start_pgpool(&self) -> anyhow::Result<()> {
+        self.run_unit_op("start", &self.pgpool_service, || {
+            self.proxy.start_unit(&self.pgpool_service, "replace")
         })
         .await
     }

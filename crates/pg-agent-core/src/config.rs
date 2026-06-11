@@ -135,6 +135,8 @@ pub struct Config {
     pub healthz: HealthzConfig,
     #[serde(default)]
     pub startup: StartupConfig,
+    #[serde(default)]
+    pub supervisor: SupervisorConfig,
 
     /// Set by the `--dev` CLI flag — never read from config.toml.
     #[serde(skip)]
@@ -385,6 +387,35 @@ impl StartupConfig {
 }
 
 pub const DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS: usize = 1;
+
+/// `[supervisor]` — knobs for the local-service supervisor tasks.
+///
+/// At present this configures the pgpool supervisor only: when enabled
+/// (the default), pg_agentd ensures `pgpool2.service` is running once at
+/// startup (after the phantom-primary verdict resolves to `Confirmed`
+/// or `NotApplicable`) and continuously thereafter on a rate-limited
+/// cadence. The supervisor is intentionally NOT spawned for phantom
+/// verdicts — a node whose role hasn't been validated against the
+/// cluster shouldn't have pgpool routing traffic at it.
+///
+/// Disable the pgpool supervisor if you manage pgpool's lifecycle
+/// externally (e.g. via a separate systemd dependency chain or a
+/// configuration-management tool that explicitly drives pgpool state).
+/// Note: a sustained "operator wants pgpool down" is also handled by
+/// stopping `pg_agentd` itself; no maintenance-mode flag exists yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SupervisorConfig {
+    #[serde(default)]
+    pub pgpool: Option<bool>,
+}
+
+impl SupervisorConfig {
+    pub fn effective_pgpool_enabled(&self) -> bool {
+        self.pgpool.unwrap_or(DEFAULT_PGPOOL_SUPERVISOR_ENABLED)
+    }
+}
+
+pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 
 // ---------------------------------------------------------------------------
 // Runtime projections

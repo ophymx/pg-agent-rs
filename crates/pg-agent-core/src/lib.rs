@@ -24,6 +24,7 @@ pub mod maintenance;
 pub mod pcp;
 pub mod peers;
 pub mod peerserver;
+pub mod pgpool_supervisor;
 pub mod pgstandby;
 pub mod preflight;
 pub mod replay_markers;

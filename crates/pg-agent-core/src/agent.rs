@@ -87,6 +87,13 @@ pub struct Options {
     /// 0 disables the quorum gate — see `StartupConfig` docs for the
     /// 2-node operational trade-off.
     pub phantom_check_required_peers: usize,
+    /// Enable the `PgpoolSupervisor` task. Projected from
+    /// `Config::supervisor.effective_pgpool_enabled()`. When true (the
+    /// default), the supervisor is spawned by `Agent::serve` if and only
+    /// if the startup phantom-primary verdict is `Confirmed` or
+    /// `NotApplicable` — phantom states must not have pgpool routing
+    /// traffic at them.
+    pub supervisor_pgpool_enabled: bool,
     /// Shared mTLS material for the peer server and outbound peer clients.
     /// `None` means no TLS — caller is responsible for passing `--dev` and
     /// ensuring `serve.reject_insecure_remote_peer()` is false. The check
@@ -108,6 +115,7 @@ impl Options {
             maintenance_store,
             maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
             phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+            supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
             cert_reloader: None,
         }
     }
@@ -388,6 +396,36 @@ impl Agent {
         // gate releasing lets that 503 reflect actual cluster state
         // instead of the bootstrap-pending placeholder.
         self.startup_verified.store(true, Ordering::SeqCst);
+
+        // PgpoolSupervisor — only spawn on a verdict that says "this
+        // node should be serving." A Phantom/SplitBrain/Unverifiable
+        // node must NOT have its local pgpool started, because pgpool's
+        // backend view is stale relative to whichever node the cluster
+        // actually chose; routing through it would surface a wrong
+        // primary to anything reading via HAProxy.
+        let supervisor_eligible = matches!(
+            verdict,
+            PrimaryVerdict::Confirmed | PrimaryVerdict::NotApplicable
+        );
+        if self.opts.supervisor_pgpool_enabled && supervisor_eligible {
+            let supervisor =
+                Arc::new(crate::pgpool_supervisor::PgpoolSupervisor::new(
+                    self.deps.sd.clone(),
+                ));
+            // Best-effort one-shot at startup: a clean boot converges
+            // in milliseconds instead of waiting `TICK` for the loop's
+            // first iteration. Logs and proceeds on any error — the
+            // continuous loop will retry.
+            if let Err(e) = supervisor.ensure_running_once().await {
+                warn!(?e, "pgpool_supervisor: startup probe failed; continuous loop will retry");
+            }
+            let s = shutdown.clone();
+            let sup = supervisor.clone();
+            js.spawn(async move {
+                sup.run(s).await;
+                Ok(())
+            });
+        }
 
         // Listeners are bound, subsystems are spawned — safe to tell systemd
         // we're ready. See [`crate::sdnotify`] for why this MUST come last.
@@ -835,6 +873,11 @@ mod tests {
         /// # of leading stop_postgres calls that should fail before
         /// success (counts down).
         stop_fail_count: std::sync::atomic::AtomicUsize,
+        /// # of start_pgpool calls observed. Used by `agent::serve` tests
+        /// to assert the supervisor was (or wasn't) spawned. Richer
+        /// supervisor-behaviour assertions live in `pgpool_supervisor` with
+        /// its own dedicated stub.
+        start_pgpool_calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -853,6 +896,11 @@ mod tests {
                     .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
                 anyhow::bail!("stub: stop_postgres boom");
             }
+            Ok(())
+        }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            self.start_pgpool_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn status_postgres(&self) -> anyhow::Result<bool> {
@@ -1117,6 +1165,7 @@ mod tests {
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+                supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
             },
         )
@@ -1346,6 +1395,7 @@ mod tests {
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+                supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
             },
         );
@@ -1401,6 +1451,7 @@ mod tests {
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+                supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
             },
         );
@@ -1409,6 +1460,171 @@ mod tests {
         assert!(
             err.contains("remote peers present but TLS is not configured"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ----- pgpool supervisor spawn matrix -------------------------------
+
+    /// Build a minimal serve-ready Agent + listeners with the supplied
+    /// deps, options overrides applied via closure.
+    async fn make_serve_setup(
+        db: Arc<dyn LocalDb>,
+        sd: Arc<dyn Systemd>,
+        peers: Arc<dyn PeerRegistry>,
+        node_pool: NodePool,
+        supervisor_pgpool_enabled: bool,
+        phantom_check_required_peers: usize,
+    ) -> (Arc<Agent>, Listeners, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("pg_agentd.sock");
+        let serve = ServeSettings {
+            unix_socket: sock.to_string_lossy().into_owned(),
+            agent_port: 0,
+            peer_listen_addr: "127.0.0.1:0".into(),
+            tls: crate::config::TlsConfig::default(),
+            tls_configured: false,
+            has_remote_peers: false,
+            dev_mode: true,
+            healthz: HealthzSettings {
+                enabled: false,
+                listen_addr: "127.0.0.1:0".into(),
+            },
+        };
+        let listeners = Listeners::bind(&serve).await.unwrap();
+        let pg = PostgresRuntime {
+            port: 5432,
+            data_dir: PathBuf::from("/var/lib/postgresql/17/main"),
+            repl_user: "repl_user".into(),
+        };
+        let agent = Agent::new(
+            make_deps_with_peers(db, sd, peers),
+            Options {
+                serve,
+                node_pool,
+                postgres: pg,
+                maintenance_store: Arc::new(StubMaint),
+                maintenance_sweep_interval: Duration::from_secs(30),
+                phantom_check_required_peers,
+                supervisor_pgpool_enabled,
+                cert_reloader: None,
+            },
+        );
+        (agent, listeners, tmp)
+    }
+
+    fn single_node_pool() -> NodePool {
+        NodePool {
+            members: vec![crate::config::NodeConfig {
+                id: 0,
+                hostname: "localhost".into(),
+            }],
+            local_node_id: 0,
+        }
+    }
+
+    fn two_node_pool() -> NodePool {
+        NodePool {
+            members: vec![
+                crate::config::NodeConfig {
+                    id: 0,
+                    hostname: "self".into(),
+                },
+                crate::config::NodeConfig {
+                    id: 1,
+                    hostname: "peer1".into(),
+                },
+            ],
+            local_node_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_spawns_pgpool_supervisor_on_confirmed() {
+        // Single-node + required_peers=0 => Confirmed without any peer
+        // responses (the operational 2-node opt-out path). pgpool stub
+        // reports inactive so ensure_running_once issues a start.
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            pgpool_running: false,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::default());
+        let (agent, listeners, _tmp) =
+            make_serve_setup(db, sd.clone(), peers, single_node_pool(), true, 0).await;
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { agent.serve(listeners, s).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            sd.start_pgpool_calls.load(Ordering::SeqCst) >= 1,
+            "expected supervisor to invoke start_pgpool at least once on Confirmed verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_spawn_pgpool_supervisor_on_phantom() {
+        // 2-node + peer reports higher TL => Phantom verdict.
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            pgpool_running: false,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(8, false))]));
+        let (agent, listeners, _tmp) =
+            make_serve_setup(db, sd.clone(), peers, two_node_pool(), true, 1).await;
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { agent.serve(listeners, s).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(
+            sd.start_pgpool_calls.load(Ordering::SeqCst),
+            0,
+            "supervisor must not be spawned on Phantom verdict"
+        );
+        // The Phantom branch did call stop_postgres.
+        assert!(sd.stop_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn serve_respects_supervisor_disabled_flag() {
+        // Confirmed verdict, but supervisor_pgpool_enabled=false => no spawn.
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            pgpool_running: false,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::default());
+        let (agent, listeners, _tmp) =
+            make_serve_setup(db, sd.clone(), peers, single_node_pool(), false, 0).await;
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { agent.serve(listeners, s).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(
+            sd.start_pgpool_calls.load(Ordering::SeqCst),
+            0,
+            "supervisor must respect supervisor_pgpool_enabled=false"
         );
     }
 
@@ -1461,6 +1677,7 @@ mod tests {
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+                supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
             },
         )
