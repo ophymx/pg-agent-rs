@@ -366,7 +366,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .drop_slot(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer drop_slot: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer drop_slot: {}", s.message()))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer drop_slot: {}", resp.message);
@@ -379,7 +379,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .get_node_config(NodeConfigRequest {})
             .await
-            .map_err(|s| anyhow::anyhow!("peer get_node_config: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer get_node_config: {}", s.message()))?
             .into_inner();
         Ok(resp)
     }
@@ -391,7 +391,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .start(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer start: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer start: {}", s.message()))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer start: {}", resp.message);
@@ -422,7 +422,7 @@ impl PeerClient for PeerChannel {
                 ))))
             }
             Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
-            Err(s) => Err(anyhow::anyhow!("peer fetch_wal: {s}")),
+            Err(s) => Err(anyhow::anyhow!("peer fetch_wal: {}", s.message())),
         }
     }
 
@@ -431,7 +431,7 @@ impl PeerClient for PeerChannel {
         Ok(client
             .get_status(GetStatusRequest {})
             .await
-            .map_err(|s| anyhow::anyhow!("peer get_status: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer get_status: {}", s.message()))?
             .into_inner())
     }
 
@@ -442,7 +442,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .stop(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer stop: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer stop: {}", s.message()))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer stop: {}", resp.message);
@@ -460,7 +460,7 @@ impl PeerClient for PeerChannel {
         let stream = client
             .rewind(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer rewind: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer rewind: {}", s.message()))?
             .into_inner();
         drain_progress_stream("peer rewind", stream).await
     }
@@ -476,7 +476,7 @@ impl PeerClient for PeerChannel {
         let stream = client
             .basebackup(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer basebackup: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer basebackup: {}", s.message()))?
             .into_inner();
         drain_progress_stream("peer basebackup", stream).await
     }
@@ -492,7 +492,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .configure_standby(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer configure_standby: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer configure_standby: {}", s.message()))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer configure_standby: {}", resp.message);
@@ -507,7 +507,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .promote(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer promote: {s}"))?
+            .map_err(|s| anyhow::anyhow!("peer promote: {}", s.message()))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer promote: {}", resp.message);
@@ -541,7 +541,7 @@ async fn drain_progress_stream(
                 anyhow::bail!("{operation}: stream ended without 'done' phase");
             }
             Err(s) => {
-                anyhow::bail!("{operation}: stream error: {s}");
+                anyhow::bail!("{operation}: stream error: {}", s.message());
             }
         }
     }

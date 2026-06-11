@@ -151,6 +151,18 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Surface a `tonic::Status` from the daemon as a single human-readable
+/// line. `Status`'s `Display` impl includes the full headers + metadata
+/// debug dump, which buries the actual server-side error string in
+/// quoted-and-escaped noise (e.g. `status: Internal, message:
+/// "recovery_1st_stage: ... \"refusing to basebackup while postgres is
+/// running\" ...", details: [], metadata: MetadataMap { headers:
+/// {"content-type": ...} }`). The message field alone is what an
+/// operator actually wants to read.
+fn rpc_failed(rpc: &str, s: tonic::Status) -> anyhow::Error {
+    anyhow::anyhow!("{rpc} RPC failed: {}", s.message())
+}
+
 fn print_hooks(as_json: bool) {
     if as_json {
         let payload = serde_json::json!({
@@ -195,7 +207,7 @@ async fn cluster_init(
             only_node_id: only_node,
         })
         .await
-        .map_err(|s| anyhow::anyhow!("ClusterInit RPC failed: {s}"))?
+        .map_err(|s| rpc_failed("ClusterInit", s))?
         .into_inner();
 
     if json {
@@ -253,7 +265,7 @@ async fn cluster_status(
     let resp = client
         .cluster_status(ClusterStatusRequest {})
         .await
-        .map_err(|s| anyhow::anyhow!("ClusterStatus RPC failed: {s}"))?
+        .map_err(|s| rpc_failed("ClusterStatus", s))?
         .into_inner();
 
     let rows: Vec<StatusRow> = resp.nodes.into_iter().map(StatusRow::from_proto).collect();
@@ -294,7 +306,7 @@ async fn cluster_recover(
             target_node_id: target,
         })
         .await
-        .map_err(|s| anyhow::anyhow!("ClusterRecover RPC failed: {s}"))?
+        .map_err(|s| rpc_failed("ClusterRecover", s))?
         .into_inner();
 
     if json {
@@ -555,7 +567,7 @@ async fn gen_pgpool(
     let resp = client
         .get_pgpool_backends(GetPgpoolBackendsRequest {})
         .await
-        .map_err(|s| anyhow::anyhow!("GetPgpoolBackends RPC failed: {s}"))?
+        .map_err(|s| rpc_failed("GetPgpoolBackends", s))?
         .into_inner();
 
     // Refuse to render a partial pgpool.conf. The daemon reports per-
@@ -690,7 +702,7 @@ async fn maintenance(
             let resp = client
                 .list_maintenance(ListMaintenanceRequest { statuses })
                 .await
-                .map_err(|s| anyhow::anyhow!("ListMaintenance failed: {s}"))?
+                .map_err(|s| rpc_failed("ListMaintenance", s))?
                 .into_inner();
 
             // SPEC §13: skipped files go to stderr.
@@ -734,7 +746,7 @@ async fn maintenance(
             let resp = client
                 .get_maintenance(GetMaintenanceRequest { id: id.clone() })
                 .await
-                .map_err(|s| anyhow::anyhow!("GetMaintenance({id}) failed: {s}"))?
+                .map_err(|s| rpc_failed(&format!("GetMaintenance({id})"), s))?
                 .into_inner();
             if json {
                 println!("{}", serde_json::to_string_pretty(&intent_to_json(&resp))?);
@@ -747,7 +759,7 @@ async fn maintenance(
             let resp = client
                 .retry_maintenance(RetryMaintenanceRequest { id: id.clone() })
                 .await
-                .map_err(|s| anyhow::anyhow!("RetryMaintenance({id}) failed: {s}"))?
+                .map_err(|s| rpc_failed(&format!("RetryMaintenance({id})"), s))?
                 .into_inner();
             if json {
                 println!(
