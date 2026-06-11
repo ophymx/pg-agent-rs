@@ -145,6 +145,15 @@ async fn validate_env(cli: &Cli, json: bool, skip_db: bool) -> ExitCode {
     // Connect failure (PG not up yet, socket mismatch) is reported as
     // a single WARN by the preflight body — the right shape for
     // pre-bootstrap runs where PG may not be running yet.
+    //
+    // `PgLocalDb::connect` is lazy (no I/O), so the connect-refused case
+    // doesn't actually surface here — it would surface inside every
+    // individual setting/role query and report N ERRs instead of one
+    // WARN, which then fails the ExecStartPre. pg_agentd's whole job
+    // when PG is down is to supervise it back up, so this would
+    // crashloop the daemon out of its own recovery role. Probe with
+    // is_in_recovery() up front: if PG is genuinely unreachable, fall
+    // through to db=None so the preflight emits its single WARN.
     let db: Option<Arc<dyn LocalDb>> = if skip_db {
         None
     } else {
@@ -155,7 +164,28 @@ async fn validate_env(cli: &Cli, json: bool, skip_db: bool) -> ExitCode {
             .expect("apply_defaults sets socket_dir");
         let port = config.postgres.port.expect("apply_defaults sets port");
         match PgLocalDb::connect(&socket_dir, port).await {
-            Ok(db) => Some(Arc::new(db) as Arc<dyn LocalDb>),
+            Ok(db) => {
+                let probe = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    db.is_in_recovery(),
+                )
+                .await;
+                match probe {
+                    Ok(Ok(_)) => Some(Arc::new(db) as Arc<dyn LocalDb>),
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "warning: local DB unreachable ({e}); skipping DB-backed checks"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "warning: local DB probe timed out after 2s; skipping DB-backed checks"
+                        );
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("warning: local DB unreachable ({e}); skipping DB-backed checks");
                 None
@@ -280,6 +310,7 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         postgres,
         maintenance_store,
         maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
+        phantom_check_required_peers: config.startup.effective_required_peers(),
         cert_reloader: cert_reloader.clone(),
     };
 
