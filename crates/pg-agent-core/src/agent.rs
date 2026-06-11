@@ -70,6 +70,10 @@ pub struct AgentDeps {
     pub pcp: Arc<dyn Pcp>,
     pub sd: Arc<dyn Systemd>,
     pub replay: Arc<dyn ReplayMarkerStore>,
+    /// Durable journal for multi-phase state-change orchestrations
+    /// (today: `cluster_handoff`). Distinct contract from `replay`
+    /// (after-success dedup) — see `crate::inflight_ops` module docs.
+    pub inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
     pub wal: Arc<dyn WalStore>,
 }
 
@@ -264,15 +268,18 @@ impl Agent {
             let maint = self.opts.maintenance_store.clone();
             let wal = self.deps.wal.clone();
             let replay = self.deps.replay.clone();
+            let inflight = self.deps.inflight.clone();
             let pcp = self.deps.pcp.clone();
             let sd = self.deps.sd.clone();
             let standby = self.deps.standby.clone();
             let pool = self.opts.node_pool.clone();
             let pg = self.opts.postgres.clone();
             js.spawn(async move {
-                LocalServer::new(me, db, peers, maint, wal, replay, pcp, sd, standby, pool, pg)
-                    .serve(listeners.unix, s)
-                    .await
+                LocalServer::new(
+                    me, db, peers, maint, wal, replay, inflight, pcp, sd, standby, pool, pg,
+                )
+                .serve(listeners.unix, s)
+                .await
             });
         }
 
@@ -1097,6 +1104,67 @@ mod tests {
         async fn sweep(&self, _: chrono::DateTime<chrono::Utc>) {}
     }
 
+    /// Minimal stub: empty store, all reads return None. Tests that
+    /// exercise the inflight contract live in `inflight_ops::tests`
+    /// and `localserver::tests`; agent::tests doesn't need richer
+    /// behaviour from this stub.
+    struct StubInflight;
+    #[async_trait]
+    impl crate::inflight_ops::InflightOpStore for StubInflight {
+        async fn begin(
+            &self,
+            payload: crate::inflight_ops::InflightPayload,
+            phase: &str,
+            _exclusive: bool,
+        ) -> anyhow::Result<crate::inflight_ops::InflightOp> {
+            let now = chrono::Utc::now();
+            Ok(crate::inflight_ops::InflightOp {
+                id: format!("stub-{}", payload.op_name()),
+                status: crate::inflight_ops::InflightStatus::InProgress,
+                payload,
+                phase: phase.to_string(),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                last_error: None,
+            })
+        }
+        async fn update_phase(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn complete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn abandon(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<Option<crate::inflight_ops::InflightOp>> {
+            Ok(None)
+        }
+        async fn get(&self, id: &str) -> anyhow::Result<crate::inflight_ops::InflightOp> {
+            anyhow::bail!("stub: get({id})")
+        }
+        async fn list(
+            &self,
+            _: &[crate::inflight_ops::InflightStatus],
+        ) -> anyhow::Result<(
+            Vec<crate::inflight_ops::InflightOp>,
+            Vec<crate::inflight_ops::SkippedInflightOp>,
+        )> {
+            Ok((vec![], vec![]))
+        }
+        async fn sweep(&self, _: chrono::DateTime<chrono::Utc>) {}
+    }
+
     struct StubWal;
     #[async_trait]
     impl WalStore for StubWal {
@@ -1220,6 +1288,7 @@ mod tests {
             pcp: Arc::new(StubPcp),
             sd,
             replay: Arc::new(StubReplay),
+            inflight: Arc::new(StubInflight),
             wal: Arc::new(StubWal),
         }
     }

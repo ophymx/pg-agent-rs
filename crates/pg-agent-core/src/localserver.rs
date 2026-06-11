@@ -67,6 +67,14 @@ pub struct LocalServer {
     maint: Arc<dyn MaintenanceStore>,
     wal: Arc<dyn WalStore>,
     replay: Arc<dyn ReplayMarkerStore>,
+    /// Durable journal for multi-phase state-change orchestrations.
+    /// See [`crate::inflight_ops`] for the contract. Consumed by
+    /// `cluster_handoff` (single-flight gate + phase journal) and by
+    /// the failover handler (cross-op consult before mutating cluster
+    /// state). Currently unused in this commit; wired through for
+    /// upcoming `cluster_handoff` refactor.
+    #[allow(dead_code)]
+    inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
     pcp: Arc<dyn Pcp>,
     /// Local systemd. `cluster_handoff` is the first handler that needs
     /// to stop/start the local PG service (every other handler runs
@@ -89,6 +97,7 @@ impl LocalServer {
         maint: Arc<dyn MaintenanceStore>,
         wal: Arc<dyn WalStore>,
         replay: Arc<dyn ReplayMarkerStore>,
+        inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
         pcp: Arc<dyn Pcp>,
         sd: Arc<dyn Systemd>,
         standby: Arc<dyn StandbyOps>,
@@ -102,6 +111,7 @@ impl LocalServer {
             maint,
             wal,
             replay,
+            inflight,
             pcp,
             sd,
             standby,
@@ -2149,6 +2159,162 @@ mod tests {
         async fn sweep(&self, _: chrono::DateTime<Utc>) {}
     }
 
+    /// In-memory `InflightOpStore` for localserver tests. Mirrors
+    /// `FileInflightOpStore`'s contract closely enough that handler
+    /// tests can drive begin/find/update_phase/complete/abandon
+    /// without spinning up a tempdir per test.
+    #[derive(Default)]
+    struct StubInflight {
+        ops: StdMutex<Vec<crate::inflight_ops::InflightOp>>,
+        seq: std::sync::atomic::AtomicU64,
+    }
+
+    impl StubInflight {
+        fn next_id(&self, op: &str) -> String {
+            let n = self.seq.fetch_add(1, Ordering::SeqCst);
+            format!("stub-{op}-{n}")
+        }
+        /// Seed an op directly without going through `begin` — used by
+        /// failover/handoff resume tests to set up a pre-existing
+        /// in-flight handoff at a specific phase.
+        #[allow(dead_code)]
+        fn seed(&self, op: crate::inflight_ops::InflightOp) {
+            self.ops.lock().unwrap().push(op);
+        }
+    }
+
+    #[async_trait]
+    impl crate::inflight_ops::InflightOpStore for StubInflight {
+        async fn begin(
+            &self,
+            payload: crate::inflight_ops::InflightPayload,
+            phase: &str,
+            exclusive: bool,
+        ) -> anyhow::Result<crate::inflight_ops::InflightOp> {
+            let mut ops = self.ops.lock().unwrap();
+            let op_name = payload.op_name();
+            let key = payload.key();
+            for existing in ops.iter() {
+                if existing.status != crate::inflight_ops::InflightStatus::InProgress {
+                    continue;
+                }
+                if existing.payload.op_name() == op_name && existing.payload.key() == key {
+                    anyhow::bail!(
+                        "stub: duplicate in-progress op (id={}, phase={})",
+                        existing.id,
+                        existing.phase
+                    );
+                }
+                if exclusive {
+                    anyhow::bail!(
+                        "stub: exclusive blocked by op (id={}, name={}, phase={})",
+                        existing.id,
+                        existing.payload.op_name(),
+                        existing.phase
+                    );
+                }
+            }
+            let now = Utc::now();
+            let op = crate::inflight_ops::InflightOp {
+                id: self.next_id(op_name),
+                status: crate::inflight_ops::InflightStatus::InProgress,
+                payload,
+                phase: phase.to_string(),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                last_error: None,
+            };
+            ops.push(op.clone());
+            Ok(op)
+        }
+        async fn update_phase(
+            &self,
+            id: &str,
+            phase: &str,
+            last_error: Option<String>,
+        ) -> anyhow::Result<()> {
+            let mut ops = self.ops.lock().unwrap();
+            let op = ops
+                .iter_mut()
+                .find(|o| o.id == id)
+                .ok_or_else(|| anyhow::anyhow!("stub: id not found: {id}"))?;
+            if op.status != crate::inflight_ops::InflightStatus::InProgress {
+                anyhow::bail!("stub: update_phase on terminal op {id}");
+            }
+            op.phase = phase.to_string();
+            op.updated_at = Utc::now();
+            op.last_error = last_error;
+            Ok(())
+        }
+        async fn complete(&self, id: &str) -> anyhow::Result<()> {
+            let mut ops = self.ops.lock().unwrap();
+            let op = ops
+                .iter_mut()
+                .find(|o| o.id == id)
+                .ok_or_else(|| anyhow::anyhow!("stub: id not found: {id}"))?;
+            op.status = crate::inflight_ops::InflightStatus::Done;
+            op.phase = "done".to_string();
+            let now = Utc::now();
+            op.updated_at = now;
+            op.completed_at = Some(now);
+            op.last_error = None;
+            Ok(())
+        }
+        async fn abandon(&self, id: &str, reason: &str) -> anyhow::Result<()> {
+            let mut ops = self.ops.lock().unwrap();
+            let op = ops
+                .iter_mut()
+                .find(|o| o.id == id)
+                .ok_or_else(|| anyhow::anyhow!("stub: id not found: {id}"))?;
+            op.status = crate::inflight_ops::InflightStatus::Abandoned;
+            let now = Utc::now();
+            op.updated_at = now;
+            op.completed_at = Some(now);
+            op.last_error = Some(reason.to_string());
+            Ok(())
+        }
+        async fn find(
+            &self,
+            op_name: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<crate::inflight_ops::InflightOp>> {
+            let ops = self.ops.lock().unwrap();
+            Ok(ops
+                .iter()
+                .filter(|o| o.payload.op_name() == op_name && o.payload.key() == key)
+                .cloned()
+                .max_by_key(|o| o.started_at))
+        }
+        async fn get(&self, id: &str) -> anyhow::Result<crate::inflight_ops::InflightOp> {
+            let ops = self.ops.lock().unwrap();
+            ops.iter()
+                .find(|o| o.id == id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("stub: id not found: {id}"))
+        }
+        async fn list(
+            &self,
+            statuses: &[crate::inflight_ops::InflightStatus],
+        ) -> anyhow::Result<(
+            Vec<crate::inflight_ops::InflightOp>,
+            Vec<crate::inflight_ops::SkippedInflightOp>,
+        )> {
+            let ops = self.ops.lock().unwrap();
+            let mut out: Vec<crate::inflight_ops::InflightOp> = if statuses.is_empty() {
+                ops.clone()
+            } else {
+                ops.iter()
+                    .filter(|o| statuses.contains(&o.status))
+                    .cloned()
+                    .collect()
+            };
+            out.sort_by_key(|o| o.started_at);
+            Ok((out, vec![]))
+        }
+        async fn sweep(&self, _: chrono::DateTime<Utc>) {}
+    }
+
     #[derive(Default)]
     struct StubPcp {
         attach_calls: StdMutex<Vec<i32>>,
@@ -2637,6 +2803,7 @@ mod tests {
         Arc<StubPcp>,
         Arc<StubSd>,
         Arc<StubStandby>,
+        Arc<StubInflight>,
     ) {
         let db = Arc::new(StubDb::default());
         let peers = Arc::new(StubPeers::default());
@@ -2646,6 +2813,7 @@ mod tests {
         let pcp = Arc::new(StubPcp::default());
         let sd = Arc::new(StubSd::default());
         let standby = Arc::new(StubStandby::default());
+        let inflight = Arc::new(StubInflight::default());
         let server = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
@@ -2653,13 +2821,14 @@ mod tests {
             maint.clone(),
             wal.clone(),
             replay.clone(),
+            inflight.clone(),
             pcp.clone(),
             sd.clone(),
             standby.clone(),
             make_pool(),
             make_pg(),
         );
-        (server, db, peers, maint, wal, replay, pcp, sd, standby)
+        (server, db, peers, maint, wal, replay, pcp, sd, standby, inflight)
     }
 
     fn pending_intent(id: &str) -> CoreIntent {
@@ -2722,7 +2891,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_calls_peer_start() {
-        let (s, _db, peers, _maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         let resp = s
             .remote_start(Request::new(RemoteStartRequest {
                 target: Some(NodeRef {
@@ -2741,7 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_refuses_when_local_is_replica() {
-        let (s, db, peers, _maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, db, peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .remote_start(Request::new(RemoteStartRequest {
@@ -2762,7 +2931,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_start_propagates_peer_error_as_internal() {
-        let (s, _db, peers, _maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         peers
             .default_client
             .start_fails
@@ -2813,7 +2982,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_no_filter_returns_all() {
-        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         maint.insert(pending_intent("a"));
         let mut done_intent = pending_intent("b");
         done_intent.status = MaintenanceStatus::Done;
@@ -2829,7 +2998,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_filters_by_status() {
-        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         maint.insert(pending_intent("pending-1"));
         let mut done_intent = pending_intent("done-1");
         done_intent.status = MaintenanceStatus::Done;
@@ -2861,7 +3030,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_maintenance_surfaces_skipped() {
-        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         maint.skipped.lock().unwrap().push(SkippedIntent {
             path: "/tmp/corrupt.json".into(),
             error: "bad json".into(),
@@ -2877,7 +3046,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_maintenance_returns_existing_intent() {
-        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         maint.insert(pending_intent("alpha"));
         let resp = s
             .get_maintenance(Request::new(GetMaintenanceRequest { id: "alpha".into() }))
@@ -2912,7 +3081,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_maintenance_reschedules_pending_intent() {
-        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         maint.insert(pending_intent("alpha"));
         let resp = s
             .retry_maintenance(Request::new(RetryMaintenanceRequest { id: "alpha".into() }))
@@ -2927,7 +3096,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_maintenance_refuses_non_pending_intent() {
-        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         let mut done = pending_intent("alpha");
         done.status = MaintenanceStatus::Done;
         maint.insert(done);
@@ -2983,7 +3152,7 @@ mod tests {
 
     #[tokio::test]
     async fn failover_no_candidates_returns_ok_false_without_marker() {
-        let (s, _db, _peers, _maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, _peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         // new_main.id == -1 — pgpool's no-candidate sentinel.
         let resp = s
             .failover(Request::new(failover_req(1, -1, 0)))
@@ -3001,7 +3170,7 @@ mod tests {
         // detached=1 (peer1), new_main=0 (us, the primary), old_primary=0.
         // Since detached.id != old_primary.id, this is the standby-down
         // branch: we drop the slot locally and don't dial a peer.
-        let (s, db, _peers, _maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, db, _peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         let resp = s
             .failover(Request::new(failover_req(1, 0, 0)))
             .await
@@ -3018,7 +3187,7 @@ mod tests {
 
     #[tokio::test]
     async fn failover_standby_down_local_drop_failure_queues_maintenance() {
-        let (s, db, _peers, maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, db, _peers, maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         db.drop_slot_fails.store(true, Ordering::SeqCst);
         let resp = s
             .failover(Request::new(failover_req(1, 0, 0)))
@@ -3051,7 +3220,7 @@ mod tests {
     /// id=0's peer client. (`peers.client()` is called for new_main.)
     #[tokio::test]
     async fn failover_primary_down_promotes_and_drops_slot() {
-        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         let new_main_client = Arc::new(StubPeerClient::default());
         peers.override_client(0, new_main_client.clone());
 
@@ -3079,7 +3248,7 @@ mod tests {
 
     #[tokio::test]
     async fn failover_primary_down_promote_failure_is_internal_no_marker() {
-        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         let new_main_client = Arc::new(StubPeerClient::default());
         new_main_client.promote_fails.store(true, Ordering::SeqCst);
         peers.override_client(0, new_main_client.clone());
@@ -3101,7 +3270,7 @@ mod tests {
 
     #[tokio::test]
     async fn failover_primary_down_drop_slot_failure_queues_maintenance() {
-        let (s, _db, peers, maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, peers, maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         let new_main_client = Arc::new(StubPeerClient::default());
         new_main_client
             .drop_slot_fails
@@ -3134,7 +3303,7 @@ mod tests {
 
     #[tokio::test]
     async fn failover_skips_when_replay_marker_present() {
-        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         let new_main_client = Arc::new(StubPeerClient::default());
         peers.override_client(0, new_main_client.clone());
         replay.mark("failover", "detached=1,new_main=0,old_primary=1");
@@ -3182,8 +3351,8 @@ mod tests {
     /// Default setup: local node (id 0) is the primary; peer1 (id 1) is
     /// the standby being recovered. Returns the StubPeerClient that
     /// represents peer1 so tests can configure it, plus the StubPcp,
-    /// StubSd, and StubStandby for cluster_recover / cluster_handoff
-    /// assertions.
+    /// StubSd, StubStandby, and StubInflight for cluster_recover /
+    /// cluster_handoff assertions.
     #[allow(clippy::type_complexity)]
     fn make_recovery_setup() -> (
         LocalServer,
@@ -3195,16 +3364,28 @@ mod tests {
         Arc<StubPcp>,
         Arc<StubSd>,
         Arc<StubStandby>,
+        Arc<StubInflight>,
     ) {
-        let (s, db, peers, maint, _wal, replay, pcp, sd, standby) = make_server();
+        let (s, db, peers, maint, _wal, replay, pcp, sd, standby, inflight) = make_server();
         let standby_client = Arc::new(StubPeerClient::default());
         peers.override_client(1, standby_client.clone());
-        (s, db, peers, maint, replay, standby_client, pcp, sd, standby)
+        (
+            s,
+            db,
+            peers,
+            maint,
+            replay,
+            standby_client,
+            pcp,
+            sd,
+            standby,
+            inflight,
+        )
     }
 
     #[tokio::test]
     async fn recovery_first_stage_happy_path() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
             .await
@@ -3229,7 +3410,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_skips_when_replay_marker_present() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         replay.mark("recovery_1st_stage", "primary=0,standby=1");
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
@@ -3266,7 +3447,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_basebackup_failure_drops_slot() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
 
         let err = s
@@ -3285,7 +3466,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_configure_standby_failure_drops_slot() {
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby
             .configure_standby_fails
             .store(true, Ordering::SeqCst);
@@ -3301,7 +3482,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_drop_slot_failure_queues_maintenance() {
-        let (s, db, _peers, maint, _replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
         db.drop_slot_fails.store(true, Ordering::SeqCst);
 
@@ -3326,7 +3507,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_delegates_to_recovery_first_stage() {
-        let (s, db, _peers, _maint, replay, standby, pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, pcp, _sd, _standby, _inflight) = make_recovery_setup();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 1,
@@ -3364,7 +3545,7 @@ mod tests {
         // recovery itself was destructive enough that rolling back is
         // worse than surfacing partial completion to the operator) and
         // report each failure in the message.
-        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby.start_fails.store(true, Ordering::SeqCst);
         standby.start_pgpool_fails.store(true, Ordering::SeqCst);
         pcp.attach_fails.store(true, Ordering::SeqCst);
@@ -3391,7 +3572,7 @@ mod tests {
     async fn cluster_recover_skips_post_steps_when_recovery_fails() {
         // recovery_first_stage hits basebackup failure → propagates Err.
         // Post-recovery steps must NOT run — there's nothing to start.
-        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -3408,7 +3589,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_refuses_when_local_is_replica() {
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -3442,7 +3623,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_recover_rejects_local_node_as_target() {
         // Local is node 0; asking to reclone it from itself is nonsense.
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 0,
@@ -3462,7 +3643,7 @@ mod tests {
         // Operator forgot --stop-target-pg; target reports PG running.
         // We must refuse cleanly here, not let recovery_first_stage run
         // headlong into the deeper basebackup safety check.
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby.mark_running(); // is_postgres_running=true on the peer's get_status
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -3487,7 +3668,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_stops_target_pg_when_flag_set() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         standby.mark_running();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -3513,7 +3694,7 @@ mod tests {
         // Flag set, but target already reports PG stopped → no peer.stop
         // (idempotent, but skipping avoids the systemd D-Bus round-trip
         // for no reason).
-        let (s, _db, _peers, _maint, _replay, standby, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         // standby.is_running default false; do not mark_running().
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -3531,7 +3712,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_happy_path() {
-        let (s, _db, _peers, _maint, replay, peer, pcp, sd, standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, replay, peer, pcp, sd, standby, _inflight) = make_recovery_setup();
         peer.mark_standby().set_lag(0);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -3559,7 +3740,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_refuses_when_local_is_standby() {
-        let (s, db, _peers, _maint, _replay, _peer, _pcp, sd, standby) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, _peer, _pcp, sd, standby, _inflight) = make_recovery_setup();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -3582,7 +3763,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_rejects_local_node_as_target() {
-        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
         let err = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
                 target_node_id: 0,
@@ -3611,7 +3792,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_handoff_refuses_when_target_pg_not_running() {
         // peer.is_running defaults to false → is_postgres_running=false.
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
         // Explicitly DO NOT mark_running.
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -3630,7 +3811,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_handoff_refuses_when_target_is_already_primary() {
         // peer reports is_postgres_running=true && is_in_recovery=false.
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
         peer.mark_running(); // running=true, in_recovery stays false
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -3648,7 +3829,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_refuses_when_lag_exceeds_threshold() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
         peer.mark_standby()
             .set_lag(crate::config::MAX_HANDOFF_LAG_BYTES + 1);
         let resp = s
@@ -3670,7 +3851,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_proceeds_with_high_lag_when_flag_set() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
         peer.mark_standby()
             .set_lag(crate::config::MAX_HANDOFF_LAG_BYTES + 1);
         let resp = s
@@ -3688,7 +3869,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_falls_back_to_basebackup_when_rewind_fails() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, standby, _inflight) = make_recovery_setup();
         peer.mark_standby();
         standby.rewind_fails.store(true, Ordering::SeqCst);
         let resp = s
@@ -3707,7 +3888,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_drops_slot_when_both_data_copies_fail() {
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, _sd, standby, _inflight) = make_recovery_setup();
         peer.mark_standby();
         standby.rewind_fails.store(true, Ordering::SeqCst);
         standby.basebackup_fails.store(true, Ordering::SeqCst);
@@ -3729,7 +3910,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_is_idempotent_via_replay_marker() {
-        let (s, _db, _peers, _maint, replay, peer, _pcp, sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
         peer.mark_standby();
         replay.mark_done("handoff", "from=0,to=1").await.unwrap();
         let resp = s
@@ -3749,7 +3930,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_attach_failure_does_not_fail_rpc() {
-        let (s, _db, _peers, _maint, _replay, peer, pcp, _sd, _standby) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, pcp, _sd, _standby, _inflight) = make_recovery_setup();
         peer.mark_standby();
         pcp.attach_fails.store(true, Ordering::SeqCst);
         let resp = s
@@ -3769,7 +3950,7 @@ mod tests {
         // Same setup as the existing primary-down failover test, but
         // mark new_main as already-primary (mark_running with in_recovery
         // staying false) — the short-circuit must skip peer.promote.
-        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby) = make_server();
+        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
         let new_main_client = Arc::new(StubPeerClient::default());
         new_main_client.mark_running(); // is_postgres_running=true, is_in_recovery=false
         peers.override_client(0, new_main_client.clone());
@@ -3835,6 +4016,7 @@ mod tests {
         let pcp = Arc::new(StubPcp::default());
         let sd = Arc::new(StubSd::default());
         let standby = Arc::new(StubStandby::default());
+        let inflight = Arc::new(StubInflight::default());
         let server = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
@@ -3842,6 +4024,7 @@ mod tests {
             maint.clone(),
             wal.clone(),
             replay,
+            inflight,
             pcp,
             sd,
             standby,
@@ -3886,7 +4069,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_wal_fetches_from_first_peer_with_segment() {
-        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         // Default client has the segment.
         let content = b"WAL_BYTES".to_vec();
         peers
@@ -3955,7 +4138,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_wal_dest_outside_pgdata_is_fatal() {
-        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, _standby) = make_server();
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
         peers
             .default_client
             .stage_wal("000000010000000000000001", b"_".to_vec());
@@ -4033,7 +4216,7 @@ mod tests {
         Arc<StubPcp>,
         Arc<StubPeerClient>,
     ) {
-        let (s, db, peers, maint, _wal, replay, pcp, _sd, _standby) = make_server();
+        let (s, db, peers, maint, _wal, replay, pcp, _sd, _standby, _inflight) = make_server();
         let detached_client = Arc::new(StubPeerClient::default());
         detached_client.mark_running();
         peers.override_client(1, detached_client.clone());
@@ -4247,6 +4430,7 @@ mod tests {
         let pcp = Arc::new(StubPcp::default());
         let sd = Arc::new(StubSd::default());
         let standby = Arc::new(StubStandby::default());
+        let inflight = Arc::new(StubInflight::default());
         let server = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
@@ -4254,6 +4438,7 @@ mod tests {
             maint.clone(),
             wal,
             replay,
+            inflight,
             pcp,
             sd,
             standby,
@@ -4441,6 +4626,7 @@ mod tests {
         };
         let sd = Arc::new(StubSd::default());
         let standby = Arc::new(StubStandby::default());
+        let inflight = Arc::new(StubInflight::default());
         let s = LocalServer::new(
             Arc::new(FakeNodeInfo),
             db.clone(),
@@ -4448,6 +4634,7 @@ mod tests {
             maint,
             wal,
             replay,
+            inflight,
             pcp,
             sd,
             standby,

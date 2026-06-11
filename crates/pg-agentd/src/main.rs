@@ -28,6 +28,7 @@ use pg_agent_core::{
     peers::{PeerPool, PeerRegistry},
     pgstandby::StandbyExec,
     preflight,
+    inflight_ops::FileInflightOpStore,
     replay_markers::{FileReplayMarkerStore, DEFAULT_RETENTION},
     symlinks::{ensure_hook_symlinks, find_pg_agentc},
     systemd::DbusSystemd,
@@ -270,13 +271,18 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         pg_agentc_bin,
     ));
 
-    // State directories under <state_dir>/{replay,maintenance}/.
+    // State directories under <state_dir>/{replay,maintenance,inflight_ops}/.
     let state_dir = config.state_dir.clone().unwrap();
     let replay_dir = state_dir.join("replay");
     let maintenance_dir = state_dir.join("maintenance");
-    create_state_subdirs(&[&replay_dir, &maintenance_dir]).await?;
+    let inflight_dir = state_dir.join("inflight_ops");
+    create_state_subdirs(&[&replay_dir, &maintenance_dir, &inflight_dir]).await?;
 
     let replay = Arc::new(FileReplayMarkerStore::new(replay_dir, DEFAULT_RETENTION));
+    let inflight = Arc::new(FileInflightOpStore::new(
+        inflight_dir,
+        pg_agent_core::inflight_ops::DEFAULT_RETENTION,
+    ));
     let wal = Arc::new(FileWalStore::new(
         postgres.data_dir.clone(),
         config.postgres.archive_dir.clone().unwrap(),
@@ -301,6 +307,7 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         pcp,
         sd,
         replay,
+        inflight,
         wal,
     };
 

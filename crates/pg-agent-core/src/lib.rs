@@ -18,6 +18,7 @@ pub mod certreload;
 pub mod config;
 pub mod errors;
 pub mod healthz;
+pub mod inflight_ops;
 pub mod localdb;
 pub mod localserver;
 pub mod maintenance;
