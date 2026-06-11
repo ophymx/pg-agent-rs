@@ -265,10 +265,12 @@ impl Agent {
             let wal = self.deps.wal.clone();
             let replay = self.deps.replay.clone();
             let pcp = self.deps.pcp.clone();
+            let sd = self.deps.sd.clone();
+            let standby = self.deps.standby.clone();
             let pool = self.opts.node_pool.clone();
             let pg = self.opts.postgres.clone();
             js.spawn(async move {
-                LocalServer::new(me, db, peers, maint, wal, replay, pcp, pool, pg)
+                LocalServer::new(me, db, peers, maint, wal, replay, pcp, sd, standby, pool, pg)
                     .serve(listeners.unix, s)
                     .await
             });
@@ -973,6 +975,9 @@ mod tests {
             unreachable!("phantom-primary check does not call get_node_config")
         }
         async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn create_slot(&self, _: &str) -> anyhow::Result<()> {
             unreachable!()
         }
         async fn start(&self) -> anyhow::Result<()> {

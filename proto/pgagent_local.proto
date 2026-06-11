@@ -137,6 +137,21 @@ message ClusterRecoverRequest {
   bool stop_target_pg = 2;
 }
 
+message ClusterHandoffRequest {
+  // pgpool node id of the standby to promote. Must be a healthy
+  // standby of the local node — the daemon refuses if the target is
+  // already a primary or if its PG isn't running.
+  int32 target_node_id = 1;
+
+  // Skip the lag pre-check. Without this, the daemon refuses to
+  // promote a target whose replication_lag_bytes exceeds
+  // `MAX_HANDOFF_LAG_BYTES` (one WAL segment, 16 MiB) — promoting a
+  // lagging standby silently loses the writes between its replay LSN
+  // and the old primary's current LSN. CLI surface: `--allow-lag` on
+  // `pg_agentctl cluster handoff`.
+  bool allow_lag = 2;
+}
+
 message GetPgpoolBackendsRequest {}
 
 // One row per pool member. Mirrors `ClusterStatusEntry`'s per-node
@@ -177,6 +192,14 @@ service PgAgentLocal {
   // recovery_1st_stage_command hook (which routes through `pg_agentc
   // recovery1`); same orchestration, no PCP creds required.
   rpc ClusterRecover    (ClusterRecoverRequest)    returns (OpResult);
+  // Planned primary handoff. Run from the current primary. Promotes the
+  // target standby (pg_promote() on the peer), demotes the local node
+  // to a standby of the new primary via rewind→basebackup fallback.
+  // Distinct from ClusterRecover (which rebuilds a broken target FROM
+  // the local primary): handoff REPLACES the local primary WITH the
+  // target. Refuses if the target lag exceeds 16 MiB unless `allow_lag`
+  // is set.
+  rpc ClusterHandoff    (ClusterHandoffRequest)    returns (OpResult);
   rpc GetPgpoolBackends (GetPgpoolBackendsRequest) returns (GetPgpoolBackendsResponse);
 
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);

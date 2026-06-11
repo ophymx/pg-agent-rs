@@ -115,10 +115,30 @@ enum ClusterCmd {
         #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
+    /// Planned primary handoff. Run from the current primary. Promotes
+    /// the target standby (pg_promote on the peer), demotes the local
+    /// node to a standby of the new primary, and reattaches in pgpool.
+    /// Distinct from `recover` (which rebuilds a broken target FROM the
+    /// local primary): handoff REPLACES the local primary WITH the
+    /// target. Refuses if target lag exceeds 16 MiB (one WAL segment)
+    /// unless `--allow-lag` is set.
+    Handoff {
+        /// Pool id of the standby to promote.
+        #[arg(long)]
+        target: i32,
+        /// Override the lag pre-check. Without this, the daemon refuses
+        /// to promote a target whose replication lag exceeds one WAL
+        /// segment. Passing the flag accepts data loss for writes
+        /// between the standby's replay LSN and the primary's current
+        /// LSN.
+        #[arg(long)]
+        allow_lag: bool,
+        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
     // v1.x roadmap items (placeholders so the surface is reserved):
     // Pause      — set cluster paused=true via shared-state RPC
     // Resume     — clear pause flag
-    // Switchover — planned promotion
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -162,6 +182,20 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
                     config,
                     target,
                     stop_target_pg,
+                    cli.socket.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
+            ClusterCmd::Handoff {
+                target,
+                allow_lag,
+                config,
+            } => {
+                cluster_handoff(
+                    config,
+                    target,
+                    allow_lag,
                     cli.socket.as_deref(),
                     cli.json,
                 )
@@ -347,6 +381,55 @@ async fn cluster_recover(
         }
     } else {
         eprintln!("cluster recover: {}", resp.message);
+    }
+
+    if resp.ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// `cluster handoff --target <id>` — planned primary handoff. The
+/// daemon resolves the local node as the current primary and refuses
+/// if it's a standby. Same wire shape as `cluster recover` — JSON or
+/// human-readable output, exit code reflects `resp.ok`.
+async fn cluster_handoff(
+    config_path: PathBuf,
+    target: i32,
+    allow_lag: bool,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::ClusterHandoffRequest;
+
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .cluster_handoff(ClusterHandoffRequest {
+            target_node_id: target,
+            allow_lag,
+        })
+        .await
+        .map_err(|s| rpc_failed("ClusterHandoff", s))?
+        .into_inner();
+
+    if json {
+        let payload = serde_json::json!({
+            "ok":        resp.ok,
+            "message":   resp.message,
+            "target":    target,
+            "allow_lag": allow_lag,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if resp.ok {
+        if resp.message.is_empty() {
+            println!("OK (handed off to node {target})");
+        } else {
+            println!("OK: {}", resp.message);
+        }
+    } else {
+        eprintln!("cluster handoff: {}", resp.message);
     }
 
     if resp.ok {

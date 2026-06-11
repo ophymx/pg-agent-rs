@@ -22,9 +22,9 @@ use crate::pgstandby::{BasebackupOpts, RewindOpts, WriteRecoveryConfOpts};
 use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
     pg_agent_peer_client::PgAgentPeerClient, BasebackupRequest, ConfigureStandbyRequest,
-    DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse,
-    NodeStatus, OpProgress, PromoteRequest, RewindRequest, StartPgpoolRequest, StartRequest,
-    StopRequest,
+    CreateSlotRequest, DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest,
+    NodeConfigResponse, NodeStatus, OpProgress, PromoteRequest, RewindRequest, StartPgpoolRequest,
+    StartRequest, StopRequest,
 };
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -68,6 +68,14 @@ pub trait PeerClient: Send + Sync {
     /// 42710 / "does not exist" should still surface as an error here —
     /// the caller (maintenance worker) decides retry vs. abandon.
     async fn drop_slot(&self, slot_name: &str) -> anyhow::Result<()>;
+
+    /// `pg_create_physical_replication_slot($1)` on the target peer's
+    /// PostgreSQL. Used by `LocalServer::ClusterHandoff` so the
+    /// newly-promoted primary has a slot for the soon-to-be-standby
+    /// (the old primary) before basebackup/rewind starts. Idempotent —
+    /// the server-side handler (`peerserver.rs::create_slot`) treats
+    /// SQLSTATE 42710 (duplicate_object) as success.
+    async fn create_slot(&self, slot_name: &str) -> anyhow::Result<()>;
 
     /// Read-only "what is your PG port + data dir" call. Cheap enough to
     /// use as a connectivity probe; preflight calls it to verify the
@@ -128,14 +136,11 @@ pub trait PeerClient: Send + Sync {
     /// to promote the chosen new main after the primary goes down.
     async fn promote(&self) -> anyhow::Result<()>;
 
-    // Deliberately absent: the `Reload`, `ReloadPgpool`, `CreateSlot`, and
+    // Deliberately absent: the `Reload`, `ReloadPgpool`, and
     // `RemoveVip` RPCs are reserved in pgagent_peer.proto for forward
     // compatibility but not called by any v1 workflow:
     //   - Reload / ReloadPgpool: every config reload in v1 is local
     //     (systemd reload + SIGHUP on the node whose config changed).
-    //   - CreateSlot: outgoing slots are created on the primary's local
-    //     DB via `LocalDb::create_slot`; standby slots are owned by the
-    //     standby itself via `myrecovery.conf`.
     //   - RemoveVip: SPEC §18 — HAProxy fronts the cluster; no VIP to
     //     manage. (Future watchdog `delegate_IP` support tracked in
     //     ROADMAP exploratory.)
@@ -365,6 +370,22 @@ struct PeerChannel {
 
 #[async_trait]
 impl PeerClient for PeerChannel {
+    async fn create_slot(&self, slot_name: &str) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        let req = CreateSlotRequest {
+            slot_name: slot_name.to_string(),
+        };
+        let resp = client
+            .create_slot(req)
+            .await
+            .map_err(|s| anyhow::anyhow!("peer create_slot: {}", s.message()))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer create_slot: {}", resp.message);
+        }
+        Ok(())
+    }
+
     async fn drop_slot(&self, slot_name: &str) -> anyhow::Result<()> {
         let mut client = self.inner.clone();
         let req = DropSlotRequest {

@@ -417,6 +417,15 @@ impl SupervisorConfig {
 
 pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 
+/// Maximum acceptable replication lag (bytes) on the handoff target,
+/// past which `pg_agentctl cluster handoff --target N` refuses to
+/// proceed unless the operator passes `--allow-lag`. One WAL segment
+/// (16 MiB) is the standard "fresh enough" threshold — a standby that
+/// just received and replayed the current segment is at most this far
+/// behind, and a planned handoff into a target that's further behind
+/// would silently lose those writes when the old primary demotes.
+pub const MAX_HANDOFF_LAG_BYTES: i64 = 16 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Runtime projections
 // ---------------------------------------------------------------------------
