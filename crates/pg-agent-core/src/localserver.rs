@@ -1597,6 +1597,7 @@ mod tests {
                 is_pgpool_running: true,
                 is_postgres_status_ok: true,
                 is_pgpool_status_ok: true,
+                timeline_id: 0,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -1646,6 +1647,9 @@ mod tests {
                 anyhow::bail!("stub: is_in_recovery boom");
             }
             Ok(self.in_recovery.load(Ordering::SeqCst))
+        }
+        async fn timeline_id(&self) -> anyhow::Result<i32> {
+            Ok(0)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             Ok(ReplicationLag::default())
@@ -1826,6 +1830,7 @@ mod tests {
                 is_pgpool_running: true,
                 is_postgres_status_ok: true,
                 is_pgpool_status_ok: true,
+                timeline_id: 0,
             })
         }
         async fn stop(&self) -> anyhow::Result<()> {

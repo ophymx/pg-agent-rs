@@ -133,6 +133,8 @@ pub struct Config {
     pub pcp: PcpConfig,
     #[serde(default)]
     pub healthz: HealthzConfig,
+    #[serde(default)]
+    pub startup: StartupConfig,
 
     /// Set by the `--dev` CLI flag — never read from config.toml.
     #[serde(skip)]
@@ -350,6 +352,39 @@ impl HealthzConfig {
         self.port.get_or_insert(DEFAULT_HEALTHZ_PORT);
     }
 }
+
+/// `[startup]` — knobs for the one-shot startup phantom-primary check.
+///
+/// Before signalling `/healthz` ready, the daemon (when it would assert
+/// the primary role) queries every peer for its WAL timeline. If any
+/// peer reports a timeline ahead of the local one, the agent refuses to
+/// come up as primary and stops PostgreSQL via systemd instead. See
+/// `Agent::verify_primary_at_startup`.
+///
+/// `phantom_check_required_peers` is the minimum count of peers that
+/// must answer (with a known timeline) for the check to produce a
+/// `Confirmed` verdict. Below that count, the verdict is `Unverifiable`
+/// and PG is stopped.
+///
+/// Default 1 — sane on 3+-node clusters even when one peer is down.
+/// **2-node operational note**: with the default, every restart while
+/// the other node is unreachable will stop PG locally. Set to `0` to
+/// disable the quorum gate (proceeds even with zero peer responses);
+/// the timeline comparison still fires if peers respond.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StartupConfig {
+    #[serde(default)]
+    pub phantom_check_required_peers: Option<usize>,
+}
+
+impl StartupConfig {
+    pub fn effective_required_peers(&self) -> usize {
+        self.phantom_check_required_peers
+            .unwrap_or(DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS)
+    }
+}
+
+pub const DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS: usize = 1;
 
 // ---------------------------------------------------------------------------
 // Runtime projections

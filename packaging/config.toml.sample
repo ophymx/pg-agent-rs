@@ -77,3 +77,21 @@ hostname = "pg3.example.com"
 # enabled = true
 # listen  = "0.0.0.0"
 # port    = 9702
+
+# --- startup phantom-primary check ------------------------------------
+# Before signalling /healthz ready, the daemon (when PG is up and
+# pg_is_in_recovery() is false) compares its WAL timeline against every
+# peer. If a peer reports a higher timeline (or asserts primary on the
+# same timeline) the daemon stops PostgreSQL via systemd instead of
+# letting a stale primary route traffic. See ROADMAP.md "Recovery and
+# reconciliation".
+#
+# phantom_check_required_peers: minimum number of peers that must answer
+# with a known timeline for the check to render a positive verdict.
+# Below that count → Unverifiable → PG stopped (conservative).
+#
+# Default 1 — appropriate for 3+-node clusters even with one peer down.
+# On 2-node clusters, every restart while the peer is unreachable will
+# stop PG locally; set to 0 to disable the quorum gate.
+# [startup]
+# phantom_check_required_peers = 1

@@ -50,6 +50,16 @@ pub trait LocalDb: Send + Sync {
 
     async fn is_in_recovery(&self) -> anyhow::Result<bool>;
 
+    /// Live PostgreSQL timeline ID parsed from the current WAL filename:
+    /// `pg_walfile_name(pg_current_wal_lsn())` on a primary,
+    /// `pg_walfile_name_offset(pg_last_wal_replay_lsn())` on a standby.
+    /// Both return a 24-char filename whose first 8 hex chars are the
+    /// timeline. WAL-derived rather than `pg_control_checkpoint()` because
+    /// the control file only updates at checkpoint — stale exactly when
+    /// the phantom-primary check needs a live value (right after a crashed
+    /// primary returns).
+    async fn timeline_id(&self) -> anyhow::Result<i32>;
+
     /// On a primary returns `ReplicationLag::default()` (zeros).
     async fn replication_lag(&self) -> anyhow::Result<ReplicationLag>;
 
@@ -163,6 +173,39 @@ impl LocalDb for PgLocalDb {
             .await
             .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?;
         Ok(row.get::<_, bool>(0))
+    }
+
+    async fn timeline_id(&self) -> anyhow::Result<i32> {
+        let conn = self.get_conn().await?;
+        let in_recovery: bool = conn
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?
+            .get(0);
+        // Standby uses replay LSN (we may have no current_wal_lsn);
+        // pg_walfile_name_offset returns (file_name, file_offset).
+        let filename: String = if in_recovery {
+            conn.query_one(
+                "SELECT (pg_walfile_name_offset(pg_last_wal_replay_lsn())).file_name",
+                &[],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_walfile_name_offset: {}", describe_pg(&e)))?
+            .get(0)
+        } else {
+            conn.query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("localdb: pg_walfile_name: {}", describe_pg(&e)))?
+                .get(0)
+        };
+        // PG WAL filename is exactly 24 hex chars: TLI(8) + LOGID(8) + SEGNO(8).
+        if filename.len() < 8 {
+            anyhow::bail!("localdb: unexpected WAL filename {filename:?}");
+        }
+        let tli = i32::from_str_radix(&filename[..8], 16).map_err(|e| {
+            anyhow::anyhow!("localdb: parse timeline from WAL filename {filename:?}: {e}")
+        })?;
+        Ok(tli)
     }
 
     async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {

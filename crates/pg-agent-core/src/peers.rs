@@ -607,6 +607,7 @@ mod tests {
                 is_pgpool_running: true,
                 is_postgres_status_ok: true,
                 is_pgpool_status_ok: true,
+                timeline_id: 0,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -717,6 +718,9 @@ mod tests {
         }
         async fn is_in_recovery(&self) -> anyhow::Result<bool> {
             Ok(false)
+        }
+        async fn timeline_id(&self) -> anyhow::Result<i32> {
+            Ok(0)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             Ok(ReplicationLag::default())

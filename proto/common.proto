@@ -31,6 +31,13 @@ message NodeStatus {
   bool   is_pgpool_running       = 7;
   bool   is_postgres_status_ok   = 8;
   bool   is_pgpool_status_ok     = 9;
+  // Current PostgreSQL timeline derived from the live WAL filename
+  // (pg_walfile_name(pg_current_wal_lsn()) on a primary, the replay
+  // equivalent on a standby). 0 = unknown / probe failed / peer is on
+  // a pre-feature build; treat 0 as "no evidence" for cross-peer
+  // comparison. Used by the startup phantom-primary check to detect a
+  // returned-primary that was promoted past during its absence.
+  int32  timeline_id             = 10;
 }
 
 message GetStatusRequest {}

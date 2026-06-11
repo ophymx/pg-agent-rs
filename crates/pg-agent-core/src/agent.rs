@@ -35,6 +35,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use pg_agent_proto::pgagentpb as pb;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UnixListener};
@@ -80,6 +81,12 @@ pub struct Options {
     pub postgres: PostgresRuntime,
     pub maintenance_store: Arc<dyn MaintenanceStore>,
     pub maintenance_sweep_interval: Duration,
+    /// Minimum count of peers that must answer the startup phantom-primary
+    /// check (with a known timeline) for it to produce a `Confirmed`
+    /// verdict. Projected from `Config::startup.effective_required_peers()`.
+    /// 0 disables the quorum gate — see `StartupConfig` docs for the
+    /// 2-node operational trade-off.
+    pub phantom_check_required_peers: usize,
     /// Shared mTLS material for the peer server and outbound peer clients.
     /// `None` means no TLS — caller is responsible for passing `--dev` and
     /// ensuring `serve.reject_insecure_remote_peer()` is false. The check
@@ -100,6 +107,7 @@ impl Options {
             postgres,
             maintenance_store,
             maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
+            phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
             cert_reloader: None,
         }
     }
@@ -158,13 +166,24 @@ impl Listeners {
 pub struct Agent {
     pub(crate) deps: AgentDeps,
     pub(crate) opts: Options,
+    /// Flips `true` after `verify_primary_at_startup` resolves
+    /// (regardless of verdict — operator visibility is the gate, not
+    /// "everything passed"). Shared with `serve_healthz` so that until
+    /// the check runs, every `/healthz` request returns 503: HAProxy
+    /// must not route at a node whose role hasn't been validated
+    /// against the cluster yet.
+    pub(crate) startup_verified: Arc<AtomicBool>,
 }
 
 impl Agent {
     /// Build a shared agent. Cheap — no I/O. Returns `Arc<Self>` because
     /// subsystems clone it as `Arc<dyn NodeInfo>`.
     pub fn new(deps: AgentDeps, opts: Options) -> Arc<Self> {
-        Arc::new(Self { deps, opts })
+        Arc::new(Self {
+            deps,
+            opts,
+            startup_verified: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Project the inbound peer mTLS config: bundle the cert reloader
@@ -287,12 +306,88 @@ impl Agent {
         if let Some(healthz_listener) = listeners.healthz {
             let s = shutdown.clone();
             let snap = snapshotter.clone();
+            let verified = self.startup_verified.clone();
             js.spawn(async move {
-                healthz::serve_healthz(healthz_listener, snap, STALE_AFTER, s)
+                healthz::serve_healthz(healthz_listener, snap, STALE_AFTER, verified, s)
                     .await
                     .map_err(Into::into)
             });
         }
+
+        // Phantom-primary detection (SPEC §...; ROADMAP recovery and
+        // reconciliation). Runs AFTER subsystems spawn so peers can
+        // answer our outbound GetStatus via the now-bound local
+        // PeerServer if they're booting concurrently, and BEFORE
+        // sd_notify(READY) so systemd's "started" signal aligns with
+        // "role has been verified against the cluster." `startup_verified`
+        // gates /healthz independently: even a Confirmed verdict
+        // requires the flag to flip before /healthz returns 200.
+        let verdict = self.verify_primary_at_startup().await;
+        match &verdict {
+            PrimaryVerdict::Confirmed => {
+                info!("phantom-primary check: confirmed");
+            }
+            PrimaryVerdict::NotApplicable => {
+                info!(
+                    "phantom-primary check: not applicable (standby or PG not running)"
+                );
+            }
+            PrimaryVerdict::Phantom { local_tl, peers } => {
+                let peer_evidence: Vec<String> = peers
+                    .iter()
+                    .map(|p| format!("{}@TL{}", p.hostname, p.timeline_id))
+                    .collect();
+                warn!(
+                    local_tl,
+                    peers = ?peer_evidence,
+                    "phantom-primary check: detected — peer reports higher timeline; stopping postgres"
+                );
+                if let Err(e) = stop_postgres_with_retry(self.deps.sd.as_ref()).await {
+                    return Err(anyhow::anyhow!(
+                        "phantom-primary detected on local TL {local_tl}; \
+                         stop_postgres failed: {e}; refusing to mark daemon ready \
+                         with PG still up"
+                    ));
+                }
+            }
+            PrimaryVerdict::SplitBrain { local_tl, peers } => {
+                let peer_evidence: Vec<String> = peers
+                    .iter()
+                    .map(|p| format!("{}@TL{}", p.hostname, p.timeline_id))
+                    .collect();
+                warn!(
+                    local_tl,
+                    peers = ?peer_evidence,
+                    "phantom-primary check: split brain — peer asserts primary on same timeline; stopping postgres"
+                );
+                if let Err(e) = stop_postgres_with_retry(self.deps.sd.as_ref()).await {
+                    return Err(anyhow::anyhow!(
+                        "split brain detected on local TL {local_tl}; \
+                         stop_postgres failed: {e}; refusing to mark daemon ready \
+                         with PG still up"
+                    ));
+                }
+            }
+            PrimaryVerdict::Unverifiable { reason } => {
+                warn!(
+                    reason,
+                    "phantom-primary check: unverifiable; stopping postgres conservatively"
+                );
+                if let Err(e) = stop_postgres_with_retry(self.deps.sd.as_ref()).await {
+                    return Err(anyhow::anyhow!(
+                        "phantom-primary unverifiable ({reason}); stop_postgres failed: \
+                         {e}; refusing to mark daemon ready with PG still up"
+                    ));
+                }
+            }
+        }
+        // The gate flips after the verdict resolves regardless of
+        // outcome — operator visibility, not "everything passed." A
+        // Phantom/SplitBrain/Unverifiable verdict still produces a 503
+        // because PG is now stopped (snapshotter reports it), and the
+        // gate releasing lets that 503 reflect actual cluster state
+        // instead of the bootstrap-pending placeholder.
+        self.startup_verified.store(true, Ordering::SeqCst);
 
         // Listeners are bound, subsystems are spawned — safe to tell systemd
         // we're ready. See [`crate::sdnotify`] for why this MUST come last.
@@ -335,6 +430,250 @@ impl Agent {
 }
 
 // ---------------------------------------------------------------------------
+// Phantom-primary startup check
+// ---------------------------------------------------------------------------
+
+/// Best-effort `stop_postgres` with one retry. Used by the
+/// phantom-primary action arm: if we couldn't even stop PG, we have a
+/// node with a stale-primary PostgreSQL still accepting writes from
+/// anyone who bypasses pgpool — the worst possible outcome of the
+/// failure mode this check exists to prevent. So a second failure
+/// surfaces as `Err`, which `serve()` propagates → daemon exits
+/// nonzero, systemd surfaces the failure, operator gets paged. Silent
+/// log lines would not.
+async fn stop_postgres_with_retry(sd: &dyn Systemd) -> anyhow::Result<()> {
+    if let Err(e) = sd.stop_postgres().await {
+        warn!(?e, "phantom-primary check: stop_postgres failed; retrying once");
+        sd.stop_postgres().await.map_err(|e2| {
+            anyhow::anyhow!("stop_postgres failed twice: first={e}; retry={e2}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Total budget for the startup peer fan-out. Five seconds matches the
+/// per-peer dial timeout in [`crate::peers::DEFAULT_CONNECT_TIMEOUT`]:
+/// long enough for healthy LAN + TLS handshake to every reachable peer
+/// in parallel; tight enough that a permanently-partitioned cluster
+/// member doesn't drag startup. Hard-coded; if a deployment turns out
+/// to need tuning, promote to a `[startup]` knob then.
+const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One peer's contribution to a [`PrimaryVerdict`]. Only reachable
+/// peers with a known timeline (`timeline_id > 0`) make it into the
+/// observation list — unreachable peers and pre-feature peers are
+/// counted via the quorum gate, not by being represented here.
+#[derive(Debug, Clone)]
+pub struct PeerObservation {
+    pub id: i32,
+    pub hostname: String,
+    pub timeline_id: i32,
+    pub is_in_recovery: bool,
+}
+
+/// Result of `verify_primary_at_startup`. Pure data — the
+/// action policy (stop PG, log, exit) lives in [`Agent::serve`]. Keeps
+/// the door open for `auto_demote_on_phantom` in a future revision
+/// without disturbing the verdict shape.
+#[derive(Debug)]
+pub enum PrimaryVerdict {
+    /// Local node is the primary AND at least
+    /// `phantom_check_required_peers` peers answered with timelines ≤
+    /// ours and none contradict (no peer reports a higher timeline; no
+    /// peer reports the same timeline while also asserting primary).
+    Confirmed,
+    /// Local node is in recovery, or PG is confirmed-stopped — there's
+    /// no primary role being asserted yet, so no verdict to render.
+    NotApplicable,
+    /// A peer reports a strictly higher timeline. Most common case: we
+    /// were offline through a failover that promoted a peer.
+    Phantom {
+        local_tl: i32,
+        peers: Vec<PeerObservation>,
+    },
+    /// A peer asserts primary on our same timeline. Both nodes think
+    /// they own writes — split brain at the same TL. Rare but possible
+    /// (two simultaneous promotions, operator error).
+    SplitBrain {
+        local_tl: i32,
+        peers: Vec<PeerObservation>,
+    },
+    /// Couldn't gather enough evidence: PG-status query failed, local
+    /// timeline unreadable, or fewer than `phantom_check_required_peers`
+    /// peers responded with a known timeline. The conservative
+    /// interpretation — refuse to assert primary, stop PG.
+    Unverifiable { reason: String },
+}
+
+impl Agent {
+    /// One-shot startup check that the local node is *really* the
+    /// primary the cluster knows about — not a returned-from-the-dead
+    /// phantom on a stale timeline. See [`PrimaryVerdict`] for the
+    /// decision shape and the module-level rationale.
+    ///
+    /// Called from [`Agent::serve`] exactly once, after subsystems are
+    /// spawned (so peers can answer our `GetStatus` outbound fan-out
+    /// via the local PeerServer if they're racing the same check) and
+    /// before [`crate::sdnotify::ready`]. Returns immediately on the
+    /// `NotApplicable` paths (PG down, we're in recovery).
+    pub(crate) async fn verify_primary_at_startup(&self) -> PrimaryVerdict {
+        // 1. PG must be running primary for there to be a role to verify.
+        //    "Could not query systemd" → conservative Unverifiable; "PG
+        //    confirmed stopped" → NotApplicable (snapshotter will pick up
+        //    if PG comes online later).
+        match self.deps.sd.status_postgres().await {
+            Ok(false) => return PrimaryVerdict::NotApplicable,
+            Ok(true) => {}
+            Err(e) => {
+                return PrimaryVerdict::Unverifiable {
+                    reason: format!("systemd status_postgres: {e}"),
+                };
+            }
+        }
+
+        match self.deps.db.is_in_recovery().await {
+            Ok(true) => return PrimaryVerdict::NotApplicable,
+            Ok(false) => {}
+            Err(e) => {
+                return PrimaryVerdict::Unverifiable {
+                    reason: format!("is_in_recovery: {e}"),
+                };
+            }
+        }
+
+        let local_tl = match self.deps.db.timeline_id().await {
+            Ok(tl) if tl > 0 => tl,
+            Ok(_) => {
+                return PrimaryVerdict::Unverifiable {
+                    reason: "local timeline_id resolved to 0".into(),
+                };
+            }
+            Err(e) => {
+                return PrimaryVerdict::Unverifiable {
+                    reason: format!("timeline_id: {e}"),
+                };
+            }
+        };
+
+        // 2. Fan out GetStatus to every non-local peer, all in parallel
+        //    under one wall-clock budget. Per-peer errors are folded
+        //    into the result list as "unreachable" (just dropped here —
+        //    the quorum gate counts what survived).
+        let local_id = self.opts.node_pool.local_node_id;
+        let peers: Vec<crate::config::NodeConfig> = self
+            .opts
+            .node_pool
+            .members
+            .iter()
+            .filter(|n| n.id != local_id)
+            .cloned()
+            .collect();
+
+        let registry = self.deps.peers.clone();
+        let fanout = async {
+            let mut js: JoinSet<Option<PeerObservation>> = JoinSet::new();
+            for peer in peers {
+                let registry = registry.clone();
+                js.spawn(async move {
+                    let client = match registry.client(&peer).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(
+                                peer = %peer.hostname,
+                                ?e,
+                                "phantom-primary check: peer dial failed"
+                            );
+                            return None;
+                        }
+                    };
+                    match client.get_status().await {
+                        Ok(status) if status.timeline_id > 0 => Some(PeerObservation {
+                            id: peer.id,
+                            hostname: peer.hostname.clone(),
+                            timeline_id: status.timeline_id,
+                            is_in_recovery: status.is_in_recovery,
+                        }),
+                        Ok(_) => {
+                            // Peer responded but timeline is 0 — pre-
+                            // feature peer or its own timeline probe
+                            // failed. Counts as "did not respond with
+                            // evidence" for the quorum gate.
+                            warn!(
+                                peer = %peer.hostname,
+                                "phantom-primary check: peer reported timeline_id=0; no evidence"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            warn!(
+                                peer = %peer.hostname,
+                                ?e,
+                                "phantom-primary check: peer get_status failed"
+                            );
+                            None
+                        }
+                    }
+                });
+            }
+            let mut out = Vec::new();
+            while let Some(res) = js.join_next().await {
+                if let Ok(Some(obs)) = res {
+                    out.push(obs);
+                }
+            }
+            out
+        };
+
+        let observations = match tokio::time::timeout(STARTUP_CHECK_TIMEOUT, fanout).await {
+            Ok(v) => v,
+            Err(_) => {
+                return PrimaryVerdict::Unverifiable {
+                    reason: format!(
+                        "peer fan-out exceeded {:?}",
+                        STARTUP_CHECK_TIMEOUT
+                    ),
+                };
+            }
+        };
+
+        // 3. Classify. Phantom wins over SplitBrain (higher-TL evidence
+        //    is the more specific failure mode); both win over the
+        //    quorum gate.
+        let mut phantom_peers: Vec<PeerObservation> = Vec::new();
+        let mut split_peers: Vec<PeerObservation> = Vec::new();
+        for obs in &observations {
+            if obs.timeline_id > local_tl {
+                phantom_peers.push(obs.clone());
+            } else if obs.timeline_id == local_tl && !obs.is_in_recovery {
+                split_peers.push(obs.clone());
+            }
+        }
+        if !phantom_peers.is_empty() {
+            return PrimaryVerdict::Phantom {
+                local_tl,
+                peers: phantom_peers,
+            };
+        }
+        if !split_peers.is_empty() {
+            return PrimaryVerdict::SplitBrain {
+                local_tl,
+                peers: split_peers,
+            };
+        }
+        if observations.len() < self.opts.phantom_check_required_peers {
+            return PrimaryVerdict::Unverifiable {
+                reason: format!(
+                    "only {}/{} peers answered with a known timeline",
+                    observations.len(),
+                    self.opts.phantom_check_required_peers
+                ),
+            };
+        }
+        PrimaryVerdict::Confirmed
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NodeInfo impl
 // ---------------------------------------------------------------------------
 
@@ -351,11 +690,12 @@ impl NodeInfo for Agent {
     /// lag. A node where any probe failed is degraded, not ready, even if
     /// the visible facts (e.g. service running) look fine. See SPEC §5.9.
     async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
-        let (pg_status_res, pgpool_status_res, in_recovery_res, lag_res) = tokio::join!(
+        let (pg_status_res, pgpool_status_res, in_recovery_res, lag_res, timeline_res) = tokio::join!(
             self.deps.sd.status_postgres(),
             self.deps.sd.status_pgpool(),
             self.deps.db.is_in_recovery(),
             self.deps.db.replication_lag(),
+            self.deps.db.timeline_id(),
         );
 
         let (pg_running, pg_status_ok) = pg_status_res
@@ -374,6 +714,14 @@ impl NodeInfo for Agent {
             .inspect_err(|e| warn!(?e, "get_status: replication_lag query failed"))
             .map_or((ReplicationLag::default(), false), |l| (l, true));
 
+        // Timeline failure is NOT folded into is_ready: it's a young
+        // probe, and a transient hiccup shouldn't flap readiness. Peers
+        // and the startup check observe `timeline_id == 0` as "unknown"
+        // and just decline to draw conclusions from this datapoint.
+        let timeline = timeline_res
+            .inspect_err(|e| warn!(?e, "get_status: timeline_id query failed"))
+            .unwrap_or(0);
+
         let ready = recovery_ok && lag_ok && pg_status_ok && pgpool_status_ok;
 
         Ok(pb::NodeStatus {
@@ -386,6 +734,7 @@ impl NodeInfo for Agent {
             is_pgpool_running: pgpool_running,
             is_postgres_status_ok: pg_status_ok,
             is_pgpool_status_ok: pgpool_status_ok,
+            timeline_id: timeline,
         })
     }
 
@@ -425,6 +774,8 @@ mod tests {
         in_recovery_fails: AtomicBool,
         lag_fails: AtomicBool,
         lag: ReplicationLag,
+        timeline: i32,
+        timeline_fails: AtomicBool,
     }
 
     #[async_trait]
@@ -446,6 +797,12 @@ mod tests {
                 anyhow::bail!("stub: is_in_recovery boom");
             }
             Ok(self.in_recovery)
+        }
+        async fn timeline_id(&self) -> anyhow::Result<i32> {
+            if self.timeline_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: timeline_id boom");
+            }
+            Ok(self.timeline)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             if self.lag_fails.load(Ordering::SeqCst) {
@@ -473,6 +830,11 @@ mod tests {
         pgpool_running: bool,
         pg_fails: AtomicBool,
         pgpool_fails: AtomicBool,
+        /// # of stop_postgres calls observed.
+        stop_calls: std::sync::atomic::AtomicUsize,
+        /// # of leading stop_postgres calls that should fail before
+        /// success (counts down).
+        stop_fail_count: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -481,6 +843,16 @@ mod tests {
             Ok(())
         }
         async fn stop_postgres(&self) -> anyhow::Result<()> {
+            self.stop_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remaining = self
+                .stop_fail_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.stop_fail_count
+                    .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("stub: stop_postgres boom");
+            }
             Ok(())
         }
         async fn status_postgres(&self) -> anyhow::Result<bool> {
@@ -517,17 +889,104 @@ mod tests {
         }
     }
 
-    struct StubPeers;
+    /// PeerClient stub answering only `get_status` from a canned value;
+    /// every other method (`promote`, `stop`, `basebackup`, …) panics
+    /// so a test that strays into them fails loudly. The phantom-primary
+    /// check uses only `get_status`.
+    struct CannedPeerClient {
+        status: pb::NodeStatus,
+    }
+    #[async_trait]
+    impl PeerClient for CannedPeerClient {
+        async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
+            Ok(self.status.clone())
+        }
+        async fn get_node_config(&self) -> anyhow::Result<pb::NodeConfigResponse> {
+            unreachable!("phantom-primary check does not call get_node_config")
+        }
+        async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn rewind(&self, _: crate::pgstandby::RewindOpts) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn basebackup(&self, _: crate::pgstandby::BasebackupOpts) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn configure_standby(
+            &self,
+            _: crate::pgstandby::WriteRecoveryConfOpts,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn promote(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn fetch_wal(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Default)]
+    struct StubPeers {
+        /// Per-node-id canned response. Absent → `client()` errors
+        /// (default behaviour matches legacy unit-struct stub).
+        responses: std::sync::Mutex<std::collections::HashMap<i32, pb::NodeStatus>>,
+    }
+
+    impl StubPeers {
+        fn with_responses(rs: Vec<(i32, pb::NodeStatus)>) -> Self {
+            let mut map = std::collections::HashMap::new();
+            for (id, s) in rs {
+                map.insert(id, s);
+            }
+            Self {
+                responses: std::sync::Mutex::new(map),
+            }
+        }
+    }
+
     #[async_trait]
     impl PeerRegistry for StubPeers {
         async fn client(
             &self,
-            _: &crate::config::NodeConfig,
+            node: &crate::config::NodeConfig,
         ) -> anyhow::Result<Arc<dyn PeerClient>> {
-            anyhow::bail!("stub: no peer client")
+            let map = self.responses.lock().unwrap();
+            match map.get(&node.id) {
+                Some(status) => Ok(Arc::new(CannedPeerClient {
+                    status: status.clone(),
+                })),
+                None => anyhow::bail!("stub: no peer client for id={}", node.id),
+            }
         }
         async fn close(&self) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Build a NodeStatus for fan-out canned responses.
+    fn ns(timeline_id: i32, is_in_recovery: bool) -> pb::NodeStatus {
+        pb::NodeStatus {
+            is_running: true,
+            is_in_recovery,
+            is_ready: true,
+            replication_lag_bytes: 0,
+            replication_state: String::new(),
+            is_postgres_running: true,
+            is_pgpool_running: true,
+            is_postgres_status_ok: true,
+            is_pgpool_status_ok: true,
+            timeline_id,
         }
     }
 
@@ -657,15 +1116,24 @@ mod tests {
                 postgres: pg,
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
+                phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 cert_reloader: None,
             },
         )
     }
 
     fn make_deps(db: Arc<dyn LocalDb>, sd: Arc<dyn Systemd>) -> AgentDeps {
+        make_deps_with_peers(db, sd, Arc::new(StubPeers::default()))
+    }
+
+    fn make_deps_with_peers(
+        db: Arc<dyn LocalDb>,
+        sd: Arc<dyn Systemd>,
+        peers: Arc<dyn PeerRegistry>,
+    ) -> AgentDeps {
         AgentDeps {
             db,
-            peers: Arc::new(StubPeers),
+            peers,
             standby: Arc::new(StubStandby),
             pcp: Arc::new(StubPcp),
             sd,
@@ -877,6 +1345,7 @@ mod tests {
                 postgres: pg,
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
+                phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 cert_reloader: None,
             },
         );
@@ -931,6 +1400,7 @@ mod tests {
                 postgres: pg,
                 maintenance_store: Arc::new(StubMaint),
                 maintenance_sweep_interval: Duration::from_secs(30),
+                phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 cert_reloader: None,
             },
         );
@@ -940,5 +1410,306 @@ mod tests {
             err.contains("remote peers present but TLS is not configured"),
             "unexpected error: {err}"
         );
+    }
+
+    // ----- verify_primary_at_startup verdict matrix ---------------------
+
+    /// Helper: build a 2-node pool (local id=0, peer id=1) and an Agent
+    /// with the given (db, sd, peers) deps.
+    fn make_agent_with_one_peer(
+        db: Arc<dyn LocalDb>,
+        sd: Arc<dyn Systemd>,
+        peers: Arc<dyn PeerRegistry>,
+    ) -> Arc<Agent> {
+        let serve = ServeSettings {
+            unix_socket: "/tmp/never".into(),
+            agent_port: 9701,
+            peer_listen_addr: "127.0.0.1:0".into(),
+            tls: crate::config::TlsConfig::default(),
+            tls_configured: false,
+            has_remote_peers: false,
+            dev_mode: true,
+            healthz: HealthzSettings {
+                enabled: false,
+                listen_addr: "127.0.0.1:0".into(),
+            },
+        };
+        let pg = PostgresRuntime {
+            port: 5432,
+            data_dir: PathBuf::from("/var/lib/postgresql/17/main"),
+            repl_user: "repl_user".into(),
+        };
+        let pool = NodePool {
+            members: vec![
+                crate::config::NodeConfig {
+                    id: 0,
+                    hostname: "self".into(),
+                },
+                crate::config::NodeConfig {
+                    id: 1,
+                    hostname: "peer1".into(),
+                },
+            ],
+            local_node_id: 0,
+        };
+        Agent::new(
+            make_deps_with_peers(db, sd, peers),
+            Options {
+                serve,
+                node_pool: pool,
+                postgres: pg,
+                maintenance_store: Arc::new(StubMaint),
+                maintenance_sweep_interval: Duration::from_secs(30),
+                phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
+                cert_reloader: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn phantom_confirmed_when_peer_is_standby_on_same_tl() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(7, true))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(matches!(v, PrimaryVerdict::Confirmed), "got {v:?}");
+        assert_eq!(
+            sd.stop_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stop should not be called on Confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn phantom_detected_when_peer_reports_higher_timeline() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(8, false))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent.verify_primary_at_startup().await;
+        match v {
+            PrimaryVerdict::Phantom { local_tl, peers } => {
+                assert_eq!(local_tl, 7);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].timeline_id, 8);
+                assert_eq!(peers[0].hostname, "peer1");
+            }
+            other => panic!("expected Phantom, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_brain_detected_when_peer_asserts_primary_on_same_tl() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(7, false))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent.verify_primary_at_startup().await;
+        match v {
+            PrimaryVerdict::SplitBrain { local_tl, peers } => {
+                assert_eq!(local_tl, 7);
+                assert_eq!(peers.len(), 1);
+                assert!(!peers[0].is_in_recovery);
+            }
+            other => panic!("expected SplitBrain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unverifiable_when_no_peers_reachable() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // Empty responses → client() bails for every peer.
+        let peers = Arc::new(StubPeers::default());
+        let agent = make_agent_with_one_peer(db, sd, peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(
+            matches!(v, PrimaryVerdict::Unverifiable { .. }),
+            "got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_applicable_when_local_in_recovery() {
+        let db = Arc::new(StubDb {
+            in_recovery: true,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(99, false))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(matches!(v, PrimaryVerdict::NotApplicable), "got {v:?}");
+        assert_eq!(
+            sd.stop_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "standby must not trigger stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_applicable_when_pg_stopped() {
+        let db = Arc::new(StubDb::default());
+        let sd = Arc::new(StubSd {
+            pg_running: false,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::default());
+        let agent = make_agent_with_one_peer(db, sd, peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(matches!(v, PrimaryVerdict::NotApplicable), "got {v:?}");
+    }
+
+    #[tokio::test]
+    async fn unverifiable_when_systemd_status_errors() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd_raw = StubSd {
+            pg_running: true,
+            ..Default::default()
+        };
+        sd_raw.pg_fails.store(true, Ordering::SeqCst);
+        let sd = Arc::new(sd_raw);
+        let peers = Arc::new(StubPeers::default());
+        let agent = make_agent_with_one_peer(db, sd, peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(
+            matches!(v, PrimaryVerdict::Unverifiable { .. }),
+            "got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unverifiable_when_local_timeline_query_fails() {
+        let db_raw = StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        };
+        db_raw.timeline_fails.store(true, Ordering::SeqCst);
+        let db = Arc::new(db_raw);
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(7, true))]));
+        let agent = make_agent_with_one_peer(db, sd, peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(
+            matches!(v, PrimaryVerdict::Unverifiable { .. }),
+            "got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_reporting_timeline_zero_is_no_evidence() {
+        // Single peer that reports timeline_id=0 (pre-feature or its
+        // own probe failed). With required_peers=1, no evidence → Unverifiable.
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(0, true))]));
+        let agent = make_agent_with_one_peer(db, sd, peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(
+            matches!(v, PrimaryVerdict::Unverifiable { .. }),
+            "got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_when_required_peers_zero_and_no_responses() {
+        // 2-node operational opt-out: required_peers=0 lets a node come
+        // up alone when its peer is partitioned.
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        let peers = Arc::new(StubPeers::default());
+        let mut agent_arc = make_agent_with_one_peer(db, sd, peers);
+        // Mutate the required_peers field on the Options.
+        // Safe — we hold the only Arc reference at this point.
+        Arc::get_mut(&mut agent_arc)
+            .expect("sole owner of Arc")
+            .opts
+            .phantom_check_required_peers = 0;
+        let v = agent_arc.verify_primary_at_startup().await;
+        assert!(matches!(v, PrimaryVerdict::Confirmed), "got {v:?}");
+    }
+
+    #[tokio::test]
+    async fn stop_postgres_retries_once_then_fails_hard() {
+        // Two leading failures → retry helper surfaces Err on the second.
+        let sd = StubSd {
+            pg_running: true,
+            ..Default::default()
+        };
+        sd.stop_fail_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let sd: Arc<dyn Systemd> = Arc::new(sd);
+        let err = stop_postgres_with_retry(sd.as_ref())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("twice"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn stop_postgres_succeeds_after_one_failure() {
+        let sd = StubSd {
+            pg_running: true,
+            ..Default::default()
+        };
+        sd.stop_fail_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let sd: Arc<dyn Systemd> = Arc::new(sd);
+        stop_postgres_with_retry(sd.as_ref()).await.unwrap();
     }
 }

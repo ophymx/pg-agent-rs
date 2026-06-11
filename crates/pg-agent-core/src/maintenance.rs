@@ -908,6 +908,9 @@ mod tests {
         async fn is_in_recovery(&self) -> anyhow::Result<bool> {
             unreachable!()
         }
+        async fn timeline_id(&self) -> anyhow::Result<i32> {
+            unreachable!()
+        }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             unreachable!()
         }

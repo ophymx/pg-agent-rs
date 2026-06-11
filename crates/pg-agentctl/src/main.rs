@@ -1068,6 +1068,7 @@ quoted_with_spaces = '  spaces inside  '
             is_pgpool_running: running,
             is_postgres_status_ok: true,
             is_pgpool_status_ok: true,
+            timeline_id: 0,
         }
     }
 
@@ -1136,6 +1137,7 @@ quoted_with_spaces = '  spaces inside  '
             is_pgpool_running: true,
             is_postgres_status_ok: true,
             is_pgpool_status_ok: true,
+            timeline_id: 0,
         };
         let cells = format_status_cells(2, "pg2.local", &status);
         assert_eq!(cells[2], "unknown", "role must not default to primary");
@@ -1160,6 +1162,7 @@ quoted_with_spaces = '  spaces inside  '
             is_pgpool_running: false,
             is_postgres_status_ok: false,
             is_pgpool_status_ok: false,
+            timeline_id: 0,
         };
         let cells = format_status_cells(3, "pg3.local", &status);
         assert_eq!(cells[2], "unknown");

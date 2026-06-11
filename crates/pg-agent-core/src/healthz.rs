@@ -51,6 +51,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -364,6 +365,11 @@ async fn probe_pgpool(pcp: &dyn Pcp, probe_timeout: Duration) -> PgpoolProbe {
 struct HealthState {
     snapshotter: Arc<HealthSnapshotter>,
     stale_after: Duration,
+    /// Flips to `true` after `Agent::verify_primary_at_startup` resolves.
+    /// While `false`, `/healthz` short-circuits to 503 so HAProxy can't
+    /// route traffic at a node whose role hasn't been validated against
+    /// the rest of the cluster yet.
+    startup_verified: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -428,6 +434,17 @@ fn backend_is_up(status: &str) -> bool {
 }
 
 async fn handle_healthz(State(state): State<HealthState>) -> Response {
+    if !state.startup_verified.load(Ordering::SeqCst) {
+        let body = HealthBody {
+            ready: false,
+            snapshot_age_ms: 0,
+            role: HealthRole::Unknown,
+            postgres: PostgresProbe::default(),
+            pgpool: PgpoolProbe::default(),
+            replication: ReplicationProbe::default(),
+        };
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
     let snap = state.snapshotter.load();
     let (status, body) = compute_health(snap, state.stale_after, Utc::now());
     (status, Json(body)).into_response()
@@ -439,10 +456,15 @@ async fn handle_healthz(State(state): State<HealthState>) -> Response {
 
 /// Build the axum router. Exposed (pub(crate)) so tests can hit it
 /// directly via `tower::ServiceExt::oneshot` without binding a socket.
-pub(crate) fn build_router(snapshotter: Arc<HealthSnapshotter>, stale_after: Duration) -> Router {
+pub(crate) fn build_router(
+    snapshotter: Arc<HealthSnapshotter>,
+    stale_after: Duration,
+    startup_verified: Arc<AtomicBool>,
+) -> Router {
     let state = HealthState {
         snapshotter,
         stale_after,
+        startup_verified,
     };
     Router::new()
         // GET + HEAD share the handler; axum strips the body for HEAD.
@@ -455,15 +477,22 @@ pub(crate) fn build_router(snapshotter: Arc<HealthSnapshotter>, stale_after: Dur
 /// `with_graceful_shutdown` stops accepting new connections and waits
 /// for in-flight requests to finish; the daemon main wraps this in a
 /// `tokio::time::timeout(SHUTDOWN_GRACE, ...)` to bound the wait.
+///
+/// `startup_verified` gates `/healthz` returning 200 — until
+/// `Agent::verify_primary_at_startup` resolves the verdict, every
+/// request gets 503 regardless of snapshot state. Prevents HAProxy from
+/// routing at a node whose role has not yet been validated against the
+/// rest of the cluster.
 pub async fn serve_healthz(
     listener: tokio::net::TcpListener,
     snapshotter: Arc<HealthSnapshotter>,
     stale_after: Duration,
+    startup_verified: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     info!(?addr, "healthz: listening");
-    let app = build_router(snapshotter, stale_after);
+    let app = build_router(snapshotter, stale_after, startup_verified);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
@@ -518,6 +547,9 @@ mod tests {
                 Ok(v) => Ok(v),
                 Err(m) => anyhow::bail!(m),
             }
+        }
+        async fn timeline_id(&self) -> anyhow::Result<i32> {
+            Ok(0)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             match self.replication_lag.lock().unwrap().clone() {
