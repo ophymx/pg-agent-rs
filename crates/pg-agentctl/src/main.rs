@@ -58,10 +58,44 @@ enum Cmd {
         cmd: MaintenanceCmd,
     },
 
+    /// In-flight state-change ops journal. Currently tracks `cluster
+    /// handoff` (more variants coming with switchover, cluster
+    /// pause/resume). Operator surface for resuming a crashed
+    /// orchestration or marking it abandoned.
+    Ops {
+        #[command(subcommand)]
+        cmd: OpsCmd,
+    },
+
     /// Cluster-wide operations.
     Cluster {
         #[command(subcommand)]
         cmd: ClusterCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpsCmd {
+    /// List in-flight (or terminal) ops.
+    List {
+        #[arg(long, value_parser = ["in_progress", "done", "abandoned"])]
+        status: Option<String>,
+    },
+    /// Show one op in full (id, status, phase, payload, timestamps).
+    Show { id: String },
+    /// Resume a crashed orchestration from its recorded phase. The
+    /// daemon verifies the cluster state still matches the recorded
+    /// phase before continuing — mismatch → refuses with a structured
+    /// "cluster state diverged" message.
+    Resume { id: String },
+    /// Mark an op terminal-Abandoned. Use when the orchestration is
+    /// unrecoverable and you want it out of the way so a fresh
+    /// `cluster handoff` (or similar) can begin. Records the reason
+    /// in `last_error` for later incident review.
+    Abandon {
+        id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
     },
 }
 
@@ -166,6 +200,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             gen_pgpool(config, write, cli.socket.as_deref(), cli.json).await
         }
         Cmd::Maintenance { cmd } => maintenance(cmd, cli.socket.as_deref(), cli.json).await,
+        Cmd::Ops { cmd } => ops(cmd, cli.socket.as_deref(), cli.json).await,
         Cmd::Cluster { cmd } => match cmd {
             ClusterCmd::Init { only_node, config } => {
                 cluster_init(config, only_node, cli.socket.as_deref(), cli.json).await
@@ -950,6 +985,172 @@ async fn maintenance(
                 Ok(ExitCode::FAILURE)
             }
         }
+    }
+}
+
+async fn ops(
+    cmd: OpsCmd,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::{
+        AbandonInflightOpRequest, GetInflightOpRequest, ListInflightOpsRequest,
+        ResumeInflightOpRequest,
+    };
+
+    // Same operator-friendliness as `maintenance`: don't require a
+    // valid config.toml for ops triage — the daemon's socket is the
+    // only thing we need.
+    let socket = match cli_socket {
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from(pg_agent_core::config::DEFAULT_UNIX_SOCKET),
+    };
+    let mut client = client::dial_local(&socket).await?;
+
+    match cmd {
+        OpsCmd::List { status } => {
+            let statuses = status.map(|s| vec![s]).unwrap_or_default();
+            let resp = client
+                .list_inflight_ops(ListInflightOpsRequest { statuses })
+                .await
+                .map_err(|s| rpc_failed("ListInflightOps", s))?
+                .into_inner();
+
+            for s in &resp.skipped {
+                eprintln!("warning: skipped {}: {}", s.path, s.error);
+            }
+
+            if json {
+                let payload = serde_json::json!({
+                    "ops": resp.ops.iter().map(inflight_to_json).collect::<Vec<_>>(),
+                    "skipped": resp.skipped.iter().map(|s| serde_json::json!({
+                        "path": s.path, "error": s.error,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if resp.ops.is_empty() {
+                println!("(no in-flight ops)");
+            } else {
+                println!(
+                    "{:<40}  {:<10}  {:<12}  {:<24}  STARTED",
+                    "ID", "OP", "STATUS", "PHASE"
+                );
+                for o in &resp.ops {
+                    println!(
+                        "{:<40}  {:<10}  {:<12}  {:<24}  {}",
+                        o.id, o.op, o.status, o.phase, o.started_at
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        OpsCmd::Show { id } => {
+            let resp = client
+                .get_inflight_op(GetInflightOpRequest { id: id.clone() })
+                .await
+                .map_err(|s| rpc_failed(&format!("GetInflightOp({id})"), s))?
+                .into_inner();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&inflight_to_json(&resp))?);
+            } else {
+                print_inflight_human(&resp);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        OpsCmd::Resume { id } => {
+            let resp = client
+                .resume_inflight_op(ResumeInflightOpRequest { id: id.clone() })
+                .await
+                .map_err(|s| rpc_failed(&format!("ResumeInflightOp({id})"), s))?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"ok": resp.ok, "message": resp.message})
+                    )?
+                );
+            } else if !resp.message.is_empty() {
+                println!("{}", resp.message);
+            }
+            if resp.ok {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
+        }
+        OpsCmd::Abandon { id, reason } => {
+            let resp = client
+                .abandon_inflight_op(AbandonInflightOpRequest {
+                    id: id.clone(),
+                    reason,
+                })
+                .await
+                .map_err(|s| rpc_failed(&format!("AbandonInflightOp({id})"), s))?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"ok": resp.ok, "message": resp.message})
+                    )?
+                );
+            } else if !resp.message.is_empty() {
+                println!("{}", resp.message);
+            }
+            if resp.ok {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+fn inflight_to_json(o: &pg_agent_proto::pgagentpb::InflightOp) -> serde_json::Value {
+    let payload = match std::str::from_utf8(&o.payload) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => v,
+            Err(_) => serde_json::Value::String(s.to_string()),
+        },
+        Err(_) => serde_json::Value::String(format!("<{} bytes>", o.payload.len())),
+    };
+    serde_json::json!({
+        "id":           o.id,
+        "op":           o.op,
+        "status":       o.status,
+        "phase":        o.phase,
+        "started_at":   o.started_at,
+        "updated_at":   o.updated_at,
+        "completed_at": o.completed_at,
+        "last_error":   o.last_error,
+        "payload":      payload,
+    })
+}
+
+fn print_inflight_human(o: &pg_agent_proto::pgagentpb::InflightOp) {
+    println!("id:           {}", o.id);
+    println!("op:           {}", o.op);
+    println!("status:       {}", o.status);
+    println!("phase:        {}", o.phase);
+    println!("started_at:   {}", o.started_at);
+    println!("updated_at:   {}", o.updated_at);
+    if !o.completed_at.is_empty() {
+        println!("completed_at: {}", o.completed_at);
+    }
+    if !o.last_error.is_empty() {
+        println!("last_error:   {}", o.last_error);
+    }
+    let payload = match std::str::from_utf8(&o.payload) {
+        Ok(s) => serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| s.to_string()),
+        Err(_) => format!("<{} bytes>", o.payload.len()),
+    };
+    println!("payload:");
+    for line in payload.lines() {
+        println!("  {line}");
     }
 }
 
