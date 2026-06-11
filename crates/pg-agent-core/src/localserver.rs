@@ -336,6 +336,70 @@ impl PgAgentLocal for LocalServer {
             "failover: primary down, promoting new main"
         );
 
+        // Cross-op consult: is a `cluster handoff` orchestration in
+        // flight that conflicts with pgpool's pick?
+        //
+        // The handoff handler (which runs from the OLD primary's
+        // daemon — the same daemon that handles this failover RPC
+        // when pgpool invokes failover_command after local PG goes
+        // down) journals every phase. If we find an InProgress
+        // handoff whose target matches `new_main`, we know the
+        // handoff already promoted it and we should NOT redundantly
+        // promote (HIGH #5 from the 0.5.0 review) or drop the slot
+        // the handoff just created on it (HIGH #1 from the review).
+        //
+        // If we find an InProgress handoff whose target does NOT
+        // match pgpool's `new_main`, the two orchestrations
+        // disagree — refuse the failover rather than promote a
+        // second primary (HIGH #6).
+        let inflight_handoff = match self
+            .inflight
+            .list(&[crate::inflight_ops::InflightStatus::InProgress])
+            .await
+        {
+            Ok((ops, _)) => ops
+                .into_iter()
+                .find(|o| o.payload.op_name() == "handoff"),
+            Err(e) => {
+                warn!(?e, "failover: inflight list failed; proceeding without cross-op consult");
+                None
+            }
+        };
+        let handoff_targets_new_main = inflight_handoff
+            .as_ref()
+            .is_some_and(|o| match &o.payload {
+                crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } => {
+                    *to_node_id == new_main.id
+                }
+            });
+        if let Some(ref h) = inflight_handoff {
+            if !handoff_targets_new_main {
+                // Single-variant pattern today; refutability returns
+                // when InflightPayload grows variants.
+                #[allow(irrefutable_let_patterns)]
+                if let crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } =
+                    &h.payload
+                {
+                    warn!(
+                        handoff_id = %h.id,
+                        handoff_to = to_node_id,
+                        pgpool_new_main = new_main.id,
+                        "failover: in-flight handoff targets different node than pgpool's pick; refusing"
+                    );
+                    return Ok(Response::new(OpResult {
+                        ok: false,
+                        message: format!(
+                            "failover: in-flight handoff (id={}, phase={}) targets node {}, \
+                             but pgpool's failover_command picked node {} as new_main; refusing \
+                             to promote a second primary. Resolve the handoff first with \
+                             `pg_agentctl ops resume {}` or `pg_agentctl ops abandon {}`.",
+                            h.id, h.phase, to_node_id, new_main.id, h.id, h.id
+                        ),
+                    }));
+                }
+            }
+        }
+
         let peer = self.peers.client(new_main).await.map_err(|e| {
             internal(anyhow::anyhow!(
                 "failover: peer client for {}: {e}",
@@ -350,15 +414,29 @@ impl PgAgentLocal for LocalServer {
         // not in progress", which would otherwise surface as a noisy
         // failover failure even though the post-condition we wanted
         // (new_main is primary) already holds.
+        //
+        // HIGH #5 fix: when get_status itself errors but the inflight
+        // handoff records that we've already past target_promoted, we
+        // trust the journal rather than falling through to "promote
+        // anyway" — the latter defeats the short-circuit in exactly the
+        // adverse-network conditions where it matters most.
         let already_primary = match peer.get_status().await {
             Ok(s) => s.is_postgres_running && !s.is_in_recovery,
             Err(e) => {
+                let trust_journal = handoff_targets_new_main
+                    && inflight_handoff
+                        .as_ref()
+                        .map(|h| {
+                            handoff_phase_at_or_past(&h.phase, HANDOFF_PHASE_TARGET_PROMOTED)
+                        })
+                        .unwrap_or(false);
                 warn!(
                     new_main = %new_main.hostname,
                     ?e,
-                    "failover: peer get_status failed; assuming promote is still needed"
+                    trust_journal,
+                    "failover: peer get_status failed; consulting inflight handoff"
                 );
-                false
+                trust_journal
             }
         };
         if already_primary {
@@ -373,16 +451,42 @@ impl PgAgentLocal for LocalServer {
             )));
         }
 
-        info!(
-            slot = %slot_name,
-            on = %new_main.hostname,
-            "failover: dropping old primary's replication slot on new primary"
-        );
-        let message = match peer.drop_slot(&slot_name).await {
-            Ok(()) => "primary failover: promoted and slot dropped".to_string(),
-            Err(drop_err) => {
-                self.queue_drop_slot_cleanup(&slot_name, &new_main.hostname, "rpc_error", &drop_err)
+        // HIGH #1: when a handoff targeting this new_main has already
+        // passed the slot_created phase, the slot we're about to drop
+        // is the one the handoff created for the demoting old primary
+        // to rebase via. Dropping it now would orphan the rebase. The
+        // handoff's own complete()/abandon() path is responsible for
+        // the slot's lifecycle — leave it alone.
+        let skip_slot_drop = handoff_targets_new_main
+            && inflight_handoff
+                .as_ref()
+                .map(|h| handoff_phase_at_or_past(&h.phase, HANDOFF_PHASE_SLOT_CREATED))
+                .unwrap_or(false);
+        let message = if skip_slot_drop {
+            info!(
+                slot = %slot_name,
+                on = %new_main.hostname,
+                handoff_id = inflight_handoff.as_ref().map(|h| h.id.as_str()).unwrap_or(""),
+                "failover: handoff in flight has staked this slot; skipping drop"
+            );
+            "primary failover: promoted; slot retained for in-flight handoff".to_string()
+        } else {
+            info!(
+                slot = %slot_name,
+                on = %new_main.hostname,
+                "failover: dropping old primary's replication slot on new primary"
+            );
+            match peer.drop_slot(&slot_name).await {
+                Ok(()) => "primary failover: promoted and slot dropped".to_string(),
+                Err(drop_err) => {
+                    self.queue_drop_slot_cleanup(
+                        &slot_name,
+                        &new_main.hostname,
+                        "rpc_error",
+                        &drop_err,
+                    )
                     .await
+                }
             }
         };
         self.write_replay_marker_then_ok("failover", &replay_key, message)
@@ -4582,6 +4686,135 @@ mod tests {
             .unwrap());
         // db unused on the primary-down path.
         let _ = db;
+    }
+
+    // ----- failover ⇄ inflight handoff cross-op consult -----------------
+
+    #[tokio::test]
+    async fn failover_refuses_when_inflight_handoff_targets_different_node() {
+        // pgpool's failover_command fires with new_main=0, but there's
+        // an InProgress handoff targeting node 2 — that's a clear
+        // cross-target conflict; refuse rather than promote two
+        // primaries.
+        let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        peers.override_client(0, new_main_client.clone());
+        let now = chrono::Utc::now();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "live-handoff".into(),
+            status: crate::inflight_ops::InflightStatus::InProgress,
+            payload: crate::inflight_ops::InflightPayload::Handoff {
+                from_node_id: 1,
+                to_node_id: 2,
+                to_hostname: "peer2.local".into(),
+                slot_name: "node1".into(),
+                allow_lag: false,
+            },
+            phase: HANDOFF_PHASE_TARGET_PROMOTED.into(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            last_error: None,
+        });
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message
+                .contains("in-flight handoff (id=live-handoff"),
+            "unexpected: {}",
+            resp.message
+        );
+        // Promote was NOT called; the failover refused before getting there.
+        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
+        // No slot drop either.
+        assert!(new_main_client.drop_slot_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failover_skips_slot_drop_when_handoff_owns_slot() {
+        // Handoff is in flight at phase=slot_created targeting the same
+        // new_main that pgpool just picked. The slot belongs to the
+        // handoff's demoting old primary; failover must NOT drop it.
+        let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        new_main_client.mark_running(); // already promoted
+        peers.override_client(0, new_main_client.clone());
+        let now = chrono::Utc::now();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "handoff-mid-flight".into(),
+            status: crate::inflight_ops::InflightStatus::InProgress,
+            payload: crate::inflight_ops::InflightPayload::Handoff {
+                from_node_id: 1,
+                to_node_id: 0,
+                to_hostname: "peer1.local".into(),
+                slot_name: "node1".into(),
+                allow_lag: false,
+            },
+            phase: HANDOFF_PHASE_SLOT_CREATED.into(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            last_error: None,
+        });
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // Promote skipped (already_primary=true via get_status).
+        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
+        // Slot drop SKIPPED — the slot belongs to the in-flight handoff.
+        assert!(
+            new_main_client.drop_slot_calls.lock().unwrap().is_empty(),
+            "failover dropped the slot the handoff just created"
+        );
+        assert!(resp.message.contains("retained for in-flight handoff"));
+    }
+
+    #[tokio::test]
+    async fn failover_get_status_error_with_handoff_promoted_trusts_journal() {
+        // peer.get_status errors transiently. Without the journal we'd
+        // fall through to false and try to promote — but the journal
+        // says we already promoted past target_promoted, so trust it
+        // and skip promote.
+        let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
+        let new_main_client = Arc::new(StubPeerClient::default());
+        new_main_client.get_status_fails.store(true, Ordering::SeqCst);
+        peers.override_client(0, new_main_client.clone());
+        let now = chrono::Utc::now();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "in-progress".into(),
+            status: crate::inflight_ops::InflightStatus::InProgress,
+            payload: crate::inflight_ops::InflightPayload::Handoff {
+                from_node_id: 1,
+                to_node_id: 0,
+                to_hostname: "peer1.local".into(),
+                slot_name: "node1".into(),
+                allow_lag: false,
+            },
+            phase: HANDOFF_PHASE_SLOT_CREATED.into(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            last_error: None,
+        });
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // Even with get_status erroring, the journal said target was
+        // already primary — so promote was NOT called.
+        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
+        // Slot drop still skipped (handoff owns it).
+        assert!(new_main_client.drop_slot_calls.lock().unwrap().is_empty());
     }
 
     // ----- inflight ops RPCs + resume -----------------------------------
