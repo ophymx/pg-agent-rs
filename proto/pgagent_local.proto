@@ -86,6 +86,51 @@ message RetryMaintenanceRequest {
   string id = 1; // min_len 1
 }
 
+// Mirrors `pg_agent_core::inflight_ops::InflightOp`. `payload` is the
+// JSON-serialised tagged enum (single source of truth on the wire so
+// pg_agentctl doesn't need to know each variant's shape — it just
+// pretty-prints what it gets). Statuses on the wire: "in_progress" |
+// "done" | "abandoned".
+message InflightOp {
+  string id            = 1;
+  string op            = 2;  // payload's `op` tag — "handoff", etc.
+  string status        = 3;
+  bytes  payload       = 4;  // JSON
+  string phase         = 5;
+  string started_at    = 6;  // RFC3339Nano UTC
+  string updated_at    = 7;
+  string completed_at  = 8;  // empty when unset (still in-flight)
+  string last_error    = 9;  // empty when unset
+}
+
+message SkippedInflightOp {
+  string path  = 1;
+  string error = 2;
+}
+
+message ListInflightOpsRequest {
+  // Filter by status. Empty = every status.
+  repeated string statuses = 1;
+}
+
+message ListInflightOpsResponse {
+  repeated InflightOp        ops     = 1;
+  repeated SkippedInflightOp skipped = 2;
+}
+
+message GetInflightOpRequest {
+  string id = 1; // min_len 1
+}
+
+message AbandonInflightOpRequest {
+  string id     = 1; // min_len 1
+  string reason = 2; // free-form operator note; preserved in last_error
+}
+
+message ResumeInflightOpRequest {
+  string id = 1; // min_len 1
+}
+
 message ClusterInitRequest {
   optional int32 only_node_id = 1;
 }
@@ -205,4 +250,11 @@ service PgAgentLocal {
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);
   rpc GetMaintenance   (GetMaintenanceRequest)   returns (MaintenanceIntent);
   rpc RetryMaintenance (RetryMaintenanceRequest) returns (OpResult);
+
+  // In-flight ops journal — see `pg_agent_core::inflight_ops`. Powers
+  // `pg_agentctl ops list/show/abandon/resume`.
+  rpc ListInflightOps   (ListInflightOpsRequest)   returns (ListInflightOpsResponse);
+  rpc GetInflightOp     (GetInflightOpRequest)     returns (InflightOp);
+  rpc AbandonInflightOp (AbandonInflightOpRequest) returns (OpResult);
+  rpc ResumeInflightOp  (ResumeInflightOpRequest)  returns (OpResult);
 }

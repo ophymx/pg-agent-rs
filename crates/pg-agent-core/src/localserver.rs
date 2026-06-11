@@ -28,7 +28,7 @@ use crate::maintenance::{
     SkippedIntent,
 };
 use crate::pcp::Pcp;
-use crate::peers::PeerRegistry;
+use crate::peers::{PeerClient, PeerRegistry};
 use crate::pgstandby::{BasebackupOpts, RewindOpts, StandbyOps, WriteRecoveryConfOpts};
 use crate::systemd::Systemd;
 use crate::replay_markers::ReplayMarkerStore;
@@ -36,14 +36,16 @@ use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
-    ClusterHandoffRequest, ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult,
-    ClusterRecoverRequest,
-    ClusterStatusEntry, ClusterStatusRequest, ClusterStatusResponse, EscalationRequest,
-    FailoverRequest, FollowPrimaryRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
-    GetPgpoolBackendsResponse, GetStatusRequest, ListMaintenanceRequest, ListMaintenanceResponse,
-    MaintenanceIntent as ProtoIntent, NodeConfigRequest, NodeConfigResponse, NodeRef, NodeStatus,
-    OpResult, PgpoolBackendEntry, RecoveryRequest, RemoteStartRequest, RestoreWalRequest,
-    RetryMaintenanceRequest, SkippedMaintenanceIntent,
+    AbandonInflightOpRequest, ClusterHandoffRequest, ClusterInitRequest, ClusterInitResponse,
+    ClusterInitStandbyResult, ClusterRecoverRequest, ClusterStatusEntry, ClusterStatusRequest,
+    ClusterStatusResponse, EscalationRequest, FailoverRequest, FollowPrimaryRequest,
+    GetInflightOpRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
+    GetPgpoolBackendsResponse, GetStatusRequest, InflightOp as ProtoInflightOp,
+    ListInflightOpsRequest, ListInflightOpsResponse, ListMaintenanceRequest,
+    ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
+    NodeConfigResponse, NodeRef, NodeStatus, OpResult, PgpoolBackendEntry, RecoveryRequest,
+    RemoteStartRequest, RestoreWalRequest, ResumeInflightOpRequest, RetryMaintenanceRequest,
+    SkippedInflightOp as ProtoSkippedInflightOp, SkippedMaintenanceIntent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -59,6 +61,53 @@ use tracing::{debug, info, warn};
 /// so 30 s is wide slack for handshake + transfer on a healthy LAN while
 /// still letting an unresponsive peer fail fast.
 const RESTORE_WAL_PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Handoff phase ladder
+// ---------------------------------------------------------------------------
+//
+// Recorded in `InflightOp.phase` so a crashed orchestration can resume
+// (`ResumeInflightOp`). Constants instead of an enum so the journal
+// store stays generic over future ops. Order is the ladder; the
+// `run_handoff_from_phase` function steps through them.
+
+pub(crate) const HANDOFF_PHASE_PREFLIGHT_DONE: &str = "preflight_done";
+pub(crate) const HANDOFF_PHASE_TARGET_PROMOTED: &str = "target_promoted";
+pub(crate) const HANDOFF_PHASE_SLOT_CREATED: &str = "slot_created";
+pub(crate) const HANDOFF_PHASE_LOCAL_STOPPED: &str = "local_stopped";
+pub(crate) const HANDOFF_PHASE_DATA_COPIED: &str = "data_copied";
+pub(crate) const HANDOFF_PHASE_RECOVERY_CONF_WRITTEN: &str = "recovery_conf_written";
+pub(crate) const HANDOFF_PHASE_LOCAL_STARTED: &str = "local_started";
+pub(crate) const HANDOFF_PHASE_ATTACHED: &str = "attached";
+
+const HANDOFF_PHASES: &[&str] = &[
+    HANDOFF_PHASE_PREFLIGHT_DONE,
+    HANDOFF_PHASE_TARGET_PROMOTED,
+    HANDOFF_PHASE_SLOT_CREATED,
+    HANDOFF_PHASE_LOCAL_STOPPED,
+    HANDOFF_PHASE_DATA_COPIED,
+    HANDOFF_PHASE_RECOVERY_CONF_WRITTEN,
+    HANDOFF_PHASE_LOCAL_STARTED,
+    HANDOFF_PHASE_ATTACHED,
+];
+
+/// Index of `phase` in [`HANDOFF_PHASES`], or `None` if unknown.
+pub(crate) fn handoff_phase_index(phase: &str) -> Option<usize> {
+    HANDOFF_PHASES.iter().position(|p| *p == phase)
+}
+
+/// True if `actual` is at or past `threshold` in the handoff ladder.
+/// Returns `false` for unknown phases. Used by the failover handler
+/// to decide whether handoff has already claimed a resource (e.g.
+/// "phase >= slot_created" means the slot exists on the new primary
+/// and the failover handler must NOT drop it).
+#[allow(dead_code)] // consumed by C3
+pub(crate) fn handoff_phase_at_or_past(actual: &str, threshold: &str) -> bool {
+    match (handoff_phase_index(actual), handoff_phase_index(threshold)) {
+        (Some(a), Some(t)) => a >= t,
+        _ => false,
+    }
+}
 
 pub struct LocalServer {
     node_info: Arc<dyn NodeInfo>,
@@ -1107,7 +1156,13 @@ impl PgAgentLocal for LocalServer {
     /// - target lag > `MAX_HANDOFF_LAG_BYTES` (16 MiB) unless
     ///   `allow_lag=true`
     ///
-    /// Idempotent via replay marker `handoff:from=X,to=Y`.
+    /// Idempotent + crash-safe via [`crate::inflight_ops`]: every phase
+    /// transition is journaled to `<state_dir>/inflight_ops/<id>.json`,
+    /// so a crashed orchestration surfaces via `pg_agentctl ops list`
+    /// and can be continued with `pg_agentctl ops resume <id>` or
+    /// terminated with `pg_agentctl ops abandon <id>`. Single-flight
+    /// is structural: `inflight.begin(.., exclusive=true)` atomically
+    /// refuses if any state-change op is already in flight.
     async fn cluster_handoff(
         &self,
         req: Request<ClusterHandoffRequest>,
@@ -1132,37 +1187,58 @@ impl PgAgentLocal for LocalServer {
         let local = self
             .node_pool
             .local_node()
-            .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: resolve local: {e}")))?;
-        let target = self.node_pool.node_by_id(req.target_node_id).map_err(|e| {
-            Status::invalid_argument(format!(
-                "cluster_handoff: target node {}: {e}",
-                req.target_node_id
-            ))
-        })?;
-        if self.node_pool.is_local(target) {
+            .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: resolve local: {e}")))?
+            .clone();
+        let target = self
+            .node_pool
+            .node_by_id(req.target_node_id)
+            .map_err(|e| {
+                Status::invalid_argument(format!(
+                    "cluster_handoff: target node {}: {e}",
+                    req.target_node_id
+                ))
+            })?
+            .clone();
+        if self.node_pool.is_local(&target) {
             return Err(Status::invalid_argument(
                 "cluster_handoff: target is the local node — handoff target must be a peer",
             ));
         }
 
-        let replay_key = format!("from={},to={}", local.id, target.id);
-        match self.replay.has("handoff", &replay_key).await {
-            Ok(true) => {
-                info!(%replay_key, "cluster_handoff: replay detected, skipping");
+        // Idempotency: find the most-recent journal entry for this
+        // (op, key). Done → "already processed"; InProgress → tell the
+        // operator to resume or abandon (refusing the fresh begin
+        // would happen at `begin` anyway, but a friendlier message
+        // here saves a round-trip).
+        let key = format!("from={},to={}", local.id, target.id);
+        match self.inflight.find("handoff", &key).await {
+            Ok(Some(op)) if op.status == crate::inflight_ops::InflightStatus::Done => {
+                info!(%key, id = %op.id, "cluster_handoff: replay detected, skipping");
                 return Ok(Response::new(OpResult {
                     ok: true,
                     message: "cluster_handoff: already processed; skipping duplicate".into(),
                 }));
             }
-            Ok(false) => {}
+            Ok(Some(op)) if op.status == crate::inflight_ops::InflightStatus::InProgress => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "cluster_handoff: handoff already in flight (id={}, phase={}); \
+                         resume with `pg_agentctl ops resume {}` or abandon with \
+                         `pg_agentctl ops abandon {}`",
+                        op.id, op.phase, op.id, op.id
+                    ),
+                }));
+            }
+            Ok(_) => {} // None or Abandoned — fresh handoff.
             Err(e) => {
                 return Err(internal(anyhow::anyhow!(
-                    "cluster_handoff: idempotency marker check: {e}"
+                    "cluster_handoff: inflight lookup: {e}"
                 )));
             }
         }
 
-        let peer = self.peers.client(target).await.map_err(|e| {
+        let peer = self.peers.client(&target).await.map_err(|e| {
             internal(anyhow::anyhow!(
                 "cluster_handoff: dial peer {}: {e}",
                 target.hostname
@@ -1210,155 +1286,163 @@ impl PgAgentLocal for LocalServer {
             }));
         }
 
+        // ----- Begin journal entry (single-flight gate) ---------------
+        let slot_name = local.slot_name();
+        let payload = crate::inflight_ops::InflightPayload::Handoff {
+            from_node_id: local.id,
+            to_node_id: target.id,
+            to_hostname: target.hostname.clone(),
+            slot_name: slot_name.clone(),
+            allow_lag: req.allow_lag,
+        };
+        let op = match self
+            .inflight
+            .begin(payload, HANDOFF_PHASE_PREFLIGHT_DONE, true)
+            .await
+        {
+            Ok(op) => op,
+            Err(e) => {
+                // BeginRejected from the store maps to ok=false so the
+                // operator can act on the structured message.
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!("cluster_handoff: {e}"),
+                }));
+            }
+        };
+
         info!(
+            id = %op.id,
             local = %local.hostname,
             target = %target.hostname,
             target_lag_bytes = target_status.replication_lag_bytes,
             "cluster_handoff: preflight ok, starting orchestration"
         );
 
-        // ----- Orchestration ------------------------------------------
-        // 1. Local checkpoint — minimise the WAL diff the target replicates.
-        self.db
-            .checkpoint()
+        self.run_handoff_from_phase(
+            &op.id,
+            HANDOFF_PHASE_PREFLIGHT_DONE,
+            &peer,
+            &target,
+            &local,
+            &slot_name,
+        )
+        .await
+    }
+
+    async fn list_inflight_ops(
+        &self,
+        req: Request<ListInflightOpsRequest>,
+    ) -> Result<Response<ListInflightOpsResponse>, Status> {
+        let req = req.into_inner();
+        let statuses = parse_inflight_statuses(&req.statuses)
+            .map_err(|e| Status::invalid_argument(format!("list_inflight_ops: {e}")))?;
+        let (ops, skipped) = self
+            .inflight
+            .list(&statuses)
             .await
-            .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: checkpoint: {e}")))?;
-
-        // 2. Promote target. pg_promote(wait=true) blocks until the
-        //    target finishes promotion (TL+1).
-        info!(target = %target.hostname, "cluster_handoff: promoting target");
-        peer.promote().await.map_err(|e| {
-            internal(anyhow::anyhow!(
-                "cluster_handoff: promote {}: {e}",
-                target.hostname
-            ))
-        })?;
-
-        // 3. Create a slot for local on the new primary so basebackup
-        //    (if rewind falls back) doesn't get its WAL garbage-collected.
-        let slot_name = local.slot_name();
-        info!(slot = %slot_name, on = %target.hostname, "cluster_handoff: creating slot for local");
-        peer.create_slot(&slot_name).await.map_err(|e| {
-            internal(anyhow::anyhow!(
-                "cluster_handoff: create_slot on {}: {e}",
-                target.hostname
-            ))
-        })?;
-
-        // 4. Stop local PG. Briefly there is "no primary" from pgpool's
-        //    POV (target promoted, local not yet down); pgpool's
-        //    health probe will see local go down and run
-        //    failover_command. The failover handler short-circuits when
-        //    the announced new_main is already primary, so this races
-        //    safely.
-        info!("cluster_handoff: stopping local postgres");
-        self.sd
-            .stop_postgres()
-            .await
-            .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: stop_postgres: {e}")))?;
-
-        // 5. Reconfigure local as a standby of the new primary.
-        let bb_opts = BasebackupOpts {
-            primary_host: target.hostname.clone(),
-            primary_port: self.pg.port,
-            repl_user: self.pg.repl_user.clone(),
-            slot_name: slot_name.clone(),
-        };
-        let rewind_opts = RewindOpts {
-            primary_host: target.hostname.clone(),
-            primary_port: self.pg.port,
-            repl_user: self.pg.repl_user.clone(),
-        };
-        info!(target = %target.hostname, "cluster_handoff: attempting rewind against new primary");
-        let mut basebackup_ran = false;
-        if let Err(e) = self.standby.rewind(rewind_opts, None).await {
-            warn!(?e, "cluster_handoff: rewind failed; falling back to basebackup");
-            if let Err(bb_err) = self.standby.basebackup(bb_opts.clone(), None).await {
-                // Both data-copy paths failed. Drop the slot we just
-                // created on the new primary — it's pinning WAL there
-                // for a clone that never happened.
-                let drop_err = peer.drop_slot(&slot_name).await;
-                if let Err(drop_e) = drop_err {
-                    warn!(
-                        ?drop_e,
-                        slot = %slot_name,
-                        "cluster_handoff: drop_slot cleanup also failed; manual cleanup may be required"
-                    );
-                }
-                return Ok(Response::new(OpResult {
-                    ok: false,
-                    message: format!(
-                        "cluster_handoff: rewind and basebackup both failed against {}: {bb_err}; \
-                         local PG is stopped, target is now the primary; \
-                         run `pg_agentctl cluster recover --target {} --stop-target-pg` from \
-                         the new primary to finish converging the local node",
-                        target.hostname, local.id
-                    ),
-                }));
-            }
-            basebackup_ran = true;
+            .map_err(|e| internal(anyhow::anyhow!("list_inflight_ops: {e}")))?;
+        let mut out = Vec::with_capacity(ops.len());
+        for op in ops {
+            out.push(inflight_to_proto(&op)?);
         }
+        Ok(Response::new(ListInflightOpsResponse {
+            ops: out,
+            skipped: skipped
+                .into_iter()
+                .map(|s| ProtoSkippedInflightOp {
+                    path: s.path,
+                    error: s.error,
+                })
+                .collect(),
+        }))
+    }
 
-        let cfg_opts = WriteRecoveryConfOpts {
-            primary_host: target.hostname.clone(),
-            primary_port: self.pg.port,
-            repl_user: self.pg.repl_user.clone(),
-            slot_name: slot_name.clone(),
-        };
-        self.standby
-            .write_recovery_conf(cfg_opts)
-            .await
-            .map_err(|e| {
-                internal(anyhow::anyhow!(
-                    "cluster_handoff: write_recovery_conf: {e}"
-                ))
-            })?;
-
-        // 6. Start local PG — comes up as a standby of the new primary.
-        info!("cluster_handoff: starting local postgres as standby");
-        self.sd
-            .start_postgres()
-            .await
-            .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: start_postgres: {e}")))?;
-
-        // 7. Pgpool attach (best effort — recovery itself succeeded).
-        let mut attach_note = String::new();
-        if let Err(e) = self.pcp.attach_node(local.id).await {
-            warn!(
-                ?e,
-                local_id = local.id,
-                "cluster_handoff: pcp attach_node failed; operator may need pcp_attach_node manually"
-            );
-            attach_note = format!("; pgpool attach failed: {e}");
+    async fn get_inflight_op(
+        &self,
+        req: Request<GetInflightOpRequest>,
+    ) -> Result<Response<ProtoInflightOp>, Status> {
+        let id = req.into_inner().id;
+        if id.is_empty() {
+            return Err(Status::invalid_argument("get_inflight_op: id is required"));
         }
-
-        // 8. Replay marker + return.
-        self.replay
-            .mark_done("handoff", &replay_key)
+        let op = self
+            .inflight
+            .get(&id)
             .await
-            .map_err(|e| {
-                internal(anyhow::anyhow!(
-                    "cluster_handoff: replay marker write: {e}"
-                ))
-            })?;
+            .map_err(|e| Status::not_found(format!("get_inflight_op: {e}")))?;
+        Ok(Response::new(inflight_to_proto(&op)?))
+    }
 
-        let how = if basebackup_ran {
-            "basebackup"
+    async fn abandon_inflight_op(
+        &self,
+        req: Request<AbandonInflightOpRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        let req = req.into_inner();
+        if req.id.is_empty() {
+            return Err(Status::invalid_argument("abandon_inflight_op: id is required"));
+        }
+        let op = self
+            .inflight
+            .get(&req.id)
+            .await
+            .map_err(|e| Status::not_found(format!("abandon_inflight_op: {e}")))?;
+        if op.status != crate::inflight_ops::InflightStatus::InProgress {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "abandon_inflight_op: op {} is in status {}; only in-progress ops \
+                     can be abandoned",
+                    op.id,
+                    op.status.as_wire()
+                ),
+            }));
+        }
+        let reason = if req.reason.is_empty() {
+            "operator-abandoned".to_string()
         } else {
-            "rewind"
+            req.reason
         };
-        info!(
-            target = %target.hostname,
-            method = how,
-            "cluster_handoff: complete"
-        );
+        self.inflight
+            .abandon(&req.id, &reason)
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("abandon_inflight_op: {e}")))?;
         Ok(Response::new(OpResult {
             ok: true,
             message: format!(
-                "handoff complete: primary is now {}; local demoted to standby via {}{}",
-                target.hostname, how, attach_note
+                "op {} abandoned (was at phase {})",
+                op.id, op.phase
             ),
         }))
+    }
+
+    async fn resume_inflight_op(
+        &self,
+        req: Request<ResumeInflightOpRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        let id = req.into_inner().id;
+        if id.is_empty() {
+            return Err(Status::invalid_argument("resume_inflight_op: id is required"));
+        }
+        let op = self
+            .inflight
+            .get(&id)
+            .await
+            .map_err(|e| Status::not_found(format!("resume_inflight_op: {e}")))?;
+        if op.status != crate::inflight_ops::InflightStatus::InProgress {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "resume_inflight_op: op {} is in status {}; only in-progress ops \
+                     can be resumed",
+                    op.id,
+                    op.status.as_wire()
+                ),
+            }));
+        }
+        match &op.payload {
+            crate::inflight_ops::InflightPayload::Handoff { .. } => self.resume_handoff(op).await,
+        }
     }
 
     /// `cluster status` — fan-out `GetStatus` to every pool member and
@@ -1918,6 +2002,411 @@ impl LocalServer {
             }
         }
     }
+
+    /// Step through the handoff phase ladder from `start_phase`. Each
+    /// successful step writes `update_phase(next_phase)` BEFORE moving
+    /// on, so a crash leaves the journal at the last-completed phase
+    /// and resume picks up at the correct boundary.
+    ///
+    /// `start_phase` is one of the [`HANDOFF_PHASES`] constants. The
+    /// caller (`cluster_handoff` or `resume_handoff`) is responsible
+    /// for ensuring the cluster state matches what `start_phase`
+    /// implies — fresh handoffs always start from
+    /// [`HANDOFF_PHASE_PREFLIGHT_DONE`] so the whole ladder runs;
+    /// resume must call [`verify_handoff_state`] first.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_handoff_from_phase(
+        &self,
+        op_id: &str,
+        start_phase: &str,
+        peer: &Arc<dyn PeerClient>,
+        target: &NodeConfig,
+        local: &NodeConfig,
+        slot_name: &str,
+    ) -> Result<Response<OpResult>, Status> {
+        let Some(start_idx) = handoff_phase_index(start_phase) else {
+            return Err(Status::invalid_argument(format!(
+                "cluster_handoff: unknown phase {start_phase:?}"
+            )));
+        };
+
+        // Always run checkpoint when resuming from preflight_done.
+        // Idempotent — re-checkpointing is harmless.
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_PREFLIGHT_DONE).unwrap() {
+            self.db
+                .checkpoint()
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: checkpoint: {e}")))?;
+
+            info!(id = op_id, target = %target.hostname, "cluster_handoff: promoting target");
+            peer.promote().await.map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "cluster_handoff: promote {}: {e}",
+                    target.hostname
+                ))
+            })?;
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_TARGET_PROMOTED, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_TARGET_PROMOTED).unwrap() {
+            info!(
+                id = op_id,
+                slot = %slot_name,
+                on = %target.hostname,
+                "cluster_handoff: creating slot for local"
+            );
+            peer.create_slot(slot_name).await.map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "cluster_handoff: create_slot on {}: {e}",
+                    target.hostname
+                ))
+            })?;
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_SLOT_CREATED, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_SLOT_CREATED).unwrap() {
+            info!(id = op_id, "cluster_handoff: stopping local postgres");
+            self.sd
+                .stop_postgres()
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: stop_postgres: {e}")))?;
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_LOCAL_STOPPED, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        let bb_opts = BasebackupOpts {
+            primary_host: target.hostname.clone(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+            slot_name: slot_name.to_string(),
+        };
+        let rewind_opts = RewindOpts {
+            primary_host: target.hostname.clone(),
+            primary_port: self.pg.port,
+            repl_user: self.pg.repl_user.clone(),
+        };
+        let mut basebackup_ran = false;
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_LOCAL_STOPPED).unwrap() {
+            info!(
+                id = op_id,
+                target = %target.hostname,
+                "cluster_handoff: attempting rewind against new primary"
+            );
+            if let Err(e) = self.standby.rewind(rewind_opts, None).await {
+                warn!(
+                    ?e,
+                    "cluster_handoff: rewind failed; falling back to basebackup"
+                );
+                if let Err(bb_err) = self.standby.basebackup(bb_opts.clone(), None).await {
+                    // Both paths failed. Drop the slot we created and
+                    // abandon the journal entry so the operator sees
+                    // exactly where it died.
+                    let drop_err = peer.drop_slot(slot_name).await;
+                    if let Err(drop_e) = drop_err {
+                        warn!(
+                            ?drop_e,
+                            slot = %slot_name,
+                            "cluster_handoff: drop_slot cleanup also failed; manual cleanup may be required"
+                        );
+                    }
+                    let reason = format!("rewind+basebackup both failed: {bb_err}");
+                    if let Err(ab_err) = self.inflight.abandon(op_id, &reason).await {
+                        warn!(?ab_err, "cluster_handoff: abandon journal entry failed");
+                    }
+                    return Ok(Response::new(OpResult {
+                        ok: false,
+                        message: format!(
+                            "cluster_handoff: rewind and basebackup both failed against {}: {bb_err}; \
+                             local PG is stopped, target is now the primary; \
+                             run `pg_agentctl cluster recover --target {} --stop-target-pg` from \
+                             the new primary to finish converging the local node",
+                            target.hostname, local.id
+                        ),
+                    }));
+                }
+                basebackup_ran = true;
+            }
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_DATA_COPIED, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_DATA_COPIED).unwrap() {
+            let cfg_opts = WriteRecoveryConfOpts {
+                primary_host: target.hostname.clone(),
+                primary_port: self.pg.port,
+                repl_user: self.pg.repl_user.clone(),
+                slot_name: slot_name.to_string(),
+            };
+            self.standby
+                .write_recovery_conf(cfg_opts)
+                .await
+                .map_err(|e| {
+                    internal(anyhow::anyhow!("cluster_handoff: write_recovery_conf: {e}"))
+                })?;
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_RECOVERY_CONF_WRITTEN, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_RECOVERY_CONF_WRITTEN).unwrap() {
+            info!(id = op_id, "cluster_handoff: starting local postgres as standby");
+            self.sd
+                .start_postgres()
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: start_postgres: {e}")))?;
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_LOCAL_STARTED, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        let mut attach_note = String::new();
+        if start_idx <= handoff_phase_index(HANDOFF_PHASE_LOCAL_STARTED).unwrap() {
+            if let Err(e) = self.pcp.attach_node(local.id).await {
+                warn!(
+                    ?e,
+                    local_id = local.id,
+                    "cluster_handoff: pcp attach_node failed; operator may need pcp_attach_node manually"
+                );
+                attach_note = format!("; pgpool attach failed: {e}");
+            }
+            self.inflight
+                .update_phase(op_id, HANDOFF_PHASE_ATTACHED, None)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: journal: {e}")))?;
+        }
+
+        // Final transition.
+        self.inflight
+            .complete(op_id)
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: complete journal: {e}")))?;
+
+        let how = if basebackup_ran { "basebackup" } else { "rewind" };
+        info!(
+            id = op_id,
+            target = %target.hostname,
+            method = how,
+            "cluster_handoff: complete"
+        );
+        Ok(Response::new(OpResult {
+            ok: true,
+            message: format!(
+                "handoff complete: primary is now {}; local demoted to standby via {}{}",
+                target.hostname, how, attach_note
+            ),
+        }))
+    }
+
+    /// Operator-driven resume of a crashed handoff. Verifies that the
+    /// cluster state still matches the recorded phase before
+    /// continuing — if a peer node has moved underneath us (someone
+    /// else promoted, the target reverted, etc.) we refuse rather than
+    /// run destructive steps blindly.
+    async fn resume_handoff(
+        &self,
+        op: crate::inflight_ops::InflightOp,
+    ) -> Result<Response<OpResult>, Status> {
+        // The dispatcher (`resume_inflight_op`) already matched on the
+        // Handoff variant; this destructure is irrefutable today.
+        // Adding a new InflightPayload variant in the future will turn
+        // this into a refutable pattern again — compiler will catch it.
+        #[allow(irrefutable_let_patterns)]
+        let crate::inflight_ops::InflightPayload::Handoff {
+            from_node_id,
+            to_node_id,
+            ref to_hostname,
+            ref slot_name,
+            ..
+        } = op.payload
+        else {
+            return Err(Status::failed_precondition(
+                "resume_handoff: payload is not a handoff",
+            ));
+        };
+
+        // Resolve current pool state. Payload-recorded `to_hostname` is
+        // the source of truth for the orchestration's target — if the
+        // pool was renumbered we'd see a mismatch and refuse rather
+        // than guessing.
+        let local = self
+            .node_pool
+            .local_node()
+            .map_err(|e| internal(anyhow::anyhow!("resume_handoff: resolve local: {e}")))?
+            .clone();
+        if local.id != from_node_id {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "resume_handoff: op recorded from_node_id={} but local is node {}; \
+                     pool topology has changed since the op began",
+                    from_node_id, local.id
+                ),
+            }));
+        }
+        let target = match self.node_pool.node_by_id(to_node_id) {
+            Ok(n) if n.hostname == *to_hostname => n.clone(),
+            Ok(n) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_handoff: op recorded to_hostname={to_hostname:?} but current \
+                         pool has node {} as {:?}; pool topology has changed since the op began",
+                        to_node_id, n.hostname
+                    ),
+                }));
+            }
+            Err(e) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_handoff: target node {to_node_id} not in current pool: {e}"
+                    ),
+                }));
+            }
+        };
+        let peer = self.peers.client(&target).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "resume_handoff: dial peer {}: {e}",
+                target.hostname
+            ))
+        })?;
+
+        // Verify-then-resume.
+        if let Some(diverged) = self
+            .verify_handoff_state(&op.phase, &peer, &target)
+            .await?
+        {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "resume_handoff: cluster state diverged from recorded phase {:?}: {diverged}; \
+                     run `pg_agentctl ops abandon {}` if this op is unrecoverable",
+                    op.phase, op.id
+                ),
+            }));
+        }
+
+        info!(
+            id = %op.id,
+            phase = %op.phase,
+            target = %target.hostname,
+            "resume_handoff: continuing orchestration"
+        );
+
+        self.run_handoff_from_phase(&op.id, &op.phase, &peer, &target, &local, slot_name)
+            .await
+    }
+
+    /// Returns `Ok(Some(reason))` when the cluster state has moved
+    /// underneath us in a way that resume can't safely paper over.
+    /// `Ok(None)` means the recorded phase is still consistent with
+    /// observed cluster state and resume should proceed.
+    async fn verify_handoff_state(
+        &self,
+        recorded_phase: &str,
+        peer: &Arc<dyn PeerClient>,
+        target: &NodeConfig,
+    ) -> Result<Option<String>, Status> {
+        let target_status = peer.get_status().await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "verify_handoff_state: peer get_status {}: {e}",
+                target.hostname
+            ))
+        })?;
+
+        // At phases prior to target_promoted, the target should still
+        // be a standby (we haven't promoted it yet).
+        if recorded_phase == HANDOFF_PHASE_PREFLIGHT_DONE {
+            if !target_status.is_in_recovery {
+                return Ok(Some(format!(
+                    "target {} is already a primary; the original handoff was about to \
+                     promote it but someone else promoted it first",
+                    target.hostname
+                )));
+            }
+            return Ok(None);
+        }
+
+        // From target_promoted onward, the target MUST be the primary.
+        // If it's been demoted or restarted into recovery, the resume
+        // assumptions don't hold.
+        if !target_status.is_postgres_running {
+            return Ok(Some(format!(
+                "target {} has postgres stopped; original handoff had promoted it",
+                target.hostname
+            )));
+        }
+        if target_status.is_in_recovery {
+            return Ok(Some(format!(
+                "target {} is back in recovery; original handoff had promoted it to primary",
+                target.hostname
+            )));
+        }
+
+        // Verify local PG state for the post-stop phases. Errors here
+        // are conservative — if systemd can't tell us, refuse rather
+        // than guess.
+        let pg_running = self.sd.status_postgres().await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "verify_handoff_state: status_postgres: {e}"
+            ))
+        })?;
+        match recorded_phase {
+            // local should still be primary (we haven't stopped it yet).
+            HANDOFF_PHASE_TARGET_PROMOTED | HANDOFF_PHASE_SLOT_CREATED if !pg_running => {
+                return Ok(Some(
+                    "local PG is stopped but recorded phase is pre-stop; someone else \
+                     stopped the old primary"
+                        .into(),
+                ));
+            }
+            // local should still be stopped.
+            HANDOFF_PHASE_LOCAL_STOPPED
+            | HANDOFF_PHASE_DATA_COPIED
+            | HANDOFF_PHASE_RECOVERY_CONF_WRITTEN
+                if pg_running =>
+            {
+                return Ok(Some(
+                    "local PG is running but recorded phase is post-stop; \
+                     someone else started the old primary"
+                        .into(),
+                ));
+            }
+            // local should be running as a standby.
+            HANDOFF_PHASE_LOCAL_STARTED | HANDOFF_PHASE_ATTACHED => {
+                if !pg_running {
+                    return Ok(Some(
+                        "local PG is stopped but recorded phase is post-start".into(),
+                    ));
+                }
+                let in_recovery =
+                    self.db.is_in_recovery().await.map_err(|e| {
+                        internal(anyhow::anyhow!(
+                            "verify_handoff_state: is_in_recovery: {e}"
+                        ))
+                    })?;
+                if !in_recovery {
+                    return Ok(Some(
+                        "local PG is a primary but recorded phase implies standby".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
 }
 
 fn internal(e: anyhow::Error) -> Status {
@@ -1938,6 +2427,50 @@ fn ok() -> OpResult {
         ok: true,
         message: String::new(),
     }
+}
+
+/// Parse the wire `statuses` filter into the enum form
+/// `InflightOpStore::list` expects. Empty list = no filter.
+#[allow(clippy::result_large_err)]
+fn parse_inflight_statuses(
+    raw: &[String],
+) -> Result<Vec<crate::inflight_ops::InflightStatus>, String> {
+    raw.iter()
+        .map(|s| match s.as_str() {
+            "in_progress" => Ok(crate::inflight_ops::InflightStatus::InProgress),
+            "done" => Ok(crate::inflight_ops::InflightStatus::Done),
+            "abandoned" => Ok(crate::inflight_ops::InflightStatus::Abandoned),
+            other => Err(format!(
+                "unknown status filter {other:?}; \
+                 expected one of: in_progress, done, abandoned"
+            )),
+        })
+        .collect()
+}
+
+/// Project a core `InflightOp` to the wire shape. Payload is rendered
+/// as JSON so callers don't need a discriminated decoder.
+#[allow(clippy::result_large_err)]
+fn inflight_to_proto(op: &crate::inflight_ops::InflightOp) -> Result<ProtoInflightOp, Status> {
+    let payload = serde_json::to_vec(&op.payload).map_err(|e| {
+        internal(anyhow::anyhow!(
+            "inflight_to_proto: marshal payload: {e}"
+        ))
+    })?;
+    Ok(ProtoInflightOp {
+        id: op.id.clone(),
+        op: op.payload.op_name().to_string(),
+        status: op.status.as_wire().to_string(),
+        payload,
+        phase: op.phase.clone(),
+        started_at: op.started_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        updated_at: op.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        completed_at: op
+            .completed_at
+            .map(|t| t.to_rfc3339_opts(SecondsFormat::Nanos, true))
+            .unwrap_or_default(),
+        last_error: op.last_error.clone().unwrap_or_default(),
+    })
 }
 
 /// Parse the wire `statuses` filter into the enum form `MaintenanceStore::list`
@@ -2013,6 +2546,7 @@ fn map_intent_lookup_error(id: &str, err: anyhow::Error) -> Status {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
+    use crate::inflight_ops::InflightOpStore;
     use crate::localdb::ReplicationLag;
     use crate::maintenance::{MaintenancePayload, MaintenanceStatus};
     use crate::peers::PeerClient;
@@ -3712,7 +4246,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_happy_path() {
-        let (s, _db, _peers, _maint, replay, peer, pcp, sd, standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, pcp, sd, standby, inflight) =
+            make_recovery_setup();
         peer.mark_standby().set_lag(0);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -3725,7 +4260,7 @@ mod tests {
         assert!(resp.ok, "{}", resp.message);
         assert!(resp.message.contains("handoff complete"));
         // Promote target, create slot on target, stop local PG, rewind,
-        // write recovery conf, start local PG, attach in pgpool, mark replay.
+        // write recovery conf, start local PG, attach in pgpool.
         assert_eq!(peer.promote_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*peer.create_slot_calls.lock().unwrap(), vec!["node0".to_string()]);
         assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 1);
@@ -3735,7 +4270,14 @@ mod tests {
         assert_eq!(standby.write_recovery_conf_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sd.start_postgres_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![0]);
-        assert!(replay.has("handoff", "from=0,to=1").await.unwrap());
+        // Journal: op was begun + transitioned through phases + completed.
+        let op = inflight
+            .find("handoff", "from=0,to=1")
+            .await
+            .unwrap()
+            .expect("inflight op should exist after handoff");
+        assert_eq!(op.status, crate::inflight_ops::InflightStatus::Done);
+        assert_eq!(op.phase, "done");
     }
 
     #[tokio::test]
@@ -3909,10 +4451,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_handoff_is_idempotent_via_replay_marker() {
-        let (s, _db, _peers, _maint, replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
+    async fn cluster_handoff_is_idempotent_via_inflight_done() {
+        // Pre-seed a Done op for (from=0,to=1) — the preflight should
+        // detect it and short-circuit with "already processed".
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, inflight) =
+            make_recovery_setup();
         peer.mark_standby();
-        replay.mark_done("handoff", "from=0,to=1").await.unwrap();
+        let now = chrono::Utc::now();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "preseeded".into(),
+            status: crate::inflight_ops::InflightStatus::Done,
+            payload: crate::inflight_ops::InflightPayload::Handoff {
+                from_node_id: 0,
+                to_node_id: 1,
+                to_hostname: "peer1.local".into(),
+                slot_name: "node0".into(),
+                allow_lag: false,
+            },
+            phase: "done".into(),
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            last_error: None,
+        });
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
                 target_node_id: 1,
@@ -3924,6 +4485,52 @@ mod tests {
         assert!(resp.ok);
         assert!(resp.message.contains("already processed"));
         // No-op: nothing called.
+        assert_eq!(peer.promote_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_handoff_refuses_when_an_inflight_handoff_exists() {
+        // Pre-seed an InProgress op — preflight must return ok=false
+        // with a "resume or abandon" message, NOT start a parallel
+        // handoff.
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, inflight) =
+            make_recovery_setup();
+        peer.mark_standby();
+        let now = chrono::Utc::now();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "stuck-handoff".into(),
+            status: crate::inflight_ops::InflightStatus::InProgress,
+            payload: crate::inflight_ops::InflightPayload::Handoff {
+                from_node_id: 0,
+                to_node_id: 1,
+                to_hostname: "peer1.local".into(),
+                slot_name: "node0".into(),
+                allow_lag: false,
+            },
+            phase: "target_promoted".into(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            last_error: None,
+        });
+        let resp = s
+            .cluster_handoff(Request::new(ClusterHandoffRequest {
+                target_node_id: 1,
+                allow_lag: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("already in flight"),
+            "unexpected: {}",
+            resp.message
+        );
+        assert!(resp.message.contains("stuck-handoff"));
+        assert!(resp.message.contains("ops resume"));
+        // No destructive work happened.
         assert_eq!(peer.promote_calls.load(Ordering::SeqCst), 0);
         assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 0);
     }
@@ -3975,6 +4582,231 @@ mod tests {
             .unwrap());
         // db unused on the primary-down path.
         let _ = db;
+    }
+
+    // ----- inflight ops RPCs + resume -----------------------------------
+
+    fn seed_handoff_at_phase(
+        inflight: &Arc<StubInflight>,
+        id: &str,
+        phase: &str,
+        status: crate::inflight_ops::InflightStatus,
+    ) {
+        let now = chrono::Utc::now();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: id.into(),
+            status,
+            payload: crate::inflight_ops::InflightPayload::Handoff {
+                from_node_id: 0,
+                to_node_id: 1,
+                to_hostname: "peer1.local".into(),
+                slot_name: "node0".into(),
+                allow_lag: false,
+            },
+            phase: phase.into(),
+            started_at: now,
+            updated_at: now,
+            completed_at: if status == crate::inflight_ops::InflightStatus::InProgress {
+                None
+            } else {
+                Some(now)
+            },
+            last_error: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn list_inflight_ops_returns_seeded_op_and_filters_by_status() {
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, inflight) =
+            make_recovery_setup();
+        seed_handoff_at_phase(
+            &inflight,
+            "alpha",
+            "slot_created",
+            crate::inflight_ops::InflightStatus::InProgress,
+        );
+        seed_handoff_at_phase(
+            &inflight,
+            "bravo",
+            "done",
+            crate::inflight_ops::InflightStatus::Done,
+        );
+
+        let all = s
+            .list_inflight_ops(Request::new(ListInflightOpsRequest { statuses: vec![] }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(all.ops.len(), 2);
+
+        let only_in_progress = s
+            .list_inflight_ops(Request::new(ListInflightOpsRequest {
+                statuses: vec!["in_progress".into()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(only_in_progress.ops.len(), 1);
+        assert_eq!(only_in_progress.ops[0].id, "alpha");
+        assert_eq!(only_in_progress.ops[0].phase, "slot_created");
+        assert_eq!(only_in_progress.ops[0].op, "handoff");
+    }
+
+    #[tokio::test]
+    async fn get_inflight_op_returns_full_payload() {
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, inflight) =
+            make_recovery_setup();
+        seed_handoff_at_phase(
+            &inflight,
+            "abc",
+            "local_stopped",
+            crate::inflight_ops::InflightStatus::InProgress,
+        );
+        let op = s
+            .get_inflight_op(Request::new(GetInflightOpRequest { id: "abc".into() }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(op.id, "abc");
+        assert_eq!(op.phase, "local_stopped");
+        assert!(!op.payload.is_empty(), "payload should be JSON-encoded");
+    }
+
+    #[tokio::test]
+    async fn abandon_inflight_op_marks_terminal_and_includes_reason() {
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, inflight) =
+            make_recovery_setup();
+        seed_handoff_at_phase(
+            &inflight,
+            "abc",
+            "local_stopped",
+            crate::inflight_ops::InflightStatus::InProgress,
+        );
+        let resp = s
+            .abandon_inflight_op(Request::new(AbandonInflightOpRequest {
+                id: "abc".into(),
+                reason: "operator triage decided to roll back".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert!(resp.message.contains("abandoned"));
+        let op = inflight.get("abc").await.unwrap();
+        assert_eq!(op.status, crate::inflight_ops::InflightStatus::Abandoned);
+        assert_eq!(
+            op.last_error.as_deref(),
+            Some("operator triage decided to roll back")
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_inflight_op_refuses_terminal_op() {
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, inflight) =
+            make_recovery_setup();
+        seed_handoff_at_phase(
+            &inflight,
+            "abc",
+            "done",
+            crate::inflight_ops::InflightStatus::Done,
+        );
+        let resp = s
+            .abandon_inflight_op(Request::new(AbandonInflightOpRequest {
+                id: "abc".into(),
+                reason: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("only in-progress"));
+    }
+
+    #[tokio::test]
+    async fn resume_inflight_op_continues_handoff_from_slot_created() {
+        // Seed a handoff at phase=slot_created. Resume should pick up
+        // from stop_postgres onward and reach completion.
+        let (s, _db, _peers, _maint, _replay, peer, pcp, sd, standby, inflight) =
+            make_recovery_setup();
+        peer.mark_running(); // peer has already been promoted
+        seed_handoff_at_phase(
+            &inflight,
+            "resume-me",
+            "slot_created",
+            crate::inflight_ops::InflightStatus::InProgress,
+        );
+        let resp = s
+            .resume_inflight_op(Request::new(ResumeInflightOpRequest {
+                id: "resume-me".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // Promote was NOT called (we resumed past it).
+        assert_eq!(peer.promote_calls.load(Ordering::SeqCst), 0);
+        // create_slot was NOT called (we resumed past it).
+        assert!(peer.create_slot_calls.lock().unwrap().is_empty());
+        // stop, rewind, write_recovery_conf, start, attach were called.
+        assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.rewind_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.write_recovery_conf_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sd.start_postgres_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![0]);
+        // Journal completed.
+        let op = inflight.get("resume-me").await.unwrap();
+        assert_eq!(op.status, crate::inflight_ops::InflightStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn resume_inflight_op_refuses_when_cluster_state_diverged() {
+        // Seed at target_promoted but the peer reports is_in_recovery=true
+        // (target is somehow back to standby). Verify should refuse.
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, inflight) =
+            make_recovery_setup();
+        peer.mark_standby(); // running but in_recovery=true
+        seed_handoff_at_phase(
+            &inflight,
+            "diverged",
+            "target_promoted",
+            crate::inflight_ops::InflightStatus::InProgress,
+        );
+        let resp = s
+            .resume_inflight_op(Request::new(ResumeInflightOpRequest {
+                id: "diverged".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("diverged from recorded phase"),
+            "unexpected: {}",
+            resp.message
+        );
+        // No destructive work.
+        assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_inflight_op_refuses_terminal_op() {
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, inflight) =
+            make_recovery_setup();
+        seed_handoff_at_phase(
+            &inflight,
+            "already-done",
+            "done",
+            crate::inflight_ops::InflightStatus::Done,
+        );
+        let resp = s
+            .resume_inflight_op(Request::new(ResumeInflightOpRequest {
+                id: "already-done".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("only in-progress"));
     }
 
     // ----- restore_wal ---------------------------------------------------
