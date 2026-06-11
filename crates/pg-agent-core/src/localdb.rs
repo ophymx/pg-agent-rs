@@ -60,6 +60,16 @@ pub trait LocalDb: Send + Sync {
     /// primary returns).
     async fn timeline_id(&self) -> anyhow::Result<i32>;
 
+    /// Live write-ahead log position as a 64-bit value
+    /// (high 32 | low 32 of `pg_lsn`). On a primary returns
+    /// `pg_current_wal_lsn()` — the position of the last WAL record
+    /// flushed to disk. On a standby returns `pg_last_wal_replay_lsn()`
+    /// — the position replay has caught up to. Used by `cluster status`
+    /// to disambiguate which primary is most-up-to-date in a
+    /// split-brain (higher LSN on the same timeline = more committed
+    /// WAL).
+    async fn current_wal_lsn(&self) -> anyhow::Result<u64>;
+
     /// On a primary returns `ReplicationLag::default()` (zeros).
     async fn replication_lag(&self) -> anyhow::Result<ReplicationLag>;
 
@@ -208,6 +218,32 @@ impl LocalDb for PgLocalDb {
         Ok(tli)
     }
 
+    async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+        let conn = self.get_conn().await?;
+        let in_recovery: bool = conn
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?
+            .get(0);
+        // pg_lsn renders as `XXXXXXXX/XXXXXXXX` (two hex halves of the
+        // 64-bit value). tokio-postgres doesn't have a built-in pg_lsn
+        // mapping, so we cast to text and parse — mirrors the timeline_id
+        // path. The standby flavor must use pg_last_wal_replay_lsn()
+        // since pg_current_wal_lsn() errors on a node in recovery.
+        let text: String = if in_recovery {
+            conn.query_one("SELECT pg_last_wal_replay_lsn()::text", &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("localdb: pg_last_wal_replay_lsn: {}", describe_pg(&e)))?
+                .get(0)
+        } else {
+            conn.query_one("SELECT pg_current_wal_lsn()::text", &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("localdb: pg_current_wal_lsn: {}", describe_pg(&e)))?
+                .get(0)
+        };
+        parse_pg_lsn(&text)
+    }
+
     async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
         let conn = self.get_conn().await?;
         let in_recovery: bool = conn
@@ -338,6 +374,24 @@ impl PgLocalDb {
 /// this project are restricted to a conservative identifier subset so they
 /// can be safely interpolated into `CREATE ROLE` (since the role name is
 /// not parameter-bindable).
+/// Parse a `pg_lsn` text rendering (`XXXXXXXX/XXXXXXXX`) into a 64-bit
+/// value with the high half in the upper 32 bits. Tolerant of variable-
+/// length hex segments (PG sometimes strips leading zeros when the
+/// value is small) — accepts `0/0` through 16/16 hex digits.
+pub fn parse_pg_lsn(s: &str) -> anyhow::Result<u64> {
+    let (hi, lo) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("localdb: pg_lsn missing '/': {s:?}"))?;
+    if hi.is_empty() || lo.is_empty() || hi.len() > 16 || lo.len() > 16 {
+        anyhow::bail!("localdb: pg_lsn unexpected width: {s:?}");
+    }
+    let hi = u64::from_str_radix(hi, 16)
+        .map_err(|e| anyhow::anyhow!("localdb: pg_lsn high half {hi:?}: {e}"))?;
+    let lo = u64::from_str_radix(lo, 16)
+        .map_err(|e| anyhow::anyhow!("localdb: pg_lsn low half {lo:?}: {e}"))?;
+    Ok((hi << 32) | lo)
+}
+
 fn allowed_role_name() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"^[A-Za-z0-9_.-]+$").unwrap())
@@ -408,6 +462,30 @@ fn describe_pg(e: &tokio_postgres::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pg_lsn_canonical() {
+        // "0/0" → 0
+        assert_eq!(parse_pg_lsn("0/0").unwrap(), 0u64);
+        // "0/1A2B3C4D" — primary just after restart
+        assert_eq!(parse_pg_lsn("0/1A2B3C4D").unwrap(), 0x1A2B_3C4D);
+        // "1/FFFFFFFF" — high half non-zero
+        assert_eq!(parse_pg_lsn("1/FFFFFFFF").unwrap(), 0x1_FFFF_FFFF);
+        // "FFFFFFFF/FFFFFFFF" — saturated upper bound
+        assert_eq!(parse_pg_lsn("FFFFFFFF/FFFFFFFF").unwrap(), u64::MAX);
+        // pg accepts variable-width hex; we tolerate it.
+        assert_eq!(parse_pg_lsn("00000000/00000000").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_pg_lsn_rejects_malformed() {
+        assert!(parse_pg_lsn("").is_err());
+        assert!(parse_pg_lsn("0").is_err()); // missing '/'
+        assert!(parse_pg_lsn("/0").is_err()); // empty high half
+        assert!(parse_pg_lsn("0/").is_err()); // empty low half
+        assert!(parse_pg_lsn("XYZ/0").is_err());
+        assert!(parse_pg_lsn("0/12345678901234567").is_err()); // too long
+    }
 
     #[test]
     fn allowed_role_name_accepts_safe_identifiers() {

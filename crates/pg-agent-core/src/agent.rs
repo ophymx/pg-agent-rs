@@ -728,12 +728,20 @@ impl NodeInfo for Agent {
     /// lag. A node where any probe failed is degraded, not ready, even if
     /// the visible facts (e.g. service running) look fine. See SPEC §5.9.
     async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
-        let (pg_status_res, pgpool_status_res, in_recovery_res, lag_res, timeline_res) = tokio::join!(
+        let (
+            pg_status_res,
+            pgpool_status_res,
+            in_recovery_res,
+            lag_res,
+            timeline_res,
+            wal_lsn_res,
+        ) = tokio::join!(
             self.deps.sd.status_postgres(),
             self.deps.sd.status_pgpool(),
             self.deps.db.is_in_recovery(),
             self.deps.db.replication_lag(),
             self.deps.db.timeline_id(),
+            self.deps.db.current_wal_lsn(),
         );
 
         let (pg_running, pg_status_ok) = pg_status_res
@@ -752,12 +760,15 @@ impl NodeInfo for Agent {
             .inspect_err(|e| warn!(?e, "get_status: replication_lag query failed"))
             .map_or((ReplicationLag::default(), false), |l| (l, true));
 
-        // Timeline failure is NOT folded into is_ready: it's a young
-        // probe, and a transient hiccup shouldn't flap readiness. Peers
-        // and the startup check observe `timeline_id == 0` as "unknown"
-        // and just decline to draw conclusions from this datapoint.
+        // Timeline + WAL LSN failures are NOT folded into is_ready —
+        // they're informational metrics, and a transient hiccup
+        // shouldn't flap readiness. Consumers treat 0 as "unknown" and
+        // skip the cross-node comparison for that node.
         let timeline = timeline_res
             .inspect_err(|e| warn!(?e, "get_status: timeline_id query failed"))
+            .unwrap_or(0);
+        let wal_lsn = wal_lsn_res
+            .inspect_err(|e| warn!(?e, "get_status: current_wal_lsn query failed"))
             .unwrap_or(0);
 
         let ready = recovery_ok && lag_ok && pg_status_ok && pgpool_status_ok;
@@ -773,6 +784,7 @@ impl NodeInfo for Agent {
             is_postgres_status_ok: pg_status_ok,
             is_pgpool_status_ok: pgpool_status_ok,
             timeline_id: timeline,
+            current_wal_lsn: wal_lsn,
         })
     }
 
@@ -814,6 +826,8 @@ mod tests {
         lag: ReplicationLag,
         timeline: i32,
         timeline_fails: AtomicBool,
+        wal_lsn: u64,
+        wal_lsn_fails: AtomicBool,
     }
 
     #[async_trait]
@@ -841,6 +855,12 @@ mod tests {
                 anyhow::bail!("stub: timeline_id boom");
             }
             Ok(self.timeline)
+        }
+        async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            if self.wal_lsn_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("stub: current_wal_lsn boom");
+            }
+            Ok(self.wal_lsn)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             if self.lag_fails.load(Ordering::SeqCst) {
@@ -1027,6 +1047,10 @@ mod tests {
 
     /// Build a NodeStatus for fan-out canned responses.
     fn ns(timeline_id: i32, is_in_recovery: bool) -> pb::NodeStatus {
+        ns_with_lsn(timeline_id, is_in_recovery, 0)
+    }
+
+    fn ns_with_lsn(timeline_id: i32, is_in_recovery: bool, current_wal_lsn: u64) -> pb::NodeStatus {
         pb::NodeStatus {
             is_running: true,
             is_in_recovery,
@@ -1038,6 +1062,7 @@ mod tests {
             is_postgres_status_ok: true,
             is_pgpool_status_ok: true,
             timeline_id,
+            current_wal_lsn,
         }
     }
 

@@ -38,6 +38,14 @@ message NodeStatus {
   // comparison. Used by the startup phantom-primary check to detect a
   // returned-primary that was promoted past during its absence.
   int32  timeline_id             = 10;
+  // Current write-ahead log position as a 64-bit value
+  // (high 32 bits | low 32 bits of pg_lsn). Populated from
+  // pg_current_wal_lsn() on a primary, pg_last_wal_replay_lsn() on a
+  // standby. 0 = unknown / probe failed / pre-feature peer. Used by
+  // `pg_agentctl cluster status` to disambiguate which primary is the
+  // most-up-to-date in a split-brain (`(timeline_id, current_wal_lsn)`
+  // lex order — higher TL wins, ties broken by higher LSN).
+  uint64 current_wal_lsn         = 11;
 }
 
 message GetStatusRequest {}

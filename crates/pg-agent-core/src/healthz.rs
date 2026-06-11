@@ -551,6 +551,9 @@ mod tests {
         async fn timeline_id(&self) -> anyhow::Result<i32> {
             Ok(0)
         }
+        async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             match self.replication_lag.lock().unwrap().clone() {
                 Ok(v) => Ok(v),

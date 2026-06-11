@@ -385,10 +385,42 @@ impl StatusRow {
 }
 
 fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io::Result<()> {
-    // Fixed columns; widths grow with content. Eight columns + a final
-    // optional "ERR" trailer that only appears on the unreachable
-    // summary line below the table.
-    let headers = [
+    // Fixed columns; widths grow with content. The optional LSN column
+    // appears only when at least one reachable row reports a primary —
+    // hides the column on healthy single-primary clusters where it
+    // would always be unique to one row.
+    let primaries: Vec<&StatusRow> = rows
+        .iter()
+        .filter(|r| {
+            matches!(&r.result, Ok(s)
+                if s.is_postgres_status_ok && s.is_postgres_running && !s.is_in_recovery)
+        })
+        .collect();
+    let show_lsn = !primaries.is_empty();
+    // Identify the lead primary by (timeline_id, current_wal_lsn) lex
+    // order, but only when 2+ primaries are present (a single primary
+    // is unambiguous; no marker needed). Primaries with both fields=0
+    // can't be compared — fall back to no marker rather than marking
+    // an arbitrary winner.
+    let lead_id: Option<i32> = if primaries.len() >= 2 {
+        primaries
+            .iter()
+            .filter_map(|r| {
+                r.result.as_ref().ok().and_then(|s| {
+                    if s.timeline_id == 0 && s.current_wal_lsn == 0 {
+                        None
+                    } else {
+                        Some((s.timeline_id, s.current_wal_lsn, r.id))
+                    }
+                })
+            })
+            .max_by_key(|(tl, lsn, _)| (*tl, *lsn))
+            .map(|(_, _, id)| id)
+    } else {
+        None
+    };
+
+    let mut headers: Vec<&str> = vec![
         "ID",
         "HOSTNAME",
         "ROLE",
@@ -398,16 +430,37 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         "LAG",
         "REPL_STATE",
     ];
-
-    let mut cells: Vec<[String; 8]> = Vec::with_capacity(rows.len());
-    for r in rows {
-        cells.push(match &r.result {
-            Ok(s) => format_status_cells(r.id, &r.hostname, s),
-            Err(_) => format_unreachable_cells(r.id, &r.hostname),
-        });
+    if show_lsn {
+        headers.push("LSN");
     }
 
-    let mut widths = headers.map(|h| h.len());
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut row = match &r.result {
+            Ok(s) => format_status_cells(r.id, &r.hostname, s).to_vec(),
+            Err(_) => format_unreachable_cells(r.id, &r.hostname).to_vec(),
+        };
+        // Annotate the lead's ROLE cell with `*`.
+        if Some(r.id) == lead_id {
+            row[2] = format!("{}*", row[2]);
+        }
+        if show_lsn {
+            row.push(match &r.result {
+                Ok(s)
+                    if s.is_postgres_status_ok
+                        && s.is_postgres_running
+                        && s.current_wal_lsn != 0 =>
+                {
+                    format_lsn(s.current_wal_lsn)
+                }
+                Ok(_) => "-".into(),
+                Err(_) => "—".into(),
+            });
+        }
+        cells.push(row);
+    }
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in &cells {
         for (i, c) in row.iter().enumerate() {
             widths[i] = widths[i].max(c.len());
@@ -416,14 +469,14 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
 
     fn write_row(
         w: &mut dyn std::io::Write,
-        row: &[String; 8],
-        widths: &[usize; 8],
+        row: &[String],
+        widths: &[usize],
     ) -> std::io::Result<()> {
         for (i, c) in row.iter().enumerate() {
             if i > 0 {
                 write!(w, "  ")?;
             }
-            // Right-align the numeric ID + LAG columns; left-align the rest.
+            // Right-align ID and LAG (numeric); left-align the rest.
             if i == 0 || i == 6 {
                 write!(w, "{:>width$}", c, width = widths[i])?;
             } else {
@@ -433,7 +486,7 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         writeln!(w)
     }
 
-    let header_row: [String; 8] = headers.map(String::from);
+    let header_row: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
     write_row(w, &header_row, &widths)?;
     for row in &cells {
         write_row(w, row, &widths)?;
@@ -448,7 +501,21 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
             writeln!(w, "  {} {}: {}", r.id, r.hostname, err)?;
         }
     }
+    if lead_id.is_some() {
+        writeln!(w)?;
+        writeln!(
+            w,
+            "* lead primary by (timeline, LSN) — recover other primaries to this one"
+        )?;
+    }
     Ok(())
+}
+
+/// Render a 64-bit `pg_lsn` as PostgreSQL's canonical `XXXXXXXX/XXXXXXXX`
+/// hex form. Matches what `psql -c "SELECT pg_current_wal_lsn()"` prints,
+/// so an operator can grep+compare without translation.
+fn format_lsn(lsn: u64) -> String {
+    format!("{:X}/{:X}", (lsn >> 32) as u32, lsn as u32)
 }
 
 fn format_status_cells(
@@ -1093,6 +1160,18 @@ quoted_with_spaces = '  spaces inside  '
         lag: i64,
         repl_state: &str,
     ) -> pg_agent_proto::pgagentpb::NodeStatus {
+        ns_with(in_recovery, running, ready, lag, repl_state, 0, 0)
+    }
+
+    fn ns_with(
+        in_recovery: bool,
+        running: bool,
+        ready: bool,
+        lag: i64,
+        repl_state: &str,
+        timeline_id: i32,
+        current_wal_lsn: u64,
+    ) -> pg_agent_proto::pgagentpb::NodeStatus {
         pg_agent_proto::pgagentpb::NodeStatus {
             is_running: running,
             is_in_recovery: in_recovery,
@@ -1103,7 +1182,8 @@ quoted_with_spaces = '  spaces inside  '
             is_pgpool_running: running,
             is_postgres_status_ok: true,
             is_pgpool_status_ok: true,
-            timeline_id: 0,
+            timeline_id,
+            current_wal_lsn,
         }
     }
 
@@ -1173,6 +1253,7 @@ quoted_with_spaces = '  spaces inside  '
             is_postgres_status_ok: true,
             is_pgpool_status_ok: true,
             timeline_id: 0,
+            current_wal_lsn: 0,
         };
         let cells = format_status_cells(2, "pg2.local", &status);
         assert_eq!(cells[2], "unknown", "role must not default to primary");
@@ -1198,6 +1279,7 @@ quoted_with_spaces = '  spaces inside  '
             is_postgres_status_ok: false,
             is_pgpool_status_ok: false,
             timeline_id: 0,
+            current_wal_lsn: 0,
         };
         let cells = format_status_cells(3, "pg3.local", &status);
         assert_eq!(cells[2], "unknown");
@@ -1233,5 +1315,159 @@ quoted_with_spaces = '  spaces inside  '
             j2["error"],
             serde_json::Value::String("dial peer: refused".into())
         );
+    }
+
+    // ----- LSN column + LEAD marker --------------------------------------
+
+    #[test]
+    fn format_lsn_renders_xy_hex() {
+        assert_eq!(format_lsn(0), "0/0");
+        assert_eq!(format_lsn(0x1A2B_3C4D), "0/1A2B3C4D");
+        assert_eq!(format_lsn(0x1_FFFF_FFFF), "1/FFFFFFFF");
+        assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+    }
+
+    #[test]
+    fn print_status_table_shows_lsn_column_when_primary_present() {
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 7, 0x1A2B_3C4D)),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns_with(true, true, true, 0, "streaming", 7, 0)),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("LSN"), "LSN column missing: {s}");
+        assert!(s.contains("0/1A2B3C4D"), "primary LSN not rendered: {s}");
+        // Single primary → no LEAD marker.
+        assert!(!s.contains("lead primary"), "unexpected lead footer: {s}");
+        assert!(!s.contains("primary*"), "unexpected lead asterisk: {s}");
+    }
+
+    #[test]
+    fn print_status_table_omits_lsn_column_when_no_primary() {
+        // All rows are standbys → no primary → LSN column hidden.
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns(true, true, true, 0, "streaming")),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns(true, true, true, 100, "streaming")),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Note: "standby" rows still get "standby" so we can't grep for
+        // "LSN" against the role column; assert there's no LSN header.
+        assert!(
+            !s.split('\n').next().unwrap().contains("LSN"),
+            "LSN column should be hidden when no primary present: {s}"
+        );
+    }
+
+    #[test]
+    fn print_status_table_marks_lead_primary_by_lsn_on_same_tl() {
+        // Both nodes are primary on TL=7; pg0 has higher LSN → lead.
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 7, 0x2_0000_0000)),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 7, 0x1_FFFF_FFFF)),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // The lead is annotated with `*` in its ROLE cell. Find the row
+        // containing pg0's hostname and check ROLE has the marker.
+        let pg0_line = s
+            .lines()
+            .find(|l| l.contains("pg0"))
+            .expect("pg0 row missing");
+        assert!(
+            pg0_line.contains("primary*"),
+            "pg0 expected to be lead: {pg0_line}"
+        );
+        let pg1_line = s
+            .lines()
+            .find(|l| l.contains("pg1"))
+            .expect("pg1 row missing");
+        // pg1 has plain "primary" — no asterisk.
+        assert!(pg1_line.contains("primary"));
+        assert!(
+            !pg1_line.contains("primary*"),
+            "pg1 should not be marked lead: {pg1_line}"
+        );
+        assert!(s.contains("lead primary by (timeline, LSN)"));
+    }
+
+    #[test]
+    fn print_status_table_marks_lead_primary_by_higher_timeline() {
+        // pg0 is on TL=7 with very high LSN; pg1 is on TL=8 with low
+        // LSN. TL takes precedence — pg1 wins.
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 7, u64::MAX - 1)),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 8, 1)),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let pg1_line = s.lines().find(|l| l.contains("pg1")).unwrap();
+        assert!(
+            pg1_line.contains("primary*"),
+            "pg1 (higher TL) expected to be lead: {pg1_line}"
+        );
+    }
+
+    #[test]
+    fn print_status_table_no_lead_when_both_primaries_report_unknown_lsn() {
+        // Two primaries, both with TL=0 and LSN=0 (pre-feature peers).
+        // The comparison degrades to no-marker rather than arbitrary
+        // winner.
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns(false, true, true, 0, "")),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns(false, true, true, 0, "")),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            !s.contains("primary*"),
+            "should not pick a lead when both primaries are pre-feature"
+        );
+        assert!(!s.contains("lead primary"));
     }
 }

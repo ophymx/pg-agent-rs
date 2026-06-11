@@ -911,6 +911,9 @@ mod tests {
         async fn timeline_id(&self) -> anyhow::Result<i32> {
             unreachable!()
         }
+        async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            unreachable!()
+        }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             unreachable!()
         }
