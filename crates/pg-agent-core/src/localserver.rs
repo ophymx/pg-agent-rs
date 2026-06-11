@@ -850,6 +850,13 @@ impl PgAgentLocal for LocalServer {
     /// another standby, and the error message names the operation so
     /// the caller can redirect.
     ///
+    /// Preflights `peer.get_status` on the target. If PG is running
+    /// there, the operator must opt in via `--stop-target-pg` (proto:
+    /// `stop_target_pg=true`) to stop it first — otherwise the call
+    /// returns `ok=false` with an actionable message instead of dying
+    /// eight layers deep inside the basebackup safety check. With the
+    /// flag, the daemon issues `peer.stop` and then proceeds.
+    ///
     /// Resolves the local node as primary (its config-sourced
     /// `NodeConfig` — same source of truth as `cluster init`) and the
     /// target by pool id, then delegates to `recovery_first_stage`.
@@ -894,6 +901,51 @@ impl PgAgentLocal for LocalServer {
             return Err(Status::invalid_argument(
                 "cluster_recover: target is the local node — reclone target must be a peer",
             ));
+        }
+
+        // Preflight: assess PG state on the target. If PG is running we
+        // either stop it now (operator opt-in via --stop-target-pg) or
+        // refuse with an actionable message. Without this preflight the
+        // basebackup safety check (peerserver.rs: "refusing to basebackup
+        // while postgres is running") catches it, but eight layers deep
+        // inside recovery_first_stage and with no opt-in path for the
+        // operator. The peer channel is cached, so the get_status here
+        // is "free" relative to the peer.basebackup recovery_first_stage
+        // will run shortly.
+        let peer = self.peers.client(standby).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "cluster_recover: dial peer {}: {e}",
+                standby.hostname
+            ))
+        })?;
+        let target_status = peer.get_status().await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "cluster_recover: peer get_status {}: {e}",
+                standby.hostname
+            ))
+        })?;
+        if target_status.is_postgres_running {
+            if !req.stop_target_pg {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "cluster_recover: postgres is running on target {}; \
+                         rerun with --stop-target-pg to stop it before reclone, \
+                         or stop it manually on that host first",
+                        standby.hostname
+                    ),
+                }));
+            }
+            info!(
+                target = %standby.hostname,
+                "cluster_recover: stopping postgres on target (--stop-target-pg)"
+            );
+            peer.stop().await.map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "cluster_recover: stop postgres on {}: {e}",
+                    standby.hostname
+                ))
+            })?;
         }
 
         info!(
@@ -2767,6 +2819,7 @@ mod tests {
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 1,
+                stop_target_pg: false,
             }))
             .await
             .unwrap()
@@ -2791,6 +2844,7 @@ mod tests {
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 1,
+                stop_target_pg: false,
             }))
             .await
             .unwrap()
@@ -2808,6 +2862,7 @@ mod tests {
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 99,
+                stop_target_pg: false,
             }))
             .await
             .unwrap_err();
@@ -2822,6 +2877,7 @@ mod tests {
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 0,
+                stop_target_pg: false,
             }))
             .await
             .unwrap_err();
@@ -2830,6 +2886,76 @@ mod tests {
         // No work happened.
         assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
         assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_refuses_when_target_pg_running_without_flag() {
+        // Operator forgot --stop-target-pg; target reports PG running.
+        // We must refuse cleanly here, not let recovery_first_stage run
+        // headlong into the deeper basebackup safety check.
+        let (s, db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        standby.mark_running(); // is_postgres_running=true on the peer's get_status
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("postgres is running on target"),
+            "unexpected: {}",
+            resp.message
+        );
+        assert!(resp.message.contains("--stop-target-pg"));
+        // No downstream work — we didn't even checkpoint.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(standby.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_stops_target_pg_when_flag_set() {
+        let (s, db, _peers, _maint, replay, standby) = make_recovery_setup();
+        standby.mark_running();
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // peer.stop fired exactly once; then recovery_first_stage ran.
+        assert_eq!(standby.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
+        assert!(replay
+            .has("recovery_1st_stage", "primary=0,standby=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_skips_stop_when_target_pg_already_stopped() {
+        // Flag set, but target already reports PG stopped → no peer.stop
+        // (idempotent, but skipping avoids the systemd D-Bus round-trip
+        // for no reason).
+        let (s, _db, _peers, _maint, _replay, standby) = make_recovery_setup();
+        // standby.is_running default false; do not mark_running().
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(standby.stop_calls.load(Ordering::SeqCst), 0);
     }
 
     // ----- restore_wal ---------------------------------------------------

@@ -103,6 +103,15 @@ enum ClusterCmd {
         /// Pool id of the standby to reclone.
         #[arg(long)]
         target: i32,
+        /// Stop PostgreSQL on the target via the peer agent before
+        /// running basebackup. Without this flag, a target that still
+        /// has PG running is refused — the basebackup safety check
+        /// won't wipe a live $PGDATA, and we surface that as a refusal
+        /// here rather than dying eight layers deeper inside recovery.
+        /// Pass this when you're sure the target's current PG state is
+        /// safe to discard (which is the entire point of recloning it).
+        #[arg(long)]
+        stop_target_pg: bool,
         #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
@@ -144,8 +153,19 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             ClusterCmd::Status { config } => {
                 cluster_status(config, cli.socket.as_deref(), cli.json).await
             }
-            ClusterCmd::Recover { target, config } => {
-                cluster_recover(config, target, cli.socket.as_deref(), cli.json).await
+            ClusterCmd::Recover {
+                target,
+                stop_target_pg,
+                config,
+            } => {
+                cluster_recover(
+                    config,
+                    target,
+                    stop_target_pg,
+                    cli.socket.as_deref(),
+                    cli.json,
+                )
+                .await
             }
         },
     }
@@ -294,6 +314,7 @@ async fn cluster_status(
 async fn cluster_recover(
     config_path: PathBuf,
     target: i32,
+    stop_target_pg: bool,
     cli_socket: Option<&std::path::Path>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -304,6 +325,7 @@ async fn cluster_recover(
     let resp = client
         .cluster_recover(ClusterRecoverRequest {
             target_node_id: target,
+            stop_target_pg,
         })
         .await
         .map_err(|s| rpc_failed("ClusterRecover", s))?
@@ -311,9 +333,10 @@ async fn cluster_recover(
 
     if json {
         let payload = serde_json::json!({
-            "ok":      resp.ok,
-            "message": resp.message,
-            "target":  target,
+            "ok":             resp.ok,
+            "message":        resp.message,
+            "target":         target,
+            "stop_target_pg": stop_target_pg,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if resp.ok {

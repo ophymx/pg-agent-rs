@@ -127,6 +127,14 @@ message ClusterRecoverRequest {
   // pgpool node id of the standby to reclone from this primary.
   // The daemon resolves the primary itself (must be the local node).
   int32 target_node_id = 1;
+
+  // Operator opt-in: stop PostgreSQL on the target before basebackup.
+  // Without this, a target that still has PG running is refused with
+  // an actionable message instead of hitting the deeper basebackup
+  // safety check (peerserver.rs `refusing to basebackup while postgres
+  // is running`). The CLI surface is `--stop-target-pg` on
+  // `pg_agentctl cluster recover`.
+  bool stop_target_pg = 2;
 }
 
 message GetPgpoolBackendsRequest {}
