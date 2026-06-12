@@ -307,6 +307,11 @@ async fn handle_recovery_1st_stage(
             get(&p, StandbyPort),
             get(&p, StandbyData),
         )?),
+        // pgpool's recovery_1st_stage_command path — leave the replay
+        // marker dedup ON so re-fired hooks don't trigger a duplicate
+        // basebackup. Operator-driven `cluster_recover` sets this
+        // true to mean "I want this to run now."
+        bypass_replay_marker: false,
     };
 
     let resp = with_deadline(timeout, client.recovery_first_stage(req)).await?;

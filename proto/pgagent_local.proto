@@ -39,6 +39,12 @@ message FollowPrimaryRequest {
 message RecoveryRequest {
   NodeRef standby = 1;
   NodeRef primary = 2;
+  // When true, recovery_1st_stage skips its replay-marker idempotency
+  // check and always runs basebackup. Set by `cluster_recover` because
+  // the operator's intent on every `pg_agentctl cluster recover` is
+  // "actually reclone now"; pgpool's `recovery_1st_stage_command` path
+  // leaves this false so retried hooks still dedup.
+  bool bypass_replay_marker = 3;
 }
 
 message RemoteStartRequest {

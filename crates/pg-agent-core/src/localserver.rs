@@ -787,19 +787,33 @@ impl PgAgentLocal for LocalServer {
             .ok_or_else(|| Status::invalid_argument("recovery_1st_stage: standby is required"))?;
 
         let replay_key = format!("primary={},standby={}", primary_ref.id, standby_ref.id);
-        match self.replay.has("recovery_1st_stage", &replay_key).await {
-            Ok(true) => {
-                info!(%replay_key, "recovery_1st_stage: replay detected, skipping");
-                return Ok(Response::new(OpResult {
-                    ok: true,
-                    message: "recovery_1st_stage: already processed; skipping duplicate".into(),
-                }));
-            }
-            Ok(false) => {}
-            Err(e) => {
-                return Err(internal(anyhow::anyhow!(
-                    "recovery_1st_stage: idempotency marker check: {e}"
-                )));
+        if req.bypass_replay_marker {
+            info!(
+                %replay_key,
+                "recovery_1st_stage: bypass_replay_marker=true; running unconditionally"
+            );
+        } else {
+            match self.replay.has("recovery_1st_stage", &replay_key).await {
+                Ok(true) => {
+                    info!(%replay_key, "recovery_1st_stage: replay detected, skipping");
+                    // Distinct message from the basebackup-ran success
+                    // case so operator-facing callers (cluster_recover)
+                    // can flag this as "no work done" rather than the
+                    // identical-looking "complete" wording that masked
+                    // a silent skip on db2 on 2026-06-12.
+                    return Ok(Response::new(OpResult {
+                        ok: true,
+                        message: "recovery_1st_stage: skipped via replay marker \
+                                  (already processed within the 24h retention window)"
+                            .into(),
+                    }));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(internal(anyhow::anyhow!(
+                        "recovery_1st_stage: idempotency marker check: {e}"
+                    )));
+                }
             }
         }
 
@@ -1202,6 +1216,13 @@ impl PgAgentLocal for LocalServer {
                 pg_port: 0,
                 pg_data: String::new(),
             }),
+            // Operator-driven `cluster recover` always means "actually
+            // reclone now." Without this, a stale 24h replay marker
+            // (set by a prior cluster_recover or pgpool hook) silently
+            // short-circuits recovery_first_stage and the wrapper
+            // reports "recovery complete" even though basebackup never
+            // ran — observed live on db2 on 2026-06-12.
+            bypass_replay_marker: true,
         };
         let rec_resp = self
             .recovery_first_stage(Request::new(inner_req))
@@ -4556,6 +4577,9 @@ mod tests {
                 pg_port: 0,
                 pg_data: String::new(),
             }),
+            // Default to pgpool's path (dedup on). Tests that exercise
+            // operator-bypass override this explicitly.
+            bypass_replay_marker: false,
         }
     }
 
@@ -4629,10 +4653,49 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp.ok);
-        assert!(resp.message.contains("already processed"));
+        // Distinct message so cluster_recover-wrapped callers can flag
+        // a silent skip vs. an actual basebackup. Two halves so a future
+        // refactor of one of the strings doesn't break both tests.
+        assert!(
+            resp.message.contains("skipped via replay marker"),
+            "got: {}",
+            resp.message
+        );
+        assert!(
+            resp.message.contains("24h retention window"),
+            "got: {}",
+            resp.message
+        );
         // Nothing downstream of the marker touched.
         assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
         assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// `bypass_replay_marker=true` makes recovery_first_stage ignore an
+    /// existing marker and run basebackup. Operator-driven
+    /// `cluster_recover` relies on this — without it, a 24h-old marker
+    /// silently short-circuited the recover and reported "complete"
+    /// without actually reclonating (observed live on db2 2026-06-12).
+    #[tokio::test]
+    async fn recovery_first_stage_bypass_runs_even_with_marker_present() {
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        replay.mark("recovery_1st_stage", "primary=0,standby=1");
+        let mut req = recovery_req(0, 1);
+        req.bypass_replay_marker = true;
+        let resp = s
+            .recovery_first_stage(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert!(
+            !resp.message.contains("skipped"),
+            "bypass should not produce skip message: {}",
+            resp.message
+        );
+        // Basebackup actually ran.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4917,6 +4980,36 @@ mod tests {
             .into_inner();
         assert!(resp.ok, "{}", resp.message);
         assert_eq!(standby.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// cluster_recover bypasses a stale replay marker on
+    /// recovery_first_stage. Without this, a 24h-old marker silently
+    /// short-circuited the recover and the operator got back
+    /// "recovery complete" with no work actually done — observed live
+    /// on db2 on 2026-06-12.
+    #[tokio::test]
+    async fn cluster_recover_bypasses_stale_replay_marker() {
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        // Plant a marker that would short-circuit recovery_first_stage.
+        replay.mark("recovery_1st_stage", "primary=0,standby=1");
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // Basebackup actually ran — the wrapper set bypass_replay_marker.
+        assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
+        // And the response is NOT the silent-skip message.
+        assert!(
+            !resp.message.contains("skipped via replay marker"),
+            "got: {}",
+            resp.message
+        );
     }
 
     // ----- cluster_handoff -----------------------------------------------

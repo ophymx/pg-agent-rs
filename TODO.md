@@ -5,7 +5,18 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
-### Slot lifecycle: drop/create boundary cases
+### `cluster_recover` reports OK + attaches pgpool even when PG start failed
+
+- **Where:** `crates/pg-agent-core/src/localserver.rs::cluster_recover` (recovery_1st_stage path). Observed live 2026-06-12: recover --target 2 returned `OK: recovery complete for db2.home.ophymx.com; postgres start failed: ...; pgpool started; attached node 2 in pgpool`. The peer start error was concatenated into the message but the response was `ok=true` and `pcp_attach_node` ran anyway.
+- **Why it bites:** pgpool now routes to a backend whose PG is down. Health-check eventually flags it, but in the meantime any write trying that backend errors out, and the operator sees `READY=yes` ish lines in `cluster status` that misrepresent the real state.
+- **Fix shape:** treat "start failed" as terminal for the recover. Don't `pcp_attach_node`. Return `ok=false` with the underlying systemd error verbatim so the operator immediately sees what to fix. The slot + basebackup work that DID succeed stays on disk; the next `cluster recover` re-run picks up from there if we ever wire recover into `inflight_ops` (currently uses replay markers).
+- **Pairs with:** the recover-completion auto-attach work from 0.4.0 — the auto-attach is correct when the start succeeded; it just needs to be gated on `start_ok`.
+
+### `recovery_first_stage`: migrate replay markers to `inflight_ops`
+
+- **Where:** `crates/pg-agent-core/src/localserver.rs::recovery_first_stage` + the in-flight ops substrate from 0.6.0.
+- **Why:** 0.7.2 fixed the silent-skip bug by adding `bypass_replay_marker` and a distinguishable skip message, but the underlying contract is still a binary marker with 24h global TTL. A more honest model treats recovery_first_stage as a phased orchestration (checkpoint → create_slot → basebackup → configure_standby) and journals each phase so (a) operators can see what step a stuck recover is at, (b) resume is possible after a crash, and (c) the per-op retention can be tuned without affecting failover/follow_primary's markers.
+- **Pairs with:** the `follow_primary` unification item — both are state-changing operations that today use the binary replay marker for dedup; converging them both onto `inflight_ops` lets the operator surface be uniform across all the cluster-shape RPCs.
 
 Two related issues around handoff's replication-slot management on the new primary. Both have narrow trigger conditions but the fixes are small and defensive.
 
