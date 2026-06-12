@@ -100,10 +100,17 @@ impl FileWalStore {
     /// return the canonical destination path. Errors with
     /// [`AgentError::DestOutsidePgData`] for any of:
     ///
-    /// - relative path
     /// - parent directory doesn't exist or can't be canonicalized
     /// - canonicalized parent isn't a descendant of canonicalized
     ///   `pg_data_dir` (catches symlink escapes)
+    ///
+    /// PostgreSQL's `restore_command` substitutes `%p` with a path
+    /// **relative to PGDATA** (PG `chdir`'s there before invoking the
+    /// command). pg_agentc passes that value verbatim as `dest_path`,
+    /// so a relative path here is the normal case — we resolve it
+    /// against `pg_data_dir`. Absolute paths are also accepted (a
+    /// future restore_command might pre-resolve, or an operator might
+    /// hit this RPC directly) and validated the same way.
     ///
     /// We canonicalize the *parent* rather than the destination itself
     /// because the destination may not yet exist (we're about to create
@@ -111,11 +118,13 @@ impl FileWalStore {
     /// invocation — PostgreSQL writes into `pg_wal/`, which initdb
     /// creates.
     async fn resolve_dest_path(&self, dest_path: &Path) -> Result<PathBuf, AgentError> {
-        if !dest_path.is_absolute() {
-            return Err(AgentError::DestOutsidePgData);
-        }
-        let parent = dest_path.parent().ok_or(AgentError::DestOutsidePgData)?;
-        let base = dest_path.file_name().ok_or(AgentError::DestOutsidePgData)?;
+        let absolute = if dest_path.is_absolute() {
+            dest_path.to_path_buf()
+        } else {
+            self.pg_data_dir.join(dest_path)
+        };
+        let parent = absolute.parent().ok_or(AgentError::DestOutsidePgData)?;
+        let base = absolute.file_name().ok_or(AgentError::DestOutsidePgData)?;
 
         let parent_canonical = tokio::fs::canonicalize(parent)
             .await
@@ -352,12 +361,38 @@ mod tests {
 
     // ----- write_restore ---------------------------------------------------
 
+    /// PostgreSQL's `restore_command` substitutes `%p` as a path
+    /// relative to PGDATA (PG `chdir`'s to PGDATA before exec). When
+    /// the parent of the resolved path exists under pg_data_dir, the
+    /// write should succeed — that's the live shape on every restore.
     #[tokio::test]
-    async fn write_restore_rejects_relative_path() {
+    async fn write_restore_resolves_relative_path_against_pg_data_dir() {
         let (_tmp, store) = fixture();
+        // pg_basebackup creates pg_wal/; mirror that so the parent canonicalises.
+        std::fs::create_dir(store.pg_data_dir.join("pg_wal")).unwrap();
+        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"wal bytes"[..]);
+        store
+            .write_restore(Path::new("pg_wal/000000010000000000000001"), src)
+            .await
+            .expect("relative path under pg_data_dir should resolve and write");
+        let written = std::fs::read(
+            store
+                .pg_data_dir
+                .join("pg_wal/000000010000000000000001"),
+        )
+        .unwrap();
+        assert_eq!(written, b"wal bytes");
+    }
+
+    /// A relative path with a parent that doesn't exist under pg_data_dir
+    /// still fails — the parent canonicalize step catches it.
+    #[tokio::test]
+    async fn write_restore_rejects_relative_path_with_missing_parent() {
+        let (_tmp, store) = fixture();
+        // pg_wal/ deliberately NOT created.
         let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"x"[..]);
         let e = store
-            .write_restore(Path::new("relative/foo"), src)
+            .write_restore(Path::new("pg_wal/000000010000000000000001"), src)
             .await
             .unwrap_err();
         assert!(matches!(e, AgentError::DestOutsidePgData));
