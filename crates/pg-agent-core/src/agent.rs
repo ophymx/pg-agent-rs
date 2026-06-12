@@ -339,7 +339,7 @@ impl Agent {
         // "role has been verified against the cluster." `startup_verified`
         // gates /healthz independently: even a Confirmed verdict
         // requires the flag to flip before /healthz returns 200.
-        let verdict = self.verify_primary_at_startup().await;
+        let verdict = self.verify_primary_with_retries().await;
         match &verdict {
             PrimaryVerdict::Confirmed => {
                 info!("phantom-primary check: confirmed");
@@ -533,6 +533,24 @@ async fn stop_postgres_with_retry(sd: &dyn Systemd) -> anyhow::Result<()> {
 /// to need tuning, promote to a `[startup]` knob then.
 const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// On a first-pass `Unverifiable` verdict, retry `verify_primary_at_startup`
+/// up to this many additional times with [`STARTUP_CHECK_RETRY_DELAY`]
+/// between attempts before treating the verdict as final. Covers the
+/// rolling-deploy race observed on 2026-06-12: every node's pg_agentd
+/// restarts within the same second, each daemon's localdb pool isn't
+/// ready yet so peers respond with `timeline_id=0`, the quorum gate
+/// fails, and a healthy primary gets a conservative stop. By the
+/// second or third retry the peers have settled.
+///
+/// Total worst-case extra wait is `STARTUP_CHECK_RETRIES *
+/// STARTUP_CHECK_RETRY_DELAY` — kept short enough that systemd's
+/// `TimeoutStartSec` (default 90 s) still tolerates it on top of the
+/// 5 s fan-out budget per pass. Phantom/SplitBrain verdicts skip the
+/// retry — those are positive evidence; no amount of waiting changes
+/// them.
+const STARTUP_CHECK_RETRIES: u8 = 3;
+const STARTUP_CHECK_RETRY_DELAY: Duration = Duration::from_secs(3);
+
 /// One peer's contribution to a [`PrimaryVerdict`]. Only reachable
 /// peers with a known timeline (`timeline_id > 0`) make it into the
 /// observation list — unreachable peers and pre-feature peers are
@@ -590,6 +608,51 @@ impl Agent {
     /// via the local PeerServer if they're racing the same check) and
     /// before [`crate::sdnotify::ready`]. Returns immediately on the
     /// `NotApplicable` paths (PG down, we're in recovery).
+    /// Retry-wrapped wrapper around [`Self::verify_primary_at_startup`].
+    /// Phantom / SplitBrain / Confirmed / NotApplicable verdicts return
+    /// immediately. An `Unverifiable` verdict is retried up to
+    /// [`STARTUP_CHECK_RETRIES`] more times with a delay between
+    /// attempts — the peer evidence may stabilize once their daemons
+    /// finish bootstrapping. The final verdict is whatever the last
+    /// attempt produced.
+    pub(crate) async fn verify_primary_with_retries(&self) -> PrimaryVerdict {
+        self.verify_primary_with_retries_params(STARTUP_CHECK_RETRIES, STARTUP_CHECK_RETRY_DELAY)
+            .await
+    }
+
+    /// Parameterised retry — production goes through
+    /// [`Self::verify_primary_with_retries`] which substitutes the
+    /// module constants; tests pass small values so the suite doesn't
+    /// pay the production delay.
+    ///
+    /// Each attempt is logged so an operator can correlate a slow
+    /// startup with rolling-deploy peer noise.
+    pub(crate) async fn verify_primary_with_retries_params(
+        &self,
+        max_retries: u8,
+        delay: Duration,
+    ) -> PrimaryVerdict {
+        let mut last = self.verify_primary_at_startup().await;
+        for attempt in 1..=max_retries {
+            match &last {
+                PrimaryVerdict::Unverifiable { reason } => {
+                    info!(
+                        attempt,
+                        max_attempts = max_retries,
+                        ?delay,
+                        reason,
+                        "phantom-primary check: unverifiable; retrying after delay \
+                         (peers may be mid-restart)"
+                    );
+                    tokio::time::sleep(delay).await;
+                    last = self.verify_primary_at_startup().await;
+                }
+                _ => return last,
+            }
+        }
+        last
+    }
+
     pub(crate) async fn verify_primary_at_startup(&self) -> PrimaryVerdict {
         // 1. PG must be running primary for there to be a role to verify.
         //    "Could not query systemd" → conservative Unverifiable; "PG
@@ -1974,6 +2037,139 @@ mod tests {
         assert!(
             matches!(v, PrimaryVerdict::Unverifiable { .. }),
             "got {v:?}"
+        );
+    }
+
+    /// Peer registry that returns a different canned response per call
+    /// to `client()`. Each call pops the front of the per-peer
+    /// sequence; once exhausted, the last value is returned forever.
+    /// Used to simulate a peer whose own daemon is mid-bootstrap on the
+    /// first verification attempt and stabilises by the second —
+    /// regression scaffolding for the 2026-06-12 rolling-deploy race
+    /// where db1's primary got stopped because its peers reported
+    /// `timeline_id=0` (their localdb pool wasn't ready yet).
+    #[derive(Default)]
+    struct SequencedPeers {
+        seq: std::sync::Mutex<std::collections::HashMap<i32, Vec<pb::NodeStatus>>>,
+    }
+    impl SequencedPeers {
+        fn new(rs: Vec<(i32, Vec<pb::NodeStatus>)>) -> Self {
+            let mut map = std::collections::HashMap::new();
+            for (id, v) in rs {
+                assert!(!v.is_empty(), "SequencedPeers: empty sequence for id={id}");
+                map.insert(id, v);
+            }
+            Self {
+                seq: std::sync::Mutex::new(map),
+            }
+        }
+    }
+    #[async_trait]
+    impl PeerRegistry for SequencedPeers {
+        async fn client(
+            &self,
+            node: &crate::config::NodeConfig,
+        ) -> anyhow::Result<Arc<dyn PeerClient>> {
+            let mut seqs = self.seq.lock().unwrap();
+            let v = seqs
+                .get_mut(&node.id)
+                .ok_or_else(|| anyhow::anyhow!("sequenced: no peer for id={}", node.id))?;
+            let status = if v.len() > 1 { v.remove(0) } else { v[0].clone() };
+            Ok(Arc::new(CannedPeerClient { status }))
+        }
+        async fn close(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Rolling-deploy race fix: when the first attempt's peer answers
+    /// with `timeline_id=0` (its localdb pool wasn't ready), the
+    /// retry-wrapped verification should NOT stop PG. The second
+    /// attempt sees the stabilised peer (real timeline) and resolves
+    /// to Confirmed.
+    #[tokio::test]
+    async fn verify_with_retries_recovers_after_peer_settles() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // First call: peer's localdb still warming up → timeline=0.
+        // Second call: peer settled → timeline=7, standby. Confirmed.
+        let peers = Arc::new(SequencedPeers::new(vec![(1, vec![ns(0, true), ns(7, true)])]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent
+            .verify_primary_with_retries_params(3, Duration::from_millis(1))
+            .await;
+        assert!(matches!(v, PrimaryVerdict::Confirmed), "got {v:?}");
+        assert_eq!(
+            sd.stop_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stop must not be called when retry resolves to Confirmed"
+        );
+    }
+
+    /// If every retry still resolves to Unverifiable, the final
+    /// verdict is Unverifiable. Caller stops PG conservatively as
+    /// before — the retry only buys time for transient noise to
+    /// clear, it doesn't make persistent unverifiability safe.
+    #[tokio::test]
+    async fn verify_with_retries_remains_unverifiable_when_peers_never_settle() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // Every call returns timeline=0; never any evidence.
+        let peers = Arc::new(SequencedPeers::new(vec![(1, vec![ns(0, true)])]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent
+            .verify_primary_with_retries_params(2, Duration::from_millis(1))
+            .await;
+        assert!(
+            matches!(v, PrimaryVerdict::Unverifiable { .. }),
+            "got {v:?}"
+        );
+    }
+
+    /// Phantom verdicts are positive evidence — no amount of retrying
+    /// changes them. The retry wrapper must return immediately on a
+    /// Phantom verdict so a real split-brain returner stops PG fast.
+    #[tokio::test]
+    async fn verify_with_retries_returns_phantom_immediately() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // Peer is on a higher timeline → Phantom.
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns(8, false))]));
+        let agent = make_agent_with_one_peer(db, sd, peers);
+        let before = std::time::Instant::now();
+        let v = agent
+            .verify_primary_with_retries_params(3, Duration::from_millis(500))
+            .await;
+        let elapsed = before.elapsed();
+        assert!(
+            matches!(v, PrimaryVerdict::Phantom { .. }),
+            "got {v:?}"
+        );
+        // Should NOT have paid the retry delay even once.
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "Phantom verdict should skip retry delays; took {elapsed:?}"
         );
     }
 
