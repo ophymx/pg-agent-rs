@@ -109,6 +109,43 @@ pub(crate) fn handoff_phase_at_or_past(actual: &str, threshold: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FollowPrimary phase ladder (journaled / resumable)
+// ---------------------------------------------------------------------------
+//
+// One per standby being rebased onto a primary. Driven by
+// `drive_follow_primary`, which both the post-handoff fan-out and the
+// operator-initiated resume path enter. Resume re-enters the driver at
+// the recorded phase. The existing `PgAgentLocal::FollowPrimary` RPC
+// (the pgpool hook) does NOT yet use these phases — it's still on the
+// binary replay marker. Convergence is tracked as the "follow_primary
+// unification" item; the two should eventually share this driver so
+// orchestration is agnostic about which node pulled the trigger.
+
+pub(crate) const FP_PHASE_QUEUED: &str = "queued";
+pub(crate) const FP_PHASE_DIALING: &str = "dialing";
+pub(crate) const FP_PHASE_DETACHED_STOPPED: &str = "detached_stopped";
+pub(crate) const FP_PHASE_SLOT_CREATED: &str = "slot_created";
+pub(crate) const FP_PHASE_DATA_COPIED: &str = "data_copied";
+pub(crate) const FP_PHASE_RECOVERY_CONF_WRITTEN: &str = "recovery_conf_written";
+pub(crate) const FP_PHASE_DETACHED_STARTED: &str = "detached_started";
+pub(crate) const FP_PHASE_ATTACHED: &str = "attached";
+
+const FP_PHASES: &[&str] = &[
+    FP_PHASE_QUEUED,
+    FP_PHASE_DIALING,
+    FP_PHASE_DETACHED_STOPPED,
+    FP_PHASE_SLOT_CREATED,
+    FP_PHASE_DATA_COPIED,
+    FP_PHASE_RECOVERY_CONF_WRITTEN,
+    FP_PHASE_DETACHED_STARTED,
+    FP_PHASE_ATTACHED,
+];
+
+pub(crate) fn fp_phase_index(phase: &str) -> Option<usize> {
+    FP_PHASES.iter().position(|p| *p == phase)
+}
+
 pub struct LocalServer {
     node_info: Arc<dyn NodeInfo>,
     db: Arc<dyn LocalDb>,
@@ -371,12 +408,10 @@ impl PgAgentLocal for LocalServer {
                 crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } => {
                     *to_node_id == new_main.id
                 }
+                _ => false,
             });
         if let Some(ref h) = inflight_handoff {
             if !handoff_targets_new_main {
-                // Single-variant pattern today; refutability returns
-                // when InflightPayload grows variants.
-                #[allow(irrefutable_let_patterns)]
                 if let crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } =
                     &h.payload
                 {
@@ -1465,15 +1500,25 @@ impl PgAgentLocal for LocalServer {
             "cluster_handoff: preflight ok, starting orchestration"
         );
 
-        self.run_handoff_from_phase(
-            &op.id,
-            HANDOFF_PHASE_PREFLIGHT_DONE,
-            &peer,
-            &target,
-            &local,
-            &slot_name,
-        )
-        .await
+        let resp = self
+            .run_handoff_from_phase(
+                &op.id,
+                HANDOFF_PHASE_PREFLIGHT_DONE,
+                &peer,
+                &target,
+                &local,
+                &slot_name,
+            )
+            .await?;
+        // Demotion done; rebase any other standbys onto the new primary
+        // in background tasks. Each follow-up is an independent
+        // InflightOp visible via `pg_agentctl ops list` — failure on one
+        // does not affect the others, and operator can resume any that
+        // stall mid-way. See `drive_follow_primary`.
+        if resp.get_ref().ok {
+            self.fan_out_follow_primary(&local, &target).await;
+        }
+        Ok(resp)
     }
 
     async fn list_inflight_ops(
@@ -1588,6 +1633,9 @@ impl PgAgentLocal for LocalServer {
         }
         match &op.payload {
             crate::inflight_ops::InflightPayload::Handoff { .. } => self.resume_handoff(op).await,
+            crate::inflight_ops::InflightPayload::FollowPrimary { .. } => {
+                self.resume_follow_primary(op).await
+            }
         }
     }
 
@@ -2099,6 +2147,200 @@ impl LocalServer {
         }
     }
 
+    /// Post-handoff fan-out: for every member of the pool that's
+    /// neither `local` (the just-demoted node) nor `new_primary` (the
+    /// freshly-promoted target), enqueue an
+    /// [`crate::inflight_ops::InflightPayload::FollowPrimary`] in
+    /// the journal and spawn a background driver task. The drivers are
+    /// independent — one stuck standby cannot block another, and the
+    /// operator can inspect/resume/abandon each via
+    /// `pg_agentctl ops list`.
+    ///
+    /// Errors during `inflight.begin` (e.g. journal write failure) are
+    /// logged but do NOT block the other fan-outs or the handoff's
+    /// response. The detached node will simply not be rebased until an
+    /// operator runs `pg_agentctl cluster recover --target N
+    /// --stop-target-pg` or pgpool fires a follow_primary hook.
+    async fn fan_out_follow_primary(&self, local: &NodeConfig, new_primary: &NodeConfig) {
+        for member in &self.node_pool.members {
+            if member.id == local.id || member.id == new_primary.id {
+                continue;
+            }
+            let detached = member.clone();
+            let np = new_primary.clone();
+            let payload = crate::inflight_ops::InflightPayload::FollowPrimary {
+                detached_node_id: detached.id,
+                detached_hostname: detached.hostname.clone(),
+                new_primary_node_id: np.id,
+                new_primary_hostname: np.hostname.clone(),
+            };
+            let op = match self.inflight.begin(payload, FP_PHASE_QUEUED, false).await {
+                Ok(op) => op,
+                Err(e) => {
+                    warn!(
+                        detached = %detached.hostname,
+                        new_primary = %np.hostname,
+                        ?e,
+                        "follow_primary: skip fan-out — inflight.begin failed \
+                         (existing in-flight follow-up?); operator can resume manually"
+                    );
+                    continue;
+                }
+            };
+            let inflight = self.inflight.clone();
+            let peers = self.peers.clone();
+            let pcp = self.pcp.clone();
+            let maint = self.maint.clone();
+            let pg = self.pg.clone();
+            let id = op.id.clone();
+            info!(
+                id = %id,
+                detached = %detached.hostname,
+                new_primary = %np.hostname,
+                "follow_primary: enqueued; driver task spawning"
+            );
+            tokio::spawn(async move {
+                let outcome = drive_follow_primary(
+                    &inflight, &peers, &pcp, &maint, &pg, &id, FP_PHASE_QUEUED, &detached, &np,
+                )
+                .await;
+                match outcome {
+                    Ok(()) => {
+                        if let Err(e) = inflight.complete(&id).await {
+                            warn!(id = %id, ?e, "follow_primary: journal complete failed");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            id = %id,
+                            detached = %detached.hostname,
+                            ?e,
+                            "follow_primary: driver failed; marking abandoned"
+                        );
+                        if let Err(je) = inflight.abandon(&id, &e.to_string()).await {
+                            warn!(id = %id, ?je, "follow_primary: journal abandon failed");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Operator-driven resume of a stuck follow-other-standby. Verifies
+    /// the recorded payload is still consistent with the current pool
+    /// then re-enters [`drive_follow_primary`] at the recorded
+    /// phase. On success the driver runs synchronously (resume blocks
+    /// until done or refused) so the operator gets a definitive
+    /// response.
+    async fn resume_follow_primary(
+        &self,
+        op: crate::inflight_ops::InflightOp,
+    ) -> Result<Response<OpResult>, Status> {
+        let crate::inflight_ops::InflightPayload::FollowPrimary {
+            detached_node_id,
+            ref detached_hostname,
+            new_primary_node_id,
+            ref new_primary_hostname,
+        } = op.payload
+        else {
+            return Err(Status::failed_precondition(
+                "resume_follow_primary: payload is not a follow_primary",
+            ));
+        };
+
+        let detached = match self.node_pool.node_by_id(detached_node_id) {
+            Ok(n) if n.hostname == *detached_hostname => n.clone(),
+            Ok(n) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_follow_primary: op recorded detached_hostname={:?} \
+                         but current pool has node {} as {:?}; pool topology has changed",
+                        detached_hostname, detached_node_id, n.hostname
+                    ),
+                }));
+            }
+            Err(e) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_follow_primary: detached node {detached_node_id} not in \
+                         current pool: {e}"
+                    ),
+                }));
+            }
+        };
+        let new_primary = match self.node_pool.node_by_id(new_primary_node_id) {
+            Ok(n) if n.hostname == *new_primary_hostname => n.clone(),
+            Ok(n) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_follow_primary: op recorded new_primary_hostname={:?} \
+                         but current pool has node {} as {:?}; pool topology has changed",
+                        new_primary_hostname, new_primary_node_id, n.hostname
+                    ),
+                }));
+            }
+            Err(e) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_follow_primary: new_primary node {new_primary_node_id} \
+                         not in current pool: {e}"
+                    ),
+                }));
+            }
+        };
+
+        info!(
+            id = %op.id,
+            phase = %op.phase,
+            detached = %detached.hostname,
+            new_primary = %new_primary.hostname,
+            "resume_follow_primary: continuing"
+        );
+
+        let outcome = drive_follow_primary(
+            &self.inflight,
+            &self.peers,
+            &self.pcp,
+            &self.maint,
+            &self.pg,
+            &op.id,
+            &op.phase,
+            &detached,
+            &new_primary,
+        )
+        .await;
+        match outcome {
+            Ok(()) => {
+                self.inflight.complete(&op.id).await.map_err(|e| {
+                    internal(anyhow::anyhow!(
+                        "resume_follow_primary: complete journal: {e}"
+                    ))
+                })?;
+                Ok(Response::new(OpResult {
+                    ok: true,
+                    message: format!(
+                        "follow_primary complete for {} (resumed)",
+                        detached.hostname
+                    ),
+                }))
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = self.inflight.abandon(&op.id, &reason).await;
+                Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "resume_follow_primary: driver failed: {reason}; op marked abandoned"
+                    ),
+                }))
+            }
+        }
+    }
+
     /// One peer's worth of restore_wal: dial → FetchWal → write to
     /// `dest_path` via `WalStore::write_restore`. Bounded by
     /// `RESTORE_WAL_PER_PEER_TIMEOUT`; timeouts and connect failures are
@@ -2557,6 +2799,275 @@ impl LocalServer {
 
 fn internal(e: anyhow::Error) -> Status {
     Status::internal(e.to_string())
+}
+
+/// Drive one third-standby's rebase onto the new primary. Used by both
+/// the post-handoff fan-out (spawned, fire-and-forget) and the
+/// operator-driven `ResumeInflightOp` handler (synchronous). Steps,
+/// each recorded in the inflight journal so a crash + resume picks up
+/// where it left off:
+///
+/// 1. `dialing` — open peer clients to detached and new_primary
+/// 2. (skip if detached PG is deliberately stopped — operator owns it)
+/// 3. `detached_stopped` — peer.stop on the orphaned standby
+/// 4. `slot_created` — new_primary.create_slot for the detached
+///    (idempotent — `42710` is treated as success peer-side)
+/// 5. `data_copied` — rewind, then basebackup on rewind failure
+/// 6. `recovery_conf_written` — repoint detached at new_primary
+/// 7. `detached_started` — bring detached back up
+/// 8. `attached` — pcp_attach_node so pgpool routes to it again
+///
+/// Per-phase failures between `slot_created` and `detached_started`
+/// queue a `DropSlotCleanup` maintenance intent so the slot on the new
+/// primary doesn't pin WAL forever. Once `detached_started`, the slot
+/// is in use and must not be dropped — failure of `attach_node` leaves
+/// only pgpool's view stale (the slot is correct).
+#[allow(clippy::too_many_arguments)]
+async fn drive_follow_primary(
+    inflight: &Arc<dyn crate::inflight_ops::InflightOpStore>,
+    peers: &Arc<dyn PeerRegistry>,
+    pcp: &Arc<dyn Pcp>,
+    maint: &Arc<dyn MaintenanceStore>,
+    pg: &PostgresRuntime,
+    op_id: &str,
+    start_phase: &str,
+    detached: &NodeConfig,
+    new_primary: &NodeConfig,
+) -> anyhow::Result<()> {
+    let start_idx = fp_phase_index(start_phase)
+        .ok_or_else(|| anyhow::anyhow!("follow_primary: unknown phase {start_phase:?}"))?;
+    let slot_name = detached.slot_name();
+
+    // ----- dialing -------------------------------------------------
+    if start_idx <= fp_phase_index(FP_PHASE_QUEUED).unwrap() {
+        inflight
+            .update_phase(op_id, FP_PHASE_DIALING, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal dialing: {e}"))?;
+    }
+    let detached_peer = peers.client(detached).await.map_err(|e| {
+        anyhow::anyhow!(
+            "follow_primary: dial detached {}: {e}",
+            detached.hostname
+        )
+    })?;
+    let new_primary_peer = peers.client(new_primary).await.map_err(|e| {
+        anyhow::anyhow!(
+            "follow_primary: dial new_primary {}: {e}",
+            new_primary.hostname
+        )
+    })?;
+
+    // ----- detached_stopped ----------------------------------------
+    if start_idx <= fp_phase_index(FP_PHASE_DIALING).unwrap() {
+        let status = detached_peer.get_status().await.map_err(|e| {
+            anyhow::anyhow!(
+                "follow_primary: get_status {}: {e}",
+                detached.hostname
+            )
+        })?;
+        if !status.is_running {
+            info!(
+                detached = %detached.hostname,
+                "follow_primary: detached PG not running, skipping (operator owns)"
+            );
+            // Skip the rest. The op completes — no work to do.
+            return Ok(());
+        }
+        detached_peer.stop().await.map_err(|e| {
+            anyhow::anyhow!("follow_primary: stop {}: {e}", detached.hostname)
+        })?;
+        inflight
+            .update_phase(op_id, FP_PHASE_DETACHED_STOPPED, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal detached_stopped: {e}"))?;
+    }
+
+    // ----- slot_created --------------------------------------------
+    if start_idx <= fp_phase_index(FP_PHASE_DETACHED_STOPPED).unwrap() {
+        new_primary_peer.create_slot(&slot_name).await.map_err(|e| {
+            anyhow::anyhow!(
+                "follow_primary: create_slot {slot_name} on {}: {e}",
+                new_primary.hostname
+            )
+        })?;
+        inflight
+            .update_phase(op_id, FP_PHASE_SLOT_CREATED, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal slot_created: {e}"))?;
+    }
+
+    // ----- data_copied (rewind → basebackup fallback) --------------
+    if start_idx <= fp_phase_index(FP_PHASE_SLOT_CREATED).unwrap() {
+        let rewind_opts = RewindOpts {
+            primary_host: new_primary.hostname.clone(),
+            primary_port: pg.port,
+            repl_user: pg.repl_user.clone(),
+        };
+        let rewind_ok = match detached_peer.rewind(rewind_opts).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    detached = %detached.hostname,
+                    err = %e,
+                    "follow_primary: rewind failed; falling back to basebackup"
+                );
+                false
+            }
+        };
+        if !rewind_ok {
+            let bb_opts = BasebackupOpts {
+                primary_host: new_primary.hostname.clone(),
+                primary_port: pg.port,
+                repl_user: pg.repl_user.clone(),
+                slot_name: slot_name.clone(),
+            };
+            if let Err(e) = detached_peer.basebackup(bb_opts).await {
+                let err = anyhow::anyhow!(
+                    "follow_primary: basebackup {}: {e}",
+                    detached.hostname
+                );
+                cleanup_peer_slot_after_failure(
+                    maint,
+                    &new_primary_peer,
+                    &new_primary.hostname,
+                    &slot_name,
+                    "follow_primary_basebackup_failed",
+                    &err,
+                )
+                .await;
+                return Err(err);
+            }
+        }
+        inflight
+            .update_phase(op_id, FP_PHASE_DATA_COPIED, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal data_copied: {e}"))?;
+    }
+
+    // ----- recovery_conf_written -----------------------------------
+    if start_idx <= fp_phase_index(FP_PHASE_DATA_COPIED).unwrap() {
+        let cfg_opts = WriteRecoveryConfOpts {
+            primary_host: new_primary.hostname.clone(),
+            primary_port: pg.port,
+            repl_user: pg.repl_user.clone(),
+            slot_name: slot_name.clone(),
+        };
+        if let Err(e) = detached_peer.configure_standby(cfg_opts).await {
+            let err = anyhow::anyhow!(
+                "follow_primary: configure_standby {}: {e}",
+                detached.hostname
+            );
+            cleanup_peer_slot_after_failure(
+                maint,
+                &new_primary_peer,
+                &new_primary.hostname,
+                &slot_name,
+                "follow_primary_configure_standby_failed",
+                &err,
+            )
+            .await;
+            return Err(err);
+        }
+        inflight
+            .update_phase(op_id, FP_PHASE_RECOVERY_CONF_WRITTEN, None)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("follow_primary: journal recovery_conf_written: {e}")
+            })?;
+    }
+
+    // ----- detached_started ----------------------------------------
+    if start_idx <= fp_phase_index(FP_PHASE_RECOVERY_CONF_WRITTEN).unwrap() {
+        if let Err(e) = detached_peer.start().await {
+            let err = anyhow::anyhow!("follow_primary: start {}: {e}", detached.hostname);
+            cleanup_peer_slot_after_failure(
+                maint,
+                &new_primary_peer,
+                &new_primary.hostname,
+                &slot_name,
+                "follow_primary_start_failed",
+                &err,
+            )
+            .await;
+            return Err(err);
+        }
+        inflight
+            .update_phase(op_id, FP_PHASE_DETACHED_STARTED, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal detached_started: {e}"))?;
+    }
+
+    // ----- attached (slot is now in use — DO NOT drop on failure) --
+    if start_idx <= fp_phase_index(FP_PHASE_DETACHED_STARTED).unwrap() {
+        if let Err(e) = pcp.attach_node(detached.id).await {
+            // pgpool's view is stale, but the standby is up and
+            // streaming from new_primary. Surface the error in the
+            // journal; operator runs `pcp_attach_node` to finish.
+            return Err(anyhow::anyhow!(
+                "follow_primary: pcp_attach_node {}: {e}",
+                detached.id
+            ));
+        }
+        inflight
+            .update_phase(op_id, FP_PHASE_ATTACHED, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal attached: {e}"))?;
+    }
+
+    info!(
+        id = op_id,
+        detached = %detached.hostname,
+        new_primary = %new_primary.hostname,
+        "follow_primary: complete"
+    );
+    Ok(())
+}
+
+/// Same shape as [`LocalServer::cleanup_slot_after_failure`] but the
+/// slot lives on a peer (the new primary), not on the local DB. Used
+/// by [`drive_follow_primary`] when an orchestration phase
+/// between `slot_created` and `detached_started` errors out.
+async fn cleanup_peer_slot_after_failure(
+    maint: &Arc<dyn MaintenanceStore>,
+    new_primary_peer: &Arc<dyn PeerClient>,
+    new_primary_hostname: &str,
+    slot_name: &str,
+    cause: &str,
+    original_err: &anyhow::Error,
+) {
+    info!(slot = %slot_name, "follow_primary cleanup: dropping slot on new primary after failure");
+    match new_primary_peer.drop_slot(slot_name).await {
+        Ok(()) => debug!(slot = %slot_name, "follow_primary cleanup: slot dropped"),
+        Err(drop_err) => {
+            let payload = MaintenancePayload::DropSlotCleanup {
+                slot_name: slot_name.to_string(),
+                target_hostname: new_primary_hostname.to_string(),
+                cause: cause.to_string(),
+                initial_error: drop_err.to_string(),
+            };
+            match maint.append(payload).await {
+                Ok(intent) => warn!(
+                    slot = %slot_name,
+                    target = %new_primary_hostname,
+                    cause,
+                    intent_id = %intent.id,
+                    drop_err = %drop_err,
+                    original_err = %original_err,
+                    "follow_primary cleanup: queued maintenance for failed drop_slot"
+                ),
+                Err(queue_err) => warn!(
+                    slot = %slot_name,
+                    target = %new_primary_hostname,
+                    cause,
+                    drop_err = %drop_err,
+                    queue_err = %queue_err,
+                    original_err = %original_err,
+                    "follow_primary cleanup: drop_slot failed AND maintenance queue failed — slot is orphaned"
+                ),
+            }
+        }
+    }
 }
 
 fn standby_result(node: &NodeConfig, ok: bool, message: String) -> ClusterInitStandbyResult {
@@ -5898,5 +6409,474 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&proto.payload).unwrap();
         assert_eq!(parsed["op"], "drop_slot_cleanup");
         assert_eq!(parsed["slot_name"], "node1");
+    }
+
+    // ----- follow_primary driver + post-handoff fan-out ---------------
+
+    /// 3-node pool with a shared inflight + pcp + maint stash so the
+    /// follow_primary tests can assert post-conditions.
+    #[allow(clippy::type_complexity)]
+    fn make_fp_fixture() -> (
+        LocalServer,
+        Arc<StubPeers>,
+        Arc<StubPcp>,
+        Arc<StubMaint>,
+        Arc<StubInflight>,
+    ) {
+        let db = Arc::new(StubDb::default());
+        let peers = Arc::new(StubPeers::default());
+        let maint = Arc::new(StubMaint::default());
+        let wal = Arc::new(StubWal::default());
+        let replay = Arc::new(StubReplay::default());
+        let pcp = Arc::new(StubPcp::default());
+        let sd = Arc::new(StubSd::default());
+        let standby = Arc::new(StubStandby::default());
+        let inflight = Arc::new(StubInflight::default());
+        let server = LocalServer::new(
+            Arc::new(FakeNodeInfo),
+            db,
+            peers.clone(),
+            maint.clone(),
+            wal,
+            replay,
+            inflight.clone(),
+            pcp.clone(),
+            sd,
+            standby,
+            make_pool_3(),
+            make_pg(),
+        );
+        (server, peers, pcp, maint, inflight)
+    }
+
+    fn fp_detached() -> NodeConfig {
+        NodeConfig {
+            id: 2,
+            hostname: "peer2.local".into(),
+        }
+    }
+
+    fn fp_new_primary() -> NodeConfig {
+        NodeConfig {
+            id: 1,
+            hostname: "peer1.local".into(),
+        }
+    }
+
+    /// Driver happy path: rewind succeeds end-to-end. Every phase
+    /// transition lands in the journal; pcp.attach_node fires once.
+    #[tokio::test]
+    async fn drive_follow_primary_happy_path() {
+        let (s, peers, pcp, _maint, inflight) = make_fp_fixture();
+        let detached = fp_detached();
+        let new_primary = fp_new_primary();
+
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running();
+        peers.override_client(detached.id, detached_client.clone());
+
+        let np_client = Arc::new(StubPeerClient::default());
+        peers.override_client(new_primary.id, np_client.clone());
+
+        // Seed a journal entry the driver will advance.
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::FollowPrimary {
+                    detached_node_id: detached.id,
+                    detached_hostname: detached.hostname.clone(),
+                    new_primary_node_id: new_primary.id,
+                    new_primary_hostname: new_primary.hostname.clone(),
+                },
+                FP_PHASE_QUEUED,
+                false,
+            )
+            .await
+            .unwrap();
+
+        drive_follow_primary(
+            &s.inflight,
+            &s.peers,
+            &s.pcp,
+            &s.maint,
+            &s.pg,
+            &op.id,
+            FP_PHASE_QUEUED,
+            &detached,
+            &new_primary,
+        )
+        .await
+        .expect("driver should succeed");
+
+        // Detached side: stop, rewind, configure_standby, start.
+        assert_eq!(detached_client.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached_client.rewind_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached_client.basebackup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            detached_client
+                .configure_standby_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(detached_client.start_calls.load(Ordering::SeqCst), 1);
+        // New primary side: slot created for detached, no drop.
+        assert_eq!(
+            np_client.create_slot_calls.lock().unwrap().as_slice(),
+            &["node2".to_string()]
+        );
+        assert!(np_client.drop_slot_calls.lock().unwrap().is_empty());
+        // pcp attach for detached.
+        assert_eq!(pcp.attach_calls.lock().unwrap().as_slice(), &[2]);
+        // Journal advanced through attached (driver leaves complete()
+        // to the caller — the spawn wrapper or resume RPC).
+        let final_op = inflight.get(&op.id).await.unwrap();
+        assert_eq!(final_op.phase, FP_PHASE_ATTACHED);
+    }
+
+    /// Driver falls back to basebackup when peer.rewind returns Err.
+    #[tokio::test]
+    async fn drive_follow_primary_falls_back_to_basebackup() {
+        let (s, peers, _pcp, _maint, inflight) = make_fp_fixture();
+        let detached = fp_detached();
+        let new_primary = fp_new_primary();
+
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running();
+        detached_client.rewind_fails.store(true, Ordering::SeqCst);
+        peers.override_client(detached.id, detached_client.clone());
+
+        let np_client = Arc::new(StubPeerClient::default());
+        peers.override_client(new_primary.id, np_client.clone());
+
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::FollowPrimary {
+                    detached_node_id: detached.id,
+                    detached_hostname: detached.hostname.clone(),
+                    new_primary_node_id: new_primary.id,
+                    new_primary_hostname: new_primary.hostname.clone(),
+                },
+                FP_PHASE_QUEUED,
+                false,
+            )
+            .await
+            .unwrap();
+
+        drive_follow_primary(
+            &s.inflight,
+            &s.peers,
+            &s.pcp,
+            &s.maint,
+            &s.pg,
+            &op.id,
+            FP_PHASE_QUEUED,
+            &detached,
+            &new_primary,
+        )
+        .await
+        .expect("driver should succeed via basebackup");
+
+        assert_eq!(detached_client.rewind_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached_client.basebackup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Detached PG not running → driver returns Ok early without
+    /// touching the detached or the new primary. Slot is NOT created
+    /// because there's nothing to rebase yet.
+    #[tokio::test]
+    async fn drive_follow_primary_skips_when_detached_stopped() {
+        let (s, peers, pcp, _maint, inflight) = make_fp_fixture();
+        let detached = fp_detached();
+        let new_primary = fp_new_primary();
+
+        let detached_client = Arc::new(StubPeerClient::default());
+        // NOT marked running — is_running is false by default.
+        peers.override_client(detached.id, detached_client.clone());
+
+        let np_client = Arc::new(StubPeerClient::default());
+        peers.override_client(new_primary.id, np_client.clone());
+
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::FollowPrimary {
+                    detached_node_id: detached.id,
+                    detached_hostname: detached.hostname.clone(),
+                    new_primary_node_id: new_primary.id,
+                    new_primary_hostname: new_primary.hostname.clone(),
+                },
+                FP_PHASE_QUEUED,
+                false,
+            )
+            .await
+            .unwrap();
+
+        drive_follow_primary(
+            &s.inflight,
+            &s.peers,
+            &s.pcp,
+            &s.maint,
+            &s.pg,
+            &op.id,
+            FP_PHASE_QUEUED,
+            &detached,
+            &new_primary,
+        )
+        .await
+        .expect("driver should return Ok early");
+
+        assert_eq!(detached_client.stop_calls.load(Ordering::SeqCst), 0);
+        assert!(np_client.create_slot_calls.lock().unwrap().is_empty());
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+    }
+
+    /// Basebackup failure after slot creation queues a maintenance
+    /// intent to drop the slot on the new primary, and surfaces the
+    /// original error so the caller marks the op Abandoned.
+    #[tokio::test]
+    async fn drive_follow_primary_queues_maintenance_on_basebackup_failure() {
+        let (s, peers, _pcp, maint, inflight) = make_fp_fixture();
+        let detached = fp_detached();
+        let new_primary = fp_new_primary();
+
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running();
+        detached_client.rewind_fails.store(true, Ordering::SeqCst);
+        detached_client.basebackup_fails.store(true, Ordering::SeqCst);
+        peers.override_client(detached.id, detached_client.clone());
+
+        let np_client = Arc::new(StubPeerClient::default());
+        // drop_slot also fails — forces the maintenance queue path.
+        np_client.drop_slot_fails.store(true, Ordering::SeqCst);
+        peers.override_client(new_primary.id, np_client.clone());
+
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::FollowPrimary {
+                    detached_node_id: detached.id,
+                    detached_hostname: detached.hostname.clone(),
+                    new_primary_node_id: new_primary.id,
+                    new_primary_hostname: new_primary.hostname.clone(),
+                },
+                FP_PHASE_QUEUED,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let err = drive_follow_primary(
+            &s.inflight,
+            &s.peers,
+            &s.pcp,
+            &s.maint,
+            &s.pg,
+            &op.id,
+            FP_PHASE_QUEUED,
+            &detached,
+            &new_primary,
+        )
+        .await
+        .expect_err("driver should bubble basebackup failure");
+        assert!(err.to_string().contains("basebackup"), "{err}");
+
+        // Slot drop was attempted on new primary, failed, so a
+        // DropSlotCleanup intent was queued.
+        assert_eq!(
+            np_client.drop_slot_calls.lock().unwrap().as_slice(),
+            &["node2".to_string()]
+        );
+        let intents = maint.intents.lock().unwrap();
+        assert_eq!(intents.len(), 1);
+        match &intents[0].payload {
+            MaintenancePayload::DropSlotCleanup {
+                slot_name,
+                target_hostname,
+                cause,
+                ..
+            } => {
+                assert_eq!(slot_name, "node2");
+                // Slot lives on the NEW PRIMARY, not the detached.
+                assert_eq!(target_hostname, "peer1.local");
+                assert_eq!(cause, "follow_primary_basebackup_failed");
+            }
+        }
+    }
+
+    /// Driver resumes from a recorded phase mid-ladder. Seed at
+    /// `slot_created`; driver should skip the stop+create_slot phases
+    /// and pick up at rewind/basebackup forward.
+    #[tokio::test]
+    async fn drive_follow_primary_resumes_from_recorded_phase() {
+        let (s, peers, _pcp, _maint, inflight) = make_fp_fixture();
+        let detached = fp_detached();
+        let new_primary = fp_new_primary();
+
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running();
+        peers.override_client(detached.id, detached_client.clone());
+
+        let np_client = Arc::new(StubPeerClient::default());
+        peers.override_client(new_primary.id, np_client.clone());
+
+        // Pre-seed at slot_created (e.g. the daemon crashed right
+        // after writing the journal entry for slot_created).
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::FollowPrimary {
+                    detached_node_id: detached.id,
+                    detached_hostname: detached.hostname.clone(),
+                    new_primary_node_id: new_primary.id,
+                    new_primary_hostname: new_primary.hostname.clone(),
+                },
+                FP_PHASE_SLOT_CREATED,
+                false,
+            )
+            .await
+            .unwrap();
+
+        drive_follow_primary(
+            &s.inflight,
+            &s.peers,
+            &s.pcp,
+            &s.maint,
+            &s.pg,
+            &op.id,
+            FP_PHASE_SLOT_CREATED,
+            &detached,
+            &new_primary,
+        )
+        .await
+        .expect("resume from slot_created should succeed");
+
+        // Stop and create_slot SKIPPED — already done before crash.
+        assert_eq!(detached_client.stop_calls.load(Ordering::SeqCst), 0);
+        assert!(np_client.create_slot_calls.lock().unwrap().is_empty());
+        // But rewind and downstream phases DID run.
+        assert_eq!(detached_client.rewind_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detached_client.start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// fan_out_follow_primary enqueues exactly one InflightOp per
+    /// non-local non-target standby. With a 3-node pool and target=1,
+    /// node 2 gets exactly one FollowPrimary op.
+    #[tokio::test]
+    async fn fan_out_follow_primary_enqueues_one_per_other_standby() {
+        let (s, peers, _pcp, _maint, inflight) = make_fp_fixture();
+        let local = NodeConfig {
+            id: 0,
+            hostname: "local".into(),
+        };
+        let new_primary = fp_new_primary();
+
+        // Make peer calls slow enough that we can observe the
+        // InProgress op before the spawned task completes. Without
+        // overrides the driver would race to completion.
+        peers.mark_unreachable(2); // detached unreachable → driver errs out fast
+
+        s.fan_out_follow_primary(&local, &new_primary).await;
+
+        // Give the spawned task a tick to record the enqueue (the
+        // spawn happens AFTER inflight.begin, so the op is already
+        // present even before the task runs).
+        let (ops, _) = inflight.list(&[]).await.unwrap();
+        let fp_ops: Vec<_> = ops
+            .iter()
+            .filter(|o| {
+                matches!(
+                    &o.payload,
+                    crate::inflight_ops::InflightPayload::FollowPrimary { .. }
+                )
+            })
+            .collect();
+        assert_eq!(fp_ops.len(), 1, "expected exactly one FollowPrimary op");
+        match &fp_ops[0].payload {
+            crate::inflight_ops::InflightPayload::FollowPrimary {
+                detached_node_id,
+                new_primary_node_id,
+                ..
+            } => {
+                assert_eq!(*detached_node_id, 2);
+                assert_eq!(*new_primary_node_id, 1);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// resume_follow_primary verifies pool topology, then drives to
+    /// completion. The op must end up Done.
+    #[tokio::test]
+    async fn resume_follow_primary_completes_via_resume_inflight_op() {
+        let (s, peers, _pcp, _maint, inflight) = make_fp_fixture();
+        let detached = fp_detached();
+        let new_primary = fp_new_primary();
+
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running();
+        peers.override_client(detached.id, detached_client.clone());
+        let np_client = Arc::new(StubPeerClient::default());
+        peers.override_client(new_primary.id, np_client.clone());
+
+        // Seed at queued. (`seed` bypasses `begin` so we can pick any
+        // phase / id.)
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "fp-resume".into(),
+            status: crate::inflight_ops::InflightStatus::InProgress,
+            payload: crate::inflight_ops::InflightPayload::FollowPrimary {
+                detached_node_id: detached.id,
+                detached_hostname: detached.hostname.clone(),
+                new_primary_node_id: new_primary.id,
+                new_primary_hostname: new_primary.hostname.clone(),
+            },
+            phase: FP_PHASE_QUEUED.into(),
+            started_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            completed_at: None,
+            last_error: None,
+        });
+
+        let resp = s
+            .resume_inflight_op(Request::new(ResumeInflightOpRequest {
+                id: "fp-resume".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+
+        let final_op = inflight.get("fp-resume").await.unwrap();
+        assert_eq!(final_op.status, crate::inflight_ops::InflightStatus::Done);
+    }
+
+    /// resume refuses when the pool topology has shifted — detached
+    /// hostname no longer matches the recorded one.
+    #[tokio::test]
+    async fn resume_follow_primary_refuses_on_topology_mismatch() {
+        let (s, _peers, _pcp, _maint, inflight) = make_fp_fixture();
+        inflight.seed(crate::inflight_ops::InflightOp {
+            id: "fp-bad-topo".into(),
+            status: crate::inflight_ops::InflightStatus::InProgress,
+            payload: crate::inflight_ops::InflightPayload::FollowPrimary {
+                detached_node_id: 2,
+                detached_hostname: "renamed.example".into(), // does NOT match make_pool_3
+                new_primary_node_id: 1,
+                new_primary_hostname: "peer1.local".into(),
+            },
+            phase: FP_PHASE_QUEUED.into(),
+            started_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            completed_at: None,
+            last_error: None,
+        });
+        let resp = s
+            .resume_inflight_op(Request::new(ResumeInflightOpRequest {
+                id: "fp-bad-topo".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("pool topology has changed"),
+            "got: {}",
+            resp.message
+        );
     }
 }

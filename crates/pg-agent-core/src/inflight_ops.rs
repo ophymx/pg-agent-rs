@@ -4,10 +4,11 @@
 //!
 //! Tracks operator-initiated cluster-state-changing operations whose
 //! execution spans multiple steps that must survive a daemon crash —
-//! today only [`InflightPayload::Handoff`], future operations
-//! (switchover, cluster pause/resume) slot in as new enum variants. The
-//! contract is distinct from the other two durable stores in
-//! `<state_dir>/`:
+//! today [`InflightPayload::Handoff`] and the rebase-a-standby
+//! orchestration [`InflightPayload::FollowPrimary`], with future
+//! operations (switchover, cluster pause/resume) slotted in as new
+//! enum variants. The contract is distinct from the other two durable
+//! stores in `<state_dir>/`:
 //!
 //! - [`crate::replay_markers`] — after-success dedup of pgpool-driven
 //!   hooks. Binary: file exists = done. 24 h TTL.
@@ -21,6 +22,9 @@
 //! ladder. For handoff: `"preflight_done"` → `"target_promoted"` →
 //! `"slot_created"` → `"local_stopped"` → `"data_copied"` →
 //! `"recovery_conf_written"` → `"local_started"` → `"attached"` →
+//! `"done"`. For follow_primary: `"queued"` → `"dialing"` →
+//! `"detached_stopped"` → `"slot_created"` → `"data_copied"` →
+//! `"recovery_conf_written"` → `"detached_started"` → `"attached"` →
 //! `"done"`.
 //!
 //! # On-disk format
@@ -116,6 +120,28 @@ pub enum InflightPayload {
         /// `--allow-lag` was passed; preserved for resume.
         allow_lag: bool,
     },
+    /// Rebase a standby onto a (possibly new) primary. Same logical
+    /// operation as the existing `PgAgentLocal::FollowPrimary` RPC
+    /// handler that pgpool's `follow_primary_command` invokes; this
+    /// variant tracks instances triggered by something other than
+    /// pgpool — currently `cluster_handoff`'s post-completion fan-out
+    /// (one variant per remaining standby).
+    ///
+    /// Long-term, the existing `FollowPrimary` RPC should converge on
+    /// this same driver: orchestration shouldn't care who pulled the
+    /// trigger, only that the right peers get the right instructions
+    /// and the end state is correct. See ROADMAP item
+    /// "follow_primary unification".
+    FollowPrimary {
+        /// The standby being rebased.
+        detached_node_id: i32,
+        /// Resolved at orchestration start so resume doesn't depend on
+        /// the pool still containing this node.
+        detached_hostname: String,
+        /// The primary the detached should follow.
+        new_primary_node_id: i32,
+        new_primary_hostname: String,
+    },
 }
 
 impl InflightPayload {
@@ -124,6 +150,7 @@ impl InflightPayload {
     pub fn op_name(&self) -> &'static str {
         match self {
             Self::Handoff { .. } => "handoff",
+            Self::FollowPrimary { .. } => "follow_primary",
         }
     }
 
@@ -138,6 +165,11 @@ impl InflightPayload {
                 to_node_id,
                 ..
             } => format!("from={from_node_id},to={to_node_id}"),
+            Self::FollowPrimary {
+                detached_node_id,
+                new_primary_node_id,
+                ..
+            } => format!("detached={detached_node_id},new_primary={new_primary_node_id}"),
         }
     }
 }
@@ -811,6 +843,52 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].id, op.id);
         assert!(skipped.is_empty(), "skipped should be empty: {skipped:?}");
+    }
+
+    fn follow_primary_payload(detached: i32, new_primary: i32) -> InflightPayload {
+        InflightPayload::FollowPrimary {
+            detached_node_id: detached,
+            detached_hostname: format!("db{detached}"),
+            new_primary_node_id: new_primary,
+            new_primary_hostname: format!("db{new_primary}"),
+        }
+    }
+
+    /// FollowPrimary payload round-trips through the journal: op_name,
+    /// key, and a re-read produce the same payload. The journal does
+    /// not collide with a Handoff op for the same nodes — different
+    /// op_name, different namespace.
+    #[tokio::test]
+    async fn follow_primary_payload_persists_and_keys_distinctly_from_handoff() {
+        let (_tmp, store) = fixture();
+        // A handoff and a follow_primary for the same (1, 2) pair
+        // coexist because they have different op_names.
+        let h = store
+            .begin(handoff_payload(1, 2), "preflight_done", false)
+            .await
+            .unwrap();
+        let fp = store
+            .begin(follow_primary_payload(2, 1), "queued", false)
+            .await
+            .unwrap();
+        assert_eq!(h.payload.op_name(), "handoff");
+        assert_eq!(fp.payload.op_name(), "follow_primary");
+        assert_eq!(fp.payload.key(), "detached=2,new_primary=1");
+        // Round-trip from disk.
+        let got = store.get(&fp.id).await.unwrap();
+        assert_eq!(got.payload, fp.payload);
+        // find() scopes by op_name.
+        let found = store
+            .find("follow_primary", "detached=2,new_primary=1")
+            .await
+            .unwrap();
+        assert_eq!(found.as_ref().map(|o| &o.id), Some(&fp.id));
+        // Same key as a handoff would NOT collide.
+        let no_match = store
+            .find("follow_primary", "from=1,to=2")
+            .await
+            .unwrap();
+        assert!(no_match.is_none());
     }
 
     #[tokio::test]
