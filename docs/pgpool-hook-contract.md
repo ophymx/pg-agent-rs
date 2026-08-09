@@ -172,25 +172,67 @@ notify-only poke (buys detection latency, costs a forever-documented
 
 ---
 
-## 5. To verify empirically before cutover
+## 5. Empirical results
 
-1. **Per-instance firing count** (promotion-authority open question 7).
-   The 4.6 docs attribute single-execution to watchdog coordination,
-   which implies once-per-instance without it — but "implies" is not
-   measured. Confirm on a 3-instance test cluster: kill a backend, count
-   `failover_command` invocations and diff their argument vectors.
-2. **Attach fan-out sufficiency.** Verify that issuing `pcp_attach_node`
-   on each instance (no watchdog) converges all three routing maps, and
-   what the window of divergence looks like under load.
-3. **`pgpool_status` after restart.** Restart one pgpool instance with a
-   stale status file while the cluster shape has changed; confirm the
-   down-is-sticky behavior (§3) and that only explicit attach or
-   `pgpool -D` corrects it.
-4. **`follow_primary_command` empty vs. mass-degeneration.** Confirm
-   that with the hook empty, a primary failover does *not* degenerate
-   the healthy standbys (the docs condition the degeneration pass on
-   the hook being non-empty; this is load-bearing for §4's config, so
-   measure it).
-5. **`detach_false_primary` storm behavior.** With three independent
-   instances, confirm concurrent false-primary detaches produce only
-   per-instance detaches plus advisory hook noise, nothing destructive.
+Measured on the dockerized 3-node acceptance cluster
+([testing/README.md](../testing/README.md)), pgpool-II 4.6 with
+`use_watchdog = off`, this config, and real PostgreSQL 17 replication.
+Items 1–2 are **confirmed**; 3–5 remain open.
+
+1. **Per-instance firing count — CONFIRMED** (promotion-authority open
+   question 7). Stopping the primary's PostgreSQL produced **exactly
+   one `failover_command` invocation per pgpool instance, three across
+   the cluster**, all within the same second, all carrying *identical*
+   arguments (`%d = 0`, `%m = 1`, `%P = 0`). So without watchdog the
+   hook is not deduplicated, but neither did the instances disagree:
+   each computed `%m` = lowest alive node id from its own view and
+   reached the same answer.
+
+   Two consequences for the design. The N-invocations prediction holds,
+   so the cutover must keep the hook idempotent or advisory — that part
+   is confirmed. But the *reason* they agreed is worth naming: `%m` is
+   a pure function of the backend-status map, and the instances agreed
+   because their maps agreed. Under the asymmetric-partition case where
+   the maps differ, the invocations will differ too, and today only
+   idempotence + the "already primary" short-circuit stand between
+   that and a double promotion. That is precisely the gap the lease
+   CAS closes.
+
+   Today's outcome without a lease: **exactly one primary, no split
+   brain** — three agents each received the same hint, the first
+   promoted, the rest short-circuited on `get_status` reporting the
+   target already primary. Idempotence carried it. Worth having as the
+   pre-consensus baseline.
+
+2. **Attach/detach propagation — CONFIRMED ABSENT, and asymmetric as
+   predicted (§3).** `pcp_detach_node -n 2` on db0's instance marked
+   node 2 down *there only*; db1's instance still routed to it. The
+   detach was sticky (no `auto_failback`), and an explicit
+   `pcp_attach_node` per instance was required to converge. This
+   confirms the fan-out obligation §3 describes.
+
+   **New finding, not predicted:** a `pcp_detach_node` against a
+   *healthy* standby fires that instance's `failover_command` with the
+   standby as `%d`, which routes into the agent's standby-down branch —
+   whose job is to drop the detached node's replication slot. Without
+   the precondition check (SPEC §5.1 step 3), an operator detaching a
+   backend for maintenance would have silently destroyed a live
+   standby's slot and broken its replication. With the check, the agent
+   refuses because the "failed" standby is reachable and streaming.
+   The precondition work therefore protects against routine operator
+   actions, not only against false health reports — a stronger
+   justification than the one it was written for.
+
+3. **`pgpool_status` after restart.** Not yet measured. Restart one
+   instance with a stale status file while the cluster shape has
+   changed; confirm the down-is-sticky behavior and that only explicit
+   attach or `pgpool -D` corrects it.
+4. **`follow_primary_command` empty vs. mass-degeneration.** Not yet
+   measured — the acceptance cluster runs it empty (the target
+   contract) and the standbys were not degenerated on failover, which
+   is consistent with the claim but does not isolate it. Isolating it
+   needs a run with the hook non-empty, comparing backend states after
+   a primary failover.
+5. **`detach_false_primary` storm behavior.** Not yet measured.
+   Requires manufacturing a false primary (promote a standby out of
+   band) with three independent instances watching.

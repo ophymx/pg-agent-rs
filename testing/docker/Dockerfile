@@ -29,10 +29,12 @@ RUN apt-get update && apt-get install -y /tmp/pg-agent.deb \
 # (the agent deliberately owns no /etc files; see systemd.rs docs).
 COPY 50-pg-agent.rules /etc/polkit-1/rules.d/50-pg-agent.rules
 
-# Per-node provisioning at boot (config.toml, TLS, pg_hba, roles…).
+# Per-node provisioning at boot (config.toml, TLS, pg_hba, roles…),
+# plus the operator-run pgpool setup (phase 2 scenarios).
 COPY provision.sh /usr/local/sbin/pg-agent-provision
+COPY pgpool-setup.sh /usr/local/sbin/pg-agent-pgpool-setup
 COPY provision.service /etc/systemd/system/pg-agent-provision.service
-RUN chmod 0755 /usr/local/sbin/pg-agent-provision \
+RUN chmod 0755 /usr/local/sbin/pg-agent-provision /usr/local/sbin/pg-agent-pgpool-setup \
     && systemctl enable pg-agent-provision.service \
     # PostgreSQL does not auto-start: provision starts it on the
     # bootstrap primary only; standbys get theirs via ClusterInit

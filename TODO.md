@@ -5,6 +5,24 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
+### `gen-pgpool` emits hooks the agent-led target contract forbids
+
+- **Where:** `crates/pg-agent-hookspec/src/lib.rs::pgpool_hooks()` (the
+  canonical block), consumed by `gen-pgpool` and `check-hooks`.
+- **Why:** under [docs/pgpool-hook-contract.md](docs/pgpool-hook-contract.md)
+  §4, `follow_primary_command` must be **empty** (a non-empty value
+  makes pgpool degenerate every healthy standby after a primary
+  failover) and the two `wd_*` escalation hooks never fire once
+  watchdog is off. The canonical block still emits all three, so the
+  intended configuration is reported as drift by `check-hooks` —
+  confirmed in the acceptance suite (testing/README.md finding 8).
+- **Fix shape:** a target-contract mode for both tools (e.g.
+  `gen-pgpool --agent-led`), or flip the canonical block outright at
+  the cutover (promotion-authority §10 step 7) and keep the current
+  block behind a legacy flag. Needs deciding *with* the cutover, not
+  before it: while pgpool still drives failover the current block is
+  correct.
+
 ### `validate-env`: assert `include_if_exists` for `myrecovery.conf`
 
 - **Where:** `crates/pg-agent-core/src/preflight.rs` (a new `fs_*` check).

@@ -30,6 +30,7 @@ bash`, `journalctl -u pg_agentd`).
 | `compose.yaml` | 3 nodes (`db0..db2`), privileged + `cgroup: host` so systemd is PID 1 |
 | `docker/Dockerfile` | debian:trixie + systemd + postgresql-17 + the `.deb`; pgpool2 installed but masked (BOOTSTRAP.md Phase 1.1) |
 | `docker/provision.sh` | boot-time provisioning = Ansible's Phase-1 role: node id, TLS, config.toml, pg_hba, roles/extension, archive dir |
+| `docker/pgpool-setup.sh` | operator-run pgpool config + start (BOOTSTRAP Phase 1.4 + 3.1), in the target hook-contract shape |
 | `docker/50-pg-agent.rules` | polkit grant (postgres user → manage PG/pgpool units) |
 | `gen-certs.sh` | one CA + per-node certs, SAN = compose hostname (matches the peer SAN allowlist) |
 | `acceptance.sh` | scenario driver + assertions |
@@ -46,22 +47,47 @@ bash`, `journalctl -u pg_agentd`).
   `leader_ttl`, then **exactly one** (db1, node-id tiebreak at equal
   WAL positions) shadow-takes the lease; db2 stands down. Primary
   returns → shadow converges back (nothing was actually promoted).
+- **S3c** — lag gate with *real* WAL lag: replay paused on db2, ~80 MB
+  of WAL generated, primary stopped, then the handler is handed the
+  lagging node as `new_main`. Refused, naming db1 as the better
+  candidate. Runs before pgpool exists so nothing else reacts to the
+  primary going down.
 - **S4** — the 2026-06-11 incident replayed: `pg_agentc failover`
   announcing the healthy primary as dead → refused
   ("running as primary"), nothing promoted.
 - **S5** — agent restart on the primary: phantom check confirms, no
   conservative stop, PG untouched.
 
-## Phase 2 (planned)
+## Phase 2 — pgpool in the loop
 
-- pgpool2 unmasked + configured (gen-pgpool, pcp.conf, pool_passwd,
-  .pcppass), hook wiring, `/healthz` readiness assertions.
+pgpool-II 4.6 on all three nodes, configured per
+[docs/pgpool-hook-contract.md](../docs/pgpool-hook-contract.md) §4:
+watchdog **off**, `failover_command` as an advisory poke,
+`follow_primary_command` **empty**, `detach_false_primary` on,
+`auto_failback` off. `docker/pgpool-setup.sh` plays BOOTSTRAP Phase 1.4
++ 3.1 and is run by the driver after `cluster init`.
+
+- **S6** — pgpool starts on all three; every instance shows all three
+  backends up; `/healthz` reports ready.
+- **S7** — `check-hooks` detects drift between `gen-pgpool`'s canonical
+  block and the target contract (see finding 8).
+- **S8** — detach does **not** propagate between instances, and the
+  detach-fired hook is refused by the precondition check because the
+  "failed" standby is still streaming (hook-contract §5, item 2).
+- **S9** — real primary failover driven by pgpool, with every
+  `failover_command` invocation recorded per instance (hook-contract
+  §5, item 1). Asserts a single primary afterwards.
+
+Run `PHASE=1 testing/acceptance.sh` to stop before pgpool comes up.
+
+## Phase 3 (planned)
+
 - Network partitions (`docker network disconnect`) once the real
   consensus store exists — partition scenarios against a process-local
-  shadow store prove nothing.
-- Lag-gate scenario with real replication lag (pause replay on one
-  standby via `pg_wal_replay_pause()`, kill primary, assert refusal /
-  candidate choice).
+  shadow store prove nothing. This is step 6's acceptance criteria.
+- The three unmeasured hook-contract items: `pgpool_status` staleness
+  after an instance restart, `follow_primary_command` non-empty
+  mass-degeneration, `detach_false_primary` storms.
 - `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
 
 ## Findings log
@@ -130,3 +156,21 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
    Without it, `ConfigureStandby` reports success and the standby comes
    up with no `primary_conninfo` at all — a silent no-op. Candidate for
    a `validate-env` check: assert the include is present.
+
+7. **A `pcp_detach_node` on a healthy standby would have dropped its
+   replication slot.** Detaching a backend fires that instance's
+   `failover_command` with the standby as `%d`, which routes into the
+   agent's standby-down branch — whose job is to drop the detached
+   node's slot. So "detach a backend for maintenance" was, before the
+   precondition check landed, a silent way to break a live standby's
+   replication. S8 asserts the refusal. This makes the precondition
+   work protective against routine operator actions, not just against
+   false health reports.
+8. **`gen-pgpool` emits hooks the target contract forbids.** Its
+   canonical block still sets `follow_primary_command` (which must be
+   empty — a non-empty value makes pgpool degenerate every healthy
+   standby after a primary failover) and the two watchdog escalation
+   hooks (which never fire with watchdog off). `check-hooks` correctly
+   flags the deviation, which means at cutover the tools will report
+   the *intended* configuration as drift. `gen-pgpool` needs a
+   target-contract mode before step 7.

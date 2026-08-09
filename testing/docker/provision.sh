@@ -88,9 +88,12 @@ chown -R postgres:postgres "$PGCONF_DIR/conf.d"
 HBA="$PGCONF_DIR/pg_hba.conf"
 if ! grep -q "pg-agent-acceptance" "$HBA"; then
     cat >> "$HBA" <<'EOF'
-# pg-agent-acceptance: replication + rewind across the compose network
-host    replication     repl            0.0.0.0/0               trust
-host    postgres        repl            0.0.0.0/0               trust
+# pg-agent-acceptance: replication + rewind + pgpool sr_check/health
+# check across the compose network. Trust everywhere: this is an
+# isolated test network, and pool_passwd/AES auth is orthogonal to the
+# failover behavior under test (see testing/README.md deviations).
+host    replication     all             0.0.0.0/0               trust
+host    all             all             0.0.0.0/0               trust
 EOF
 fi
 
