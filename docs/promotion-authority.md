@@ -833,6 +833,18 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    two decision streams on the live cluster. Highest-value step — it turns
    the argument empirical before anything destructive changes, and it needs
    no working Raft to do so.
+   **Loop landed** (post-0.7.3): `ha` module — one `HaDecision` per
+   `loop_wait` tick covering retain / follow / holder-watch / candidacy
+   (most-advanced check, node-id tiebreak within `max_lag_on_failover`,
+   jittered backoff), demote-on-quorum-loss and demote-on-not-primary,
+   with "cannot read ≠ vacant" enforced. Shadow-safety is structural:
+   the loop holds no Systemd/Pcp/StandbyOps and can only write to its
+   process-local store. Enabled by `[raft] shadow = true`; decisions log
+   on the `ha_shadow` target. One shadow-only artifact to remove at
+   cutover: vacant-lease adoption of the single observed primary. **The
+   live-cluster diffing itself — running with `shadow = true` on the
+   real cluster and comparing streams against pgpool's behavior — is
+   the remaining (operational) half of this step.**
 6. **(M)** openraft: `PgAgentRaft` service, `redb` storage impl passing
    `openraft::testing`, membership bootstrap in `ClusterInit`,
    `validate-env` checks. Swap it in behind the trait; shadow mode keeps

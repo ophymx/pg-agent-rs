@@ -85,6 +85,15 @@ hits them.
 > lsn)` ordering, now shared by the phantom-primary check and the lag
 > gate) have landed. Still open from 4: jittered backoff and the
 > node-id tiebreak, which belong to the HA loop itself.
+>
+> **Update (2026-08-09):** the consensus-store trait (item 2 — the
+> `consensus` module with `InMemoryConsensusStore`), the `[raft]` config
+> block (item 7's config half), and the shadow-mode HA loop itself
+> (item 6, including item 4's backoff + tiebreak, in the `ha` module)
+> have landed. The daemon is no longer structurally reactive when
+> `[raft] shadow = true`. Still open: demote/self-promote primitives
+> (items 1, 2, 9 of "does not exist"), the `PgAgentRaft` proto +
+> channel factoring, and everything openraft.
 
 **Does not exist at all:**
 

@@ -320,6 +320,15 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         phantom_check_required_peers: config.startup.effective_required_peers(),
         supervisor_pgpool_enabled: config.supervisor.effective_pgpool_enabled(),
         cert_reloader: cert_reloader.clone(),
+        ha_shadow: config
+            .raft
+            .effective_shadow()
+            .then(|| pg_agent_core::ha::HaTiming {
+                loop_wait: config.raft.effective_loop_wait(),
+                retry_timeout: config.raft.effective_retry_timeout(),
+                leader_ttl: config.raft.effective_leader_ttl(),
+                max_lag_on_failover: config.raft.effective_max_lag_on_failover(),
+            }),
     };
 
     // Bind listeners synchronously — every fd exists once this returns.

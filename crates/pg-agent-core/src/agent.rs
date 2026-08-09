@@ -103,6 +103,11 @@ pub struct Options {
     /// ensuring `serve.reject_insecure_remote_peer()` is false. The check
     /// runs again inside [`Agent::serve`] as a defense in depth.
     pub cert_reloader: Option<Arc<CertReloader>>,
+    /// `Some(timing)` spawns the HA loop in shadow mode (compute + log
+    /// role decisions, act on nothing — see `crate::ha`). Projected from
+    /// `[raft] shadow = true` + the `[raft]` timing knobs. `None` (the
+    /// default) spawns nothing.
+    pub ha_shadow: Option<crate::ha::HaTiming>,
 }
 
 impl Options {
@@ -121,6 +126,7 @@ impl Options {
             phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
             supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
             cert_reloader: None,
+            ha_shadow: None,
         }
     }
 }
@@ -416,6 +422,25 @@ impl Agent {
             verdict,
             PrimaryVerdict::Confirmed | PrimaryVerdict::NotApplicable
         );
+        // HA loop, shadow mode (see crate::ha) — spawned regardless of
+        // the phantom verdict: it acts on nothing, and its decision
+        // stream is most interesting exactly when the cluster is in a
+        // degraded shape.
+        if let Some(timing) = self.opts.ha_shadow.clone() {
+            let ha = Arc::new(crate::ha::HaLoop::new(
+                Arc::new(crate::consensus::InMemoryConsensusStore::new()),
+                self.deps.db.clone(),
+                self.deps.peers.clone(),
+                self.opts.node_pool.clone(),
+                timing,
+            ));
+            let s = shutdown.clone();
+            js.spawn(async move {
+                ha.run(s).await;
+                Ok(())
+            });
+        }
+
         if self.opts.supervisor_pgpool_enabled && supervisor_eligible {
             let supervisor =
                 Arc::new(crate::pgpool_supervisor::PgpoolSupervisor::new(
@@ -1333,6 +1358,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
+                ha_shadow: None,
             },
         )
     }
@@ -1564,6 +1590,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
+                ha_shadow: None,
             },
         );
         let shutdown = CancellationToken::new();
@@ -1632,6 +1659,7 @@ mod tests {
                     supervisor_pgpool_enabled:
                         crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                     cert_reloader: None,
+                    ha_shadow: None,
                 },
             );
             let shutdown = CancellationToken::new();
@@ -1693,6 +1721,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
+                ha_shadow: None,
             },
         );
         let res = agent.serve(listeners, CancellationToken::new()).await;
@@ -1747,6 +1776,7 @@ mod tests {
                 phantom_check_required_peers,
                 supervisor_pgpool_enabled,
                 cert_reloader: None,
+                ha_shadow: None,
             },
         );
         (agent, listeners, tmp)
@@ -1919,6 +1949,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
+                ha_shadow: None,
             },
         )
     }

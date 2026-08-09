@@ -960,11 +960,12 @@ healthz.port          = 9702
 - Local node id must resolve (see §8.4) and be present in the pool.
 - `[postgres.replication]` is all-or-nothing; sslmode and cert paths
   validated as in §5.10.
-- `[raft]` (parsed and invariant-checked; consumed by the HA loop when
-  it lands — docs/promotion-authority.md §5): `leader_ttl >= loop_wait +
+- `[raft]` (docs/promotion-authority.md §5): `leader_ttl >= loop_wait +
   2 * retry_timeout`, and `retry_timeout > election_timeout`. Violating
   either is a config error, because each converts routine events into
-  spurious failovers.
+  spurious failovers. `shadow = true` additionally spawns the HA loop
+  in shadow mode — role decisions computed and logged every `loop_wait`
+  on the `ha_shadow` tracing target, nothing acted on.
 
 ### 8.4 Local-node id resolution
 

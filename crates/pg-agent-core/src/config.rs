@@ -438,6 +438,13 @@ pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 ///    §"Prior art").
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaftConfig {
+    /// Run the HA loop in **shadow mode**: compute and log role
+    /// decisions every `loop_wait` against a process-local in-memory
+    /// store, taking no action. Off by default. This is sequencing
+    /// step 5's live-cluster validation knob; the decision stream logs
+    /// on the `ha_shadow` tracing target.
+    #[serde(default)]
+    pub shadow: Option<bool>,
     #[serde(default)]
     pub loop_wait_secs: Option<u64>,
     #[serde(default)]
@@ -462,6 +469,9 @@ pub const DEFAULT_RAFT_LEADER_TTL_SECS: u64 = 30;
 pub const DEFAULT_RAFT_ELECTION_TIMEOUT_MS: u64 = 5_000;
 
 impl RaftConfig {
+    pub fn effective_shadow(&self) -> bool {
+        self.shadow.unwrap_or(false)
+    }
     pub fn effective_loop_wait(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.loop_wait_secs.unwrap_or(DEFAULT_RAFT_LOOP_WAIT_SECS))
     }

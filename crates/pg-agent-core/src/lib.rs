@@ -19,6 +19,7 @@ pub mod cluster_view;
 pub mod config;
 pub mod consensus;
 pub mod errors;
+pub mod ha;
 pub mod healthz;
 pub mod inflight_ops;
 pub mod localdb;
