@@ -606,6 +606,9 @@ mod tests {
         async fn attach_node(&self, _: i32) -> anyhow::Result<()> {
             unreachable!()
         }
+        async fn detach_node(&self, _: i32) -> anyhow::Result<()> {
+            unreachable!()
+        }
         async fn node_count(&self) -> anyhow::Result<i32> {
             unreachable!()
         }

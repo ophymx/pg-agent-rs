@@ -1,8 +1,8 @@
 //! pgpool Control Protocol client. Shells out to `pcp_attach_node`,
-//! `pcp_node_info`, and `pcp_node_count` (all shipped by the `pgpool2`
-//! distro package); `-w` disables the password prompt so auth flows
-//! through `~/.pcppass` (mode 0600, owned by the postgres user,
-//! provisioned by Ansible — see SPEC §10.5 and §13.1).
+//! `pcp_detach_node`, `pcp_node_info`, and `pcp_node_count` (all shipped
+//! by the `pgpool2` distro package); `-w` disables the password prompt so
+//! auth flows through `~/.pcppass` (mode 0600, owned by the postgres
+//! user, provisioned by Ansible — see SPEC §10.5 and §13.1).
 //!
 //! # Hot path: `pcp_node_info -a`
 //!
@@ -26,14 +26,30 @@
 use crate::config::{PcpConfig, DEFAULT_PCP_PORT, DEFAULT_PCP_USER};
 use async_trait::async_trait;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, info};
+
+/// Ceiling on any single PCP invocation. PCP talks to the local pgpool
+/// over loopback and every wrapped command is a metadata operation, so
+/// this is generous — its job is to stop a wedged pgpool from pinning a
+/// handler (or the healthz probe path) forever, not to race normal
+/// completion. On expiry the child is SIGKILLed via `kill_on_drop`.
+const PCP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait Pcp: Send + Sync {
     /// Re-attach a detached node to the local pgpool. Used at the tail of
     /// `FollowPrimary` after a standby is back up and replicating.
     async fn attach_node(&self, node_id: i32) -> anyhow::Result<()>;
+
+    /// Detach a node from the local pgpool's routing (`pcp_detach_node`,
+    /// non-graceful — no `-g`). No hook path calls this today; it exists
+    /// for planned-maintenance flows and the watchdog-off fan-out, where
+    /// every attach/detach must be issued per pgpool instance
+    /// (docs/pgpool-hook-contract.md §3). Note pgpool fires its
+    /// `failover_command` in response to a detach.
+    async fn detach_node(&self, node_id: i32) -> anyhow::Result<()>;
 
     /// Total backends defined in pgpool.conf. Does **not** distinguish
     /// attached from detached — see module docs. Kept for preflight /
@@ -146,34 +162,65 @@ impl PcpCli {
             "-w".to_string(),
         ]
     }
+
+    /// Run one PCP binary to completion under [`PCP_TIMEOUT`] and return
+    /// its stdout. `desc` is the human-readable invocation label used in
+    /// error messages (e.g. `"pcp_attach_node (node 2)"`), which may carry
+    /// more context than the bare binary name.
+    async fn run_pcp(&self, bin: &str, desc: &str, extra_args: &[&str]) -> anyhow::Result<String> {
+        let mut cmd = Command::new(bin);
+        cmd.args(self.common_args())
+            .args(extra_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = tokio::time::timeout(PCP_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| {
+                // Dropping the output() future SIGKILLs the child
+                // (kill_on_drop above), so nothing lingers past this error.
+                anyhow::anyhow!("{desc}: timed out after {}s", PCP_TIMEOUT.as_secs())
+            })?
+            .map_err(|e| spawn_error(bin, e))?;
+        if !output.status.success() {
+            let tail = combine_output(&output.stdout, &output.stderr);
+            anyhow::bail!(
+                "{desc}: exit {}: {}",
+                exit_code(&output.status),
+                tail.trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 #[async_trait]
 impl Pcp for PcpCli {
     async fn attach_node(&self, node_id: i32) -> anyhow::Result<()> {
         info!(node_id, "pcp_attach: starting");
-        let mut cmd = Command::new("pcp_attach_node");
-        cmd.args(self.common_args())
-            .arg("-n")
-            .arg(node_id.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| spawn_error("pcp_attach_node", e))?;
-        if !output.status.success() {
-            let tail = combine_output(&output.stdout, &output.stderr);
-            anyhow::bail!(
-                "pcp_attach_node (node {node_id}): exit {}: {}",
-                exit_code(&output.status),
-                tail.trim()
-            );
-        }
+        let id = node_id.to_string();
+        self.run_pcp(
+            "pcp_attach_node",
+            &format!("pcp_attach_node (node {node_id})"),
+            &["-n", &id],
+        )
+        .await?;
         info!(node_id, "pcp_attach: completed");
+        Ok(())
+    }
+
+    async fn detach_node(&self, node_id: i32) -> anyhow::Result<()> {
+        info!(node_id, "pcp_detach: starting");
+        let id = node_id.to_string();
+        self.run_pcp(
+            "pcp_detach_node",
+            &format!("pcp_detach_node (node {node_id})"),
+            &["-n", &id],
+        )
+        .await?;
+        info!(node_id, "pcp_detach: completed");
         Ok(())
     }
 
@@ -181,27 +228,7 @@ impl Pcp for PcpCli {
         // Demoted to debug — this fires on every healthsnap tick (~1s)
         // and would otherwise dominate journalctl output.
         debug!("pcp_node_count: starting");
-        let mut cmd = Command::new("pcp_node_count");
-        cmd.args(self.common_args())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| spawn_error("pcp_node_count", e))?;
-        if !output.status.success() {
-            let tail = combine_output(&output.stdout, &output.stderr);
-            anyhow::bail!(
-                "pcp_node_count: exit {}: {}",
-                exit_code(&output.status),
-                tail.trim()
-            );
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
+        let raw = self.run_pcp("pcp_node_count", "pcp_node_count", &[]).await?;
         let trimmed = raw.trim();
         let n = trimmed
             .parse::<i32>()
@@ -213,28 +240,10 @@ impl Pcp for PcpCli {
     async fn node_info_all(&self) -> anyhow::Result<Vec<NodeInfo>> {
         // Demoted to debug — fires every healthsnap tick (~1s).
         debug!("pcp_node_info -a: starting");
-        let mut cmd = Command::new("pcp_node_info");
-        cmd.args(self.common_args())
-            .arg("-a") // dump every backend in one invocation
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| spawn_error("pcp_node_info", e))?;
-        if !output.status.success() {
-            let tail = combine_output(&output.stdout, &output.stderr);
-            anyhow::bail!(
-                "pcp_node_info -a: exit {}: {}",
-                exit_code(&output.status),
-                tail.trim()
-            );
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
+        // -a = dump every backend in one invocation.
+        let raw = self
+            .run_pcp("pcp_node_info", "pcp_node_info -a", &["-a"])
+            .await?;
         let nodes = parse_node_info_all(&raw)?;
         debug!(n = nodes.len(), "pcp_node_info -a: completed");
         Ok(nodes)

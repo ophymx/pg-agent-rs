@@ -3552,6 +3552,9 @@ mod tests {
             }
             Ok(())
         }
+        async fn detach_node(&self, _: i32) -> anyhow::Result<()> {
+            unreachable!("no handler under test detaches")
+        }
         async fn node_count(&self) -> anyhow::Result<i32> {
             Ok(0)
         }
