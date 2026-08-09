@@ -810,6 +810,12 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
 2. **(S)** Land `validate_cluster_preconditions` with the
    `detached`-is-actually-down check, per TODO. Closes the known trigger
    now. Label it defense-in-depth in the code comment.
+   **Landed** (post-0.7.3): `preconditions` module, wired into both
+   `Failover` branches — primary-down refuses when the announced-failed
+   primary is reachable and running as primary (the 2026-06-11 shape);
+   standby-down refuses when the announced-failed standby is reachable
+   and streaming. Unverifiable evidence logs and proceeds, per §3.
+   The module docs carry the not-the-fix caveat verbatim.
 3. **(S)** Mark the ROADMAP gossip-plane item as superseded rather than
    scope-noted — §5's state machine replaces it. Keep the scope note in
    force for as long as both are notionally on the board.

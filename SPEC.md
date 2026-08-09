@@ -370,11 +370,25 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
 2. Resolve `detached`, `new_main`, `old_primary` from topology
    (hostname-authoritative — see §8.2).
 3. **Standby down** (`detached.id != old_primary.id`):
+   - **Precondition** (defense in depth — see
+     [docs/promotion-authority.md](docs/promotion-authority.md) §3): if
+     `detached` is reachable, running, in recovery, and
+     `replication_state == "streaming"`, the failure report is provably
+     wrong — refuse with `ok=false` rather than break healthy
+     replication. Unreachable/unverifiable → log and proceed.
    - Drop the slot locally with a best-effort cleanup context (30s timeout,
      decoupled from the hook ctx).
    - On error: enqueue `drop_slot_cleanup` maintenance intent; still return
      `ok=true` with a descriptive message.
 4. **Primary down** (`detached.id == old_primary.id`):
+   - **Precondition** (defense in depth, the 2026-06-11 check): if
+     `detached` is reachable and running as primary
+     (`is_postgres_running && !is_in_recovery`), the failure report is
+     wrong — refuse with `ok=false` rather than promote a second
+     primary. Unreachable/unverifiable → log and proceed (under a real
+     partition, refusing here would be an availability outage — this
+     check narrows the split-brain window; it does not close it).
+     Skipped when a cooperating in-flight handoff targets `new_main`.
    - **Lag gate** (see [docs/promotion-authority.md](docs/promotion-authority.md)
      §2.2): compare `new_main`'s `(timeline, lsn)` against every other
      surviving node's `GetStatus`. If a reachable node is on a newer

@@ -36,6 +36,17 @@ Two related issues around handoff's replication-slot management on the new prima
 
 ### Design: pre-execution cluster-state validation pattern
 
+> **Landed in part (post-0.7.3):** `crates/pg-agent-core/src/preconditions.rs`
+> — `validate_cluster_preconditions(intent)` with the
+> `detached`-is-actually-down check, wired into both `Failover` branches
+> (primary-down: refuse when the announced-failed primary is reachable
+> and running as primary; standby-down: refuse when the announced-failed
+> standby is reachable and streaming). Labeled defense-in-depth in the
+> module docs, per the caveat below, which remains in force. Still open
+> from the sketch: converging the other handlers' ad-hoc preflights
+> (`follow_primary`, `cluster_recover`, `cluster_handoff`) onto the
+> intent enum, and the slot-state-consistency check.
+
 (Generalisation of review HIGH #6 to the broader principle. **Confirmed in production:** on 2026-06-11, pgpool's `failover_command` announced `detached=db1, new_main=db0` after db1's pg_agentd briefly restarted due to the shutdown race above. db1 was actually still primary and healthy — pgpool's quorum just couldn't reach the daemon during the restart window. Our handler trusted pgpool and promoted db0, creating split-brain.)
 
 - **Where:** every cluster-state-changing RPC handler (`failover`, `follow_primary`, `cluster_recover`, `cluster_handoff`, future switchover/pause/resume). Today each handler has ad-hoc preflight checks; some are comprehensive (`cluster_handoff`'s six refusal cases) and some assume the caller did the right thing (`failover` trusts pgpool's `new_main` pick without verifying the announced `detached` is actually down).

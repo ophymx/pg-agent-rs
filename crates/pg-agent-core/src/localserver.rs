@@ -347,6 +347,26 @@ impl PgAgentLocal for LocalServer {
 
         if detached.id != old_primary.id {
             // §1: standby down. We're the primary; drop the slot locally.
+            //
+            // Defense in depth, not the fix (promotion-authority §3): if
+            // the announced-dead standby is reachable and demonstrably
+            // streaming, pgpool's failure report is wrong and dropping
+            // its slot would break healthy replication.
+            match crate::preconditions::validate_cluster_preconditions(
+                self.peers.clone(),
+                crate::preconditions::ClusterIntent::DropSlotBecauseStandbyDown { detached },
+            )
+            .await
+            {
+                crate::preconditions::PreconditionOutcome::Refuse { message } => {
+                    warn!(detached = %detached.hostname, %message, "failover: precondition refused");
+                    return Ok(Response::new(OpResult { ok: false, message }));
+                }
+                crate::preconditions::PreconditionOutcome::Unverifiable { reason } => {
+                    crate::preconditions::log_unverifiable("standby_down", &reason);
+                }
+                crate::preconditions::PreconditionOutcome::Pass => {}
+            }
             info!(
                 detached = %detached.hostname,
                 slot = %slot_name,
@@ -435,6 +455,32 @@ impl PgAgentLocal for LocalServer {
                         ),
                     }));
                 }
+            }
+        }
+
+        // Defense in depth, not the fix (promotion-authority §3): if the
+        // announced-failed primary is reachable and still running as
+        // primary, pgpool's report is wrong — this is the 2026-06-11
+        // incident shape (health-check false positive during a brief
+        // agent restart), and promoting would create split-brain.
+        // Skipped when a cooperating handoff targets new_main: the
+        // handoff briefly holds both nodes primary mid-flight by design,
+        // and its own six refusal cases + lag gate own safety there.
+        if !handoff_targets_new_main {
+            match crate::preconditions::validate_cluster_preconditions(
+                self.peers.clone(),
+                crate::preconditions::ClusterIntent::PromoteBecausePrimaryDown { detached },
+            )
+            .await
+            {
+                crate::preconditions::PreconditionOutcome::Refuse { message } => {
+                    warn!(detached = %detached.hostname, %message, "failover: precondition refused");
+                    return Ok(Response::new(OpResult { ok: false, message }));
+                }
+                crate::preconditions::PreconditionOutcome::Unverifiable { reason } => {
+                    crate::preconditions::log_unverifiable("primary_down", &reason);
+                }
+                crate::preconditions::PreconditionOutcome::Pass => {}
             }
         }
 
@@ -3740,6 +3786,10 @@ mod tests {
         /// the failover lag gate out of tests that aren't about it —
         /// `WalPosition::from_status` requires both fields known.
         timeline_id: std::sync::atomic::AtomicI32,
+        /// `pg_stat_wal_receiver.status` as reported via GetStatus.
+        /// Defaults to "" (= no receiver), which keeps the standby-down
+        /// precondition check passing in tests that aren't about it.
+        replication_state: StdMutex<String>,
         get_status_fails: AtomicBool,
         stop_calls: AtomicUsize,
         stop_fails: AtomicBool,
@@ -3788,6 +3838,12 @@ mod tests {
         /// peer to contribute a `WalPosition` to the failover lag gate.
         fn set_timeline(&self, tl: i32) -> &Self {
             self.timeline_id.store(tl, Ordering::SeqCst);
+            self
+        }
+        /// Mark the peer as actively streaming (healthy standby) — the
+        /// state the standby-down precondition check refuses to break.
+        fn set_streaming(&self) -> &Self {
+            *self.replication_state.lock().unwrap() = "streaming".to_string();
             self
         }
     }
@@ -3859,7 +3915,7 @@ mod tests {
                 is_in_recovery: in_recovery,
                 is_ready: false,
                 replication_lag_bytes: lag,
-                replication_state: String::new(),
+                replication_state: self.replication_state.lock().unwrap().clone(),
                 is_postgres_running: running,
                 is_pgpool_running: true,
                 is_postgres_status_ok: true,
@@ -4762,6 +4818,97 @@ mod tests {
             .into_inner();
         assert!(resp.ok, "expected promote, got: {}", resp.message);
         assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ----- failover preconditions (defense in depth, TODO.md / §3) ----------
+
+    #[tokio::test]
+    async fn failover_refuses_when_detached_primary_still_alive() {
+        // The 2026-06-11 incident shape: pgpool announces the primary as
+        // failed while it is reachable and healthy. Promoting would
+        // create a second primary.
+        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_running(); // running, NOT in recovery = live primary
+        peers.override_client(1, detached_client);
+        let candidate = Arc::new(StubPeerClient::default());
+        peers.override_client(0, candidate.clone());
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
+        assert!(resp.message.contains("running as primary"), "{}", resp.message);
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
+        // No marker — a retry after the operator stops the node must run.
+        assert!(!replay
+            .has("failover", "detached=1,new_main=0,old_primary=1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_proceeds_when_detached_primary_unreachable() {
+        // Unverifiable is NOT refusal: under a real partition the dead
+        // primary is unreachable, and refusing would make the cluster
+        // unavailable during exactly the event failover exists for.
+        let (s, _db, peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
+        peers.mark_unreachable(1);
+        let candidate = Arc::new(StubPeerClient::default());
+        peers.override_client(0, candidate.clone());
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "expected promote, got: {}", resp.message);
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_refuses_slot_drop_when_detached_standby_streaming() {
+        // Standby-down flavor of the same false report: the standby is
+        // reachable, in recovery, and streaming — dropping its slot
+        // would break replication that is demonstrably healthy.
+        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_standby().set_streaming();
+        peers.override_client(1, detached_client);
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
+        assert!(resp.message.contains("streaming"), "{}", resp.message);
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+        assert!(!replay
+            .has("failover", "detached=1,new_main=0,old_primary=0")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_drops_slot_when_detached_standby_up_but_not_streaming() {
+        // A standby that is up but has no WAL receiver is exactly what a
+        // legitimate detach looks like (its replication broke) — the
+        // precondition check must not shield it.
+        let (s, db, peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_standby(); // in recovery, replication_state ""
+        peers.override_client(1, detached_client);
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "expected drop, got: {}", resp.message);
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
     }
 
     #[tokio::test]
