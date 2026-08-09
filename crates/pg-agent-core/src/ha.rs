@@ -88,6 +88,12 @@ pub enum HaDecision {
     /// We hold the lease, local PG is running as primary, and the
     /// linearizable read confirmed it — the healthy steady state.
     RetainedLease { term: u64 },
+    /// We hold the lease but local PostgreSQL is still in recovery,
+    /// within the post-takeover grace window. Expected: `pg_promote()`
+    /// is asynchronous, so a freshly-won lease legitimately precedes
+    /// the role change. No action — releasing here would thrash the
+    /// lease (see the grace-window note on [`HaLoop::promotion_grace`]).
+    AwaitingPromotion { term: u64, waiting: Duration },
     /// Someone else holds the lease and looks healthy; we follow.
     Following { holder: i32 },
     /// The holder changed since the last tick — the loop would
@@ -132,6 +138,11 @@ struct TickState {
     holder_unhealthy_since: Option<Instant>,
     store_unknown_since: Option<Instant>,
     backoff_until: Option<Instant>,
+    /// The lease term we currently believe we hold, and when we first
+    /// observed ourselves holding it — the clock for the promotion
+    /// grace window.
+    held_term: Option<u64>,
+    held_since: Option<Instant>,
     last_logged: Option<std::mem::Discriminant<HaDecision>>,
 }
 
@@ -163,6 +174,8 @@ impl HaLoop {
                 holder_unhealthy_since: None,
                 store_unknown_since: None,
                 backoff_until: None,
+                held_term: None,
+                held_since: None,
                 last_logged: None,
             }),
         }
@@ -233,18 +246,43 @@ impl HaLoop {
 
         let decision = match &state.lease {
             Some(lease) if lease.holder == local_id => {
-                self.state.lock().unwrap().holder_unhealthy_since = None;
+                let held_for = {
+                    let mut ts = self.state.lock().unwrap();
+                    ts.holder_unhealthy_since = None;
+                    if ts.held_term != Some(lease.term) {
+                        ts.held_term = Some(lease.term);
+                        ts.held_since = Some(now);
+                    }
+                    now.duration_since(ts.held_since.unwrap_or(now))
+                };
                 match local.is_primary {
                     Some(true) => HaDecision::RetainedLease { term: lease.term },
                     Some(false) => {
-                        // Holding the lease while in recovery: release so
-                        // a real primary can claim it. (Store write only —
-                        // shadow never touches PG.)
-                        let _ = self.store.release(local_id, lease.term).await;
-                        HaDecision::WouldDemote {
-                            reason: "holding lease but local PostgreSQL is in recovery; \
+                        // Holding the lease while in recovery. Do NOT
+                        // release immediately: pg_promote() is
+                        // asynchronous, so this is the expected state
+                        // for a short window after winning a takeover.
+                        // Releasing on sight thrashes the lease — the
+                        // docker acceptance suite caught exactly that
+                        // (take → release → retake every two ticks).
+                        if held_for < self.promotion_grace() {
+                            HaDecision::AwaitingPromotion {
+                                term: lease.term,
+                                waiting: held_for,
+                            }
+                        } else {
+                            // Promotion is not coming. Release so a real
+                            // primary can claim the lease, and back off
+                            // so we don't immediately re-take it.
+                            let _ = self.store.release(local_id, lease.term).await;
+                            self.arm_backoff(now);
+                            HaDecision::WouldDemote {
+                                reason: format!(
+                                    "held lease for {held_for:.1?} without local PostgreSQL \
+                                     leaving recovery (promotion did not take effect); \
                                      released lease"
-                                .into(),
+                                ),
+                            }
                         }
                     }
                     None => HaDecision::WouldDemote {
@@ -391,7 +429,12 @@ impl HaLoop {
             .filter_map(|p| p.pos.map(|pos| (p.node.id, pos)))
             .max_by_key(|(id, pos)| (*pos, std::cmp::Reverse(*id)));
         if let Some((best_id, best_pos)) = best_other {
-            if best_pos > my_pos {
+            // >= not >: equal positions are the COMMON case after a
+            // clean primary death (all standbys replayed to the same
+            // LSN), and they must still funnel into the node-id
+            // tiebreak below — otherwise every equal candidate
+            // proceeds and only the store CAS separates them.
+            if best_pos >= my_pos {
                 match my_pos.lag_behind(&best_pos) {
                     None => {
                         self.arm_backoff(now);
@@ -445,6 +488,20 @@ impl HaLoop {
                 reason: format!("takeover proposal failed: {e}"),
             },
         }
+    }
+
+    /// How long a fresh lease holder may sit in recovery before the
+    /// loop concludes promotion failed and releases.
+    ///
+    /// Deliberately equal to `leader_ttl` rather than a separate knob:
+    /// `leader_ttl` is already the window the *rest* of the cluster
+    /// gives a holder before treating it as dead, so matching it means
+    /// self-release and others' takeover eligibility mature together.
+    /// A longer grace would leave a window where we hold a lease we
+    /// cannot use and nobody else may claim; a shorter one risks
+    /// releasing during a legitimately slow promotion.
+    fn promotion_grace(&self) -> Duration {
+        self.timing.leader_ttl
     }
 
     /// Jittered backoff: `loop_wait + rand(0..loop_wait)`. Enough to
@@ -864,6 +921,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vacant_equal_positions_still_tiebreak_by_node_id() {
+        // Clean primary death: both standbys replayed to the SAME LSN.
+        // Exactly one may proceed — node id decides, even at equality.
+        let ahead = fixture(1, StubDb::standby(2, BASE));
+        ahead.peers.set(2, standby_status(2, BASE));
+        ahead.peers.mark_unreachable(0);
+        assert!(matches!(
+            ahead.ha.tick_once().await,
+            HaDecision::TookOver { .. }
+        ));
+
+        let behind = fixture(2, StubDb::standby(2, BASE));
+        behind.peers.set(1, standby_status(2, BASE));
+        behind.peers.mark_unreachable(0);
+        match behind.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => {
+                assert!(reason.contains("tiebreak"), "{reason}")
+            }
+            other => panic!("expected tiebreak StoodDown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn local_primary_claims_vacant_lease_for_itself() {
         let f = fixture(0, StubDb::primary(2, BASE + 500));
         f.peers.set(1, standby_status(2, BASE));
@@ -883,21 +963,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn holder_in_recovery_releases_and_would_demote() {
-        // Seed: we (node 0) hold the lease, but local PG is a standby.
+    async fn fresh_holder_in_recovery_awaits_promotion_before_releasing() {
+        // Seed: we (node 0) hold the lease, but local PG is a standby —
+        // the state right after a takeover, since pg_promote() is
+        // asynchronous. The loop must WAIT, not thrash the lease.
         let f = fixture(0, StubDb::standby(2, BASE));
         f.store.try_takeover(0, None).await.unwrap();
         f.peers.set(1, primary_status(2, BASE + 10));
 
         match f.ha.tick_once().await {
+            HaDecision::AwaitingPromotion { .. } => {}
+            other => panic!("expected AwaitingPromotion, got {other:?}"),
+        }
+        assert!(
+            f.store.snapshot().lease.is_some(),
+            "lease must be held through the promotion grace window"
+        );
+
+        // Past the grace window (leader_ttl = 50ms), promotion clearly
+        // did not take effect: release so a real primary can claim it.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        match f.ha.tick_once().await {
             HaDecision::WouldDemote { reason } => {
-                assert!(reason.contains("in recovery"), "{reason}");
+                assert!(reason.contains("promotion did not take effect"), "{reason}");
             }
             other => panic!("expected WouldDemote, got {other:?}"),
         }
         assert!(
             f.store.snapshot().lease.is_none(),
-            "lease must be released so the real primary can claim it"
+            "lease must be released once promotion is deemed failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_does_not_thrash_the_lease() {
+        // Regression for the flapping the docker acceptance suite found:
+        // take over → (no promotion happens) → the next ticks must NOT
+        // release-and-retake on every cycle.
+        let f = fixture(1, StubDb::standby(2, BASE + 10_000));
+        f.peers.set(2, standby_status(2, BASE));
+        f.peers.mark_unreachable(0);
+
+        assert!(matches!(
+            f.ha.tick_once().await,
+            HaDecision::TookOver { .. }
+        ));
+        let term = f.store.snapshot().lease.unwrap().term;
+        for _ in 0..3 {
+            match f.ha.tick_once().await {
+                HaDecision::AwaitingPromotion { .. } => {}
+                other => panic!("expected AwaitingPromotion, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            f.store.snapshot().lease.unwrap().term,
+            term,
+            "term must not churn while awaiting promotion"
         );
     }
 

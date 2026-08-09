@@ -5,6 +5,20 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
+### `validate-env`: assert `include_if_exists` for `myrecovery.conf`
+
+- **Where:** `crates/pg-agent-core/src/preflight.rs` (a new `fs_*` check).
+- **Why:** a standby reads `$PGDATA/myrecovery.conf` only if
+  `postgresql.conf` includes it (BOOTSTRAP.md Phase 1.2; Ansible owns
+  the line). When the include is missing, `ConfigureStandby` still
+  reports success and the standby starts with no `primary_conninfo` —
+  it just never streams. Found while building the docker acceptance
+  harness (testing/README.md finding 6); it is exactly the class of
+  silent localhost misconfiguration `validate-env` exists to catch.
+- **Fix shape:** grep the effective `postgresql.conf` (+ `conf.d/`) for
+  an `include_if_exists`/`include` naming `myrecovery.conf`; ERR when
+  absent. Cheap, local, no DB round-trip.
+
 ### `cluster_recover` reports OK + attaches pgpool even when PG start failed
 
 - **Where:** `crates/pg-agent-core/src/localserver.rs::cluster_recover` (recovery_1st_stage path). Observed live 2026-06-12: recover --target 2 returned `OK: recovery complete for db2.home.ophymx.com; postgres start failed: ...; pgpool started; attached node 2 in pgpool`. The peer start error was concatenated into the message but the response was `ok=true` and `pcp_attach_node` ran anyway.

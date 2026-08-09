@@ -219,22 +219,35 @@ impl LocalDb for PgLocalDb {
             .await
             .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?
             .get(0);
-        // Standby uses replay LSN (we may have no current_wal_lsn);
-        // pg_walfile_name_offset returns (file_name, file_offset).
-        let filename: String = if in_recovery {
-            conn.query_one(
-                "SELECT (pg_walfile_name_offset(pg_last_wal_replay_lsn())).file_name",
-                &[],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("localdb: pg_walfile_name_offset: {}", describe_pg(&e)))?
-            .get(0)
-        } else {
-            conn.query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        if in_recovery {
+            // pg_walfile_name*() refuses to run during recovery
+            // ("recovery is in progress" — found by the docker
+            // acceptance suite; every standby reported timeline 0
+            // before this). Streaming standby: the WAL receiver's
+            // received_tli is the live timeline. Not streaming:
+            // fall back to the control file, which a standby updates
+            // at restartpoints — mildly stale at worst, and the
+            // phantom-check consumer only compares for *higher* peer
+            // timelines, so stale-low is the conservative direction.
+            let tli: i32 = conn
+                .query_one(
+                    "SELECT COALESCE( \
+                       (SELECT received_tli FROM pg_stat_wal_receiver), \
+                       (SELECT timeline_id FROM pg_control_checkpoint()))",
+                    &[],
+                )
                 .await
-                .map_err(|e| anyhow::anyhow!("localdb: pg_walfile_name: {}", describe_pg(&e)))?
-                .get(0)
-        };
+                .map_err(|e| {
+                    anyhow::anyhow!("localdb: standby timeline: {}", describe_pg(&e))
+                })?
+                .get(0);
+            return Ok(tli);
+        }
+        let filename: String = conn
+            .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_walfile_name: {}", describe_pg(&e)))?
+            .get(0);
         // PG WAL filename is exactly 24 hex chars: TLI(8) + LOGID(8) + SEGNO(8).
         if filename.len() < 8 {
             anyhow::bail!("localdb: unexpected WAL filename {filename:?}");
