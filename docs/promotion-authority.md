@@ -270,6 +270,20 @@ exhausts its retry budget and demotes before any candidate is eligible to
 propose a takeover. This buys *hysteresis*, not correctness: violating it
 causes unnecessary failovers, not split-brain.
 
+**Second invariant:** `retry_timeout > worst-case Raft election duration`
+(the election timeout's upper bound plus one round-trip). A linearizable
+read cannot complete while an election is in flight — ReadIndex needs a
+leader — so a retry budget shorter than an election converts every Raft
+re-election into a demotion of a healthy primary. This is not a
+hypothetical: it is the recurring field failure that got Patroni's
+embedded-raft backend deprecated (see [prior art](#prior-art-patronis-raft-backend-pysyncobj)
+below — "failed to update leader lock" during raft-plane churn, followed
+by a spurious PG failover). Like the first invariant, violating it costs
+availability, not correctness — but it is the availability failure this
+design is most likely to actually exhibit, so it gets stated rather than
+discovered. It also composes with the first invariant: raising
+`retry_timeout` to clear elections raises the `leader_ttl` floor with it.
+
 #### What the state machine holds
 
 Small, and deliberately bounded:
@@ -524,6 +538,73 @@ deterministic in-memory store turns partition and failure cases into
 ordinary unit tests, and lets the HA loop's shadow mode run before any real
 store exists.
 
+### Prior art: Patroni's `raft` backend (pysyncobj)
+
+Patroni shipped exactly this shape — consensus embedded in the agent, no
+external DCS — in 2.0 (September 2020), via
+[pysyncobj](https://github.com/bakwc/PySyncObj) plugged in under its DCS
+abstraction. It never left beta and was deprecated in
+[3.0.0](https://patroni.readthedocs.io/en/latest/releases.html) (January
+2023): *"we will do our best to maintain it, but take neither guarantee
+nor responsibility for possible issues."* Researched 2026-08; the record
+cuts both ways, and both cuts matter.
+
+**It confirms the demand.** The issue tracker is full of users asking for
+precisely this design's pitch: *"I'd like to get rid of etcd as it's an
+additional layer"*
+([#2112](https://github.com/patroni/patroni/issues/2112)), *"we are not
+able to deploy hosts only for DCS"*
+([#2147](https://github.com/patroni/patroni/issues/2147)). The
+maintainer's fallback answer — run etcd co-located on the database nodes —
+is the deployment-convention posture §5 rejects as non-structural. Patroni
+tried to build the "no DCS to run" moat and retreated; the demand did not
+go anywhere.
+
+**Why it died — and why those reasons do not transfer.** From maintainer
+comments, three causes, none architectural:
+
+- **Never dogfooded.** *"We don't use Raft and all recent bugfixes were
+  triggered by reports of existing users"*
+  ([#2041](https://github.com/patroni/patroni/issues/2041), 2021). The
+  backend was community-driven from its first release.
+- **An opaque, unowned consensus library.** When users reported database
+  failovers coinciding with raft leadership changes, the maintainer could
+  not reproduce them and had no leverage on the library: *"Maybe PySyncObj
+  isn't good enough for your needs. I would advise switching to Etcd"*
+  ([#2147](https://github.com/patroni/patroni/issues/2147)). The stated
+  deprecation reason, verbatim: *"'Occurred randomly, can not be
+  reproduced' — that's the main reason we declared Raft support as
+  deprecated"* ([#3051](https://github.com/patroni/patroni/issues/3051),
+  2024).
+- **An emulation layer.** Patroni's DCS abstraction is etcd-shaped — TTL
+  keys, watches, CAS — and the raft backend had to emulate those semantics
+  on top of pysyncobj. The design here owns the state machine natively;
+  there is no impedance-mismatch layer for semantics to quietly diverge in.
+
+The mitigations this document already mandates target exactly that failure
+class: the `openraft::testing` conformance suite as a hard CI gate (the
+answer to "can not be reproduced" is a storage layer that is exhaustively
+tested before it ships), the deterministic in-memory store for
+fault-injection tests, and shadow mode diffed on the live cluster — which
+is dogfooding by construction, the thing Zalando never did. openraft
+itself is the opposite dependency profile from pysyncobj: actively
+maintained, run in production inside Databend, and pre-1.0 churn is
+already budgeted in "What this costs."
+
+**The transferable lesson.** The recurring field-failure signature —
+[#1701](https://github.com/patroni/patroni/issues/1701),
+[#2147](https://github.com/patroni/patroni/issues/2147),
+[#3051](https://github.com/patroni/patroni/issues/3051), spanning
+2021–2024 — was raft leadership churn causing *"failed to update leader
+lock"* and a spurious PostgreSQL failover. That is the "Raft leader is not
+the PostgreSQL primary" invariant being violated through the subtle door:
+not by conflating the roles, but by the lease-refresh path failing during
+elections. Hence the second invariant under "Lease semantics":
+`retry_timeout` must span a worst-case election. The failure mode to fear
+in this design is not split-brain — the quorum forecloses it — it is
+spurious demotion via the raft plane, and Patroni's history is the
+evidence of where those bodies get buried.
+
 ---
 
 ## 6. The pgpool configuration contract
@@ -632,9 +713,10 @@ rather than parity**:
   etcd/Consul/ZooKeeper quorum; for most small deployments that store is
   the majority of the operational burden. An agent that carries its own
   consensus is not a thing Patroni can be configured into being. (Patroni
-  did ship a `raft` DCS backend via `pysyncobj` for exactly this reason —
-  worth reading as prior art, including how it has fared since, before
-  committing to the design.)
+  did ship a `raft` DCS backend via `pysyncobj` for exactly this reason;
+  it never left beta and was deprecated in 3.0.0. The post-mortem — see
+  "Prior art" in §5 — confirms the demand and locates the failure in
+  dependency quality and testing discipline, not in the architecture.)
 
 The ROADMAP bar — *"be a more pleasant HA layer to operate than Patroni,
 on top of the pgpool-II substrate we're stuck with"* — is unchanged and
@@ -677,6 +759,9 @@ Decisions to make before implementation, not blockers to the design:
    long enough that Ansible restarting three agents in sequence does not
    cascade into a PG failover, and short enough that real failure detection
    stays useful. Needs a measured answer on the live cluster, not a guess.
+   Note it does not stand alone: the second lease invariant chains
+   `election_timeout < retry_timeout` and the first chains `retry_timeout`
+   into the `leader_ttl` floor, so these three tune together or not at all.
 4. **`failover_command`: removed, or notify-only?** Notify-only buys
    detection latency at the cost of a hook path that must be documented
    as non-authoritative forever.
