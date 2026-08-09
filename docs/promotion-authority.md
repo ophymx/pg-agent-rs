@@ -621,11 +621,17 @@ pgpool conflates two concerns:
 `failover_command` is the bridge that lets (1) drive (2). Cutting that
 bridge is the entire change.
 
+> The hook-by-hook working of this section — exact 4.6 firing semantics
+> under `use_watchdog = off`, the full hook table, and one cost this
+> section had not priced (backend-status sync between pgpool instances
+> is a watchdog feature; attach becomes an agent-side fan-out) — is in
+> [pgpool-hook-contract.md](pgpool-hook-contract.md).
+
 | Setting | Today | Target | Rationale |
 |---|---|---|---|
 | `use_watchdog` | on (quorum-only, no VIP) | **off** | see below |
 | `failover_command` | promotes `%m` | **notify-only or removed** | hint, not order |
-| `follow_primary_command` | reconfigures standbys | **notify-only or removed** | agent reacts to lease change instead |
+| `follow_primary_command` | reconfigures standbys | **removed (must be empty)** | agent reacts to lease change instead; a non-empty hook makes pgpool degenerate every healthy standby after a primary failover ([details](pgpool-hook-contract.md)) |
 | `sr_check_period` | on | **keep** | this is how pgpool *learns* the primary |
 | health checks | on | **keep** | per-instance routing, self-limiting |
 | `detach_false_primary` | — | **on** | defense in depth |
@@ -779,7 +785,10 @@ Decisions to make before implementation, not blockers to the design:
    written for single-instance semantics. Confirm empirically how many
    times it fires across three uncoordinated instances. This does not
    change the design — CAS makes it safe either way — but it should be
-   documented rather than assumed.
+   documented rather than assumed. The doc-derived expectation
+   (once per instance, arguments computed from each instance's local
+   view) and the test recipe are in
+   [pgpool-hook-contract.md](pgpool-hook-contract.md) §5.
 
 ---
 
