@@ -1,0 +1,16 @@
+[Unit]
+Description=pg-agent acceptance-node provisioning
+# Everything this writes (config.toml, TLS, pg_hba, node id) must exist
+# before the agent comes up. PostgreSQL is NOT listed: it is disabled in
+# the image and started by this script itself (ordering Before= a unit
+# that the script then starts would deadlock — systemd cancels the job).
+Before=pg_agentd.service
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pg-agent-provision
+
+[Install]
+WantedBy=multi-user.target

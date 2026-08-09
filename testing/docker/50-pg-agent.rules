@@ -1,0 +1,15 @@
+// Grant the postgres user (which pg_agentd runs as) management of the
+// PostgreSQL + pgpool units over the system bus. Mirrors the rule
+// Ansible installs in production (see crates/pg-agent-core/src/systemd.rs
+// module docs).
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "postgres") {
+        var unit = action.lookup("unit");
+        if (unit == "postgresql@17-main.service" ||
+            unit == "postgresql.service" ||
+            unit == "pgpool2.service") {
+            return polkit.Result.YES;
+        }
+    }
+});

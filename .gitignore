@@ -5,3 +5,5 @@
 .DS_Store
 /dist
 /docs/incidents/
+testing/.certs/
+testing/docker/pg-agent.deb

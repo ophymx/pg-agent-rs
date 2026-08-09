@@ -1,0 +1,39 @@
+name: pg-agent-acceptance
+
+# Three systemd-booted nodes, each: PostgreSQL 17 + pg_agentd (from the
+# real .deb). Requires a cgroup-v2 host; `privileged` + `cgroup: host`
+# is the standard systemd-in-docker recipe.
+
+x-node: &node
+  image: pg-agent-acceptance
+  privileged: true
+  cgroup: host
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 20s
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  volumes:
+    - ./.certs:/certs:ro
+  networks:
+    - pgnet
+
+services:
+  db0:
+    <<: *node
+    build: ./docker
+    hostname: db0
+    container_name: pga-db0
+  db1:
+    <<: *node
+    hostname: db1
+    container_name: pga-db1
+  db2:
+    <<: *node
+    hostname: db2
+    container_name: pga-db2
+
+networks:
+  pgnet:
+    name: pga-net
