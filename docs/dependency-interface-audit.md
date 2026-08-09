@@ -76,6 +76,16 @@ runner against a shell-script `pg_basebackup` stub.
 Ordered roughly by how early the sequencing (promotion-authority §10)
 hits them.
 
+> **Update (2026-08-08):** items 3 (`pcp_detach_node`), 6 (timeouts:
+> deadpool pool + statement_timeout, systemd job-wait ceiling,
+> basebackup/rewind stall watchdog, PCP call timeout), 7
+> (`retry::retry_result`; value-predicate retries stay bespoke), 9 (the
+> reactive-failover lag gate), and the comparator half of 4 (the
+> `cluster_view` module: status fan-out + lexicographic `(timeline,
+> lsn)` ordering, now shared by the phantom-primary check and the lag
+> gate) have landed. Still open from 4: jittered backoff and the
+> node-id tiebreak, which belong to the HA loop itself.
+
 **Does not exist at all:**
 
 1. **Demote primitive** — the design's most safety-critical component.

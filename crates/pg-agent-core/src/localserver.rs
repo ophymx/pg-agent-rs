@@ -268,8 +268,11 @@ impl PgAgentLocal for LocalServer {
     ///
     /// **Primary down** (`detached.id == old_primary.id`): the detached
     /// node IS the failed primary. Dial `new_main` (the chosen
-    /// successor), tell it to `Promote()`, then drop the old primary's
-    /// slot on the newly-promoted node.
+    /// successor), run it through [`Self::failover_lag_gate`] (pgpool
+    /// picks `%m` by lowest alive node id, not WAL position — refuse
+    /// while a strictly more-advanced surviving node is reachable),
+    /// tell it to `Promote()`, then drop the old primary's slot on the
+    /// newly-promoted node.
     ///
     /// Either branch returns `Ok` (with replay marker written) even
     /// when the slot drop itself fails — the drop is queued to
@@ -455,7 +458,8 @@ impl PgAgentLocal for LocalServer {
         // trust the journal rather than falling through to "promote
         // anyway" — the latter defeats the short-circuit in exactly the
         // adverse-network conditions where it matters most.
-        let already_primary = match peer.get_status().await {
+        let candidate_status = peer.get_status().await;
+        let already_primary = match &candidate_status {
             Ok(s) => s.is_postgres_running && !s.is_in_recovery,
             Err(e) => {
                 let trust_journal = handoff_targets_new_main
@@ -479,11 +483,27 @@ impl PgAgentLocal for LocalServer {
                 new_main = %new_main.hostname,
                 "failover: new main is already primary; skipping promote"
             );
-        } else if let Err(e) = peer.promote().await {
-            return Err(internal(anyhow::anyhow!(
-                "failover: promote {}: {e}",
-                new_main.hostname
-            )));
+        } else {
+            // Lag gate — docs/promotion-authority.md §2.2 / §10 step 1.
+            // pgpool picks %m by lowest alive node id, not WAL position,
+            // so the candidate it hands us can be arbitrarily behind a
+            // surviving standby it didn't pick. Promoting the lagging
+            // one discards the difference. Refuse while a strictly
+            // better reachable candidate exists; no replay marker is
+            // written, so a retry after the operator promotes the right
+            // node (or the condition clears) is not suppressed.
+            if let Some(refusal) = self
+                .failover_lag_gate(detached, new_main, candidate_status.as_ref().ok())
+                .await
+            {
+                return Ok(Response::new(refusal));
+            }
+            if let Err(e) = peer.promote().await {
+                return Err(internal(anyhow::anyhow!(
+                    "failover: promote {}: {e}",
+                    new_main.hostname
+                )));
+            }
         }
 
         // HIGH #1: when a handoff targeting this new_main has already
@@ -527,6 +547,7 @@ impl PgAgentLocal for LocalServer {
         self.write_replay_marker_then_ok("failover", &replay_key, message)
             .await
     }
+
     /// `follow_primary_command` — pgpool runs this on the new primary
     /// after a failover, telling each surviving standby to rebase onto
     /// the new primary. Per-standby flow on this primary:
@@ -1960,6 +1981,138 @@ enum FetchOutcome {
 }
 
 impl LocalServer {
+    /// The reactive-failover lag gate (docs/promotion-authority.md §2.2,
+    /// sequencing step 1). Compares the promotion candidate's WAL
+    /// position against every *other* surviving node and returns a
+    /// refusal when one of them is strictly ahead — on a newer timeline,
+    /// or more than [`crate::config::MAX_HANDOFF_LAG_BYTES`] ahead on
+    /// the same timeline (the same threshold the planned
+    /// `cluster_handoff` path applies).
+    ///
+    /// Best-effort by design: unknown candidate position, unreachable
+    /// comparison peers, or a blown fan-out budget all *skip* the gate
+    /// rather than block the failover. Refusing on missing evidence
+    /// would recreate the §3 dilemma (unavailable during exactly the
+    /// partition the failover exists to survive); this gate only acts
+    /// on positive evidence that a better candidate is reachable right
+    /// now.
+    async fn failover_lag_gate(
+        &self,
+        detached: &crate::config::NodeConfig,
+        new_main: &crate::config::NodeConfig,
+        candidate_status: Option<&NodeStatus>,
+    ) -> Option<OpResult> {
+        use crate::cluster_view::{collect_statuses, WalPosition, STATUS_FANOUT_BUDGET};
+
+        let Some(candidate_pos) = candidate_status.and_then(WalPosition::from_status) else {
+            warn!(
+                new_main = %new_main.hostname,
+                "failover: candidate WAL position unknown; lag gate skipped"
+            );
+            return None;
+        };
+
+        // Everyone except the candidate and the detached (dead) primary.
+        // Includes the local node when it is itself a surviving standby —
+        // its own PeerServer answers the status call.
+        let others: Vec<crate::config::NodeConfig> = self
+            .node_pool
+            .members
+            .iter()
+            .filter(|n| n.id != new_main.id && n.id != detached.id)
+            .cloned()
+            .collect();
+        if others.is_empty() {
+            return None;
+        }
+
+        let views = match collect_statuses(self.peers.clone(), &others, STATUS_FANOUT_BUDGET).await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("failover: lag-gate fan-out exceeded budget; gate skipped");
+                return None;
+            }
+        };
+
+        let mut best: Option<(crate::config::NodeConfig, WalPosition)> = None;
+        for view in views {
+            match view.status {
+                Ok(s) => {
+                    if let Some(pos) = WalPosition::from_status(&s) {
+                        if best.as_ref().is_none_or(|(_, b)| pos > *b) {
+                            best = Some((view.node, pos));
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    peer = %view.node.hostname,
+                    ?e,
+                    "failover: lag gate: peer status unavailable; excluded from comparison"
+                ),
+            }
+        }
+        let (ahead_node, ahead_pos) = best?;
+
+        if ahead_pos.timeline > candidate_pos.timeline {
+            warn!(
+                new_main = %new_main.hostname,
+                candidate_pos = %candidate_pos,
+                ahead = %ahead_node.hostname,
+                ahead_pos = %ahead_pos,
+                "failover: refusing — candidate is on an older timeline than a surviving node"
+            );
+            return Some(OpResult {
+                ok: false,
+                message: format!(
+                    "failover: refusing to promote node {} ({}): node {} ({}) is on a newer \
+                     timeline ({} vs {}). Promoting the stale candidate would fork history. \
+                     Promote the most-advanced node instead (pcp_promote_node -n {}).",
+                    new_main.id,
+                    new_main.hostname,
+                    ahead_node.id,
+                    ahead_node.hostname,
+                    ahead_pos,
+                    candidate_pos,
+                    ahead_node.id
+                ),
+            });
+        }
+
+        let lag = candidate_pos.lag_behind(&ahead_pos)?;
+        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
+        if lag > max {
+            warn!(
+                new_main = %new_main.hostname,
+                candidate_pos = %candidate_pos,
+                ahead = %ahead_node.hostname,
+                ahead_pos = %ahead_pos,
+                lag_bytes = lag,
+                max_lag_bytes = max,
+                "failover: refusing — candidate lags a surviving node beyond the threshold"
+            );
+            return Some(OpResult {
+                ok: false,
+                message: format!(
+                    "failover: refusing to promote node {} ({}): node {} ({}) has more WAL \
+                     ({} vs {}; {} bytes ahead, limit {}). Promoting the lagging candidate \
+                     would discard that WAL. Promote the most-advanced node instead \
+                     (pcp_promote_node -n {}), or retry once the condition clears.",
+                    new_main.id,
+                    new_main.hostname,
+                    ahead_node.id,
+                    ahead_node.hostname,
+                    ahead_pos,
+                    candidate_pos,
+                    lag,
+                    max,
+                    ahead_node.id
+                ),
+            });
+        }
+        None
+    }
+
     /// Queue a `DropSlotCleanup` maintenance intent after a slot drop
     /// failed in `failover` / `follow_primary`. Returns the human-
     /// readable message to bake into the hook's `OpResult`. The
@@ -3583,6 +3736,10 @@ mod tests {
         /// Used by the handoff lag check after 0.6.1; tests set this
         /// to a non-zero value to bypass the "cannot measure lag" guard.
         current_wal_lsn: std::sync::atomic::AtomicU64,
+        /// Peer's live timeline. Defaults to 0 (= unknown), which keeps
+        /// the failover lag gate out of tests that aren't about it —
+        /// `WalPosition::from_status` requires both fields known.
+        timeline_id: std::sync::atomic::AtomicI32,
         get_status_fails: AtomicBool,
         stop_calls: AtomicUsize,
         stop_fails: AtomicBool,
@@ -3625,6 +3782,12 @@ mod tests {
         /// Standby's `pg_last_wal_replay_lsn()` as a 64-bit value.
         fn set_replay_lsn(&self, lsn: u64) -> &Self {
             self.current_wal_lsn.store(lsn, Ordering::SeqCst);
+            self
+        }
+        /// Peer's live timeline — needed (with a non-zero LSN) for the
+        /// peer to contribute a `WalPosition` to the failover lag gate.
+        fn set_timeline(&self, tl: i32) -> &Self {
+            self.timeline_id.store(tl, Ordering::SeqCst);
             self
         }
     }
@@ -3701,7 +3864,7 @@ mod tests {
                 is_pgpool_running: true,
                 is_postgres_status_ok: true,
                 is_pgpool_status_ok: true,
-                timeline_id: 0,
+                timeline_id: self.timeline_id.load(Ordering::SeqCst),
                 current_wal_lsn: lsn,
             })
         }
@@ -4479,6 +4642,126 @@ mod tests {
             .has("failover", "detached=1,new_main=0,old_primary=1")
             .await
             .unwrap());
+    }
+
+    // ----- failover lag gate (promotion-authority §2.2 / §10 step 1) --------
+
+    /// 3-node pool: detached/old_primary = 2, candidate new_main = 0,
+    /// surviving comparison standby = 1. Returns the two standby stubs.
+    fn lag_gate_fixture(
+        peers: &StubPeers,
+    ) -> (Arc<StubPeerClient>, Arc<StubPeerClient>) {
+        let candidate = Arc::new(StubPeerClient::default());
+        candidate.mark_standby();
+        let survivor = Arc::new(StubPeerClient::default());
+        survivor.mark_standby();
+        peers.override_client(0, candidate.clone());
+        peers.override_client(1, survivor.clone());
+        (candidate, survivor)
+    }
+
+    const GATE_BASE_LSN: u64 = 1 << 32;
+
+    #[tokio::test]
+    async fn failover_lag_gate_refuses_when_survivor_far_ahead() {
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        let (candidate, survivor) = lag_gate_fixture(&peers);
+        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
+        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN);
+        survivor
+            .set_timeline(2)
+            .set_replay_lsn(GATE_BASE_LSN + max + 1);
+
+        let resp = s
+            .failover(Request::new(failover_req(2, 0, 2)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
+        assert!(resp.message.contains("has more WAL"), "{}", resp.message);
+        assert!(
+            resp.message.contains("pcp_promote_node -n 1"),
+            "{}",
+            resp.message
+        );
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failover_lag_gate_allows_within_threshold() {
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        let (candidate, survivor) = lag_gate_fixture(&peers);
+        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN);
+        survivor
+            .set_timeline(2)
+            .set_replay_lsn(GATE_BASE_LSN + 1024);
+
+        let resp = s
+            .failover(Request::new(failover_req(2, 0, 2)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "expected promote, got: {}", resp.message);
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_lag_gate_refuses_on_newer_timeline() {
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        let (candidate, survivor) = lag_gate_fixture(&peers);
+        // Survivor is on TL3 with *less* WAL by raw LSN — timeline
+        // dominates; raw-LSN comparison across timelines would get
+        // this exactly wrong.
+        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN * 2);
+        survivor.set_timeline(3).set_replay_lsn(GATE_BASE_LSN);
+
+        let resp = s
+            .failover(Request::new(failover_req(2, 0, 2)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
+        assert!(resp.message.contains("newer timeline"), "{}", resp.message);
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failover_lag_gate_skips_when_survivor_unreachable() {
+        // Best-effort: no reachable comparison evidence → the gate must
+        // NOT block the failover (refusing on absence-of-evidence is
+        // §3's unavailability branch).
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        let (candidate, _survivor) = lag_gate_fixture(&peers);
+        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN);
+        peers.mark_unreachable(1);
+
+        let resp = s
+            .failover(Request::new(failover_req(2, 0, 2)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "expected promote, got: {}", resp.message);
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_lag_gate_skips_when_candidate_position_unknown() {
+        // Candidate reports timeline 0 (probe failure / pre-feature
+        // peer) — no position, no gate, failover proceeds as before.
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        let (candidate, survivor) = lag_gate_fixture(&peers);
+        candidate.set_replay_lsn(GATE_BASE_LSN); // timeline stays 0
+        survivor
+            .set_timeline(2)
+            .set_replay_lsn(GATE_BASE_LSN * 3);
+
+        let resp = s
+            .failover(Request::new(failover_req(2, 0, 2)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "expected promote, got: {}", resp.message);
+        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

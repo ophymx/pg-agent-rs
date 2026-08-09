@@ -801,6 +801,12 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    `MAX_HANDOFF_LAG_BYTES` logic. Fixes §2.2 — a live data-loss defect,
    independent of everything below and valuable even if the rest never
    ships. First because it is the only step that closes a distinct bug.
+   **Landed** (post-0.7.3): `LocalServer::failover_lag_gate`, built on
+   the new `cluster_view` module — a status fan-out plus a lexicographic
+   `(timeline, lsn)` comparator, which is also the HA loop's future
+   candidate-selection primitive. Refuses only on positive evidence that
+   a strictly better candidate is reachable; missing evidence skips the
+   gate (refusing there would be §3's unavailability branch).
 2. **(S)** Land `validate_cluster_preconditions` with the
    `detached`-is-actually-down check, per TODO. Closes the known trigger
    now. Label it defense-in-depth in the code comment.

@@ -700,62 +700,13 @@ impl Agent {
             .cloned()
             .collect();
 
-        let registry = self.deps.peers.clone();
-        let fanout = async {
-            let mut js: JoinSet<Option<PeerObservation>> = JoinSet::new();
-            for peer in peers {
-                let registry = registry.clone();
-                js.spawn(async move {
-                    let client = match registry.client(&peer).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!(
-                                peer = %peer.hostname,
-                                ?e,
-                                "phantom-primary check: peer dial failed"
-                            );
-                            return None;
-                        }
-                    };
-                    match client.get_status().await {
-                        Ok(status) if status.timeline_id > 0 => Some(PeerObservation {
-                            id: peer.id,
-                            hostname: peer.hostname.clone(),
-                            timeline_id: status.timeline_id,
-                            is_in_recovery: status.is_in_recovery,
-                        }),
-                        Ok(_) => {
-                            // Peer responded but timeline is 0 — pre-
-                            // feature peer or its own timeline probe
-                            // failed. Counts as "did not respond with
-                            // evidence" for the quorum gate.
-                            warn!(
-                                peer = %peer.hostname,
-                                "phantom-primary check: peer reported timeline_id=0; no evidence"
-                            );
-                            None
-                        }
-                        Err(e) => {
-                            warn!(
-                                peer = %peer.hostname,
-                                ?e,
-                                "phantom-primary check: peer get_status failed"
-                            );
-                            None
-                        }
-                    }
-                });
-            }
-            let mut out = Vec::new();
-            while let Some(res) = js.join_next().await {
-                if let Ok(Some(obs)) = res {
-                    out.push(obs);
-                }
-            }
-            out
-        };
-
-        let observations = match tokio::time::timeout(STARTUP_CHECK_TIMEOUT, fanout).await {
+        let views = match crate::cluster_view::collect_statuses(
+            self.deps.peers.clone(),
+            &peers,
+            STARTUP_CHECK_TIMEOUT,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(_) => {
                 return PrimaryVerdict::Unverifiable {
@@ -766,6 +717,33 @@ impl Agent {
                 };
             }
         };
+        let mut observations: Vec<PeerObservation> = Vec::new();
+        for view in views {
+            match view.status {
+                Ok(status) if status.timeline_id > 0 => observations.push(PeerObservation {
+                    id: view.node.id,
+                    hostname: view.node.hostname.clone(),
+                    timeline_id: status.timeline_id,
+                    is_in_recovery: status.is_in_recovery,
+                }),
+                Ok(_) => {
+                    // Peer responded but timeline is 0 — pre-feature peer
+                    // or its own timeline probe failed. Counts as "did
+                    // not respond with evidence" for the quorum gate.
+                    warn!(
+                        peer = %view.node.hostname,
+                        "phantom-primary check: peer reported timeline_id=0; no evidence"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        peer = %view.node.hostname,
+                        ?e,
+                        "phantom-primary check: peer status unavailable"
+                    );
+                }
+            }
+        }
 
         // 3. Classify. Phantom wins over SplitBrain (higher-TL evidence
         //    is the more specific failure mode); both win over the

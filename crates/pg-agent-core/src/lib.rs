@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod certreload;
+pub mod cluster_view;
 pub mod config;
 pub mod errors;
 pub mod healthz;

@@ -375,6 +375,15 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
    - On error: enqueue `drop_slot_cleanup` maintenance intent; still return
      `ok=true` with a descriptive message.
 4. **Primary down** (`detached.id == old_primary.id`):
+   - **Lag gate** (see [docs/promotion-authority.md](docs/promotion-authority.md)
+     §2.2): compare `new_main`'s `(timeline, lsn)` against every other
+     surviving node's `GetStatus`. If a reachable node is on a newer
+     timeline, or ahead by more than `MAX_HANDOFF_LAG_BYTES` on the same
+     timeline, refuse with `ok=false` naming the better candidate — pgpool
+     picks `%m` by lowest alive node id, not WAL position, and promoting
+     the lagging pick would discard the difference. Best-effort: unknown
+     positions or unreachable comparison peers skip the gate rather than
+     block the failover.
    - `peers[new_main].Promote()`.
    - `peers[new_main].DropSlot(detached.slot_name)`.
    - On DropSlot failure: enqueue maintenance intent; still mark done.
