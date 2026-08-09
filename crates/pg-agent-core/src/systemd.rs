@@ -48,10 +48,20 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{debug, warn};
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, Type};
 use zbus::Connection;
+
+/// Ceiling on waiting for a unit job's `JobRemoved` signal. The long
+/// pole is stopping PostgreSQL through its shutdown checkpoint, which
+/// systemd itself bounds via the unit's `TimeoutStopSec`; ten minutes
+/// sits above any sane unit timeout so this fires only when the signal
+/// is genuinely never coming (systemd wedged, signal stream stalled).
+/// On expiry the *job keeps running in systemd* — we can only stop
+/// waiting for it, not cancel it, and the error message says so.
+const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[async_trait]
 pub trait Systemd: Send + Sync {
@@ -190,19 +200,31 @@ impl DbusSystemd {
             .map_err(|e| anyhow::anyhow!("systemd: {op} {unit}: {e}"))?;
         debug!(unit, op, job = %job_path.as_str(), "systemd: job submitted");
 
-        while let Some(signal) = stream.next().await {
-            let args = signal
-                .args()
-                .map_err(|e| anyhow::anyhow!("systemd: parse JobRemoved args: {e}"))?;
-            if args.job == job_path {
-                if job_result_ok(&args.result) {
-                    debug!(unit, op, "systemd: job completed");
-                    return Ok(());
+        let wait = async {
+            while let Some(signal) = stream.next().await {
+                let args = signal
+                    .args()
+                    .map_err(|e| anyhow::anyhow!("systemd: parse JobRemoved args: {e}"))?;
+                if args.job == job_path {
+                    if job_result_ok(&args.result) {
+                        debug!(unit, op, "systemd: job completed");
+                        return Ok(());
+                    }
+                    anyhow::bail!("systemd: {op} {unit}: job result {:?}", args.result);
                 }
-                anyhow::bail!("systemd: {op} {unit}: job result {:?}", args.result);
             }
-        }
-        anyhow::bail!("systemd: {op} {unit}: signal stream closed before job completed")
+            anyhow::bail!("systemd: {op} {unit}: signal stream closed before job completed")
+        };
+        tokio::time::timeout(JOB_WAIT_TIMEOUT, wait)
+            .await
+            .unwrap_or_else(|_| {
+                anyhow::bail!(
+                    "systemd: {op} {unit}: no JobRemoved signal after {}s; \
+                     giving up waiting (the job itself may still be running \
+                     in systemd — check `systemctl status {unit}`)",
+                    JOB_WAIT_TIMEOUT.as_secs()
+                )
+            })
     }
 
     async fn unit_running(&self, unit: &str) -> anyhow::Result<bool> {

@@ -29,6 +29,7 @@ pub mod pgpool_supervisor;
 pub mod pgstandby;
 pub mod preflight;
 pub mod replay_markers;
+pub mod retry;
 pub mod sdnotify;
 pub mod symlinks;
 pub mod systemd;

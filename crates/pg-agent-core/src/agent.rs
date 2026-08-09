@@ -516,13 +516,7 @@ impl Agent {
 /// nonzero, systemd surfaces the failure, operator gets paged. Silent
 /// log lines would not.
 async fn stop_postgres_with_retry(sd: &dyn Systemd) -> anyhow::Result<()> {
-    if let Err(e) = sd.stop_postgres().await {
-        warn!(?e, "phantom-primary check: stop_postgres failed; retrying once");
-        sd.stop_postgres().await.map_err(|e2| {
-            anyhow::anyhow!("stop_postgres failed twice: first={e}; retry={e2}")
-        })?;
-    }
-    Ok(())
+    crate::retry::retry_result("stop_postgres", 2, Duration::ZERO, || sd.stop_postgres()).await
 }
 
 /// Total budget for the startup peer fan-out. Five seconds matches the
@@ -2316,7 +2310,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("twice"), "unexpected error: {err}");
+        assert!(
+            err.contains("after 2 attempts") && err.contains("attempt 1") && err.contains("attempt 2"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

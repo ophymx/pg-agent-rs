@@ -24,9 +24,24 @@ use async_trait::async_trait;
 use deadpool_postgres::{Config as PoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
 use tracing::debug;
+
+/// Bound on pool acquisition, connection creation, and recycle. The
+/// target is a Unix socket on the same host, so a healthy PostgreSQL
+/// answers in microseconds — five seconds means "PG is not accepting
+/// connections", and surfacing that beats queueing behind it forever.
+const POOL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Server-side `statement_timeout` applied to every connection in the
+/// pool. The agent's queries are sub-second except `CHECKPOINT` and
+/// `pg_promote()`; 300 s matches [`crate::peers`]' LONG_RPC_TIMEOUT so a
+/// statement can never outlive the most patient caller budget in the
+/// system. Without this, a hung backend pins the handler that called it
+/// for as long as the backend stays hung.
+const STATEMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Lag of a standby behind its primary, plus the WAL receiver's state.
 /// `bytes = 0, state = ""` on a primary (no receiver, no lag to report).
@@ -110,6 +125,18 @@ impl PgLocalDb {
             // check is plenty — pg either accepts a new statement or the
             // statement itself errors and we retry at the call site.
             recycling_method: RecyclingMethod::Fast,
+        });
+        cfg.options = Some(format!(
+            "-c statement_timeout={}",
+            STATEMENT_TIMEOUT.as_millis()
+        ));
+        cfg.pool = Some(deadpool_postgres::PoolConfig {
+            timeouts: deadpool_postgres::Timeouts {
+                wait: Some(POOL_TIMEOUT),
+                create: Some(POOL_TIMEOUT),
+                recycle: Some(POOL_TIMEOUT),
+            },
+            ..Default::default()
         });
 
         let pool = cfg

@@ -356,9 +356,24 @@ impl StandbyOps for StandbyExec {
 // Subprocess driver
 // ---------------------------------------------------------------------------
 
+/// Kill the subprocess if stderr goes completely silent for this long.
+/// Both tools run with `--progress` in production (the peer-RPC callers
+/// always pass a progress callback), so the copy phases chatter
+/// continuously and *any* stderr byte counts as liveness — this is a
+/// hung-transfer detector, not a duration cap. Five minutes of total
+/// silence comfortably clears the quiet phases that legitimately exist
+/// (fast-checkpoint wait at basebackup start, rewind's source scan)
+/// while still catching a dead-peer TCP connection with no keepalive.
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often the stall watchdog samples `last_activity`.
+const STALL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Spawn `bin`, drain its stderr concurrently, and surface a useful
 /// error message on non-zero exit. `kill_on_drop(true)` + `join!` means
-/// a cancelled outer future SIGKILLs the subprocess in the same drop.
+/// a cancelled outer future SIGKILLs the subprocess in the same drop —
+/// which is also how the stall watchdog kills a silent transfer (drop
+/// the joined future, not a signal race).
 async fn run_pg_binary(
     bin: &Path,
     args: &[String],
@@ -398,14 +413,46 @@ async fn run_pg_binary(
         .to_string();
 
     let tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let last_activity: Arc<Mutex<std::time::Instant>> =
+        Arc::new(Mutex::new(std::time::Instant::now()));
 
     // tokio::join! runs both concurrently in the SAME task. Dropping the
     // outer future drops both, which kills the subprocess (kill_on_drop)
     // and abandons the drain. tokio::spawn would have detached the
     // drain task — that's the wrong behaviour for cancellation.
-    let drain = drain_stderr(stderr, progress.as_ref(), tail.clone(), &bin_name);
+    let drain = drain_stderr(
+        stderr,
+        progress.as_ref(),
+        tail.clone(),
+        &bin_name,
+        last_activity.clone(),
+    );
     let wait = child.wait();
-    let (drain_result, wait_result) = tokio::join!(drain, wait);
+    let run = async { tokio::join!(drain, wait) };
+    tokio::pin!(run);
+
+    let (drain_result, wait_result) = loop {
+        tokio::select! {
+            results = &mut run => break results,
+            _ = tokio::time::sleep(STALL_CHECK_INTERVAL) => {
+                let silent_for = last_activity.lock().unwrap().elapsed();
+                if silent_for >= STALL_TIMEOUT {
+                    // Dropping `run` SIGKILLs the child (kill_on_drop)
+                    // and abandons the drain in the same drop.
+                    let tail_str = tail.lock().unwrap().clone();
+                    let suffix = if tail_str.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; last output: {tail_str}")
+                    };
+                    anyhow::bail!(
+                        "{bin_name}: no output for {}s — presumed hung; killed{suffix}",
+                        silent_for.as_secs()
+                    );
+                }
+            }
+        }
+    };
 
     if let Err(e) = drain_result {
         // Drain failure isn't fatal — wait_result is the authority on
@@ -435,11 +482,14 @@ const STDERR_TAIL_MAX: usize = 4096;
 /// Read `\r`- or `\n`-delimited lines from `stderr`; dispatch progress
 /// updates via `progress`, log everything else at debug, accumulate the
 /// first `STDERR_TAIL_MAX` bytes of non-progress output into `tail`.
+/// Every successful read stamps `last_activity` — the stall watchdog's
+/// liveness signal.
 async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
     stderr: R,
     progress: Option<&ProgressCb>,
     tail: Arc<Mutex<String>>,
     bin_name: &str,
+    last_activity: Arc<Mutex<std::time::Instant>>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::with_capacity(4096, stderr);
     let mut chunk = [0u8; 256];
@@ -447,6 +497,7 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
 
     loop {
         let n = reader.read(&mut chunk).await?;
+        *last_activity.lock().unwrap() = std::time::Instant::now();
         if n == 0 {
             // EOF — flush any pending line that didn't end with a delim.
             if !line.is_empty() {
@@ -717,6 +768,12 @@ mod tests {
 
     // ----- drain_stderr -----------------------------------------------------
 
+    /// Fresh `last_activity` stamp for drain tests — the stall watchdog
+    /// isn't under test here, the drain just requires the argument.
+    fn test_activity() -> Arc<Mutex<std::time::Instant>> {
+        Arc::new(Mutex::new(std::time::Instant::now()))
+    }
+
     type CapturedCalls = Arc<std::sync::Mutex<Vec<(i64, i64)>>>;
 
     fn capture_progress() -> (ProgressCb, CapturedCalls) {
@@ -740,7 +797,7 @@ mod tests {
 
         let (cb, calls) = capture_progress();
         let tail = Arc::new(Mutex::new(String::new()));
-        drain_stderr(bytes, Some(&cb), tail.clone(), "pg_basebackup")
+        drain_stderr(bytes, Some(&cb), tail.clone(), "pg_basebackup", test_activity())
             .await
             .unwrap();
 
@@ -762,7 +819,7 @@ mod tests {
         // captured into the tail (rare but real for crashed subprocesses).
         let bytes: &[u8] = b"FATAL: incomplete";
         let tail = Arc::new(Mutex::new(String::new()));
-        drain_stderr(bytes, None, tail.clone(), "pg_rewind")
+        drain_stderr(bytes, None, tail.clone(), "pg_rewind", test_activity())
             .await
             .unwrap();
         assert_eq!(tail.lock().unwrap().as_str(), "FATAL: incomplete");
@@ -774,7 +831,7 @@ mod tests {
         // (they're not diagnostic info) — they're silently consumed.
         let bytes: &[u8] = b"1/2 kB\nFATAL: x\n";
         let tail = Arc::new(Mutex::new(String::new()));
-        drain_stderr(bytes, None, tail.clone(), "pg_basebackup")
+        drain_stderr(bytes, None, tail.clone(), "pg_basebackup", test_activity())
             .await
             .unwrap();
         let t = tail.lock().unwrap();
