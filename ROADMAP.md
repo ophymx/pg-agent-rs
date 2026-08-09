@@ -133,9 +133,14 @@ dependency, so we need a lightweight equivalent:
 > LWW scheme below is not linearizable; two partitioned nodes can both
 > believe they won and reconcile only *after* both have been primary.
 > That is acceptable for a `paused` flag and fatal for "who is primary."
-> See [docs/promotion-authority.md](docs/promotion-authority.md), which
-> also re-prices the "avoid the dependency" tradeoff against the
-> 2026-06-11 split-brain.
+>
+> **Likely superseded.**
+> [docs/promotion-authority.md](docs/promotion-authority.md) proposes
+> embedding Raft (openraft) in `pg_agentd` so the agents replicate their
+> own log — no external DCS. Its state machine already holds `paused`,
+> scheduled switchover, and a generation counter, so it subsumes this
+> item outright. Prefer deleting this in favour of that; the scope limit
+> above stands for as long as both are on the board.
 
 - **Cluster-state RPC + gossip** *(M)* — extend `PgAgentPeer` with
   `GetClusterState` / `ProposeClusterState(version, payload)`. State is a
