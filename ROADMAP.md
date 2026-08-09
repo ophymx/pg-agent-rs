@@ -129,6 +129,14 @@ operator's environment is intact at the moment they need it most.
 Patroni gets free shared state from the DCS. We chose to avoid that
 dependency, so we need a lightweight equivalent:
 
+> **Scope limit — role assignment is out of scope for this item.** The
+> LWW scheme below is not linearizable; two partitioned nodes can both
+> believe they won and reconcile only *after* both have been primary.
+> That is acceptable for a `paused` flag and fatal for "who is primary."
+> See [docs/promotion-authority.md](docs/promotion-authority.md), which
+> also re-prices the "avoid the dependency" tradeoff against the
+> 2026-06-11 split-brain.
+
 - **Cluster-state RPC + gossip** *(M)* — extend `PgAgentPeer` with
   `GetClusterState` / `ProposeClusterState(version, payload)`. State is a
   small JSON document (paused flag, scheduled switchover, current
