@@ -821,6 +821,13 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    force for as long as both are notionally on the board.
 4. **(M)** Consensus-store trait + in-memory impl + `[raft]` config. No
    openraft yet, no behaviour change. This is what makes step 5 testable.
+   **Landed** (post-0.7.3): `consensus` module — `ConsensusStore` trait
+   (linearizable `read_state` where `Err` = unknown-never-vacant, lease
+   CAS with generation-minted fencing terms, `release`, pause/switchover)
+   plus `InMemoryConsensusStore` with fault injection (transient
+   read/write failures, persistent partition switch). `[raft]` config
+   block parses with both lease invariants enforced at load. Nothing
+   consumes the store yet.
 5. **(M)** The HA loop against the in-memory store, **shadow mode**:
    compute what it *would* decide, log it, keep obeying pgpool. Diff the
    two decision streams on the live cluster. Highest-value step — it turns

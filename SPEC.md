@@ -313,6 +313,7 @@ following Go interfaces to Rust traits, every method `async fn` returning
 | `ReplayMarkerStore` | JSON files under `<state_dir>/replay/` | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
 | `MaintenanceStore` | one JSON file per intent under `<state_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
+| `ConsensusStore`   | in-memory only for now (openraft-backed at the promotion-authority cutover) | `read_state() -> ClusterState` (linearizable; `Err` = unknown, never vacant), `try_takeover(candidate, expected)` (lease CAS, terms are fencing tokens), `release(holder, term)`, `set_paused(…)`, `set_switchover(…)` — see docs/promotion-authority.md §5 |
 
 A `NodeInfo` trait (`get_status`, `get_node_config`) is satisfied by
 `Agent` itself; `LocalServer` and `PeerServer` both delegate `GetStatus` /
@@ -959,6 +960,11 @@ healthz.port          = 9702
 - Local node id must resolve (see §8.4) and be present in the pool.
 - `[postgres.replication]` is all-or-nothing; sslmode and cert paths
   validated as in §5.10.
+- `[raft]` (parsed and invariant-checked; consumed by the HA loop when
+  it lands — docs/promotion-authority.md §5): `leader_ttl >= loop_wait +
+  2 * retry_timeout`, and `retry_timeout > election_timeout`. Violating
+  either is a config error, because each converts routine events into
+  spurious failovers.
 
 ### 8.4 Local-node id resolution
 

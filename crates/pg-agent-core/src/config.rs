@@ -137,6 +137,8 @@ pub struct Config {
     pub startup: StartupConfig,
     #[serde(default)]
     pub supervisor: SupervisorConfig,
+    #[serde(default)]
+    pub raft: RaftConfig,
 
     /// Set by the `--dev` CLI flag — never read from config.toml.
     #[serde(skip)]
@@ -416,6 +418,101 @@ impl SupervisorConfig {
 }
 
 pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
+
+/// `[raft]` — timing knobs for the lease-backed HA loop
+/// (docs/promotion-authority.md §5). Parsed and invariant-checked now;
+/// consumed by the HA loop when it lands (sequencing steps 5–6).
+/// Absent block = all defaults, which satisfy both invariants.
+///
+/// Two invariants are enforced at config load, because violating either
+/// converts routine events into spurious failovers:
+///
+/// 1. `leader_ttl >= loop_wait + 2 * retry_timeout` — the holder
+///    exhausts its retry budget and demotes *before* any candidate is
+///    eligible to propose a takeover (hysteresis, not correctness).
+/// 2. `retry_timeout > election_timeout` — a linearizable read cannot
+///    complete while a Raft election is in flight, so a retry budget
+///    shorter than an election converts every Raft re-election into a
+///    demotion of a healthy primary. This is the field failure that got
+///    Patroni's embedded-raft backend deprecated (promotion-authority
+///    §"Prior art").
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RaftConfig {
+    #[serde(default)]
+    pub loop_wait_secs: Option<u64>,
+    #[serde(default)]
+    pub retry_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub leader_ttl_secs: Option<u64>,
+    /// Raft election timeout upper bound. Milliseconds because it is a
+    /// protocol-level knob; the default is deliberately long so an
+    /// Ansible rolling agent restart does not cascade into elections
+    /// (open question 3 — needs a measured answer on the live cluster).
+    #[serde(default)]
+    pub election_timeout_ms: Option<u64>,
+    /// Candidate eligibility: refuse to promote a candidate lagging the
+    /// most-advanced reachable peer by more than this many bytes.
+    #[serde(default)]
+    pub max_lag_on_failover_bytes: Option<u64>,
+}
+
+pub const DEFAULT_RAFT_LOOP_WAIT_SECS: u64 = 10;
+pub const DEFAULT_RAFT_RETRY_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_RAFT_LEADER_TTL_SECS: u64 = 30;
+pub const DEFAULT_RAFT_ELECTION_TIMEOUT_MS: u64 = 5_000;
+
+impl RaftConfig {
+    pub fn effective_loop_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.loop_wait_secs.unwrap_or(DEFAULT_RAFT_LOOP_WAIT_SECS))
+    }
+    pub fn effective_retry_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.retry_timeout_secs
+                .unwrap_or(DEFAULT_RAFT_RETRY_TIMEOUT_SECS),
+        )
+    }
+    pub fn effective_leader_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.leader_ttl_secs.unwrap_or(DEFAULT_RAFT_LEADER_TTL_SECS))
+    }
+    pub fn effective_election_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.election_timeout_ms
+                .unwrap_or(DEFAULT_RAFT_ELECTION_TIMEOUT_MS),
+        )
+    }
+    pub fn effective_max_lag_on_failover(&self) -> u64 {
+        self.max_lag_on_failover_bytes
+            .unwrap_or(MAX_HANDOFF_LAG_BYTES as u64)
+    }
+
+    pub fn validate(&self) -> Result<(), AgentError> {
+        let loop_wait = self.effective_loop_wait();
+        let retry = self.effective_retry_timeout();
+        let ttl = self.effective_leader_ttl();
+        let election = self.effective_election_timeout();
+        if ttl < loop_wait + 2 * retry {
+            return Err(AgentError::RaftConfig(format!(
+                "leader_ttl ({}s) must be >= loop_wait ({}s) + 2 * retry_timeout ({}s) — \
+                 otherwise a candidate can become eligible to take over before the \
+                 current holder has exhausted its retry budget and demoted",
+                ttl.as_secs(),
+                loop_wait.as_secs(),
+                retry.as_secs()
+            )));
+        }
+        if retry <= election {
+            return Err(AgentError::RaftConfig(format!(
+                "retry_timeout ({}ms) must exceed election_timeout ({}ms) — a \
+                 linearizable read cannot complete during an election, so a shorter \
+                 retry budget turns every Raft re-election into a demotion of a \
+                 healthy primary",
+                retry.as_millis(),
+                election.as_millis()
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Maximum acceptable replication lag (bytes) on the handoff target,
 /// past which `pg_agentctl cluster handoff --target N` refuses to
@@ -827,6 +924,7 @@ impl Config {
         self.local_node()?;
 
         self.postgres.replication.validate()?;
+        self.raft.validate()?;
         Ok(())
     }
 
@@ -1256,6 +1354,59 @@ mod tests {
             sslmode: Some("disable".into()),
         };
         assert!(cfg.conninfo("h", 5432, "u", "").contains("sslmode=disable"));
+    }
+
+    // ----- [raft] ----------------------------------------------------------
+
+    #[test]
+    fn raft_defaults_satisfy_both_invariants() {
+        RaftConfig::default().validate().unwrap();
+        // Defaults: ttl 30 >= 10 + 2*10; retry 10s > election 5s.
+        let d = RaftConfig::default();
+        assert_eq!(d.effective_leader_ttl().as_secs(), 30);
+        assert_eq!(d.effective_max_lag_on_failover(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn raft_rejects_ttl_below_retry_budget() {
+        let cfg = RaftConfig {
+            leader_ttl_secs: Some(20), // < 10 + 2*10
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("leader_ttl"), "{err}");
+    }
+
+    #[test]
+    fn raft_rejects_retry_not_exceeding_election() {
+        let cfg = RaftConfig {
+            retry_timeout_secs: Some(5),
+            election_timeout_ms: Some(5_000),
+            leader_ttl_secs: Some(30), // keeps invariant 1 satisfied
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("election_timeout"), "{err}");
+    }
+
+    #[test]
+    fn raft_block_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            pool = [{ id = 0, hostname = "db0" }]
+            [raft]
+            loop_wait_secs = 5
+            retry_timeout_secs = 12
+            leader_ttl_secs = 40
+            election_timeout_ms = 8000
+            max_lag_on_failover_bytes = 1048576
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.raft.effective_loop_wait().as_secs(), 5);
+        assert_eq!(cfg.raft.effective_election_timeout().as_millis(), 8000);
+        assert_eq!(cfg.raft.effective_max_lag_on_failover(), 1048576);
+        cfg.raft.validate().unwrap(); // 40 >= 5 + 24; 12s > 8s
     }
 
     #[test]

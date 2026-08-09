@@ -47,6 +47,8 @@ pub enum AgentError {
     NodeRefUnresolvable { id: i32, hostname: String },
     #[error("node id={id} ({hostname}) is not the local node")]
     NodeRefNotLocal { id: i32, hostname: String },
+    #[error("config: [raft]: {0}")]
+    RaftConfig(String),
 
     // ----- TLS ----------------------------------------------------------
     #[error("config: tls requires ca_cert, cert, and key")]
