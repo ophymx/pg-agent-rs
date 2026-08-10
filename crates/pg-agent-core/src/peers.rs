@@ -755,7 +755,14 @@ mod tests {
             let db: Arc<dyn LocalDb> = Arc::new(NoOpDb);
             let standby: Arc<dyn StandbyOps> = Arc::new(NoOpStandby);
             let wal: Arc<dyn WalStore> = Arc::new(NoOpWal);
-            let _ = PeerServer::new(Arc::new(FakeNodeInfo), sd, db, standby, wal)
+            let _ = PeerServer::new(
+                Arc::new(FakeNodeInfo),
+                sd,
+                db,
+                standby,
+                wal,
+                Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
+            )
                 .serve(listener, Some(tls), s)
                 .await;
         });

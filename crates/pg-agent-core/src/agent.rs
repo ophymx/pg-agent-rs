@@ -258,6 +258,7 @@ impl Agent {
             self.opts.node_pool.clone(),
             self.deps.db.clone(),
             self.deps.replay.clone(),
+            self.deps.inflight.clone(),
             self.opts.maintenance_sweep_interval,
         );
 
@@ -299,8 +300,9 @@ impl Agent {
             let db = self.deps.db.clone();
             let standby = self.deps.standby.clone();
             let wal = self.deps.wal.clone();
+            let inflight = self.deps.inflight.clone();
             js.spawn(async move {
-                PeerServer::new(me, sd, db, standby, wal)
+                PeerServer::new(me, sd, db, standby, wal, inflight)
                     .serve(listeners.peer, tls, s)
                     .await
             });

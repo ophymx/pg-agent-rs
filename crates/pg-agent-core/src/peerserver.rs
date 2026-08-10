@@ -208,6 +208,10 @@ pub struct PeerServer {
     db: Arc<dyn LocalDb>,
     standby: Arc<dyn StandbyOps>,
     wal: Arc<dyn WalStore>,
+    /// Consulted by [`PeerServer::drop_slot`] before destroying a slot.
+    /// The slot lives here, so this node's journal — not the caller's —
+    /// is the authority on whether an orchestration still needs it.
+    inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
 }
 
 impl PeerServer {
@@ -217,6 +221,7 @@ impl PeerServer {
         db: Arc<dyn LocalDb>,
         standby: Arc<dyn StandbyOps>,
         wal: Arc<dyn WalStore>,
+        inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
     ) -> Self {
         Self {
             node_info,
@@ -224,7 +229,24 @@ impl PeerServer {
             db,
             standby,
             wal,
+            inflight,
         }
+    }
+
+    /// The orchestration that owns `slot_name`, if any — in flight, or
+    /// finished within [`crate::localserver::CROSS_OP_GRACE`].
+    ///
+    /// Slots are named `node{id}` (SPEC §5.1), which is the link
+    /// between a slot and the op that owns the node it belongs to. An
+    /// unparseable name means no owner: the guard exists to protect
+    /// known orchestrations, not to block anything unfamiliar.
+    async fn slot_owner(&self, slot_name: &str) -> Option<crate::inflight_ops::InflightOp> {
+        crate::inflight_ops::owner_of_slot(
+            self.inflight.as_ref(),
+            slot_name,
+            crate::localserver::CROSS_OP_GRACE,
+        )
+        .await
     }
 
     /// Serve until `shutdown` cancels.
@@ -446,10 +468,46 @@ impl PgAgentPeer for PeerServer {
         Ok(Response::new(ok()))
     }
 
+    /// Drop a replication slot on this node — **unless** a local
+    /// orchestration owns it.
+    ///
+    /// The guard belongs here rather than only at the call sites
+    /// because callers are plural and some of them are *stale*: a
+    /// queued `drop_slot_cleanup` maintenance intent on another node
+    /// retries with exponential backoff, so a drop request created
+    /// before a recovery started can land minutes into it. Observed in
+    /// the acceptance suite: a peer's retry loop deleted the slot
+    /// `recovery_1st_stage` had just created, once per backoff step,
+    /// leaving a rebuilt standby that could never stream. Only this
+    /// node knows whether the slot is currently spoken for.
+    ///
+    /// Answers `ok=true` when refusing, deliberately: the caller's
+    /// cleanup is genuinely no longer needed, and returning an error
+    /// would keep a maintenance intent retrying against a slot that is
+    /// now in legitimate use.
     async fn drop_slot(&self, req: Request<DropSlotRequest>) -> Result<Response<OpResult>, Status> {
         let req = req.into_inner();
         info!(slot = %req.slot_name, "peer: DropSlot");
         validate_slot_name(&req.slot_name)?;
+        if let Some(owner) = self.slot_owner(&req.slot_name).await {
+            info!(
+                slot = %req.slot_name,
+                op = %owner.payload.op_name(),
+                id = %owner.id,
+                phase = %owner.phase,
+                "peer: DropSlot refused — an orchestration owns this slot"
+            );
+            return Ok(Response::new(OpResult {
+                ok: true,
+                message: format!(
+                    "slot {} retained: in-flight {} (id={}, phase={}) owns it",
+                    req.slot_name,
+                    owner.payload.op_name(),
+                    owner.id,
+                    owner.phase
+                ),
+            }));
+        }
         self.db.drop_slot(&req.slot_name).await.map_err(internal)?;
         Ok(Response::new(ok()))
     }
@@ -1000,6 +1058,7 @@ mod tests {
             db.clone(),
             standby.clone(),
             wal.clone(),
+            Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
         );
         (server, sd, db, standby, wal)
     }
@@ -1134,6 +1193,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    /// A stale `drop_slot_cleanup` maintenance intent on *another* node
+    /// retries with backoff, so a drop request created before a recovery
+    /// started routinely lands in the middle of it. Only this node knows
+    /// the slot is spoken for, so the guard lives on the server side —
+    /// observed in the acceptance suite deleting a freshly-created slot
+    /// once per backoff step.
+    #[tokio::test]
+    async fn drop_slot_refuses_while_an_orchestration_owns_it() {
+        let inflight = Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new());
+        inflight.seed_in_progress(
+            crate::inflight_ops::InflightPayload::Recovery {
+                primary_node_id: 0,
+                standby_node_id: 1,
+                standby_hostname: "db1".into(),
+                slot_name: "node1".into(),
+            },
+            "slot_created",
+        );
+        let db = Arc::new(StubDb::default());
+        let s = PeerServer::new(
+            Arc::new(FakeNodeInfo),
+            Arc::new(StubSd::default()),
+            db.clone(),
+            Arc::new(StubStandby::default()),
+            Arc::new(StubWal::default()),
+            inflight,
+        );
+
+        let resp = s
+            .drop_slot(Request::new(DropSlotRequest {
+                slot_name: "node1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // ok=true on purpose: the caller's cleanup is genuinely no
+        // longer needed, and an error would keep the intent retrying.
+        assert!(resp.ok, "{}", resp.message);
+        assert!(resp.message.contains("retained"), "{}", resp.message);
+        assert!(
+            db.dropped_slots.lock().unwrap().is_empty(),
+            "the orchestration's slot must survive"
+        );
+
+        // A slot belonging to a node no op owns is dropped normally.
+        s.drop_slot(Request::new(DropSlotRequest {
+            slot_name: "node2".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node2".to_string()]);
     }
 
     #[tokio::test]
@@ -1318,6 +1430,7 @@ mod tests {
             Arc::new(StubDb::default()),
             Arc::new(StubStandby::default()),
             Arc::new(StubWal::default()),
+            Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
         );
         let result = server
             .basebackup(Request::new(valid_basebackup_req()))

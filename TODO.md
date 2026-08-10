@@ -5,7 +5,32 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
-### `cluster recover` races pgpool's failover hook and loses its slot
+### ~~`cluster recover` races pgpool's failover hook and loses its slot~~ — FIXED
+
+> Closed by the `inflight_ops` migration: `recovery_first_stage` now
+> journals a `Recovery` op across a `started → slot_created →
+> data_copied → standby_configured` ladder, and every path that can
+> destroy a slot consults `inflight_ops::owner_of_node/owner_of_slot`
+> first — an op owns its target while `InProgress`, and for
+> `CROSS_OP_GRACE` (120s) after completing.
+>
+> Four such paths existed, each surfaced by re-running the acceptance
+> suite after closing the previous one (testing/README.md finding 9):
+> `failover`'s standby-down branch; the same branch reached by a
+> *late* hook after the recovery completed; a stale
+> `drop_slot_cleanup` intent retried from another node over the peer
+> RPC (guard now in `PeerServer::drop_slot`, since only the slot's
+> host knows it is spoken for); and that same intent when the target
+> is local, where the maintenance worker calls `db.drop_slot` directly
+> and bypasses the RPC guard.
+>
+> The acceptance suite's `repair_cluster` no longer detaches first, so
+> S10 exercises the live race on every run (58/58 green). Original
+> report retained below for the reasoning; the replay-marker dedup it
+> describes is also gone (superseded by `RECOVERY_DEDUP_WINDOW` over
+> the journal).
+
+### (historical) `cluster recover` races pgpool's failover hook
 
 - **Where:** `crates/pg-agent-core/src/localserver.rs::cluster_recover`
   / `recovery_first_stage` (creates the slot) vs. `failover`'s
@@ -90,7 +115,22 @@ scheduled. Items roughly in priority order within each section.
 - **Fix shape:** treat "start failed" as terminal for the recover. Don't `pcp_attach_node`. Return `ok=false` with the underlying systemd error verbatim so the operator immediately sees what to fix. The slot + basebackup work that DID succeed stays on disk; the next `cluster recover` re-run picks up from there if we ever wire recover into `inflight_ops` (currently uses replay markers).
 - **Pairs with:** the recover-completion auto-attach work from 0.4.0 — the auto-attach is correct when the start succeeded; it just needs to be gated on `start_ok`.
 
-### `recovery_first_stage`: migrate replay markers to `inflight_ops`
+### ~~`recovery_first_stage`: migrate replay markers to `inflight_ops`~~ — DONE
+
+> Landed. `recovery_1st_stage` is journaled as a phased `Recovery` op;
+> (a) operators can see the phase a stuck recover reached, (c) the
+> 24 h dedup window is now per-op (`RECOVERY_DEDUP_WINDOW`) and
+> independent of failover/follow_primary's markers. **(b) resume is
+> still not implemented** — `resume_inflight_op` refuses a `Recovery`
+> op and points the operator at `cluster recover`, which restarts the
+> orchestration from a known state rather than re-entering a ladder
+> whose `$PGDATA` may be half-copied. Wiring a real resume driver
+> (skip already-completed phases) is the remaining piece.
+>
+> The migration also closed the recover/failover slot race above,
+> which was its most urgent motivation.
+
+### (historical) `recovery_first_stage`: migrate replay markers to `inflight_ops`
 
 - **Where:** `crates/pg-agent-core/src/localserver.rs::recovery_first_stage` + the in-flight ops substrate from 0.6.0.
 - **Why:** 0.7.2 fixed the silent-skip bug by adding `bypass_replay_marker` and a distinguishable skip message, but the underlying contract is still a binary marker with 24h global TTL. A more honest model treats recovery_first_stage as a phased orchestration (checkpoint → create_slot → basebackup → configure_standby) and journals each phase so (a) operators can see what step a stuck recover is at, (b) resume is possible after a crash, and (c) the per-op retention can be tuned without affecting failover/follow_primary's markers.

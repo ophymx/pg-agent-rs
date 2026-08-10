@@ -142,6 +142,29 @@ pub enum InflightPayload {
         new_primary_node_id: i32,
         new_primary_hostname: String,
     },
+    /// `recovery_1st_stage` — rebuild a standby's data directory from
+    /// this primary (checkpoint → create slot → basebackup → configure).
+    /// Driven by `pg_agentctl cluster recover` and by pgpool's
+    /// `pcp_recovery_node`.
+    ///
+    /// Journaling this is not only for operator visibility: it is what
+    /// lets `failover` know a recovery is in flight for a node. Stopping
+    /// the target's PostgreSQL (which recovery does deliberately) makes
+    /// pgpool fire `failover_command` with that node as `detached`, and
+    /// the standby-down branch's job is to drop that node's replication
+    /// slot — the slot this orchestration just created. Before this
+    /// variant existed the two raced and recovery silently produced a
+    /// standby that could never stream.
+    Recovery {
+        /// The primary running the orchestration (always the local node).
+        primary_node_id: i32,
+        /// The standby being rebuilt.
+        standby_node_id: i32,
+        /// Resolved at orchestration start, like the other variants.
+        standby_hostname: String,
+        /// Slot created on the primary for the standby to stream through.
+        slot_name: String,
+    },
 }
 
 impl InflightPayload {
@@ -151,6 +174,7 @@ impl InflightPayload {
         match self {
             Self::Handoff { .. } => "handoff",
             Self::FollowPrimary { .. } => "follow_primary",
+            Self::Recovery { .. } => "recovery",
         }
     }
 
@@ -170,6 +194,27 @@ impl InflightPayload {
                 new_primary_node_id,
                 ..
             } => format!("detached={detached_node_id},new_primary={new_primary_node_id}"),
+            Self::Recovery {
+                primary_node_id,
+                standby_node_id,
+                ..
+            } => format!("primary={primary_node_id},standby={standby_node_id}"),
+        }
+    }
+
+    /// The node whose data directory / replication slot this
+    /// orchestration owns, when it owns one. `failover` consults this
+    /// before acting destructively on a node that another op is
+    /// already mid-way through rebuilding.
+    pub fn target_node_id(&self) -> Option<i32> {
+        match self {
+            Self::Handoff { to_node_id, .. } => Some(*to_node_id),
+            Self::FollowPrimary {
+                detached_node_id, ..
+            } => Some(*detached_node_id),
+            Self::Recovery {
+                standby_node_id, ..
+            } => Some(*standby_node_id),
         }
     }
 }
@@ -902,4 +947,174 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].path, "garbled.json");
     }
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryInflightOpStore — for tests in other modules
+// ---------------------------------------------------------------------------
+
+/// Non-durable [`InflightOpStore`] for tests that need the journal
+/// present but not persistent — mirrors [`crate::peers::NoOpPeerRegistry`]'s
+/// role. Public so `peerserver` / `peers` tests can wire a `PeerServer`
+/// without each inventing its own stub.
+#[derive(Default)]
+pub struct InMemoryInflightOpStore {
+    ops: std::sync::Mutex<Vec<InflightOp>>,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+impl InMemoryInflightOpStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert an op directly, bypassing `begin` — lets a test stage a
+    /// specific status/phase.
+    pub fn seed(&self, op: InflightOp) {
+        self.ops.lock().unwrap().push(op);
+    }
+
+    /// Build an `InProgress` op at `phase` and stage it.
+    pub fn seed_in_progress(&self, payload: InflightPayload, phase: &str) -> InflightOp {
+        let n = self
+            .seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = Utc::now();
+        let op = InflightOp {
+            id: format!("mem-{}-{n}", payload.op_name()),
+            status: InflightStatus::InProgress,
+            payload,
+            phase: phase.to_string(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            last_error: None,
+        };
+        self.seed(op.clone());
+        op
+    }
+}
+
+#[async_trait]
+impl InflightOpStore for InMemoryInflightOpStore {
+    async fn begin(
+        &self,
+        payload: InflightPayload,
+        phase: &str,
+        _exclusive: bool,
+    ) -> anyhow::Result<InflightOp> {
+        Ok(self.seed_in_progress(payload, phase))
+    }
+    async fn update_phase(
+        &self,
+        id: &str,
+        phase: &str,
+        last_error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut ops = self.ops.lock().unwrap();
+        if let Some(op) = ops.iter_mut().find(|o| o.id == id) {
+            op.phase = phase.to_string();
+            op.updated_at = Utc::now();
+            op.last_error = last_error;
+        }
+        Ok(())
+    }
+    async fn complete(&self, id: &str) -> anyhow::Result<()> {
+        let mut ops = self.ops.lock().unwrap();
+        if let Some(op) = ops.iter_mut().find(|o| o.id == id) {
+            op.status = InflightStatus::Done;
+            op.completed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+    async fn abandon(&self, id: &str, reason: &str) -> anyhow::Result<()> {
+        let mut ops = self.ops.lock().unwrap();
+        if let Some(op) = ops.iter_mut().find(|o| o.id == id) {
+            op.status = InflightStatus::Abandoned;
+            op.completed_at = Some(Utc::now());
+            op.last_error = Some(reason.to_string());
+        }
+        Ok(())
+    }
+    async fn find(&self, op_name: &str, key: &str) -> anyhow::Result<Option<InflightOp>> {
+        let ops = self.ops.lock().unwrap();
+        Ok(ops
+            .iter()
+            .filter(|o| o.payload.op_name() == op_name && o.payload.key() == key)
+            .max_by_key(|o| o.started_at)
+            .cloned())
+    }
+    async fn get(&self, id: &str) -> anyhow::Result<InflightOp> {
+        let ops = self.ops.lock().unwrap();
+        ops.iter()
+            .find(|o| o.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no such op: {id}"))
+    }
+    async fn list(
+        &self,
+        statuses: &[InflightStatus],
+    ) -> anyhow::Result<(Vec<InflightOp>, Vec<SkippedInflightOp>)> {
+        let ops = self.ops.lock().unwrap();
+        let out: Vec<InflightOp> = ops
+            .iter()
+            .filter(|o| statuses.is_empty() || statuses.contains(&o.status))
+            .cloned()
+            .collect();
+        Ok((out, vec![]))
+    }
+    async fn sweep(&self, _now: DateTime<Utc>) {}
+}
+
+// ---------------------------------------------------------------------------
+// Ownership queries
+// ---------------------------------------------------------------------------
+
+/// Node id encoded in a replication-slot name. Slots are `node{id}`
+/// (SPEC §5.1); anything else has no owning node.
+pub fn node_id_from_slot(slot_name: &str) -> Option<i32> {
+    slot_name.strip_prefix("node")?.parse().ok()
+}
+
+/// The orchestration that owns `node_id` — `InProgress`, or terminal-
+/// `Done` within `grace`.
+///
+/// The grace exists because destructive requests aimed at a node reach
+/// us *late*: pgpool's `failover_command` lags its health check, and a
+/// queued `drop_slot_cleanup` intent retries with exponential backoff.
+/// Both routinely arrive after an orchestration finished but before the
+/// node it rebuilt is streaming — a window in which the node looks
+/// legitimately dead to every other check.
+///
+/// `Abandoned` ops deliberately do **not** own anything: abandonment
+/// runs the cleanup path, so the slot is meant to go.
+///
+/// A journal read failure yields `None` — guards fail open, matching
+/// the "proceed on absent evidence" posture used elsewhere.
+pub async fn owner_of_node(
+    store: &dyn InflightOpStore,
+    node_id: i32,
+    grace: chrono::Duration,
+) -> Option<InflightOp> {
+    let (ops, _) = store
+        .list(&[InflightStatus::InProgress, InflightStatus::Done])
+        .await
+        .map_err(|e| warn!(?e, "inflight ownership check failed; proceeding unguarded"))
+        .ok()?;
+    ops.into_iter()
+        .filter(|o| o.payload.target_node_id() == Some(node_id))
+        .filter(|o| match o.status {
+            InflightStatus::InProgress => true,
+            _ => o.completed_at.is_some_and(|t| Utc::now() - t < grace),
+        })
+        .max_by_key(|o| o.started_at)
+}
+
+/// [`owner_of_node`] keyed by slot name.
+pub async fn owner_of_slot(
+    store: &dyn InflightOpStore,
+    slot_name: &str,
+    grace: chrono::Duration,
+) -> Option<InflightOp> {
+    owner_of_node(store, node_id_from_slot(slot_name)?, grace).await
 }

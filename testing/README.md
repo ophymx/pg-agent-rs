@@ -199,7 +199,35 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
    the *intended* configuration as drift. `gen-pgpool` needs a
    target-contract mode before step 7.
 9. **`cluster recover` races pgpool's failover hook and loses its slot
-   — open bug, see TODO.md.** `cluster recover --target N
+   — FIXED via the `inflight_ops` migration.** The report described one
+   race; the slot turned out to have **four** ways to die, each found
+   by re-running S10 after closing the previous one:
+   1. `failover` on the primary while the recovery is mid-flight →
+      cross-op consult (`inflight_owner_of`).
+   2. `failover` arriving *after* the recovery completes but before the
+      rebuilt standby reaches `streaming` → `CROSS_OP_GRACE` (120 s).
+      pgpool's hook lags its health check, so on a small cluster the
+      recovery routinely finishes first, and in that window the node
+      reads as legitimately down to the precondition check too.
+   3. A **stale `drop_slot_cleanup` maintenance intent on another
+      node**, retried over the peer RPC with exponential backoff —
+      deleting the freshly-created slot once per backoff step
+      (`01:44:19, :49, 01:45:49, 01:47:49`). No caller-side guard can
+      fix this: the caller is a different node acting on an intent
+      recorded before the recovery existed. Guard moved to
+      `PeerServer::drop_slot`, since the node holding the slot is the
+      only one that knows it is spoken for.
+   4. The **same intent when the target is local** — the maintenance
+      worker's `if is_local { db.drop_slot }` branch bypasses the peer
+      RPC and therefore the server-side guard. This is the one that
+      kept S10 red after (1)–(3), showing up as `pg_basebackup: could
+      not send replication command "START_REPLICATION": ERROR:
+      replication slot "node0" does not exist`.
+
+   The rule now lives once, in `inflight_ops::owner_of_node` /
+   `owner_of_slot`, with all four sites delegating. S10 exercises the
+   live race (no detach-first workaround) and asserts the consult
+   fires. Original report: `cluster recover --target N
    --stop-target-pg` stops the target's PostgreSQL; pgpool sees that
    backend go down and fires `failover_command`; the agent's
    standby-down branch drops the detached node's replication slot —

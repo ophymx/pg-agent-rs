@@ -334,19 +334,17 @@ pcp_all() { # pcp_all <attach|detach> <node-id>
 # Rebuild every non-primary node as a standby of the current primary,
 # then re-attach it in every pgpool instance (the fan-out §3 requires).
 #
-# The detach-first step is the operator workaround for the recover /
-# failover-hook race (TODO.md, testing/README.md finding 9): `cluster
-# recover --stop-target-pg` stops the target's PostgreSQL, pgpool fires
-# failover_command, and its standby-down branch drops the slot the
-# recovery just created. Detaching first means the backend is already
-# down in pgpool's view, so stopping it fires nothing.
+# Deliberately does NOT detach the target first. `cluster recover
+# --stop-target-pg` stops the target's PostgreSQL, which makes pgpool
+# fire failover_command against it — and the standby-down branch's job
+# is to drop that node's slot. Letting that happen live is the point:
+# the cross-op consult (failover skips the drop while an in-flight op
+# owns the node) is what has to hold, and S10 fails without it.
 repair_cluster() {
     local prim="$1" n nid
     for n in db0 db1 db2; do
         [ "$n" = "$prim" ] && continue
         nid="${n#db}"
-        pcp_all detach "$nid"
-        sleep 3
         xp "$prim" "pg_agentctl cluster recover --target $nid --stop-target-pg" \
             > "/tmp/recover-$nid.log" 2>&1 || true
         pcp_all attach "$nid"
@@ -363,6 +361,14 @@ if [ "$(count_primaries)" = "1" ]; then
     ok "exactly one primary after repair"
 else
     bad "expected 1 primary after repair, found $(count_primaries)"
+fi
+# The recover/failover-hook race: pgpool fires failover_command when
+# recovery stops the target, and the cross-op consult must keep the
+# slot the recovery just created.
+if log_has "$PRIM" 'in-flight op owns this node; skipping slot drop'; then
+    ok "failover deferred to the in-flight recovery (slot survived)"
+else
+    bad "no cross-op consult logged during repair"
 fi
 
 say "S11: pgpool_status is sticky across a pgpool restart (hook-contract §5.3)"

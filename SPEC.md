@@ -313,6 +313,7 @@ following Go interfaces to Rust traits, every method `async fn` returning
 | `ReplayMarkerStore` | JSON files under `<state_dir>/replay/` | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
 | `MaintenanceStore` | one JSON file per intent under `<state_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
+| `InflightOpStore` | one JSON file per op under `<state_dir>/inflight_ops/` | `begin(payload, phase, exclusive)`, `update_phase`, `complete`, `abandon`, `find(op, key)`, `get(id)`, `list(statuses…)`, `sweep(now)`. Also the **slot-ownership authority**: `owner_of_node` / `owner_of_slot` gate every destructive slot path (§5.1 step 3, `PgAgentPeer.DropSlot`, the maintenance worker) |
 | `ConsensusStore`   | in-memory only for now (openraft-backed at the promotion-authority cutover) | `read_state() -> ClusterState` (linearizable; `Err` = unknown, never vacant), `try_takeover(candidate, expected)` (lease CAS, terms are fencing tokens), `release(holder, term)`, `set_paused(…)`, `set_switchover(…)` — see docs/promotion-authority.md §5 |
 
 A `NodeInfo` trait (`get_status`, `get_node_config`) is satisfied by
@@ -371,6 +372,18 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
 2. Resolve `detached`, `new_main`, `old_primary` from topology
    (hostname-authoritative — see §8.2).
 3. **Standby down** (`detached.id != old_primary.id`):
+   - **Cross-op consult:** if an `inflight_ops` entry owns `detached`
+     (recovery, follow_primary, or handoff — matched via
+     `InflightPayload::target_node_id`), retain the slot and return
+     `ok=true` naming the op. Such an orchestration stops its target's
+     PostgreSQL deliberately, which is what fired this hook; dropping
+     the slot would destroy the one it just created and leave a standby
+     that can never stream. Ownership covers `InProgress` ops **and**
+     ops completed within `CROSS_OP_GRACE` (120s): pgpool's hook is a
+     delayed reaction, so it routinely arrives after the orchestration
+     finished but before the rebuilt standby reaches `streaming` — a
+     window in which the precondition check below also reads the node
+     as legitimately down.
    - **Precondition** (defense in depth — see
      [docs/promotion-authority.md](docs/promotion-authority.md) §3): if
      `detached` is reachable, running, in recovery, and
@@ -447,19 +460,34 @@ Invoked indirectly: pgpool calls the `pgpool_recovery` PostgreSQL extension
 on the primary, which exec's `$PGDATA/recovery_1st_stage` (a symlink to
 `pg_agentc`).
 
-1. Replay key: `primary={id},standby={id}`. If done → skip.
+Journaled in `inflight_ops` as a `recovery` op (key
+`primary={id},standby={id}`) across the ladder
+`started → slot_created → data_copied → standby_configured`.
+
+1. Dedup: if a `recovery` op with the same key completed within
+   `RECOVERY_DEDUP_WINDOW` (24h) → skip with a distinct message.
+   `bypass_replay_marker=true` on the request overrides this; a
+   *concurrent* duplicate is rejected structurally by `inflight.begin`.
 2. Resolve primary as **local** node (`resolve_local_node` — refuse if not
    local) and standby normally.
-3. Local `Checkpoint`.
-4. Local `CreateSlot(standby.slot_name)`.
-5. `peers[standby].Basebackup(primary, slot=standby.slot_name)` — drain
-   progress until `phase == "done"`.
-6. `peers[standby].ConfigureStandby(primary)` — must follow basebackup
-   because basebackup wipes `$PGDATA` first.
-7. **No** `pcp_attach_node` — pgpool drives re-attachment after stage 2.
-8. `replay.mark_done(...)`.
+3. `inflight.begin(Recovery{…}, "started")`. **This is what makes the
+   orchestration visible to `Failover`** — see the cross-op consult in
+   §5.1 step 3.
+4. Local `Checkpoint`.
+5. Local `CreateSlot(standby.slot_name)` → phase `slot_created`.
+6. `peers[standby].Basebackup(primary, slot=standby.slot_name)` — drain
+   progress until `phase == "done"` → phase `data_copied`.
+7. `peers[standby].ConfigureStandby(primary)` — must follow basebackup
+   because basebackup wipes `$PGDATA` first → phase `standby_configured`.
+8. **No** `pcp_attach_node` — pgpool drives re-attachment after stage 2.
+9. `inflight.complete(...)`.
 
-Cleanup rule: drop the slot on any failure after step 4.
+Cleanup rule: drop the slot on any failure after step 5, and mark the
+op `Abandoned` so a retry isn't rejected as a duplicate of a run that
+died. No resume driver yet: `ResumeInflightOp` refuses a `recovery` op
+and directs the operator to `cluster recover`, which restarts from a
+known state rather than re-entering a ladder whose `$PGDATA` may be
+half-copied.
 
 ### 5.4 `RemoteStart(target)`
 
@@ -539,7 +567,7 @@ no password.
 | `ReloadPgpool`      | `systemd.ReloadOrRestartUnit($pgpool_service, "replace")` |
 | `Promote`           | `SELECT pg_promote()` |
 | `CreateSlot`        | `pg_create_physical_replication_slot(name)`, SQLSTATE 42710 ok |
-| `DropSlot`          | `pg_drop_replication_slot(name)` |
+| `DropSlot`          | **Ownership guard first:** if `inflight_ops::owner_of_slot` reports an op owns this slot (`InProgress`, or `Done` within `CROSS_OP_GRACE`), return `ok=true` with a "retained" message and do nothing. `ok=true` rather than an error is deliberate — the caller's cleanup is genuinely obsolete, and an error keeps a maintenance intent retrying against a slot now in legitimate use. Otherwise `pg_drop_replication_slot(name)`. The guard lives here because callers are plural and some are stale (a queued `drop_slot_cleanup` on another node retries with backoff), and only the slot's host knows whether it is spoken for. |
 | `ConfigureStandby`  | validate (`primary_host` regex, port>0, repl_user regex, slot regex). Write `$PGDATA/myrecovery.conf` (template — see §5.10) and create empty `$PGDATA/standby.signal`. Both files mode `0640`. |
 | `Basebackup`        | refuse if PostgreSQL is running (`FailedPrecondition`). Clear `$PGDATA` contents. Exec `<pg_install_prefix>/bin/pg_basebackup --pgdata <data> --dbname '<conninfo>' --wal-method=stream --checkpoint=fast --no-password [--slot <name>] [--progress]`. Scan stderr line-by-line (split on `\r` *or* `\n`), forward `done/total kB` lines as `OpProgress { phase="streaming", bytes_done=done*1024, bytes_total=total*1024 }`, log other lines, capture last ~4 KiB into the error tail if the subprocess exits non-zero. Final `OpProgress { phase="done" }`. |
 | `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pg_install_prefix>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |
@@ -619,12 +647,18 @@ into libpq's conninfo and redirect a basebackup to an attacker host.
 
 ### 5.12 Replay markers (idempotency)
 
-**Scope:** only `FollowPrimary` and `RecoveryFirstStage` carry replay
-markers. Both flows run `pg_basebackup` (conditionally for `FollowPrimary`,
-unconditionally for `RecoveryFirstStage`), which **wipes `$PGDATA` before
-streaming the primary's data**. Re-running a fully-completed flow would
-clobber the healthy standby's data dir with a fresh basebackup. The marker
-makes the second invocation a fast no-op.
+**Scope:** only `FollowPrimary` (the pgpool-hook handler) still carries
+replay markers. It runs `pg_basebackup` conditionally, which **wipes
+`$PGDATA` before streaming the primary's data**; re-running a
+fully-completed flow would clobber a healthy standby's data dir, and the
+marker makes the second invocation a fast no-op.
+
+`RecoveryFirstStage` **moved off markers** to `inflight_ops` (§5.3): it
+gets the same post-completion dedup, plus two things a binary marker
+cannot provide — rejection of *concurrent* duplicates, and visibility of
+an in-flight orchestration to `Failover`'s cross-op consult (§5.1 step
+3), without which stopping a recovery target made pgpool fire a hook
+that dropped the slot the recovery had just created.
 
 `Failover` deliberately has no marker — its operations are
 naturally-near-idempotent (see §5.1's note).
@@ -658,6 +692,16 @@ call for our threat model (re-fires after success are far more common
 than re-fires during execution).
 
 ### 5.13 Maintenance queue (durable retry of failed cleanups)
+
+> **Queued drops are stale instructions.** An intent records what looked
+> true when it was queued and retries with exponential backoff, so it
+> can execute minutes later — long enough for an orchestration to have
+> re-created that slot and started streaming through it. The worker
+> therefore runs the same `inflight_ops::owner_of_slot` guard as
+> `PgAgentPeer.DropSlot` before executing, and drops the intent
+> (`mark_done`) when an op owns the slot. The check is needed in *both*
+> places: the worker calls `LocalDb::drop_slot` directly when the target
+> is the local node, bypassing the RPC entirely.
 
 **Scope today: failed `DropSlot` retry only.** The queue's only
 production use is recovering from a peer (or local) `DropSlot` call that

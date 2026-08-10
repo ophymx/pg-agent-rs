@@ -122,6 +122,41 @@ pub(crate) fn handoff_phase_at_or_past(actual: &str, threshold: &str) -> bool {
 // unification" item; the two should eventually share this driver so
 // orchestration is agnostic about which node pulled the trigger.
 
+// `recovery_1st_stage` ladder. Mirrors the handoff/follow_primary
+// shape: one phase per externally-visible step, recorded before the
+// step's effect is durable so a crash leaves the journal pointing at
+// the step that may be half-done rather than one too early.
+pub(crate) const REC_PHASE_STARTED: &str = "started";
+pub(crate) const REC_PHASE_SLOT_CREATED: &str = "slot_created";
+pub(crate) const REC_PHASE_DATA_COPIED: &str = "data_copied";
+pub(crate) const REC_PHASE_STANDBY_CONFIGURED: &str = "standby_configured";
+
+/// How long a completed recovery suppresses an identical re-run.
+/// Preserves the semantics of the 24 h replay marker this ladder
+/// replaces (SPEC §5.12): pgpool may re-fire `recovery_1st_stage`
+/// after a partial success, and a second destructive reclone is not
+/// what it is asking for. `bypass_replay_marker` on the request
+/// overrides it, which is how `cluster recover` re-runs deliberately.
+pub(crate) const RECOVERY_DEDUP_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+
+/// How long a *finished* orchestration still counts as owning its
+/// target for `failover`'s cross-op consult.
+///
+/// pgpool's `failover_command` is a delayed reaction: health-check
+/// detection (`health_check_period` × retries) plus the hook's own
+/// exec time means a hook caused by "the recovery stopped its target"
+/// routinely arrives *after* the recovery has completed. Dropping the
+/// slot then is exactly as destructive as dropping it mid-flight, and
+/// the precondition check does not catch it either — the rebuilt
+/// standby has been started but has not necessarily reached
+/// `streaming` yet, so it reads as a legitimately-down node.
+///
+/// Two minutes comfortably clears a default pgpool detection window.
+/// The cost of being generous is bounded: it delays cleanup of a slot
+/// belonging to a node that really did fail moments after a recovery,
+/// and the maintenance queue reclaims that on the next genuine hook.
+pub const CROSS_OP_GRACE: chrono::Duration = chrono::Duration::seconds(120);
+
 pub(crate) const FP_PHASE_QUEUED: &str = "queued";
 pub(crate) const FP_PHASE_DIALING: &str = "dialing";
 pub(crate) const FP_PHASE_DETACHED_STOPPED: &str = "detached_stopped";
@@ -347,6 +382,38 @@ impl PgAgentLocal for LocalServer {
 
         if detached.id != old_primary.id {
             // §1: standby down. We're the primary; drop the slot locally.
+            //
+            // Cross-op consult first: an in-flight orchestration that
+            // owns this node's slot (recovery, follow_primary, handoff)
+            // deliberately stops its target's PostgreSQL, which is what
+            // made pgpool fire this hook. Dropping the slot now destroys
+            // the one that orchestration created and leaves a standby
+            // that can never stream — observed in the acceptance suite
+            // before this consult existed.
+            if let Some(owner) = self.inflight_owner_of(detached.id).await {
+                info!(
+                    detached = %detached.hostname,
+                    slot = %slot_name,
+                    op = %owner.payload.op_name(),
+                    id = %owner.id,
+                    phase = %owner.phase,
+                    "failover: in-flight op owns this node; skipping slot drop"
+                );
+                return self
+                    .write_replay_marker_then_ok(
+                        "failover",
+                        &replay_key,
+                        format!(
+                            "standby failover: slot {slot_name} retained — in-flight {} \
+                             (id={}, phase={}) owns node {}",
+                            owner.payload.op_name(),
+                            owner.id,
+                            owner.phase,
+                            detached.id
+                        ),
+                    )
+                    .await;
+            }
             //
             // Defense in depth, not the fix (promotion-authority §3): if
             // the announced-dead standby is reachable and demonstrably
@@ -853,16 +920,26 @@ impl PgAgentLocal for LocalServer {
             .standby
             .ok_or_else(|| Status::invalid_argument("recovery_1st_stage: standby is required"))?;
 
-        let replay_key = format!("primary={},standby={}", primary_ref.id, standby_ref.id);
+        let dedup_key = format!("primary={},standby={}", primary_ref.id, standby_ref.id);
         if req.bypass_replay_marker {
             info!(
-                %replay_key,
+                %dedup_key,
                 "recovery_1st_stage: bypass_replay_marker=true; running unconditionally"
             );
         } else {
-            match self.replay.has("recovery_1st_stage", &replay_key).await {
-                Ok(true) => {
-                    info!(%replay_key, "recovery_1st_stage: replay detected, skipping");
+            // Dedup against a recently-completed run of the same
+            // orchestration. (An *in-flight* duplicate is rejected
+            // structurally by `inflight.begin` below, which the replay
+            // marker could never do — it was only written after
+            // success.)
+            match self.inflight.find("recovery", &dedup_key).await {
+                Ok(Some(op))
+                    if op.status == crate::inflight_ops::InflightStatus::Done
+                        && op
+                            .completed_at
+                            .is_some_and(|t| chrono::Utc::now() - t < RECOVERY_DEDUP_WINDOW) =>
+                {
+                    info!(%dedup_key, id = %op.id, "recovery_1st_stage: recent completion, skipping");
                     // Distinct message from the basebackup-ran success
                     // case so operator-facing callers (cluster_recover)
                     // can flag this as "no work done" rather than the
@@ -870,15 +947,19 @@ impl PgAgentLocal for LocalServer {
                     // a silent skip on db2 on 2026-06-12.
                     return Ok(Response::new(OpResult {
                         ok: true,
-                        message: "recovery_1st_stage: skipped via replay marker \
-                                  (already processed within the 24h retention window)"
-                            .into(),
+                        message: format!(
+                            "recovery_1st_stage: skipped — an identical recovery completed \
+                             within the last {}h (op {}); pass --stop-target-pg via \
+                             `cluster recover` to force a fresh one",
+                            RECOVERY_DEDUP_WINDOW.num_hours(),
+                            op.id
+                        ),
                     }));
                 }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(e) => {
                     return Err(internal(anyhow::anyhow!(
-                        "recovery_1st_stage: idempotency marker check: {e}"
+                        "recovery_1st_stage: inflight lookup: {e}"
                     )));
                 }
             }
@@ -898,21 +979,60 @@ impl PgAgentLocal for LocalServer {
             "recovery_1st_stage"
         );
 
+        let slot_name = standby.slot_name();
+
+        // Journal before touching anything. The op is what tells a
+        // concurrent `failover` (fired by pgpool the moment this
+        // orchestration stops the target's PostgreSQL) that this node's
+        // slot belongs to an operation in progress.
+        let op = self
+            .inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: primary.id,
+                    standby_node_id: standby.id,
+                    standby_hostname: standby.hostname.clone(),
+                    slot_name: slot_name.clone(),
+                },
+                REC_PHASE_STARTED,
+                false,
+            )
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("recovery_1st_stage: journal begin: {e}")))?;
+        let op_id = op.id.clone();
+
+        // Abandon the journal entry on any failure below, so a later
+        // attempt isn't rejected as a duplicate of a run that died.
+        macro_rules! fail {
+            ($err:expr) => {{
+                let err = $err;
+                if let Err(je) = self.inflight.abandon(&op_id, &err.to_string()).await {
+                    warn!(id = %op_id, ?je, "recovery_1st_stage: journal abandon failed");
+                }
+                return Err(internal(err));
+            }};
+        }
+
         // SPEC §2: checkpoint then create_slot so the slot's restart_lsn
         // sits at the current WAL position. Without this, basebackup
         // could start from an older checkpoint and the slot would
         // immediately need WAL we no longer keep.
-        self.db
-            .checkpoint()
-            .await
-            .map_err(|e| internal(anyhow::anyhow!("recovery_1st_stage: checkpoint: {e}")))?;
+        if let Err(e) = self.db.checkpoint().await {
+            fail!(anyhow::anyhow!("recovery_1st_stage: checkpoint: {e}"));
+        }
 
-        let slot_name = standby.slot_name();
-        self.db.create_slot(&slot_name).await.map_err(|e| {
-            internal(anyhow::anyhow!(
+        if let Err(e) = self.db.create_slot(&slot_name).await {
+            fail!(anyhow::anyhow!(
                 "recovery_1st_stage: create slot {slot_name}: {e}"
-            ))
-        })?;
+            ));
+        }
+        if let Err(e) = self
+            .inflight
+            .update_phase(&op_id, REC_PHASE_SLOT_CREATED, None)
+            .await
+        {
+            warn!(id = %op_id, ?e, "recovery_1st_stage: journal phase update failed");
+        }
 
         // From here through `configure_standby`, any failure drops the
         // slot — it would otherwise pin WAL forever on this primary.
@@ -930,7 +1050,7 @@ impl PgAgentLocal for LocalServer {
                     &err,
                 )
                 .await;
-                return Err(internal(err));
+                fail!(err);
             }
         };
 
@@ -949,7 +1069,14 @@ impl PgAgentLocal for LocalServer {
                 &err,
             )
             .await;
-            return Err(internal(err));
+            fail!(err);
+        }
+        if let Err(e) = self
+            .inflight
+            .update_phase(&op_id, REC_PHASE_DATA_COPIED, None)
+            .await
+        {
+            warn!(id = %op_id, ?e, "recovery_1st_stage: journal phase update failed");
         }
 
         let cfg_opts = WriteRecoveryConfOpts {
@@ -970,20 +1097,24 @@ impl PgAgentLocal for LocalServer {
                 &err,
             )
             .await;
-            return Err(internal(err));
+            fail!(err);
+        }
+        if let Err(e) = self
+            .inflight
+            .update_phase(&op_id, REC_PHASE_STANDBY_CONFIGURED, None)
+            .await
+        {
+            warn!(id = %op_id, ?e, "recovery_1st_stage: journal phase update failed");
         }
 
         // SPEC §5: do NOT call pcp_attach_node here — pgpool drives
         // re-attachment after 2nd stage completes (which is triggered
         // by pgpool itself via pgpool_remote_start, not us).
-        self.replay
-            .mark_done("recovery_1st_stage", &replay_key)
-            .await
-            .map_err(|e| {
-                internal(anyhow::anyhow!(
-                    "recovery_1st_stage: idempotency marker write: {e}"
-                ))
-            })?;
+        self.inflight.complete(&op_id).await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "recovery_1st_stage: journal complete: {e}"
+            ))
+        })?;
 
         info!(
             primary = %primary.hostname,
@@ -1724,6 +1855,24 @@ impl PgAgentLocal for LocalServer {
             crate::inflight_ops::InflightPayload::FollowPrimary { .. } => {
                 self.resume_follow_primary(op).await
             }
+            // Recovery is journaled for visibility and for `failover`'s
+            // cross-op consult, but has no resume driver yet: restarting
+            // mid-ladder means re-running basebackup against a $PGDATA
+            // in an unknown state, which `cluster recover` already does
+            // correctly from the top. Point the operator at that rather
+            // than pretending to resume.
+            crate::inflight_ops::InflightPayload::Recovery {
+                standby_node_id, ..
+            } => Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "resume_inflight_op: op {} is a recovery, which has no resume driver. \
+                     Abandon it (`pg_agentctl ops abandon {}`) and re-run \
+                     `pg_agentctl cluster recover --target {} --stop-target-pg`, which \
+                     restarts the orchestration from a known state.",
+                    op.id, op.id, standby_node_id
+                ),
+            })),
         }
     }
 
@@ -2027,6 +2176,20 @@ enum FetchOutcome {
 }
 
 impl LocalServer {
+    /// The orchestration that owns `node_id`'s data directory /
+    /// replication slot, if any — in flight, or finished so recently
+    /// that a hook it caused may still be arriving.
+    ///
+    /// `failover` uses this to avoid acting destructively on a node
+    /// another operation is mid-way through rebuilding. A journal read
+    /// failure yields `None` — the same "proceed on absent evidence"
+    /// posture the precondition check takes, since refusing every
+    /// failover because the journal is unreadable would be worse than
+    /// the race it guards.
+    async fn inflight_owner_of(&self, node_id: i32) -> Option<crate::inflight_ops::InflightOp> {
+        crate::inflight_ops::owner_of_node(self.inflight.as_ref(), node_id, CROSS_OP_GRACE).await
+    }
+
     /// The reactive-failover lag gate (docs/promotion-authority.md §2.2,
     /// sequencing step 1). Compares the promotion candidate's WAL
     /// position against every *other* surviving node and returns a
@@ -3602,6 +3765,14 @@ mod tests {
         fn seed(&self, op: crate::inflight_ops::InflightOp) {
             self.ops.lock().unwrap().push(op);
         }
+        /// Age a completed op's `completed_at` backwards, so tests can
+        /// cross a time-based window without sleeping.
+        fn backdate_completion(&self, id: &str, by: chrono::Duration) {
+            let mut ops = self.ops.lock().unwrap();
+            if let Some(op) = ops.iter_mut().find(|o| o.id == id) {
+                op.completed_at = op.completed_at.map(|t| t - by);
+            }
+        }
     }
 
     #[async_trait]
@@ -4869,6 +5040,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failover_skips_slot_drop_while_a_recovery_owns_the_node() {
+        // The acceptance-suite race: `cluster recover --stop-target-pg`
+        // stops db1's PostgreSQL, pgpool fires failover_command with
+        // db1 detached, and the standby-down branch would drop the very
+        // slot the in-flight recovery just created. The detached node
+        // really IS down, so the precondition check cannot help — only
+        // the cross-op consult can.
+        let (s, db, _peers, _maint, _wal, replay, _pcp, _sd, _standby, inflight) = make_server();
+        inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: 0,
+                    standby_node_id: 1,
+                    standby_hostname: "peer1.local".into(),
+                    slot_name: "node1".into(),
+                },
+                REC_PHASE_SLOT_CREATED,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert!(resp.message.contains("retained"), "{}", resp.message);
+        assert!(
+            db.dropped_slots.lock().unwrap().is_empty(),
+            "the in-flight recovery's slot must survive"
+        );
+        assert!(replay
+            .has("failover", "detached=1,new_main=0,old_primary=0")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failover_skips_slot_drop_just_after_a_recovery_completes() {
+        // pgpool's hook is a delayed reaction: health-check detection
+        // plus exec time means the hook caused by "recovery stopped the
+        // target" routinely lands after the recovery finished. The
+        // rebuilt standby has been started but may not be `streaming`
+        // yet, so the precondition check reads it as legitimately down —
+        // only the grace window saves the slot.
+        let (s, db, _peers, _maint, _wal, _replay, _pcp, _sd, _standby, inflight) = make_server();
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: 0,
+                    standby_node_id: 1,
+                    standby_hostname: "peer1.local".into(),
+                    slot_name: "node1".into(),
+                },
+                REC_PHASE_SLOT_CREATED,
+                false,
+            )
+            .await
+            .unwrap();
+        inflight.complete(&op.id).await.unwrap();
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert!(resp.message.contains("retained"), "{}", resp.message);
+        assert!(
+            db.dropped_slots.lock().unwrap().is_empty(),
+            "a just-completed recovery's slot must survive the lagging hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_drops_slot_once_the_grace_window_has_passed() {
+        // Same shape, but the recovery completed long ago — nothing owns
+        // node 1 any more, so a genuine standby-down failover proceeds
+        // and the stale slot is reclaimed.
+        let (s, db, _peers, _maint, _wal, _replay, _pcp, _sd, _standby, inflight) = make_server();
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: 0,
+                    standby_node_id: 1,
+                    standby_hostname: "peer1.local".into(),
+                    slot_name: "node1".into(),
+                },
+                REC_PHASE_SLOT_CREATED,
+                false,
+            )
+            .await
+            .unwrap();
+        inflight.complete(&op.id).await.unwrap();
+        inflight.backdate_completion(&op.id, CROSS_OP_GRACE + chrono::Duration::seconds(1));
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    #[tokio::test]
     async fn failover_refuses_slot_drop_when_detached_standby_streaming() {
         // Standby-down flavor of the same false report: the standby is
         // reachable, in recovery, and streaming — dropping its slot
@@ -5070,16 +5349,34 @@ mod tests {
         assert_eq!(standby.start_calls.load(Ordering::SeqCst), 0);
         assert_eq!(standby.promote_calls.load(Ordering::SeqCst), 0);
         assert!(db.dropped_slots.lock().unwrap().is_empty());
-        assert!(replay
-            .has("recovery_1st_stage", "primary=0,standby=1")
+        // Journaled as a completed `recovery` op, walking the ladder.
+        let op = _inflight
+            .find("recovery", "primary=0,standby=1")
             .await
-            .unwrap());
+            .unwrap()
+            .expect("recovery op journaled");
+        assert_eq!(op.status, crate::inflight_ops::InflightStatus::Done);
+        assert_eq!(op.payload.target_node_id(), Some(1));
     }
 
     #[tokio::test]
-    async fn recovery_first_stage_skips_when_replay_marker_present() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
-        replay.mark("recovery_1st_stage", "primary=0,standby=1");
+    async fn recovery_first_stage_skips_after_a_recent_completion() {
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, inflight) = make_recovery_setup();
+        // A completed run of the same orchestration, moments ago.
+        let prior = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: 0,
+                    standby_node_id: 1,
+                    standby_hostname: "peer1.local".into(),
+                    slot_name: "node1".into(),
+                },
+                REC_PHASE_STARTED,
+                false,
+            )
+            .await
+            .unwrap();
+        inflight.complete(&prior.id).await.unwrap();
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
             .await
@@ -5090,16 +5387,16 @@ mod tests {
         // a silent skip vs. an actual basebackup. Two halves so a future
         // refactor of one of the strings doesn't break both tests.
         assert!(
-            resp.message.contains("skipped via replay marker"),
+            resp.message.contains("skipped"),
             "got: {}",
             resp.message
         );
         assert!(
-            resp.message.contains("24h retention window"),
+            resp.message.contains("within the last 24h"),
             "got: {}",
             resp.message
         );
-        // Nothing downstream of the marker touched.
+        // Nothing downstream of the dedup check touched.
         assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 0);
         assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 0);
     }
@@ -5230,10 +5527,6 @@ mod tests {
         assert_eq!(*db.created_slots.lock().unwrap(), vec!["node1".to_string()]);
         assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(standby.configure_standby_calls.load(Ordering::SeqCst), 1);
-        assert!(replay
-            .has("recovery_1st_stage", "primary=0,standby=1")
-            .await
-            .unwrap());
         // Post-recovery: PG started on target, pgpool started on target,
         // node attached in pgpool.
         assert_eq!(standby.start_calls.load(Ordering::SeqCst), 1);
@@ -5390,10 +5683,6 @@ mod tests {
         assert_eq!(standby.stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(db.checkpoint_calls.load(Ordering::SeqCst), 1);
         assert_eq!(standby.basebackup_calls.load(Ordering::SeqCst), 1);
-        assert!(replay
-            .has("recovery_1st_stage", "primary=0,standby=1")
-            .await
-            .unwrap());
     }
 
     #[tokio::test]

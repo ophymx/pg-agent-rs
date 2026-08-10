@@ -418,6 +418,9 @@ pub struct MaintenanceWorker {
     node_pool: NodePool,
     db: Arc<dyn LocalDb>,
     replay: Arc<dyn ReplayMarkerStore>,
+    /// Consulted before executing a `drop_slot_cleanup` — see
+    /// [`Self::process_drop_slot`].
+    inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
     sweep_every: Duration,
 }
 
@@ -428,6 +431,7 @@ impl MaintenanceWorker {
         node_pool: NodePool,
         db: Arc<dyn LocalDb>,
         replay: Arc<dyn ReplayMarkerStore>,
+        inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
         sweep_every: Duration,
     ) -> Self {
         Self {
@@ -436,6 +440,7 @@ impl MaintenanceWorker {
             node_pool,
             db,
             replay,
+            inflight,
             sweep_every,
         }
     }
@@ -513,6 +518,35 @@ impl MaintenanceWorker {
                     .await;
             }
         };
+
+        // A queued drop is a *stale* instruction: it was recorded when
+        // the slot looked abandoned, and it retries with exponential
+        // backoff. By the time it runs, an orchestration may have
+        // re-created that slot and be streaming through it — the
+        // acceptance suite caught this loop deleting a recovery's slot
+        // once per backoff step. The peer branch below is guarded
+        // server-side too, but the local branch calls `db.drop_slot`
+        // directly, so the check has to happen here as well.
+        if let Some(owner) = crate::inflight_ops::owner_of_slot(
+            self.inflight.as_ref(),
+            slot_name,
+            crate::localserver::CROSS_OP_GRACE,
+        )
+        .await
+        {
+            info!(
+                intent_id = %intent.id,
+                slot = slot_name,
+                op = %owner.payload.op_name(),
+                id = %owner.id,
+                phase = %owner.phase,
+                "maintenance: drop_slot dropped from the queue — an orchestration owns this slot"
+            );
+            if let Err(e) = self.store.mark_done(&intent.id).await {
+                return Err(anyhow::anyhow!("mark maintenance intent done: {e}"));
+            }
+            return Ok(());
+        }
 
         // Per-op timeout keeps a wedged peer from stalling the rest of
         // the sweep iteration. The sweep ctx is the long-lived agent
@@ -982,6 +1016,7 @@ mod tests {
             local_node_pool(),
             db,
             Arc::new(NoopReplay) as Arc<dyn ReplayMarkerStore>,
+            Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
             DEFAULT_SWEEP_INTERVAL,
         )
     }
