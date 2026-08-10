@@ -66,6 +66,26 @@ From [TODO.md](../TODO.md):
 The code did what the SPEC says. The SPEC trusts an authority that
 structurally cannot know the answer.
 
+**Reproduced on demand, 2026-08-09.** The production incident needed a
+coincidence (a daemon restart inside pgpool's health-check window). The
+structural claim does not: in the docker acceptance cluster
+([testing/README.md](../testing/README.md) S13), isolating the primary
+with `docker network disconnect` produces two primaries every time.
+Measured timeline, from a clean three-node cluster:
+
+```
+t+0s    primary db0 isolated from the network
+t+2s    db1 + db2 health checks fail → each pgpool fires failover_command
+t+82s   db1 promoted by the majority side
+        db0 still running as primary on the other side of the partition
+```
+
+Both sides behave correctly by their own lights: the majority cannot
+distinguish "db0 is dead" from "db0 is unreachable" and must not stall
+forever, and db0 has no reason to believe anything changed. That is
+§3's dilemma with real timestamps on it, and it is the regression test
+that must invert once the lease lands.
+
 ### 2.2 Candidate selection ignores WAL position
 
 Independent of split-brain, and easy to miss. From the pgpool failover

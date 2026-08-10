@@ -298,6 +298,164 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Phase 3 — repair, the remaining hook-contract measurements, and the
+# split-brain baseline the promotion-authority redesign exists to close.
+# ---------------------------------------------------------------------------
+if [ "${PHASE:-all}" = "2" ]; then
+    say "result"; echo "PASS=$PASS FAIL=$FAIL"
+    [ "$FAIL" -gt 0 ] && { printf '  - %s\n' "${FAILURES[@]}"; exit 1; }
+    exit 0
+fi
+
+# Which node is currently primary? Echoes db0|db1|db2, or nothing.
+current_primary() {
+    for n in db0 db1 db2; do
+        if xp "$n" "psql -tAc 'select pg_is_in_recovery()'" 2>/dev/null | grep -qx f; then
+            echo "$n"; return
+        fi
+    done
+}
+count_primaries() {
+    local c=0 n
+    for n in db0 db1 db2; do
+        if xp "$n" "psql -tAc 'select pg_is_in_recovery()'" 2>/dev/null | grep -qx f; then
+            c=$((c+1))
+        fi
+    done
+    echo "$c"
+}
+pcp_all() { # pcp_all <attach|detach> <node-id>
+    local verb="$1" nid="$2" n
+    for n in db0 db1 db2; do
+        xp "$n" "pcp_${verb}_node -h localhost -p 9898 -U pgpool -w -n $nid" >/dev/null 2>&1 || true
+    done
+}
+
+# Rebuild every non-primary node as a standby of the current primary,
+# then re-attach it in every pgpool instance (the fan-out §3 requires).
+#
+# The detach-first step is the operator workaround for the recover /
+# failover-hook race (TODO.md, testing/README.md finding 9): `cluster
+# recover --stop-target-pg` stops the target's PostgreSQL, pgpool fires
+# failover_command, and its standby-down branch drops the slot the
+# recovery just created. Detaching first means the backend is already
+# down in pgpool's view, so stopping it fires nothing.
+repair_cluster() {
+    local prim="$1" n nid
+    for n in db0 db1 db2; do
+        [ "$n" = "$prim" ] && continue
+        nid="${n#db}"
+        pcp_all detach "$nid"
+        sleep 3
+        xp "$prim" "pg_agentctl cluster recover --target $nid --stop-target-pg" \
+            > "/tmp/recover-$nid.log" 2>&1 || true
+        pcp_all attach "$nid"
+    done
+}
+
+say "S10: post-failover repair with the agent's own commands"
+PRIM=$(current_primary)
+if [ -n "$PRIM" ]; then ok "post-failover primary is $PRIM"; else bad "no primary after S9"; fi
+repair_cluster "$PRIM"
+wait_for 180 "$PRIM has 2 streaming standbys again" \
+    "[ \"\$(docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | tr -d ' ')\" = 2 ]"
+if [ "$(count_primaries)" = "1" ]; then
+    ok "exactly one primary after repair"
+else
+    bad "expected 1 primary after repair, found $(count_primaries)"
+fi
+
+say "S11: pgpool_status is sticky across a pgpool restart (hook-contract §5.3)"
+xp "$PRIM" "pcp_detach_node -h localhost -p 9898 -U pgpool -w -n 2" >/dev/null 2>&1 || true
+sleep 5
+x "$PRIM" "systemctl restart pgpool2"
+sleep 8
+if xp "$PRIM" "pcp_node_info -h localhost -p 9898 -U pgpool -w -n 2" 2>/dev/null | grep -q down; then
+    ok "node 2 still down after restart (status file survived; no leader to correct it)"
+else
+    bad "node 2 came back up on its own after restart"
+fi
+xp "$PRIM" "pcp_attach_node -h localhost -p 9898 -U pgpool -w -n 2" >/dev/null 2>&1 || true
+wait_for 30 "explicit attach clears the sticky down" \
+    "docker exec -u postgres pga-$PRIM pcp_node_info -h localhost -p 9898 -U pgpool -w -n 2 | grep -q ' up '"
+
+say "S12: follow_primary_command non-empty degenerates healthy standbys (§5.4)"
+for n in db0 db1 db2; do
+    x "$n" "FOLLOW_PRIMARY=/bin/true /usr/local/sbin/pg-agent-pgpool-setup" >/dev/null 2>&1
+done
+sleep 8
+wait_for 60 "pgpool healthy again with the non-empty hook configured" \
+    "docker exec -u postgres pga-$PRIM pcp_node_info -h localhost -p 9898 -U pgpool -w -a | grep -c ' up ' | grep -qx 3"
+x "$PRIM" "systemctl stop postgresql@17-main"
+sleep 40
+DOWN=$(xp db0 "pcp_node_info -h localhost -p 9898 -U pgpool -w -a" 2>/dev/null | grep -c down || true)
+echo "     backends marked down on db0's instance: ${DOWN:-?} of 3"
+if [ "${DOWN:-0}" -ge 2 ]; then
+    ok "non-empty follow_primary_command degenerated standbys too (${DOWN} down)"
+else
+    bad "expected >=2 backends down with the hook non-empty, saw ${DOWN}"
+fi
+# Restore the target contract everywhere and repair.
+for n in db0 db1 db2; do x "$n" "/usr/local/sbin/pg-agent-pgpool-setup" >/dev/null 2>&1; done
+PRIM=$(current_primary)
+if [ -z "$PRIM" ]; then
+    x db0 "systemctl start postgresql@17-main"; sleep 10; PRIM=$(current_primary)
+fi
+repair_cluster "$PRIM"
+wait_for 180 "cluster repaired again (primary $PRIM, 2 standbys)" \
+    "[ \"\$(docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | tr -d ' ')\" = 2 ]"
+
+say "S13: BASELINE — a partition produces split brain today"
+# The claim promotion-authority §2.1 rests on: with role derived from
+# pgpool's failure detector, an isolated-but-healthy primary and a
+# majority that promotes without it are both reachable at once. This
+# scenario is expected to FAIL SAFETY today; it is the regression test
+# that must invert once the lease lands (step 6/7).
+docker network disconnect pga-net "pga-$PRIM" >/dev/null 2>&1
+say "     (isolated $PRIM from the cluster network)"
+# Poll rather than sleep a fixed window: detection is health_check_period
+# × retries plus the hook round trip, and a too-short window reads as
+# "no split brain" when the promotion simply had not happened yet.
+MAJ_PRIMARY=""
+waited=0
+while [ "$waited" -lt 150 ]; do
+    for n in db0 db1 db2; do
+        [ "$n" = "$PRIM" ] && continue
+        if xp "$n" "psql -tAc 'select pg_is_in_recovery()'" 2>/dev/null | grep -qx f; then
+            MAJ_PRIMARY="$n"
+        fi
+    done
+    [ -n "$MAJ_PRIMARY" ] && break
+    sleep 10; waited=$((waited+10))
+done
+ISO_PRIMARY=no
+if xp "$PRIM" "psql -tAc 'select pg_is_in_recovery()'" 2>/dev/null | grep -qx f; then ISO_PRIMARY=yes; fi
+echo "     isolated $PRIM still primary: $ISO_PRIMARY | majority-side primary: ${MAJ_PRIMARY:-none}"
+if [ "$ISO_PRIMARY" = yes ] && [ -n "$MAJ_PRIMARY" ]; then
+    ok "BASELINE CONFIRMED: two primaries under partition (split brain is reachable)"
+    SPLIT=yes
+else
+    ok "no split brain observed this run (isolated=$ISO_PRIMARY majority=${MAJ_PRIMARY:-none})"
+    SPLIT=no
+fi
+docker network connect pga-net "pga-$PRIM" >/dev/null 2>&1
+sleep 10
+if [ "$SPLIT" = yes ]; then
+    say "S13b: the existing mitigation — phantom check stops the stale primary"
+    x "$PRIM" "systemctl restart pg_agentd" || true
+    sleep 20
+    if log_has "$PRIM" 'phantom-primary check: detected'; then
+        ok "restarted agent detected the phantom primary"
+    else
+        bad "phantom check did not flag the stale primary"
+    fi
+    wait_for 60 "stale primary's PostgreSQL was stopped" \
+        "! docker exec pga-$PRIM systemctl is-active -q postgresql@17-main"
+    echo "     NOTE: the mitigation needs an agent restart to fire — nothing"
+    echo "     stops the stale primary while it keeps running."
+fi
+
+# ---------------------------------------------------------------------------
 say "result"
 echo "PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then

@@ -113,6 +113,10 @@ chown postgres:postgres /var/lib/postgresql/.pcppass
 chmod 0600 /var/lib/postgresql/.pcppass
 
 # --- start (BOOTSTRAP Phase 3.1) --------------------------------------
+# Discard any cached backend status: this is a config-changing restart,
+# and down-status is otherwise sticky with no watchdog leader to correct
+# it (measured in S11 / hook-contract §5.3). Equivalent to `pgpool -D`.
+rm -f /var/log/postgresql/pgpool_status
 systemctl unmask pgpool2.service
 systemctl restart pgpool2.service
 echo "pgpool-setup: started on $(hostname)"

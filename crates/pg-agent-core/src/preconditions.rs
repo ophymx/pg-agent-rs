@@ -24,7 +24,22 @@
 use crate::config::NodeConfig;
 use crate::peers::PeerRegistry;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::warn;
+
+/// Budget for gathering the evidence. Deliberately much tighter than
+/// the peer mesh's general request timeout: this check sits on the
+/// **critical path of every failover**, and the case it must answer
+/// fastest — the announced-dead node really is dead — is exactly the
+/// case where the RPC never returns.
+///
+/// Measured in the docker acceptance suite before this bound existed:
+/// a partition-triggered failover stalled 30 s inside the precondition
+/// check (an already-established channel to the isolated peer hung
+/// until the full request timeout) before proceeding, adding 30 s to
+/// the outage it was reacting to. Evidence we cannot get in five
+/// seconds is evidence we do not get.
+pub const PRECONDITION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A cluster-state-changing action about to be taken, described with
 /// enough context to check it against live cluster state. Handlers add
@@ -66,18 +81,26 @@ pub async fn validate_cluster_preconditions(
         | ClusterIntent::DropSlotBecauseStandbyDown { detached } => *detached,
     };
 
-    let status = match peers.client(detached).await {
-        Ok(client) => match client.get_status().await {
-            Ok(s) => s,
-            Err(e) => {
-                return PreconditionOutcome::Unverifiable {
-                    reason: format!("get_status({}): {e}", detached.hostname),
-                };
-            }
-        },
-        Err(e) => {
+    let probe = async {
+        let client = peers
+            .client(detached)
+            .await
+            .map_err(|e| format!("dial {}: {e}", detached.hostname))?;
+        client
+            .get_status()
+            .await
+            .map_err(|e| format!("get_status({}): {e}", detached.hostname))
+    };
+    let status = match tokio::time::timeout(PRECONDITION_TIMEOUT, probe).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(reason)) => return PreconditionOutcome::Unverifiable { reason },
+        Err(_) => {
             return PreconditionOutcome::Unverifiable {
-                reason: format!("dial {}: {e}", detached.hostname),
+                reason: format!(
+                    "{} did not answer within {}s",
+                    detached.hostname,
+                    PRECONDITION_TIMEOUT.as_secs()
+                ),
             };
         }
     };
@@ -128,4 +151,100 @@ pub fn log_unverifiable(check: &str, reason: &str) {
          would trade split-brain risk for guaranteed unavailability — see \
          docs/promotion-authority.md §3)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peers::{PeerClient, PeerRegistry};
+    use async_trait::async_trait;
+    use pg_agent_proto::pgagentpb as pb;
+
+    /// Peer whose `get_status` never returns — an isolated node with an
+    /// already-established channel, which is what a partition looks
+    /// like from here.
+    struct HangingPeer;
+
+    #[async_trait]
+    impl PeerClient for HangingPeer {
+        async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
+            std::future::pending().await
+        }
+        async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn create_slot(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn get_node_config(&self) -> anyhow::Result<pb::NodeConfigResponse> {
+            unreachable!()
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn rewind(&self, _: crate::pgstandby::RewindOpts) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn basebackup(&self, _: crate::pgstandby::BasebackupOpts) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn configure_standby(
+            &self,
+            _: crate::pgstandby::WriteRecoveryConfOpts,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn promote(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn fetch_wal(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+            unreachable!()
+        }
+    }
+
+    struct HangingRegistry;
+
+    #[async_trait]
+    impl PeerRegistry for HangingRegistry {
+        async fn client(&self, _: &NodeConfig) -> anyhow::Result<Arc<dyn PeerClient>> {
+            Ok(Arc::new(HangingPeer))
+        }
+        async fn close(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_peer_yields_unverifiable_within_the_budget() {
+        let node = NodeConfig {
+            id: 0,
+            hostname: "db0".into(),
+        };
+        let started = tokio::time::Instant::now();
+        let outcome = validate_cluster_preconditions(
+            Arc::new(HangingRegistry),
+            ClusterIntent::PromoteBecausePrimaryDown { detached: &node },
+        )
+        .await;
+        // Auto-advanced virtual clock: assert the bound, not wall time.
+        assert!(
+            started.elapsed() <= PRECONDITION_TIMEOUT,
+            "precondition must not outlive its budget"
+        );
+        match outcome {
+            PreconditionOutcome::Unverifiable { reason } => {
+                assert!(reason.contains("did not answer"), "{reason}");
+            }
+            _ => panic!("expected Unverifiable"),
+        }
+    }
 }

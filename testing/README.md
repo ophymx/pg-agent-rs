@@ -80,14 +80,38 @@ watchdog **off**, `failover_command` as an advisory poke,
 
 Run `PHASE=1 testing/acceptance.sh` to stop before pgpool comes up.
 
-## Phase 3 (planned)
+## Phase 3 — repair, the rest of the hook contract, and the baseline
 
-- Network partitions (`docker network disconnect`) once the real
-  consensus store exists — partition scenarios against a process-local
-  shadow store prove nothing. This is step 6's acceptance criteria.
-- The three unmeasured hook-contract items: `pgpool_status` staleness
-  after an instance restart, `follow_primary_command` non-empty
-  mass-degeneration, `detach_false_primary` storms.
+- **S10** — post-failover repair with the agent's own commands
+  (`cluster recover` per surviving node, then the pgpool attach
+  fan-out). Asserts the cluster returns to one primary + two streaming
+  standbys. This is the scenario that exposed finding 9.
+- **S11** — `pgpool_status` is sticky across a pgpool restart
+  (hook-contract §5.3): a detached backend stays detached, and only an
+  explicit attach clears it.
+- **S12** — `follow_primary_command` non-empty degenerates healthy
+  standbys (hook-contract §5.4), the claim that made the contract say
+  *remove* rather than *notify-only*. Sets the hook to `/bin/true`,
+  fails the primary over, and counts the backends pgpool marks down.
+- **S13** — **the split-brain baseline.** Partitions the primary off
+  the network (`docker network disconnect`) and checks whether the
+  majority promotes while the isolated node keeps running as primary.
+  This scenario **records unsafety, and is expected to**: it is the
+  empirical form of promotion-authority §2.1, and it is the regression
+  test that must invert once the lease lands. **S13b** then shows the
+  one mitigation that exists today — restarting the agent on the stale
+  primary makes the phantom check stop it — and how narrow it is
+  (nothing fires while the stale primary just keeps running).
+
+Run `PHASE=1` to stop before pgpool, `PHASE=2` to stop before phase 3.
+
+## Phase 4 (planned)
+
+- Partition scenarios that assert *safety* rather than record
+  unsafety — i.e. S13 inverted — once openraft replaces the
+  process-local shadow store. This is step 6's acceptance criteria.
+- `detach_false_primary` storm behavior (hook-contract §5.5), which
+  needs a false primary manufactured out of band.
 - `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
 
 ## Findings log
@@ -174,3 +198,44 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
    flags the deviation, which means at cutover the tools will report
    the *intended* configuration as drift. `gen-pgpool` needs a
    target-contract mode before step 7.
+9. **`cluster recover` races pgpool's failover hook and loses its slot
+   — open bug, see TODO.md.** `cluster recover --target N
+   --stop-target-pg` stops the target's PostgreSQL; pgpool sees that
+   backend go down and fires `failover_command`; the agent's
+   standby-down branch drops the detached node's replication slot —
+   the slot the in-flight recovery just created. Recovery reports
+   `OK: recovery complete`, the standby starts, and PostgreSQL fails
+   with `replication slot "nodeN" does not exist`. The precondition
+   check does not help (the standby genuinely *is* down), and
+   `failover`'s cross-op consult only knows about in-flight *handoff*
+   ops because recovery still uses replay markers rather than
+   `inflight_ops`. `repair_cluster` in this suite works around it the
+   way an operator must today: detach the target everywhere first.
+10. **The split-brain baseline is reproducible on demand.** Isolating
+    the primary with `docker network disconnect` yields two primaries
+    every time: majority-side promotion at ~t+82s while the isolated
+    node keeps serving. Recorded with its timeline in
+    promotion-authority §2.1. Note S13's polling window must exceed the
+    full promotion latency (below) or the scenario silently reports "no
+    split brain" — an earlier run did exactly that.
+11. **Two timeout bugs on the failover critical path — both fixed.**
+    The partition probe's ~80 s promotion latency decomposed into two
+    defects, neither visible without a real unreachable peer:
+    - The precondition check cost a flat **30 s**. An
+      already-established peer channel to an isolated node does not
+      fail fast — it hangs until the full request timeout — so every
+      failover reacting to a genuine outage paid 30 s before
+      proceeding. Now bounded by `PRECONDITION_TIMEOUT` (5 s):
+      evidence we cannot get in five seconds is evidence we do not get.
+    - `LONG_RPC_TIMEOUT` (300 s) was **silently capped at 30 s**. The
+      endpoint-level `.timeout(DEFAULT_REQUEST_TIMEOUT)` installs a
+      tower layer that cancels the response future regardless of any
+      per-request `set_timeout`, so `Start`/`Stop`/`Promote` never got
+      the budget they asked for. Observed as
+      `promote db1: peer promote: Timeout expired` at exactly 30 s —
+      *while the promotion had already succeeded server-side*, since
+      `pg_promote()` alone waits up to 60 s by default. A failover that
+      works reporting failure is worse than one that fails: it invites
+      a retry against a node that is already primary. The channel
+      ceiling is now `LONG_RPC_TIMEOUT`, with fast unary RPCs bounded
+      client-side by `short_rpc`.

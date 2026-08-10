@@ -5,6 +5,52 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
+### `cluster recover` races pgpool's failover hook and loses its slot
+
+- **Where:** `crates/pg-agent-core/src/localserver.rs::cluster_recover`
+  / `recovery_first_stage` (creates the slot) vs. `failover`'s
+  standby-down branch (drops it).
+- **Reproduced** in the docker acceptance suite, 2026-08-09:
+
+  ```
+  20:08:18  cluster_recover: stopping postgres on target (--stop-target-pg) target=db1
+  20:08:18  recovery_1st_stage: running                      # creates slot node1
+  20:08:21  failover: standby down, dropping replication slot detached=db1 slot=node1
+  20:08:23  recovery_1st_stage: complete ... slot=node1
+  20:08:45  peer: DropSlot slot=node1
+  ```
+
+  `cluster recover --target N --stop-target-pg` stops the target's
+  PostgreSQL. pgpool sees that backend go down and fires
+  `failover_command` on **every** instance; the agent's standby-down
+  branch does its job and drops the detached node's replication slot —
+  which is the slot the in-flight recovery just created. `cluster
+  recover` then reports `OK: recovery complete`, the standby starts,
+  and PostgreSQL fails with `could not start WAL streaming: ERROR:
+  replication slot "node1" does not exist`. The recovery is silently
+  useless.
+- **Why the existing guards miss it:** the precondition check
+  (§5.1 step 3) correctly proceeds — the standby really *is* down, we
+  stopped it. `failover` does have a cross-op consult, but only against
+  in-flight **handoff** ops in `inflight_ops`; `recovery_first_stage`
+  still uses binary replay markers, so there is no in-flight record for
+  it to find. This is the concrete cost of the "migrate replay markers
+  to `inflight_ops`" item below.
+- **Fix shape (needs deciding):**
+  1. *Preferred:* journal recovery in `inflight_ops` (a `Recovery {
+     target_node_id }` payload), and have `failover`'s standby-down
+     branch skip the slot drop when an `InProgress` op targets the
+     detached node — the same shape the handoff consult already uses.
+  2. *Or:* have `cluster_recover` `pcp_detach_node` the target on every
+     pgpool instance before stopping it, so the backend is already down
+     in pgpool's view and going down cannot fire a fresh hook. Cheaper,
+     but the detach itself fires the hook once (acceptance S8), so the
+     ordering only works because the slot does not exist yet at that
+     point — fragile in a way (1) is not.
+- **Operator workaround today:** detach the target everywhere first,
+  then recover, then re-attach. The acceptance harness does exactly
+  this in `repair_cluster`.
+
 ### `gen-pgpool` emits hooks the agent-led target contract forbids
 
 - **Where:** `crates/pg-agent-hookspec/src/lib.rs::pgpool_hooks()` (the

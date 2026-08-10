@@ -260,7 +260,18 @@ impl PeerPool {
         let endpoint = Endpoint::from_shared(addr.clone())
             .map_err(|e| anyhow::anyhow!("peer dial {addr}: invalid uri: {e}"))?
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            // Channel-wide ceiling only. It must NOT be
+            // DEFAULT_REQUEST_TIMEOUT: this tower layer cancels the
+            // response future regardless of any per-request
+            // `set_timeout`, so a 30 s value silently capped the
+            // 300 s LONG_RPC_TIMEOUT that Start/Stop/Promote ask for.
+            // Observed in the docker acceptance suite: a partition-
+            // triggered failover reported `promote: Timeout expired`
+            // at exactly 30 s while the promotion had in fact
+            // succeeded server-side (pg_promote() alone waits up to
+            // 60 s by default). Short RPCs get their deadline from
+            // `short_rpc` below instead.
+            .timeout(LONG_RPC_TIMEOUT)
             .keep_alive_while_idle(true)
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL);
 
@@ -368,6 +379,28 @@ struct PeerChannel {
     inner: PgAgentPeerClient<Channel>,
 }
 
+/// Bound a fast unary RPC at [`DEFAULT_REQUEST_TIMEOUT`].
+///
+/// The channel's own ceiling is [`LONG_RPC_TIMEOUT`] so `Start` / `Stop`
+/// / `Promote` get the budget they ask for; everything else is a
+/// metadata call that must fail fast instead of riding that ceiling.
+/// Enforced client-side here rather than via `Request::set_timeout`,
+/// which only writes the `grpc-timeout` header for the *server* to
+/// honour — useless when the peer is unreachable, which is exactly when
+/// the deadline matters.
+async fn short_rpc<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, fut).await {
+        Ok(v) => v,
+        Err(_) => anyhow::bail!(
+            "peer {what}: timed out after {}s",
+            DEFAULT_REQUEST_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 #[async_trait]
 impl PeerClient for PeerChannel {
     async fn create_slot(&self, slot_name: &str) -> anyhow::Result<()> {
@@ -375,15 +408,18 @@ impl PeerClient for PeerChannel {
         let req = CreateSlotRequest {
             slot_name: slot_name.to_string(),
         };
-        let resp = client
-            .create_slot(req)
-            .await
-            .map_err(|s| anyhow::anyhow!("peer create_slot: {}", s.message()))?
-            .into_inner();
-        if !resp.ok {
-            anyhow::bail!("peer create_slot: {}", resp.message);
-        }
-        Ok(())
+        short_rpc("create_slot", async move {
+            let resp = client
+                .create_slot(req)
+                .await
+                .map_err(|s| anyhow::anyhow!("peer create_slot: {}", s.message()))?
+                .into_inner();
+            if !resp.ok {
+                anyhow::bail!("peer create_slot: {}", resp.message);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn drop_slot(&self, slot_name: &str) -> anyhow::Result<()> {
@@ -391,25 +427,30 @@ impl PeerClient for PeerChannel {
         let req = DropSlotRequest {
             slot_name: slot_name.to_string(),
         };
-        let resp = client
-            .drop_slot(req)
-            .await
-            .map_err(|s| anyhow::anyhow!("peer drop_slot: {}", s.message()))?
-            .into_inner();
-        if !resp.ok {
-            anyhow::bail!("peer drop_slot: {}", resp.message);
-        }
-        Ok(())
+        short_rpc("drop_slot", async move {
+            let resp = client
+                .drop_slot(req)
+                .await
+                .map_err(|s| anyhow::anyhow!("peer drop_slot: {}", s.message()))?
+                .into_inner();
+            if !resp.ok {
+                anyhow::bail!("peer drop_slot: {}", resp.message);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
         let mut client = self.inner.clone();
-        let resp = client
-            .get_node_config(NodeConfigRequest {})
-            .await
-            .map_err(|s| anyhow::anyhow!("peer get_node_config: {}", s.message()))?
-            .into_inner();
-        Ok(resp)
+        short_rpc("get_node_config", async move {
+            Ok(client
+                .get_node_config(NodeConfigRequest {})
+                .await
+                .map_err(|s| anyhow::anyhow!("peer get_node_config: {}", s.message()))?
+                .into_inner())
+        })
+        .await
     }
 
     async fn start(&self) -> anyhow::Result<()> {
@@ -471,11 +512,14 @@ impl PeerClient for PeerChannel {
 
     async fn get_status(&self) -> anyhow::Result<NodeStatus> {
         let mut client = self.inner.clone();
-        Ok(client
-            .get_status(GetStatusRequest {})
-            .await
-            .map_err(|s| anyhow::anyhow!("peer get_status: {}", s.message()))?
-            .into_inner())
+        short_rpc("get_status", async move {
+            Ok(client
+                .get_status(GetStatusRequest {})
+                .await
+                .map_err(|s| anyhow::anyhow!("peer get_status: {}", s.message()))?
+                .into_inner())
+        })
+        .await
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
