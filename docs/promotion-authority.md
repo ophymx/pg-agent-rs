@@ -920,10 +920,35 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
      Cheap either way precisely because this document makes the file
      disposable.
 
-   Remaining in this step: the `RaftNetwork` impl and `PgAgentRaft`
-   service (own channel, per "Transport"), a `ConsensusStore` impl over
-   the Raft handle with `ensure_linearizable` for `read_state`,
-   membership bootstrap in `ClusterInit`, and the `validate-env` checks.
+   **Transport landed** (post-0.7.3): `raftnet` module + the
+   `PgAgentRaft` service in `proto/pgagent_raft.proto` — `RaftGrpcService`
+   inbound on `PeerServer`'s own listener (`PeerServer::with_raft`, same
+   port, same certs, same SAN allowlist, so the mTLS gate that guards
+   the peer plane's mutating RPCs guards this one unchanged), and
+   `RaftChannelFactory`/`RaftPeerNetwork` outbound on *separate*
+   channels, per this section's starvation argument. Proven by three
+   real Raft nodes over three real sockets electing a leader and
+   committing a lease takeover; stubbing `append_entries` fails that
+   test, so it measures the transport rather than assuming it.
+
+   Two decisions this section did not make:
+
+   - **Frames are opaque.** Requests cross the wire as serialized
+     openraft types, not protobuf-mirrored fields. Mirroring would
+     re-declare a large slice of openraft's internals and re-do it every
+     upgrade, buying interop that cannot arise — both ends are the same
+     binary at the same version. The cost is real and named in the
+     `.proto`: `grpcurl` sees a blob, so debugging the consensus plane
+     goes through agent logs and openraft metrics.
+   - **Every transport failure is `Unreachable`, never `NetworkError`.**
+     openraft hot-retries the latter and backs off on the former, and
+     hot-retrying a partitioned peer spins CPU on the node still trying
+     to hold quorum together.
+
+   Remaining in this step: a `ConsensusStore` impl over the Raft handle
+   with `ensure_linearizable` for `read_state`, Raft construction and
+   membership bootstrap in `ClusterInit`, wiring `with_raft` in `Agent`,
+   and the `validate-env` checks.
 7. **(M)** Cut over: SPEC §5.1 rewrite, pgpool config contract, watchdog off.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.

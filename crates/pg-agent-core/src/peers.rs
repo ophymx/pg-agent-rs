@@ -343,7 +343,9 @@ impl PeerRegistry for PeerPool {
 /// [`Endpoint::connect_with_connector`]'s `Service<Uri>` bound: each
 /// invocation yields a `TokioIo<TlsStream<TcpStream>>` (hyper's Read/Write
 /// traits via the bridge).
-async fn connect_mtls(
+/// Shared with the consensus plane ([`crate::raftnet`]), which dials its
+/// own channels but over the same mTLS material and the same connector.
+pub(crate) async fn connect_mtls(
     endpoint: Endpoint,
     cfg: Arc<ClientConfig>,
     port: u16,

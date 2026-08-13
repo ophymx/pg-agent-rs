@@ -32,6 +32,7 @@ pub mod pgpool_supervisor;
 pub mod pgstandby;
 pub mod preconditions;
 pub mod preflight;
+pub mod raftnet;
 pub mod raftstore;
 pub mod replay_markers;
 pub mod retry;

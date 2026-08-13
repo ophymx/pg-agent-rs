@@ -11,7 +11,12 @@ use std::error::Error;
 
 const PROTO_ROOT: &str = "../../proto";
 
-const PROTOS: &[&str] = &["common.proto", "pgagent_local.proto", "pgagent_peer.proto"];
+const PROTOS: &[&str] = &[
+    "common.proto",
+    "pgagent_local.proto",
+    "pgagent_peer.proto",
+    "pgagent_raft.proto",
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     for p in PROTOS {

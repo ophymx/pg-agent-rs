@@ -32,11 +32,13 @@ use crate::localdb::LocalDb;
 use crate::pgstandby::{
     allowed_slot_name, BasebackupOpts, ProgressCb, RewindOpts, StandbyOps, WriteRecoveryConfOpts,
 };
+use crate::raftnet::RaftGrpcService;
 use crate::systemd::Systemd;
 use crate::walstore::WalStore;
 use futures_core::Stream;
 use pg_agent_proto::pgagentpb::{
     pg_agent_peer_server::{PgAgentPeer, PgAgentPeerServer},
+    pg_agent_raft_server::PgAgentRaftServer,
     BasebackupRequest, ConfigureStandbyRequest, CreateSlotRequest, DropSlotRequest,
     FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse, NodeStatus,
     OpProgress, OpResult, PromoteRequest, ReloadPgpoolRequest, ReloadRequest, RemoveVipRequest,
@@ -212,6 +214,11 @@ pub struct PeerServer {
     /// The slot lives here, so this node's journal — not the caller's —
     /// is the authority on whether an orchestration still needs it.
     inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
+    /// The consensus plane, served on this same listener when Raft is
+    /// running (promotion-authority §5, "Transport"): same port, same
+    /// certs, same SAN allowlist. `None` until the node has a Raft
+    /// instance, which is every deployment before cutover.
+    raft: Option<PgAgentRaftServer<RaftGrpcService>>,
 }
 
 impl PeerServer {
@@ -230,7 +237,18 @@ impl PeerServer {
             standby,
             wal,
             inflight,
+            raft: None,
         }
+    }
+
+    /// Also serve the consensus plane on this listener.
+    ///
+    /// Sharing the listener is deliberate and is only the *inbound*
+    /// half: outbound, Raft dials its own channels, because heartbeats
+    /// must not queue behind a basebackup. See [`crate::raftnet`].
+    pub fn with_raft(mut self, raft: crate::raftnet::PgAgentRaftHandle) -> Self {
+        self.raft = Some(RaftGrpcService::new(raft).into_server());
+        self
     }
 
     /// The orchestration that owns `slot_name`, if any — in flight, or
@@ -268,13 +286,15 @@ impl PeerServer {
     }
 
     async fn serve_plain(
-        self,
+        mut self,
         listener: TcpListener,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
         info!("peer server: starting (plain TCP — dev mode)");
         let incoming = TcpListenerStream::new(listener);
+        let raft = self.raft.take();
         Server::builder()
+            .add_optional_service(raft)
             .add_service(PgAgentPeerServer::new(self))
             .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
             .await
@@ -288,7 +308,7 @@ impl PeerServer {
     }
 
     async fn serve_mtls(
-        self,
+        mut self,
         listener: TcpListener,
         tls: PeerTlsConfig,
         shutdown: CancellationToken,
@@ -350,7 +370,9 @@ impl PeerServer {
         });
 
         let incoming = ReceiverStream::new(rx);
+        let raft = self.raft.take();
         let serve_result = Server::builder()
+            .add_optional_service(raft)
             .add_service(PgAgentPeerServer::new(self))
             .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
             .await;
@@ -1867,5 +1889,99 @@ mod tests {
             AllowlistClientCertVerifier::new(Arc::new(roots), allowed).expect_err("empty roots");
         // VerifierBuilderError prints variant name; precise message is webpki-internal.
         let _ = format!("{err:?}");
+    }
+
+    // ----- consensus plane on the shared listener ---------------------------
+
+    /// `with_raft` must actually mount `PgAgentRaft` on the same
+    /// listener as `PgAgentPeer` — the inbound half of the transport
+    /// design. Serving it on a second port would still pass every test
+    /// in `raftnet`, so the assertion has to be made here: one socket,
+    /// both services answering.
+    #[tokio::test]
+    async fn with_raft_serves_both_services_on_one_listener() {
+        use crate::raftnet::{RaftChannelFactory, RAFT_CONNECT_TIMEOUT};
+        use crate::raftstore::{open_database, RedbLogStore, RedbStateMachine};
+        use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
+        use pg_agent_proto::pgagentpb::pg_agent_peer_client::PgAgentPeerClient;
+
+        let dir = TempDir::new().unwrap();
+        let db_raft = open_database(dir.path()).unwrap();
+        let raft = openraft::Raft::new(
+            0u64,
+            Arc::new(openraft::Config::default().validate().unwrap()),
+            RaftChannelFactory::new_dev(),
+            RedbLogStore::new(db_raft.clone()),
+            RedbStateMachine::new(db_raft).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let (server, ..) = make_server();
+        let server = server.with_raft(raft);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.serve(listener, None, s).await });
+
+        // The peer plane answers.
+        let mut peer = PgAgentPeerClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let status = peer
+            .get_status(Request::new(GetStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.replication_lag_bytes, 42);
+
+        // ...and so does the consensus plane, on that same socket. An
+        // uninitialized Raft still answers a vote; what is being proved
+        // is that the request was routed, not what it decided.
+        let mut factory = RaftChannelFactory::new_dev();
+        let mut net = factory.new_client(0, &BasicNode::new(addr.clone())).await;
+        let resp = net
+            .vote(
+                openraft::raft::VoteRequest::new(openraft::Vote::new(1, 0), None),
+                openraft::network::RPCOption::new(RAFT_CONNECT_TIMEOUT),
+            )
+            .await
+            .expect("raft vote must be routed on the shared listener");
+        assert!(resp.vote.leader_id().voted_for().is_some());
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// Without `with_raft` the consensus service must be absent, not
+    /// merely idle — a node that has not joined Raft should refuse the
+    /// RPC rather than answer for a state machine it does not have.
+    #[tokio::test]
+    async fn without_raft_the_consensus_service_is_unimplemented() {
+        use pg_agent_proto::pgagentpb::pg_agent_raft_client::PgAgentRaftClient;
+        use pg_agent_proto::pgagentpb::RaftFrame;
+
+        let (server, ..) = make_server();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.serve(listener, None, s).await });
+
+        let mut client = PgAgentRaftClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let err = client
+            .vote(Request::new(RaftFrame {
+                payload: b"{}".to_vec(),
+            }))
+            .await
+            .expect_err("no raft service should be mounted");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 }

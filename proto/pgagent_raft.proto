@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package pgagentpb;
+
+// PgAgentRaft — the consensus plane (docs/promotion-authority.md §5).
+//
+// Served on the same mTLS TCP listener as PgAgentPeer: same port, same
+// certs, same SAN allowlist. Only the *client* side is separate — Raft
+// dials its own channel rather than sharing PgAgentPeer's, because
+// AppendEntries heartbeats are small, frequent and latency-critical
+// while Basebackup streams gigabytes, and sharing an HTTP/2 connection
+// lets a saturated basebackup starve heartbeats at the TCP layer and
+// trigger a spurious election — during a recovery, which is exactly
+// when an election is least welcome.
+//
+// Payloads are opaque, deliberately.
+//
+// Every message here is an openraft type (AppendEntriesRequest,
+// VoteResponse, ...) carried as a serialized frame rather than mirrored
+// field-by-field in protobuf. Mirroring would mean re-declaring a large
+// surface of openraft's internals — log ids, votes, membership configs,
+// entry payloads — and re-doing it on every openraft upgrade, in
+// exchange for interop this service will never need: both ends of this
+// RPC are the same binary at the same version. A version skew across
+// nodes is a rolling-restart concern for the whole agent, not something
+// protobuf's field compatibility would rescue on its own.
+//
+// The cost is honest and worth naming: `grpcurl` against this service
+// shows a byte blob, not a decoded request. Debugging the consensus
+// plane goes through the agent's own logs and `openraft` metrics.
+
+// A serialized openraft message. Encoding is JSON (serde), matching the
+// storage impl; volume is near-zero in steady state because retain is a
+// read, so a compact codec would buy nothing worth the extra dependency.
+message RaftFrame {
+  bytes payload = 1;
+}
+
+service PgAgentRaft {
+  // Replication + heartbeat. The hot path: sent to every follower every
+  // heartbeat interval, empty when there is nothing to replicate.
+  rpc AppendEntries   (RaftFrame) returns (RaftFrame);
+  // Leader election.
+  rpc Vote            (RaftFrame) returns (RaftFrame);
+  // Snapshot installation, chunked by openraft's default
+  // `full_snapshot` implementation.
+  rpc InstallSnapshot (RaftFrame) returns (RaftFrame);
+}
