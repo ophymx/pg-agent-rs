@@ -14,7 +14,8 @@
 //! struct simply holds no `Systemd`, no `Pcp`, no `StandbyOps`, and
 //! never dials a peer mutation RPC. Its only writes go to the
 //! [`ConsensusStore`], which today is the process-local
-//! [`InMemoryConsensusStore`] — private bookkeeping, authoritative for
+//! [`InMemoryConsensusStore`](crate::consensus::InMemoryConsensusStore)
+//! — private bookkeeping, authoritative for
 //! nothing. At cutover (step 7) the decisions gain executors and this
 //! module's docs change; until then a bug here can mislead a log reader
 //! and nothing else.
@@ -103,7 +104,7 @@ pub enum HaDecision {
     /// within the post-takeover grace window. Expected: `pg_promote()`
     /// is asynchronous, so a freshly-won lease legitimately precedes
     /// the role change. No action — releasing here would thrash the
-    /// lease (see the grace-window note on [`HaLoop::promotion_grace`]).
+    /// lease (see the grace-window note on `HaLoop::promotion_grace`).
     AwaitingPromotion { term: u64, waiting: Duration },
     /// Someone else holds the lease and looks healthy; we follow.
     Following { holder: i32 },

@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.7.3"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 authors = ["pg-agent-rs contributors"]
 repository = "https://github.com/ophymx/pg-agent-rs"
@@ -48,6 +48,19 @@ x509-parser    = { version = "0.16" }
 tokio-postgres    = { version = "0.7", default-features = false }
 deadpool-postgres = { version = "0.14" }
 zbus              = { version = "5", default-features = false, features = ["tokio"] }
+
+# Consensus (docs/promotion-authority.md §5)
+# openraft 0.9 is the released line; 0.10 has been in alpha for months and
+# pre-1.0 churn is budgeted, not courted. `storage-v2` selects the split
+# RaftLogStorage/RaftStateMachine traits — the shape 0.10 makes permanent,
+# so the storage impl does not have to be rewritten at upgrade.
+openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
+# redb sets the workspace MSRV (1.89). Taking the current line rather than
+# the last 1.85-compatible one (2.6.x, now maintenance-only) is cheap here
+# because the file is designed to be disposable: on corruption or a format
+# break across a major, recovery is `rm -rf <state_dir>/raft/` and let Raft
+# re-replicate from peers (promotion-authority §5, "Storage engine").
+redb     = { version = "4.1" }
 
 # Config / serde
 serde      = { version = "1", features = ["derive"] }

@@ -303,7 +303,7 @@ impl PgAgentLocal for LocalServer {
     ///
     /// **Primary down** (`detached.id == old_primary.id`): the detached
     /// node IS the failed primary. Dial `new_main` (the chosen
-    /// successor), run it through [`Self::failover_lag_gate`] (pgpool
+    /// successor), run it through `Self::failover_lag_gate` (pgpool
     /// picks `%m` by lowest alive node id, not WAL position — refuse
     /// while a strictly more-advanced surviving node is reachable),
     /// tell it to `Promote()`, then drop the old primary's slot on the
@@ -2795,7 +2795,7 @@ impl LocalServer {
     /// for ensuring the cluster state matches what `start_phase`
     /// implies — fresh handoffs always start from
     /// [`HANDOFF_PHASE_PREFLIGHT_DONE`] so the whole ladder runs;
-    /// resume must call [`verify_handoff_state`] first.
+    /// resume must call `Self::verify_handoff_state` first.
     #[allow(clippy::too_many_arguments)]
     async fn run_handoff_from_phase(
         &self,
@@ -5337,7 +5337,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_happy_path() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
             make_recovery_setup();
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
@@ -5518,7 +5518,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_delegates_to_recovery_first_stage() {
-        let (s, db, _peers, _maint, replay, standby, pcp, _sd, _standby, _inflight) =
+        let (s, db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) =
             make_recovery_setup();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -5684,7 +5684,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_stops_target_pg_when_flag_set() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
             make_recovery_setup();
         standby.mark_running();
         let resp = s

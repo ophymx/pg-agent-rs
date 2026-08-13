@@ -81,7 +81,7 @@ pub struct ClusterState {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TakeoverOutcome {
     /// The CAS committed; the candidate now holds `lease`.
     Won { lease: Lease },
@@ -90,7 +90,10 @@ pub enum TakeoverOutcome {
     Lost { current: Option<Lease> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serde-carried because it is a Raft state-machine response
+/// ([`crate::raftstore::CommandResponse`]) once the store is
+/// openraft-backed, not only an in-process return value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReleaseOutcome {
     Released,
     /// The `(holder, term)` presented is not the committed lease — the

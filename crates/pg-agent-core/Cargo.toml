@@ -45,6 +45,10 @@ tokio-postgres    = { workspace = true, features = ["with-chrono-0_4"] }
 deadpool-postgres = { workspace = true }
 zbus              = { workspace = true }
 
+# Consensus
+openraft = { workspace = true }
+redb     = { workspace = true }
+
 # Config / serde
 serde      = { workspace = true }
 serde_json = { workspace = true }

@@ -891,6 +891,39 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    `openraft::testing`, membership bootstrap in `ClusterInit`,
    `validate-env` checks. Swap it in behind the trait; shadow mode keeps
    running.
+
+   **Storage landed** (post-0.7.3): `raftstore` module — `RedbLogStore`
+   (log, vote, committed pointer) and `RedbStateMachine` (the applied
+   `ClusterState` plus snapshots) over one redb file at
+   `<state_dir>/raft/raft.redb`, against openraft 0.9.25's `storage-v2`
+   traits. **`openraft::testing::Suite` passes** — the hard gate this
+   section makes the basis for choosing redb over RocksDB. The gate was
+   checked for teeth rather than assumed: dropping the recorded purge
+   point, and an off-by-one making `truncate` exclusive, each fail the
+   suite.
+
+   Three things the design did not pin down, decided here:
+
+   - **Time is proposed, not read.** `Utc::now()` cannot appear in
+     `apply` — replicas would diverge on `Lease.since`. The timestamp is
+     minted by the proposing node, carried in `ConsensusCommand::Takeover`,
+     and applied verbatim everywhere. This is the only semantic
+     difference from `InMemoryConsensusStore`, where a clock read at
+     apply time was harmless because there was one replica.
+   - **Raft node ids are `u64`, agent node ids stay `i32`.**
+     `openraft::testing::Suite` requires `NodeId: From<u64>`, which
+     `i32` cannot implement. They convert at the seam; the lease *inside*
+     the state machine stays `i32`, so `ClusterState` is unchanged by
+     which store is behind it.
+   - **redb sets the workspace MSRV** (1.85 → 1.89). The alternative was
+     redb 2.6.x, the last 1.85-compatible line and now maintenance-only.
+     Cheap either way precisely because this document makes the file
+     disposable.
+
+   Remaining in this step: the `RaftNetwork` impl and `PgAgentRaft`
+   service (own channel, per "Transport"), a `ConsensusStore` impl over
+   the Raft handle with `ensure_linearizable` for `read_state`,
+   membership bootstrap in `ClusterInit`, and the `validate-env` checks.
 7. **(M)** Cut over: SPEC §5.1 rewrite, pgpool config contract, watchdog off.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.
