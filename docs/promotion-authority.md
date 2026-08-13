@@ -605,8 +605,13 @@ The mitigations this document already mandates target exactly that failure
 class: the `openraft::testing` conformance suite as a hard CI gate (the
 answer to "can not be reproduced" is a storage layer that is exhaustively
 tested before it ships), the deterministic in-memory store for
-fault-injection tests, and shadow mode diffed on the live cluster — which
-is dogfooding by construction, the thing Zalando never did. openraft
+fault-injection tests, and an acceptance suite that boots the real
+artifacts on a real three-node cluster and manufactures the failures —
+partition, stale primary, WAL divergence — rather than waiting for a user
+to report one. That last is the direct answer to "occurred randomly,
+cannot be reproduced": the cases are reproduced on demand, on every run.
+This is the same cluster the author operates, so it is also dogfooding
+by construction, the thing Zalando never did. openraft
 itself is the opposite dependency profile from pysyncobj: actively
 maintained, run in production inside Databend, and pre-1.0 churn is
 already budgeted in "What this costs."
@@ -849,10 +854,27 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    block parses with both lease invariants enforced at load. Nothing
    consumes the store yet.
 5. **(M)** The HA loop against the in-memory store, **shadow mode**:
-   compute what it *would* decide, log it, keep obeying pgpool. Diff the
-   two decision streams on the live cluster. Highest-value step — it turns
-   the argument empirical before anything destructive changes, and it needs
-   no working Raft to do so.
+   compute what it *would* decide, log it, keep obeying pgpool. Highest-value
+   step — it turns the argument empirical before anything destructive
+   changes, and it needs no working Raft to do so.
+
+   > **Correction (2026-08-13):** this step was originally written as
+   > "diff the two decision streams on the live cluster," with agreement
+   > with pgpool as the implied success signal. That oracle is wrong.
+   > pgpool's decisions are the defect under repair — §2.1 promotes on a
+   > false failure report, §2.2 picks a candidate without consulting WAL
+   > position. In exactly the cases that justify this work the loop
+   > **must** diverge, so a diff scores the loop against a reference that
+   > is wrong precisely where correctness is decided, and agreement would
+   > be the alarming reading. Validation is against ground truth instead —
+   > which node actually held the most WAL, whether the announced-dead
+   > node was actually dead, whether exactly one node ended up promotable
+   > — asserted by the dockerized acceptance suite
+   > ([testing/README.md](../testing/README.md)), where that ground truth
+   > is manufactured rather than inferred. Nothing in the landed loop
+   > changes; only how it is judged, and there is no separate operational
+   > half of this step to schedule.
+
    **Loop landed** (post-0.7.3): `ha` module — one `HaDecision` per
    `loop_wait` tick covering retain / follow / holder-watch / candidacy
    (most-advanced check, node-id tiebreak within `max_lag_on_failover`,
@@ -861,10 +883,10 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    the loop holds no Systemd/Pcp/StandbyOps and can only write to its
    process-local store. Enabled by `[raft] shadow = true`; decisions log
    on the `ha_shadow` target. One shadow-only artifact to remove at
-   cutover: vacant-lease adoption of the single observed primary. **The
-   live-cluster diffing itself — running with `shadow = true` on the
-   real cluster and comparing streams against pgpool's behavior — is
-   the remaining (operational) half of this step.**
+   cutover: vacant-lease adoption of the single observed primary.
+   The mode itself stays past this step — it is how the acceptance suite
+   exercises the loop (S2, S3) without promoting anything, and how step 6
+   runs the loop over a real store before step 7 hands it executors.
 6. **(M)** openraft: `PgAgentRaft` service, `redb` storage impl passing
    `openraft::testing`, membership bootstrap in `ClusterInit`,
    `validate-env` checks. Swap it in behind the trait; shadow mode keeps

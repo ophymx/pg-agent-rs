@@ -15,11 +15,22 @@
 //! never dials a peer mutation RPC. Its only writes go to the
 //! [`ConsensusStore`], which today is the process-local
 //! [`InMemoryConsensusStore`] — private bookkeeping, authoritative for
-//! nothing. Diffing the logged decision stream (target `ha_shadow`)
-//! against pgpool's actual behavior on the live cluster is the step-5
-//! validation the design doc calls for. At cutover (step 7) the
-//! decisions gain executors and this module's docs change; until then
-//! a bug here can mislead a log reader and nothing else.
+//! nothing. At cutover (step 7) the decisions gain executors and this
+//! module's docs change; until then a bug here can mislead a log reader
+//! and nothing else.
+//!
+//! # How the decisions are judged
+//!
+//! **Not against pgpool.** The logged stream (target `ha_shadow`) is
+//! asserted against ground truth — which node actually held the most
+//! WAL, whether the announced-dead node was actually dead, whether
+//! exactly one node became promotable — in the dockerized acceptance
+//! suite (`testing/`), where those facts are manufactured rather than
+//! inferred. Diffing against pgpool's live behavior was the design
+//! doc's original plan and is explicitly abandoned: pgpool's decisions
+//! are the defect this loop exists to replace (promotion-authority
+//! §2.1, §2.2), so in the cases that matter agreement would be the bad
+//! outcome, not the good one.
 //!
 //! # Decision rules carried over from the design doc
 //!
