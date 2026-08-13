@@ -405,6 +405,47 @@ struct StoredSnapshot {
     data: Vec<u8>,
 }
 
+/// Reads the applied [`ClusterState`] back out of the state machine's
+/// redb file.
+///
+/// This exists because openraft takes ownership of the
+/// [`RedbStateMachine`] when the [`Raft`](openraft::Raft) is built, and
+/// cloning it would not help: the clone's `data` is a point-in-time copy
+/// that stops tracking `apply`. Going back to the file is not a
+/// workaround but the direct consequence of choosing a *persistent*
+/// state machine — `apply` commits durably before it returns, so any
+/// read that happens after it observes it.
+///
+/// The linearizability of a read is the caller's business, not this
+/// type's: this returns whatever has been applied locally. Pair it with
+/// `ensure_linearizable` (see [`crate::raftconsensus`]) before treating
+/// the answer as authoritative.
+#[derive(Clone)]
+pub struct ClusterStateReader {
+    db: Arc<Database>,
+}
+
+impl ClusterStateReader {
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
+    /// The applied cluster state; `Default` when nothing has been
+    /// applied yet, which is a genuinely empty state machine rather
+    /// than an unknown one.
+    pub fn read(&self) -> anyhow::Result<ClusterState> {
+        let bytes = read_meta(&self.db, META_STATE_MACHINE)
+            .map_err(|e| anyhow::anyhow!("read state machine: {e}"))?;
+        match bytes {
+            Some(bytes) => {
+                let data: StateMachineData = serde_json::from_slice(&bytes)?;
+                Ok(data.cluster)
+            }
+            None => Ok(ClusterState::default()),
+        }
+    }
+}
+
 /// redb-backed [`RaftStateMachine`] over [`ClusterState`].
 #[derive(Clone)]
 pub struct RedbStateMachine {

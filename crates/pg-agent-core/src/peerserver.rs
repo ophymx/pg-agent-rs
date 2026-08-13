@@ -246,8 +246,12 @@ impl PeerServer {
     /// Sharing the listener is deliberate and is only the *inbound*
     /// half: outbound, Raft dials its own channels, because heartbeats
     /// must not queue behind a basebackup. See [`crate::raftnet`].
-    pub fn with_raft(mut self, raft: crate::raftnet::PgAgentRaftHandle) -> Self {
-        self.raft = Some(RaftGrpcService::new(raft).into_server());
+    pub fn with_raft(
+        mut self,
+        raft: crate::raftnet::PgAgentRaftHandle,
+        reader: crate::raftstore::ClusterStateReader,
+    ) -> Self {
+        self.raft = Some(RaftGrpcService::new(raft, reader).into_server());
         self
     }
 
@@ -1907,6 +1911,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db_raft = open_database(dir.path()).unwrap();
+        let reader = crate::raftstore::ClusterStateReader::new(db_raft.clone());
         let raft = openraft::Raft::new(
             0u64,
             Arc::new(openraft::Config::default().validate().unwrap()),
@@ -1918,7 +1923,7 @@ mod tests {
         .unwrap();
 
         let (server, ..) = make_server();
-        let server = server.with_raft(raft);
+        let server = server.with_raft(raft, reader);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();

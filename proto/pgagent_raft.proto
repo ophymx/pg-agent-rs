@@ -37,6 +37,8 @@ message RaftFrame {
 }
 
 service PgAgentRaft {
+  // ----- Raft protocol, spoken by openraft itself --------------------
+
   // Replication + heartbeat. The hot path: sent to every follower every
   // heartbeat interval, empty when there is nothing to replicate.
   rpc AppendEntries   (RaftFrame) returns (RaftFrame);
@@ -45,4 +47,25 @@ service PgAgentRaft {
   // Snapshot installation, chunked by openraft's default
   // `full_snapshot` implementation.
   rpc InstallSnapshot (RaftFrame) returns (RaftFrame);
+
+  // ----- Leader forwarding, spoken by the agent ----------------------
+  //
+  // Both a linearizable read (`ensure_linearizable`, a ReadIndex quorum
+  // round-trip) and a state-machine write are operations only the Raft
+  // *leader* can perform. The HA loop runs on every node, and the whole
+  // design turns on the Raft leader NOT being the PostgreSQL primary —
+  // so on most nodes, most of the time, both go through these two.
+  //
+  // Neither handler forwards in turn. A node that is asked and is not
+  // the leader answers with an error rather than chaining another hop:
+  // one hop bounds the latency, and a caller acting on leadership
+  // information two hops stale is worse off than one that retries next
+  // tick with fresh information.
+
+  // Propose a ConsensusCommand. Reply is the CommandResponse — which
+  // includes a *lost* CAS, an ordinary outcome rather than an error.
+  rpc Propose         (RaftFrame) returns (RaftFrame);
+  // Linearizable read of the whole ClusterState. Request payload is
+  // empty; the reply is the state document.
+  rpc ReadState       (RaftFrame) returns (RaftFrame);
 }

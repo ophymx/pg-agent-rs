@@ -945,10 +945,39 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
      hot-retrying a partitioned peer spins CPU on the node still trying
      to hold quorum together.
 
-   Remaining in this step: a `ConsensusStore` impl over the Raft handle
-   with `ensure_linearizable` for `read_state`, Raft construction and
-   membership bootstrap in `ClusterInit`, wiring `with_raft` in `Agent`,
-   and the `validate-env` checks.
+   **Store landed** (post-0.7.3): `raftconsensus` module —
+   `RaftConsensusStore` implementing `ConsensusStore` over the Raft
+   handle. The HA loop is unchanged, which is the seam paying off.
+
+   This surfaced something the section above asserts without following
+   through, and it is worth correcting rather than burying: **"retain is
+   a read" is a read *only the Raft leader can perform*.**
+   `ensure_linearizable` confirms leadership against a quorum and fails
+   on a follower; `client_write` returns `ForwardToLeader`. Since this
+   document's central invariant is that the Raft leader is *not* the
+   PostgreSQL primary, the consequence is unavoidable: on most nodes,
+   most of the time, both retain and takeover are an RPC to another
+   node. Two `PgAgentRaft` RPCs exist for exactly this (`Propose`,
+   `ReadState`), and forwarding is one hop, never two — the leader-side
+   handlers refuse rather than re-forward, because a chain would make
+   latency unbounded in precisely the churny conditions where the
+   `retry_timeout` budget is tightest.
+
+   The claim that survives unchanged is the one that matters: the log
+   still only grows on real events, and steady-state retain still writes
+   nothing. What was under-priced is latency, not write volume — one
+   extra hop inside a budget the `retry_timeout > election_timeout`
+   invariant already sizes.
+
+   `Err` still means unknown, enforced at every new failure path: no
+   leader known, leader unreachable, `ensure_linearizable` refused, RPC
+   timed out. A test asserts that a node with no quorum errors rather
+   than reporting a vacant lease — the §3 hole would otherwise walk back
+   in as an `unwrap_or_default`.
+
+   Remaining in this step: Raft construction and membership bootstrap in
+   `ClusterInit`, wiring `with_raft` in `Agent`, and the `validate-env`
+   checks.
 7. **(M)** Cut over: SPEC §5.1 rewrite, pgpool config contract, watchdog off.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.

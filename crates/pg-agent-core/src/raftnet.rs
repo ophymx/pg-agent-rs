@@ -64,7 +64,10 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
-use crate::raftstore::{PgAgentTypeConfig, RaftNodeId};
+use crate::consensus::ClusterState;
+use crate::raftstore::{
+    ClusterStateReader, CommandResponse, ConsensusCommand, PgAgentTypeConfig, RaftNodeId,
+};
 
 /// Channel-wide ceiling for consensus RPCs. Deliberately far below
 /// [`crate::peers::LONG_RPC_TIMEOUT`] — see the module docs.
@@ -123,8 +126,8 @@ where
 // Server
 // ---------------------------------------------------------------------------
 
-/// Inbound `PgAgentRaft`. Holds the local [`Raft`] and nothing else —
-/// every handler is decode, delegate, encode.
+/// Inbound `PgAgentRaft`: the three protocol RPCs openraft speaks, plus
+/// the two the agent speaks when it is not the leader.
 ///
 /// Note what is *not* here: no authorization check. That is not an
 /// omission, it is where the check lives — the mTLS handshake and SAN
@@ -133,17 +136,31 @@ where
 #[derive(Clone)]
 pub struct RaftGrpcService {
     raft: PgAgentRaftHandle,
+    /// Serves `ReadState` after the local `ensure_linearizable`.
+    reader: ClusterStateReader,
 }
 
 impl RaftGrpcService {
-    pub fn new(raft: PgAgentRaftHandle) -> Self {
-        Self { raft }
+    pub fn new(raft: PgAgentRaftHandle, reader: ClusterStateReader) -> Self {
+        Self { raft, reader }
     }
 
     /// Wrap as a tonic service, ready for `Server::add_service`.
     pub fn into_server(self) -> PgAgentRaftServer<Self> {
         PgAgentRaftServer::new(self)
     }
+}
+
+/// Status returned when a forwarded request lands on a node that is not
+/// the leader.
+///
+/// `FailedPrecondition` rather than a redirect: this handler does not
+/// forward in turn (see the `.proto`), and the caller's next tick will
+/// re-read leadership from its own Raft metrics anyway. Naming the
+/// leader it believes in would just invite the caller to act on
+/// information that is already one hop stale.
+fn not_leader(what: &str, e: impl std::fmt::Display) -> Status {
+    Status::failed_precondition(format!("raft: {what}: not the leader: {e}"))
 }
 
 #[tonic::async_trait]
@@ -182,6 +199,35 @@ impl PgAgentRaft for RaftGrpcService {
             .await
             .map_err(|e| Status::internal(format!("raft: install_snapshot: {e}")))?;
         Ok(Response::new(encode_frame(&resp)?))
+    }
+
+    async fn propose(&self, request: Request<RaftFrame>) -> Result<Response<RaftFrame>, Status> {
+        let cmd: ConsensusCommand = decode_frame(request.get_ref())?;
+        let written = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(|e| not_leader("propose", e))?;
+        Ok(Response::new(encode_frame(&written.data)?))
+    }
+
+    async fn read_state(
+        &self,
+        _request: Request<RaftFrame>,
+    ) -> Result<Response<RaftFrame>, Status> {
+        // Confirm leadership against a quorum *and* wait for the state
+        // machine to catch up to the read index, then read. In that
+        // order: reading first would answer from a state machine this
+        // node has not yet established it is entitled to speak for.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| not_leader("read_state", e))?;
+        let state = self
+            .reader
+            .read()
+            .map_err(|e| Status::internal(format!("raft: read_state: {e}")))?;
+        Ok(Response::new(encode_frame(&state)?))
     }
 }
 
@@ -349,6 +395,97 @@ impl RaftNetwork<PgAgentTypeConfig> for RaftPeerNetwork {
 }
 
 // ---------------------------------------------------------------------------
+// Leader forwarding client
+// ---------------------------------------------------------------------------
+
+/// Dials whichever node openraft names as leader, for the two RPCs only
+/// a leader can serve.
+///
+/// Separate from [`RaftChannelFactory`] because the lifetimes differ:
+/// openraft keeps one network per *peer* for as long as that peer is a
+/// member, while leadership moves. Channels are cached by address, so a
+/// stable leader is dialed once and a leadership change costs one dial.
+#[derive(Clone)]
+pub struct LeaderClient {
+    tls: Option<Arc<ClientConfig>>,
+    channels: Arc<Mutex<HashMap<String, PgAgentRaftClient<Channel>>>>,
+}
+
+impl LeaderClient {
+    pub fn new(tls: Option<Arc<ClientConfig>>) -> Self {
+        Self {
+            tls,
+            channels: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn new_dev() -> Self {
+        Self::new(None)
+    }
+
+    async fn client(&self, addr: &str) -> anyhow::Result<PgAgentRaftClient<Channel>> {
+        {
+            let cache = self.channels.lock().await;
+            if let Some(c) = cache.get(addr) {
+                return Ok(c.clone());
+            }
+        }
+        let channel = dial(addr, self.tls.clone()).await?;
+        let client = PgAgentRaftClient::new(channel);
+        self.channels
+            .lock()
+            .await
+            .insert(addr.to_string(), client.clone());
+        Ok(client)
+    }
+
+    /// Forget the channel to `addr`. Called whenever an RPC over it
+    /// fails, for the same reason the replication path invalidates: a
+    /// channel that failed once is often half-open, and leadership has
+    /// probably moved anyway.
+    async fn invalidate(&self, addr: &str) {
+        self.channels.lock().await.remove(addr);
+    }
+
+    /// Propose a command on the leader. A *lost* CAS comes back as an
+    /// ordinary [`CommandResponse`] — losing a race is an outcome, not
+    /// a failure, and collapsing it into `Err` would make the caller
+    /// unable to tell "someone else won" from "we never asked".
+    pub async fn propose(
+        &self,
+        addr: &str,
+        cmd: &ConsensusCommand,
+    ) -> anyhow::Result<CommandResponse> {
+        let mut client = self.client(addr).await?;
+        let frame = RaftFrame {
+            payload: serde_json::to_vec(cmd)?,
+        };
+        match client.propose(Request::new(frame)).await {
+            Ok(reply) => Ok(serde_json::from_slice(&reply.get_ref().payload)?),
+            Err(status) => {
+                self.invalidate(addr).await;
+                Err(anyhow::anyhow!("raft propose via {addr}: {status}"))
+            }
+        }
+    }
+
+    /// Linearizable read on the leader.
+    pub async fn read_state(&self, addr: &str) -> anyhow::Result<ClusterState> {
+        let mut client = self.client(addr).await?;
+        let frame = RaftFrame {
+            payload: Vec::new(),
+        };
+        match client.read_state(Request::new(frame)).await {
+            Ok(reply) => Ok(serde_json::from_slice(&reply.get_ref().payload)?),
+            Err(status) => {
+                self.invalidate(addr).await;
+                Err(anyhow::anyhow!("raft read_state via {addr}: {status}"))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -430,6 +567,7 @@ mod tests {
     async fn spawn_node(id: RaftNodeId, shutdown: CancellationToken) -> Node {
         let dir = TempDir::new().unwrap();
         let db = open_database(dir.path()).unwrap();
+        let reader = crate::raftstore::ClusterStateReader::new(db.clone());
         let log = RedbLogStore::new(db.clone());
         let sm = RedbStateMachine::new(db).unwrap();
 
@@ -455,7 +593,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
-        let service = RaftGrpcService::new(raft.clone()).into_server();
+        let service = RaftGrpcService::new(raft.clone(), reader).into_server();
         let s = shutdown.clone();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
