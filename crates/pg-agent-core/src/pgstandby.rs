@@ -797,9 +797,15 @@ mod tests {
 
         let (cb, calls) = capture_progress();
         let tail = Arc::new(Mutex::new(String::new()));
-        drain_stderr(bytes, Some(&cb), tail.clone(), "pg_basebackup", test_activity())
-            .await
-            .unwrap();
+        drain_stderr(
+            bytes,
+            Some(&cb),
+            tail.clone(),
+            "pg_basebackup",
+            test_activity(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *calls.lock().unwrap(),

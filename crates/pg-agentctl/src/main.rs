@@ -226,16 +226,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
                 target,
                 allow_lag,
                 config,
-            } => {
-                cluster_handoff(
-                    config,
-                    target,
-                    allow_lag,
-                    cli.socket.as_deref(),
-                    cli.json,
-                )
-                .await
-            }
+            } => cluster_handoff(config, target, allow_lag, cli.socket.as_deref(), cli.json).await,
         },
     }
 }
@@ -1051,7 +1042,10 @@ async fn ops(
                 .map_err(|s| rpc_failed(&format!("GetInflightOp({id})"), s))?
                 .into_inner();
             if json {
-                println!("{}", serde_json::to_string_pretty(&inflight_to_json(&resp))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&inflight_to_json(&resp))?
+                );
             } else {
                 print_inflight_human(&resp);
             }

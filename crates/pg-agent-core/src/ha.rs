@@ -113,7 +113,10 @@ pub enum HaDecision {
     WouldFollowNewHolder { prev: i32, holder: i32 },
     /// The holder is unreachable or not running as primary, but hasn't
     /// been for `leader_ttl` yet — watching, not acting.
-    HolderUnhealthy { holder: i32, unhealthy_for: Duration },
+    HolderUnhealthy {
+        holder: i32,
+        unhealthy_for: Duration,
+    },
     /// Candidacy considered and declined; the reason says why
     /// (ineligible, not most-advanced, tiebreak, backoff, …).
     StoodDown { reason: String },

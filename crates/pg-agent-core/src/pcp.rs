@@ -228,7 +228,9 @@ impl Pcp for PcpCli {
         // Demoted to debug — this fires on every healthsnap tick (~1s)
         // and would otherwise dominate journalctl output.
         debug!("pcp_node_count: starting");
-        let raw = self.run_pcp("pcp_node_count", "pcp_node_count", &[]).await?;
+        let raw = self
+            .run_pcp("pcp_node_count", "pcp_node_count", &[])
+            .await?;
         let trimmed = raw.trim();
         let n = trimmed
             .parse::<i32>()

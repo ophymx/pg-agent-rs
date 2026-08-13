@@ -317,12 +317,7 @@ mod tests {
     fn supervisor(sd: Arc<FlipSd>) -> PgpoolSupervisor {
         // Tight params: short cooldown so the cooldown gate can be
         // exercised without `tokio::time::pause`.
-        PgpoolSupervisor::with_params(
-            sd,
-            Duration::from_millis(10),
-            Duration::from_millis(50),
-            3,
-        )
+        PgpoolSupervisor::with_params(sd, Duration::from_millis(10), Duration::from_millis(50), 3)
     }
 
     #[tokio::test]

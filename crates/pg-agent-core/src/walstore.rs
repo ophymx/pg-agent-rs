@@ -375,12 +375,8 @@ mod tests {
             .write_restore(Path::new("pg_wal/000000010000000000000001"), src)
             .await
             .expect("relative path under pg_data_dir should resolve and write");
-        let written = std::fs::read(
-            store
-                .pg_data_dir
-                .join("pg_wal/000000010000000000000001"),
-        )
-        .unwrap();
+        let written =
+            std::fs::read(store.pg_data_dir.join("pg_wal/000000010000000000000001")).unwrap();
         assert_eq!(written, b"wal bytes");
     }
 

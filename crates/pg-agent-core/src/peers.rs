@@ -763,8 +763,8 @@ mod tests {
                 wal,
                 Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
             )
-                .serve(listener, Some(tls), s)
-                .await;
+            .serve(listener, Some(tls), s)
+            .await;
         });
         // Brief settle so the server's accept loop is ready.
         tokio::time::sleep(Duration::from_millis(50)).await;

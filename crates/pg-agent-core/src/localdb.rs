@@ -237,9 +237,7 @@ impl LocalDb for PgLocalDb {
                     &[],
                 )
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("localdb: standby timeline: {}", describe_pg(&e))
-                })?
+                .map_err(|e| anyhow::anyhow!("localdb: standby timeline: {}", describe_pg(&e)))?
                 .get(0);
             return Ok(tli);
         }
@@ -273,7 +271,9 @@ impl LocalDb for PgLocalDb {
         let text: String = if in_recovery {
             conn.query_one("SELECT pg_last_wal_replay_lsn()::text", &[])
                 .await
-                .map_err(|e| anyhow::anyhow!("localdb: pg_last_wal_replay_lsn: {}", describe_pg(&e)))?
+                .map_err(|e| {
+                    anyhow::anyhow!("localdb: pg_last_wal_replay_lsn: {}", describe_pg(&e))
+                })?
                 .get(0)
         } else {
             conn.query_one("SELECT pg_current_wal_lsn()::text", &[])

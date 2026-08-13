@@ -30,8 +30,8 @@ use crate::maintenance::{
 use crate::pcp::Pcp;
 use crate::peers::{PeerClient, PeerRegistry};
 use crate::pgstandby::{BasebackupOpts, RewindOpts, StandbyOps, WriteRecoveryConfOpts};
-use crate::systemd::Systemd;
 use crate::replay_markers::ReplayMarkerStore;
+use crate::systemd::Systemd;
 use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
@@ -484,17 +484,17 @@ impl PgAgentLocal for LocalServer {
             .list(&[crate::inflight_ops::InflightStatus::InProgress])
             .await
         {
-            Ok((ops, _)) => ops
-                .into_iter()
-                .find(|o| o.payload.op_name() == "handoff"),
+            Ok((ops, _)) => ops.into_iter().find(|o| o.payload.op_name() == "handoff"),
             Err(e) => {
-                warn!(?e, "failover: inflight list failed; proceeding without cross-op consult");
+                warn!(
+                    ?e,
+                    "failover: inflight list failed; proceeding without cross-op consult"
+                );
                 None
             }
         };
-        let handoff_targets_new_main = inflight_handoff
-            .as_ref()
-            .is_some_and(|o| match &o.payload {
+        let handoff_targets_new_main =
+            inflight_handoff.as_ref().is_some_and(|o| match &o.payload {
                 crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } => {
                     *to_node_id == new_main.id
                 }
@@ -502,8 +502,7 @@ impl PgAgentLocal for LocalServer {
             });
         if let Some(ref h) = inflight_handoff {
             if !handoff_targets_new_main {
-                if let crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } =
-                    &h.payload
+                if let crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } = &h.payload
                 {
                     warn!(
                         handoff_id = %h.id,
@@ -578,9 +577,7 @@ impl PgAgentLocal for LocalServer {
                 let trust_journal = handoff_targets_new_main
                     && inflight_handoff
                         .as_ref()
-                        .map(|h| {
-                            handoff_phase_at_or_past(&h.phase, HANDOFF_PHASE_TARGET_PROMOTED)
-                        })
+                        .map(|h| handoff_phase_at_or_past(&h.phase, HANDOFF_PHASE_TARGET_PROMOTED))
                         .unwrap_or(false);
                 warn!(
                     new_main = %new_main.hostname,
@@ -1110,11 +1107,10 @@ impl PgAgentLocal for LocalServer {
         // SPEC §5: do NOT call pcp_attach_node here — pgpool drives
         // re-attachment after 2nd stage completes (which is triggered
         // by pgpool itself via pgpool_remote_start, not us).
-        self.inflight.complete(&op_id).await.map_err(|e| {
-            internal(anyhow::anyhow!(
-                "recovery_1st_stage: journal complete: {e}"
-            ))
-        })?;
+        self.inflight
+            .complete(&op_id)
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("recovery_1st_stage: journal complete: {e}")))?;
 
         info!(
             primary = %primary.hostname,
@@ -1319,10 +1315,11 @@ impl PgAgentLocal for LocalServer {
     ) -> Result<Response<OpResult>, Status> {
         let req = req.into_inner();
 
-        let in_recovery =
-            self.db.is_in_recovery().await.map_err(|e| {
-                internal(anyhow::anyhow!("cluster_recover: check primary status: {e}"))
-            })?;
+        let in_recovery = self.db.is_in_recovery().await.map_err(|e| {
+            internal(anyhow::anyhow!(
+                "cluster_recover: check primary status: {e}"
+            ))
+        })?;
         if in_recovery {
             return Ok(Response::new(OpResult {
                 ok: false,
@@ -1474,7 +1471,10 @@ impl PgAgentLocal for LocalServer {
             }
         }
 
-        info!(target_id = standby.id, "cluster_recover: pgpool attach_node");
+        info!(
+            target_id = standby.id,
+            "cluster_recover: pgpool attach_node"
+        );
         match self.pcp.attach_node(standby.id).await {
             Ok(()) => post_status.push(format!("attached node {} in pgpool", standby.id)),
             Err(e) => {
@@ -1678,8 +1678,10 @@ impl PgAgentLocal for LocalServer {
                          replay LSN and the primary's current LSN)",
                         target.hostname,
                         lag,
-                        local_lsn >> 32, local_lsn as u32,
-                        target_replay_lsn >> 32, target_replay_lsn as u32,
+                        local_lsn >> 32,
+                        local_lsn as u32,
+                        target_replay_lsn >> 32,
+                        target_replay_lsn as u32,
                         crate::config::MAX_HANDOFF_LAG_BYTES
                     ),
                 }));
@@ -1790,7 +1792,9 @@ impl PgAgentLocal for LocalServer {
     ) -> Result<Response<OpResult>, Status> {
         let req = req.into_inner();
         if req.id.is_empty() {
-            return Err(Status::invalid_argument("abandon_inflight_op: id is required"));
+            return Err(Status::invalid_argument(
+                "abandon_inflight_op: id is required",
+            ));
         }
         let op = self
             .inflight
@@ -1819,10 +1823,7 @@ impl PgAgentLocal for LocalServer {
             .map_err(|e| internal(anyhow::anyhow!("abandon_inflight_op: {e}")))?;
         Ok(Response::new(OpResult {
             ok: true,
-            message: format!(
-                "op {} abandoned (was at phase {})",
-                op.id, op.phase
-            ),
+            message: format!("op {} abandoned (was at phase {})", op.id, op.phase),
         }))
     }
 
@@ -1832,7 +1833,9 @@ impl PgAgentLocal for LocalServer {
     ) -> Result<Response<OpResult>, Status> {
         let id = req.into_inner().id;
         if id.is_empty() {
-            return Err(Status::invalid_argument("resume_inflight_op: id is required"));
+            return Err(Status::invalid_argument(
+                "resume_inflight_op: id is required",
+            ));
         }
         let op = self
             .inflight
@@ -2584,7 +2587,15 @@ impl LocalServer {
             );
             tokio::spawn(async move {
                 let outcome = drive_follow_primary(
-                    &inflight, &peers, &pcp, &maint, &pg, &id, FP_PHASE_QUEUED, &detached, &np,
+                    &inflight,
+                    &peers,
+                    &pcp,
+                    &maint,
+                    &pg,
+                    &id,
+                    FP_PHASE_QUEUED,
+                    &detached,
+                    &np,
                 )
                 .await;
                 match outcome {
@@ -2931,7 +2942,10 @@ impl LocalServer {
         }
 
         if start_idx <= handoff_phase_index(HANDOFF_PHASE_RECOVERY_CONF_WRITTEN).unwrap() {
-            info!(id = op_id, "cluster_handoff: starting local postgres as standby");
+            info!(
+                id = op_id,
+                "cluster_handoff: starting local postgres as standby"
+            );
             self.sd
                 .start_postgres()
                 .await
@@ -2964,7 +2978,11 @@ impl LocalServer {
             .await
             .map_err(|e| internal(anyhow::anyhow!("cluster_handoff: complete journal: {e}")))?;
 
-        let how = if basebackup_ran { "basebackup" } else { "rewind" };
+        let how = if basebackup_ran {
+            "basebackup"
+        } else {
+            "rewind"
+        };
         info!(
             id = op_id,
             target = %target.hostname,
@@ -3055,10 +3073,7 @@ impl LocalServer {
         })?;
 
         // Verify-then-resume.
-        if let Some(diverged) = self
-            .verify_handoff_state(&op.phase, &peer, &target)
-            .await?
-        {
+        if let Some(diverged) = self.verify_handoff_state(&op.phase, &peer, &target).await? {
             return Ok(Response::new(OpResult {
                 ok: false,
                 message: format!(
@@ -3162,12 +3177,9 @@ impl LocalServer {
                         "local PG is stopped but recorded phase is post-start".into(),
                     ));
                 }
-                let in_recovery =
-                    self.db.is_in_recovery().await.map_err(|e| {
-                        internal(anyhow::anyhow!(
-                            "verify_handoff_state: is_in_recovery: {e}"
-                        ))
-                    })?;
+                let in_recovery = self.db.is_in_recovery().await.map_err(|e| {
+                    internal(anyhow::anyhow!("verify_handoff_state: is_in_recovery: {e}"))
+                })?;
                 if !in_recovery {
                     return Ok(Some(
                         "local PG is a primary but recorded phase implies standby".into(),
@@ -3228,12 +3240,10 @@ async fn drive_follow_primary(
             .await
             .map_err(|e| anyhow::anyhow!("follow_primary: journal dialing: {e}"))?;
     }
-    let detached_peer = peers.client(detached).await.map_err(|e| {
-        anyhow::anyhow!(
-            "follow_primary: dial detached {}: {e}",
-            detached.hostname
-        )
-    })?;
+    let detached_peer = peers
+        .client(detached)
+        .await
+        .map_err(|e| anyhow::anyhow!("follow_primary: dial detached {}: {e}", detached.hostname))?;
     let new_primary_peer = peers.client(new_primary).await.map_err(|e| {
         anyhow::anyhow!(
             "follow_primary: dial new_primary {}: {e}",
@@ -3244,10 +3254,7 @@ async fn drive_follow_primary(
     // ----- detached_stopped ----------------------------------------
     if start_idx <= fp_phase_index(FP_PHASE_DIALING).unwrap() {
         let status = detached_peer.get_status().await.map_err(|e| {
-            anyhow::anyhow!(
-                "follow_primary: get_status {}: {e}",
-                detached.hostname
-            )
+            anyhow::anyhow!("follow_primary: get_status {}: {e}", detached.hostname)
         })?;
         if !status.is_running {
             info!(
@@ -3257,9 +3264,10 @@ async fn drive_follow_primary(
             // Skip the rest. The op completes — no work to do.
             return Ok(());
         }
-        detached_peer.stop().await.map_err(|e| {
-            anyhow::anyhow!("follow_primary: stop {}: {e}", detached.hostname)
-        })?;
+        detached_peer
+            .stop()
+            .await
+            .map_err(|e| anyhow::anyhow!("follow_primary: stop {}: {e}", detached.hostname))?;
         inflight
             .update_phase(op_id, FP_PHASE_DETACHED_STOPPED, None)
             .await
@@ -3268,12 +3276,15 @@ async fn drive_follow_primary(
 
     // ----- slot_created --------------------------------------------
     if start_idx <= fp_phase_index(FP_PHASE_DETACHED_STOPPED).unwrap() {
-        new_primary_peer.create_slot(&slot_name).await.map_err(|e| {
-            anyhow::anyhow!(
-                "follow_primary: create_slot {slot_name} on {}: {e}",
-                new_primary.hostname
-            )
-        })?;
+        new_primary_peer
+            .create_slot(&slot_name)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "follow_primary: create_slot {slot_name} on {}: {e}",
+                    new_primary.hostname
+                )
+            })?;
         inflight
             .update_phase(op_id, FP_PHASE_SLOT_CREATED, None)
             .await
@@ -3306,10 +3317,7 @@ async fn drive_follow_primary(
                 slot_name: slot_name.clone(),
             };
             if let Err(e) = detached_peer.basebackup(bb_opts).await {
-                let err = anyhow::anyhow!(
-                    "follow_primary: basebackup {}: {e}",
-                    detached.hostname
-                );
+                let err = anyhow::anyhow!("follow_primary: basebackup {}: {e}", detached.hostname);
                 cleanup_peer_slot_after_failure(
                     maint,
                     &new_primary_peer,
@@ -3355,9 +3363,7 @@ async fn drive_follow_primary(
         inflight
             .update_phase(op_id, FP_PHASE_RECOVERY_CONF_WRITTEN, None)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("follow_primary: journal recovery_conf_written: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("follow_primary: journal recovery_conf_written: {e}"))?;
     }
 
     // ----- detached_started ----------------------------------------
@@ -3492,11 +3498,8 @@ fn parse_inflight_statuses(
 /// as JSON so callers don't need a discriminated decoder.
 #[allow(clippy::result_large_err)]
 fn inflight_to_proto(op: &crate::inflight_ops::InflightOp) -> Result<ProtoInflightOp, Status> {
-    let payload = serde_json::to_vec(&op.payload).map_err(|e| {
-        internal(anyhow::anyhow!(
-            "inflight_to_proto: marshal payload: {e}"
-        ))
-    })?;
+    let payload = serde_json::to_vec(&op.payload)
+        .map_err(|e| internal(anyhow::anyhow!("inflight_to_proto: marshal payload: {e}")))?;
     Ok(ProtoInflightOp {
         id: op.id.clone(),
         op: op.payload.op_name().to_string(),
@@ -4453,7 +4456,9 @@ mod tests {
             make_pool(),
             make_pg(),
         );
-        (server, db, peers, maint, wal, replay, pcp, sd, standby, inflight)
+        (
+            server, db, peers, maint, wal, replay, pcp, sd, standby, inflight,
+        )
     }
 
     fn pending_intent(id: &str) -> CoreIntent {
@@ -4875,9 +4880,7 @@ mod tests {
 
     /// 3-node pool: detached/old_primary = 2, candidate new_main = 0,
     /// surviving comparison standby = 1. Returns the two standby stubs.
-    fn lag_gate_fixture(
-        peers: &StubPeers,
-    ) -> (Arc<StubPeerClient>, Arc<StubPeerClient>) {
+    fn lag_gate_fixture(peers: &StubPeers) -> (Arc<StubPeerClient>, Arc<StubPeerClient>) {
         let candidate = Arc::new(StubPeerClient::default());
         candidate.mark_standby();
         let survivor = Arc::new(StubPeerClient::default());
@@ -4978,9 +4981,7 @@ mod tests {
         let (s, _db, peers, _maint, _wal) = make_server_3();
         let (candidate, survivor) = lag_gate_fixture(&peers);
         candidate.set_replay_lsn(GATE_BASE_LSN); // timeline stays 0
-        survivor
-            .set_timeline(2)
-            .set_replay_lsn(GATE_BASE_LSN * 3);
+        survivor.set_timeline(2).set_replay_lsn(GATE_BASE_LSN * 3);
 
         let resp = s
             .failover(Request::new(failover_req(2, 0, 2)))
@@ -5011,7 +5012,11 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(!resp.ok, "expected refusal, got: {}", resp.message);
-        assert!(resp.message.contains("running as primary"), "{}", resp.message);
+        assert!(
+            resp.message.contains("running as primary"),
+            "{}",
+            resp.message
+        );
         assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
         // No marker — a retry after the operator stops the node must run.
         assert!(!replay
@@ -5332,7 +5337,8 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_happy_path() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         let resp = s
             .recovery_first_stage(Request::new(recovery_req(0, 1)))
             .await
@@ -5361,7 +5367,8 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_skips_after_a_recent_completion() {
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, inflight) =
+            make_recovery_setup();
         // A completed run of the same orchestration, moments ago.
         let prior = inflight
             .begin(
@@ -5386,11 +5393,7 @@ mod tests {
         // Distinct message so cluster_recover-wrapped callers can flag
         // a silent skip vs. an actual basebackup. Two halves so a future
         // refactor of one of the strings doesn't break both tests.
-        assert!(
-            resp.message.contains("skipped"),
-            "got: {}",
-            resp.message
-        );
+        assert!(resp.message.contains("skipped"), "got: {}", resp.message);
         assert!(
             resp.message.contains("within the last 24h"),
             "got: {}",
@@ -5408,7 +5411,8 @@ mod tests {
     /// without actually reclonating (observed live on db2 2026-06-12).
     #[tokio::test]
     async fn recovery_first_stage_bypass_runs_even_with_marker_present() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         replay.mark("recovery_1st_stage", "primary=0,standby=1");
         let mut req = recovery_req(0, 1);
         req.bypass_replay_marker = true;
@@ -5451,7 +5455,8 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_basebackup_failure_drops_slot() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
 
         let err = s
@@ -5470,7 +5475,8 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_configure_standby_failure_drops_slot() {
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby
             .configure_standby_fails
             .store(true, Ordering::SeqCst);
@@ -5486,7 +5492,8 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_first_stage_drop_slot_failure_queues_maintenance() {
-        let (s, db, _peers, maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
         db.drop_slot_fails.store(true, Ordering::SeqCst);
 
@@ -5511,7 +5518,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_delegates_to_recovery_first_stage() {
-        let (s, db, _peers, _maint, replay, standby, pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 1,
@@ -5545,7 +5553,8 @@ mod tests {
         // recovery itself was destructive enough that rolling back is
         // worse than surfacing partial completion to the operator) and
         // report each failure in the message.
-        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby.start_fails.store(true, Ordering::SeqCst);
         standby.start_pgpool_fails.store(true, Ordering::SeqCst);
         pcp.attach_fails.store(true, Ordering::SeqCst);
@@ -5558,7 +5567,10 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(resp.ok, "recovery_1st_stage succeeded; post-step failures must not fail the RPC");
+        assert!(
+            resp.ok,
+            "recovery_1st_stage succeeded; post-step failures must not fail the RPC"
+        );
         assert!(resp.message.contains("postgres start failed"));
         assert!(resp.message.contains("pgpool start failed"));
         assert!(resp.message.contains("pgpool attach failed"));
@@ -5572,7 +5584,8 @@ mod tests {
     async fn cluster_recover_skips_post_steps_when_recovery_fails() {
         // recovery_first_stage hits basebackup failure → propagates Err.
         // Post-recovery steps must NOT run — there's nothing to start.
-        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby.basebackup_fails.store(true, Ordering::SeqCst);
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -5589,7 +5602,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_refuses_when_local_is_replica() {
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -5623,7 +5637,8 @@ mod tests {
     #[tokio::test]
     async fn cluster_recover_rejects_local_node_as_target() {
         // Local is node 0; asking to reclone it from itself is nonsense.
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         let err = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
                 target_node_id: 0,
@@ -5643,7 +5658,8 @@ mod tests {
         // Operator forgot --stop-target-pg; target reports PG running.
         // We must refuse cleanly here, not let recovery_first_stage run
         // headlong into the deeper basebackup safety check.
-        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby.mark_running(); // is_postgres_running=true on the peer's get_status
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -5668,7 +5684,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recover_stops_target_pg_when_flag_set() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         standby.mark_running();
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -5690,7 +5707,8 @@ mod tests {
         // Flag set, but target already reports PG stopped → no peer.stop
         // (idempotent, but skipping avoids the systemd D-Bus round-trip
         // for no reason).
-        let (s, _db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         // standby.is_running default false; do not mark_running().
         let resp = s
             .cluster_recover(Request::new(ClusterRecoverRequest {
@@ -5711,7 +5729,8 @@ mod tests {
     /// on db2 on 2026-06-12.
     #[tokio::test]
     async fn cluster_recover_bypasses_stale_replay_marker() {
-        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, replay, standby, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         // Plant a marker that would short-circuit recovery_first_stage.
         replay.mark("recovery_1st_stage", "primary=0,standby=1");
         let resp = s
@@ -5756,7 +5775,10 @@ mod tests {
         // Promote target, create slot on target, stop local PG, rewind,
         // write recovery conf, start local PG, attach in pgpool.
         assert_eq!(peer.promote_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*peer.create_slot_calls.lock().unwrap(), vec!["node0".to_string()]);
+        assert_eq!(
+            *peer.create_slot_calls.lock().unwrap(),
+            vec!["node0".to_string()]
+        );
         assert_eq!(sd.stop_postgres_calls.load(Ordering::SeqCst), 1);
         assert_eq!(standby.rewind_calls.load(Ordering::SeqCst), 1);
         // Rewind succeeded → basebackup NOT called.
@@ -5776,7 +5798,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_refuses_when_local_is_standby() {
-        let (s, db, _peers, _maint, _replay, _peer, _pcp, sd, standby, _inflight) = make_recovery_setup();
+        let (s, db, _peers, _maint, _replay, _peer, _pcp, sd, standby, _inflight) =
+            make_recovery_setup();
         db.in_recovery.store(true, Ordering::SeqCst);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -5799,7 +5822,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_handoff_rejects_local_node_as_target() {
-        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, _peer, _pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
         let err = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
                 target_node_id: 0,
@@ -5828,7 +5852,8 @@ mod tests {
     #[tokio::test]
     async fn cluster_handoff_refuses_when_target_pg_not_running() {
         // peer.is_running defaults to false → is_postgres_running=false.
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) =
+            make_recovery_setup();
         // Explicitly DO NOT mark_running.
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -5847,7 +5872,8 @@ mod tests {
     #[tokio::test]
     async fn cluster_handoff_refuses_when_target_is_already_primary() {
         // peer reports is_postgres_running=true && is_in_recovery=false.
-        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) = make_recovery_setup();
+        let (s, _db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) =
+            make_recovery_setup();
         peer.mark_running(); // running=true, in_recovery stays false
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -5869,7 +5895,8 @@ mod tests {
             make_recovery_setup();
         // Local primary is 16 MiB + 1 ahead of target's replay LSN.
         let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
-        db.current_wal_lsn.store(BASE_LSN + max + 1, Ordering::SeqCst);
+        db.current_wal_lsn
+            .store(BASE_LSN + max + 1, Ordering::SeqCst);
         peer.mark_standby().set_replay_lsn(BASE_LSN);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -5977,7 +6004,8 @@ mod tests {
         let (s, db, _peers, _maint, _replay, peer, _pcp, sd, _standby, _inflight) =
             make_recovery_setup();
         let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
-        db.current_wal_lsn.store(BASE_LSN + max + 1, Ordering::SeqCst);
+        db.current_wal_lsn
+            .store(BASE_LSN + max + 1, Ordering::SeqCst);
         peer.mark_standby().set_replay_lsn(BASE_LSN);
         let resp = s
             .cluster_handoff(Request::new(ClusterHandoffRequest {
@@ -6031,10 +6059,19 @@ mod tests {
             .into_inner();
         assert!(!resp.ok);
         // Slot was created on target then dropped during cleanup.
-        assert_eq!(*peer.create_slot_calls.lock().unwrap(), vec!["node0".to_string()]);
-        assert_eq!(*peer.drop_slot_calls.lock().unwrap(), vec!["node0".to_string()]);
-        assert!(resp.message.contains("cluster recover"),
-            "actionable retry hint missing: {}", resp.message);
+        assert_eq!(
+            *peer.create_slot_calls.lock().unwrap(),
+            vec!["node0".to_string()]
+        );
+        assert_eq!(
+            *peer.drop_slot_calls.lock().unwrap(),
+            vec!["node0".to_string()]
+        );
+        assert!(
+            resp.message.contains("cluster recover"),
+            "actionable retry hint missing: {}",
+            resp.message
+        );
     }
 
     #[tokio::test]
@@ -6209,8 +6246,7 @@ mod tests {
             .into_inner();
         assert!(!resp.ok);
         assert!(
-            resp.message
-                .contains("in-flight handoff (id=live-handoff"),
+            resp.message.contains("in-flight handoff (id=live-handoff"),
             "unexpected: {}",
             resp.message
         );
@@ -6270,7 +6306,9 @@ mod tests {
         // and skip promote.
         let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
         let new_main_client = Arc::new(StubPeerClient::default());
-        new_main_client.get_status_fails.store(true, Ordering::SeqCst);
+        new_main_client
+            .get_status_fails
+            .store(true, Ordering::SeqCst);
         peers.override_client(0, new_main_client.clone());
         let now = chrono::Utc::now();
         inflight.seed(crate::inflight_ops::InflightOp {
@@ -7455,7 +7493,9 @@ mod tests {
         let detached_client = Arc::new(StubPeerClient::default());
         detached_client.mark_running();
         detached_client.rewind_fails.store(true, Ordering::SeqCst);
-        detached_client.basebackup_fails.store(true, Ordering::SeqCst);
+        detached_client
+            .basebackup_fails
+            .store(true, Ordering::SeqCst);
         peers.override_client(detached.id, detached_client.clone());
 
         let np_client = Arc::new(StubPeerClient::default());

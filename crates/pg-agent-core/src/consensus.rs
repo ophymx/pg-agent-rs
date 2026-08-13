@@ -95,7 +95,9 @@ pub enum ReleaseOutcome {
     Released,
     /// The `(holder, term)` presented is not the committed lease — the
     /// caller's view was stale. Nothing was changed.
-    NotHolder { current: Option<Lease> },
+    NotHolder {
+        current: Option<Lease>,
+    },
 }
 
 // ---------------------------------------------------------------------------

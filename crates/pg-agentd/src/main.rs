@@ -22,13 +22,13 @@ use pg_agent_core::{
     certreload::CertReloader,
     config::{Config, DEFAULT_CONFIG_FILE},
     errors::AgentError,
+    inflight_ops::FileInflightOpStore,
     localdb::{LocalDb, PgLocalDb},
     maintenance::{FileMaintenanceStore, DEFAULT_SWEEP_INTERVAL},
     pcp::PcpCli,
     peers::{PeerPool, PeerRegistry},
     pgstandby::StandbyExec,
     preflight,
-    inflight_ops::FileInflightOpStore,
     replay_markers::{FileReplayMarkerStore, DEFAULT_RETENTION},
     symlinks::{ensure_hook_symlinks, find_pg_agentc},
     systemd::DbusSystemd,
@@ -166,17 +166,13 @@ async fn validate_env(cli: &Cli, json: bool, skip_db: bool) -> ExitCode {
         let port = config.postgres.port.expect("apply_defaults sets port");
         match PgLocalDb::connect(&socket_dir, port).await {
             Ok(db) => {
-                let probe = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    db.is_in_recovery(),
-                )
-                .await;
+                let probe =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), db.is_in_recovery())
+                        .await;
                 match probe {
                     Ok(Ok(_)) => Some(Arc::new(db) as Arc<dyn LocalDb>),
                     Ok(Err(e)) => {
-                        eprintln!(
-                            "warning: local DB unreachable ({e}); skipping DB-backed checks"
-                        );
+                        eprintln!("warning: local DB unreachable ({e}); skipping DB-backed checks");
                         None
                     }
                     Err(_) => {

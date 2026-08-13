@@ -353,9 +353,7 @@ impl Agent {
                 info!("phantom-primary check: confirmed");
             }
             PrimaryVerdict::NotApplicable => {
-                info!(
-                    "phantom-primary check: not applicable (standby or PG not running)"
-                );
+                info!("phantom-primary check: not applicable (standby or PG not running)");
             }
             PrimaryVerdict::Phantom { local_tl, peers } => {
                 let peer_evidence: Vec<String> = peers
@@ -444,16 +442,18 @@ impl Agent {
         }
 
         if self.opts.supervisor_pgpool_enabled && supervisor_eligible {
-            let supervisor =
-                Arc::new(crate::pgpool_supervisor::PgpoolSupervisor::new(
-                    self.deps.sd.clone(),
-                ));
+            let supervisor = Arc::new(crate::pgpool_supervisor::PgpoolSupervisor::new(
+                self.deps.sd.clone(),
+            ));
             // Best-effort one-shot at startup: a clean boot converges
             // in milliseconds instead of waiting `TICK` for the loop's
             // first iteration. Logs and proceeds on any error — the
             // continuous loop will retry.
             if let Err(e) = supervisor.ensure_running_once().await {
-                warn!(?e, "pgpool_supervisor: startup probe failed; continuous loop will retry");
+                warn!(
+                    ?e,
+                    "pgpool_supervisor: startup probe failed; continuous loop will retry"
+                );
             }
             let s = shutdown.clone();
             let sup = supervisor.clone();
@@ -737,10 +737,7 @@ impl Agent {
             Ok(v) => v,
             Err(_) => {
                 return PrimaryVerdict::Unverifiable {
-                    reason: format!(
-                        "peer fan-out exceeded {:?}",
-                        STARTUP_CHECK_TIMEOUT
-                    ),
+                    reason: format!("peer fan-out exceeded {:?}", STARTUP_CHECK_TIMEOUT),
                 };
             }
         };
@@ -826,14 +823,7 @@ impl NodeInfo for Agent {
     /// lag. A node where any probe failed is degraded, not ready, even if
     /// the visible facts (e.g. service running) look fine. See SPEC §5.9.
     async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
-        let (
-            pg_status_res,
-            pgpool_status_res,
-            in_recovery_res,
-            lag_res,
-            timeline_res,
-            wal_lsn_res,
-        ) = tokio::join!(
+        let (pg_status_res, pgpool_status_res, in_recovery_res, lag_res, timeline_res, wal_lsn_res) = tokio::join!(
             self.deps.sd.status_postgres(),
             self.deps.sd.status_pgpool(),
             self.deps.db.is_in_recovery(),
@@ -1221,12 +1211,7 @@ mod tests {
                 last_error: None,
             })
         }
-        async fn update_phase(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<String>,
-        ) -> anyhow::Result<()> {
+        async fn update_phase(&self, _: &str, _: &str, _: Option<String>) -> anyhow::Result<()> {
             Ok(())
         }
         async fn complete(&self, _: &str) -> anyhow::Result<()> {
@@ -1658,8 +1643,7 @@ mod tests {
                     maintenance_sweep_interval: Duration::from_secs(30),
                     phantom_check_required_peers:
                         crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
-                    supervisor_pgpool_enabled:
-                        crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                    supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                     cert_reloader: None,
                     ha_shadow: None,
                 },
@@ -2082,7 +2066,11 @@ mod tests {
             let v = seqs
                 .get_mut(&node.id)
                 .ok_or_else(|| anyhow::anyhow!("sequenced: no peer for id={}", node.id))?;
-            let status = if v.len() > 1 { v.remove(0) } else { v[0].clone() };
+            let status = if v.len() > 1 {
+                v.remove(0)
+            } else {
+                v[0].clone()
+            };
             Ok(Arc::new(CannedPeerClient { status }))
         }
         async fn close(&self) -> anyhow::Result<()> {
@@ -2108,7 +2096,10 @@ mod tests {
         });
         // First call: peer's localdb still warming up → timeline=0.
         // Second call: peer settled → timeline=7, standby. Confirmed.
-        let peers = Arc::new(SequencedPeers::new(vec![(1, vec![ns(0, true), ns(7, true)])]));
+        let peers = Arc::new(SequencedPeers::new(vec![(
+            1,
+            vec![ns(0, true), ns(7, true)],
+        )]));
         let agent = make_agent_with_one_peer(db, sd.clone(), peers);
         let v = agent
             .verify_primary_with_retries_params(3, Duration::from_millis(1))
@@ -2170,10 +2161,7 @@ mod tests {
             .verify_primary_with_retries_params(3, Duration::from_millis(500))
             .await;
         let elapsed = before.elapsed();
-        assert!(
-            matches!(v, PrimaryVerdict::Phantom { .. }),
-            "got {v:?}"
-        );
+        assert!(matches!(v, PrimaryVerdict::Phantom { .. }), "got {v:?}");
         // Should NOT have paid the retry delay even once.
         assert!(
             elapsed < Duration::from_millis(400),
@@ -2322,7 +2310,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("after 2 attempts") && err.contains("attempt 1") && err.contains("attempt 2"),
+            err.contains("after 2 attempts")
+                && err.contains("attempt 1")
+                && err.contains("attempt 2"),
             "unexpected error: {err}"
         );
     }

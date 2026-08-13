@@ -97,7 +97,10 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(err.contains("stop_postgres failed after 2 attempts"), "{err}");
+        assert!(
+            err.contains("stop_postgres failed after 2 attempts"),
+            "{err}"
+        );
         assert!(err.contains("attempt 1: boom 0"), "{err}");
         assert!(err.contains("attempt 2: boom 1"), "{err}");
     }

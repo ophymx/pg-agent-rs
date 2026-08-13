@@ -62,7 +62,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-#[allow(unused)] // currently unused; reserved for future variants that consult cluster topology.
+#[allow(unused)]
+// currently unused; reserved for future variants that consult cluster topology.
 use NodePool as _;
 #[allow(unused)] // ditto for cross-peer probes (e.g. switchover verifying remote state).
 use PeerRegistry as _;
@@ -569,7 +570,11 @@ impl InflightOpStore for FileInflightOpStore {
         if !statuses.is_empty() {
             ops.retain(|o| statuses.contains(&o.status));
         }
-        ops.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));
+        ops.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         skipped.sort_by(|a, b| a.path.cmp(&b.path));
         Ok((ops, skipped))
     }
@@ -790,7 +795,11 @@ mod tests {
     #[tokio::test]
     async fn find_returns_none_for_unknown() {
         let (_tmp, store) = fixture();
-        assert!(store.find("handoff", "from=1,to=2").await.unwrap().is_none());
+        assert!(store
+            .find("handoff", "from=1,to=2")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -929,10 +938,7 @@ mod tests {
             .unwrap();
         assert_eq!(found.as_ref().map(|o| &o.id), Some(&fp.id));
         // Same key as a handoff would NOT collide.
-        let no_match = store
-            .find("follow_primary", "from=1,to=2")
-            .await
-            .unwrap();
+        let no_match = store.find("follow_primary", "from=1,to=2").await.unwrap();
         assert!(no_match.is_none());
     }
 
@@ -976,9 +982,7 @@ impl InMemoryInflightOpStore {
 
     /// Build an `InProgress` op at `phase` and stage it.
     pub fn seed_in_progress(&self, payload: InflightPayload, phase: &str) -> InflightOp {
-        let n = self
-            .seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let now = Utc::now();
         let op = InflightOp {
             id: format!("mem-{}-{n}", payload.op_name()),
