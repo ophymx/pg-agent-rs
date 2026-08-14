@@ -150,7 +150,13 @@ struct PeerView {
 
 struct TickState {
     last_holder: Option<i32>,
-    holder_unhealthy_since: Option<Instant>,
+    /// `(holder, since)` — the clock is keyed to the holder it watched.
+    /// A lease that changes hands must NOT inherit the previous
+    /// holder's unhealthy time: the ttl is each holder's protection
+    /// window, and the acceptance suite's R4 caught a rival deposing a
+    /// 7-second-old lease because its clock had been running against
+    /// the *previous* holder (finding 13).
+    holder_unhealthy_since: Option<(i32, Instant)>,
     store_unknown_since: Option<Instant>,
     backoff_until: Option<Instant>,
     /// The lease term we currently believe we hold, and when we first
@@ -223,7 +229,23 @@ impl HaLoop {
         let now = Instant::now();
         let local_id = self.pool.local_node_id;
 
-        let state = self.store.read_state().await;
+        // The read is bounded by the loop's own retry budget, whatever
+        // the store behind the trait does. The raft-backed store learned
+        // this the hard way in the acceptance suite's R4: a forwarded
+        // read to a just-isolated leader blocked one tick for 34 s — the
+        // entire partition window — where "evidence we cannot get within
+        // the budget is evidence we do not get" would have produced a
+        // StoreUnknown tick and kept the loop's clock running. The store
+        // now bounds itself too (LEADER_RPC_TIMEOUT); this is the loop
+        // refusing to depend on that.
+        let state =
+            match tokio::time::timeout(self.timing.retry_timeout, self.store.read_state()).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "store read exceeded retry_timeout {:?}",
+                    self.timing.retry_timeout
+                )),
+            };
         let local = self.observe_local().await;
         let peers = self.observe_peers().await;
 
@@ -331,7 +353,16 @@ impl HaLoop {
                 } else {
                     let unhealthy_for = {
                         let mut ts = self.state.lock().unwrap();
-                        let since = *ts.holder_unhealthy_since.get_or_insert(now);
+                        let since = match ts.holder_unhealthy_since {
+                            Some((h, t)) if h == lease.holder => t,
+                            // First unhealthy observation of THIS
+                            // holder — restart the clock, whatever it
+                            // said about a predecessor.
+                            _ => {
+                                ts.holder_unhealthy_since = Some((lease.holder, now));
+                                now
+                            }
+                        };
                         now.duration_since(since)
                     };
                     if unhealthy_for >= self.timing.leader_ttl {
@@ -1101,6 +1132,74 @@ mod tests {
             other => panic!("expected TookOver, got {other:?}"),
         }
         assert_eq!(f.store.snapshot().lease.unwrap().holder, 1);
+    }
+
+    /// The unhealthy clock is each holder's, not the lease's. Watching
+    /// a dead holder past ttl earns candidacy against THAT holder; if
+    /// someone else wins the race, the new holder gets a fresh ttl —
+    /// the clock must not carry over. Regression for acceptance
+    /// finding 13: a rival deposed a 7-second-old lease during the R4
+    /// partition because its clock had been running against the
+    /// previous holder, voiding exactly the hysteresis window a fresh
+    /// winner needs to finish its (asynchronous) promotion.
+    #[tokio::test]
+    async fn a_new_holder_does_not_inherit_its_predecessors_unhealthy_clock() {
+        let f = fixture(1, StubDb::standby(2, BASE + 100));
+        f.peers.set(0, primary_status(2, BASE + 200));
+        f.peers.set(2, standby_status(2, BASE));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+
+        // Holder 0 dies; local watches it well past leader_ttl (50ms).
+        f.peers.mark_unreachable(0);
+        f.ha.tick_once().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Before local's next tick, node 2 wins the takeover race (as
+        // the real store allows). Node 2 is a standby mid-promotion:
+        // not yet running_as_primary, i.e. "unhealthy" to the watch.
+        let cur = f.store.snapshot().lease.unwrap();
+        match f
+            .store
+            .try_takeover(2, Some((cur.holder, cur.term)))
+            .await
+            .unwrap()
+        {
+            TakeoverOutcome::Won { .. } => {}
+            other => panic!("arrangement takeover lost: {other:?}"),
+        }
+
+        // Local's tick sees the NEW holder. With an inherited clock it
+        // would consider candidacy immediately (>50ms already elapsed —
+        // against the wrong holder). It must instead start watching
+        // node 2 from zero.
+        match f.ha.tick_once().await {
+            HaDecision::HolderUnhealthy {
+                holder: 2,
+                unhealthy_for,
+            } => {
+                assert!(
+                    unhealthy_for < Duration::from_millis(50),
+                    "clock carried over from holder 0: {unhealthy_for:?}"
+                );
+            }
+            other => panic!("expected a fresh HolderUnhealthy watch on node 2, got {other:?}"),
+        }
+        assert_eq!(
+            f.store.snapshot().lease.unwrap().holder,
+            2,
+            "the 7-second-old lease must survive local's tick"
+        );
+
+        // Once node 2 has been unhealthy for ITS OWN ttl, candidacy is
+        // legitimate again.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        match f.ha.tick_once().await {
+            HaDecision::TookOver { .. } => {}
+            other => panic!("expected TookOver after a full ttl on the new holder, got {other:?}"),
+        }
     }
 
     #[tokio::test]

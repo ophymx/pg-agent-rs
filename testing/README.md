@@ -103,13 +103,56 @@ Run `PHASE=1 testing/acceptance.sh` to stop before pgpool comes up.
   primary makes the phantom check stop it — and how narrow it is
   (nothing fires while the stale primary just keeps running).
 
-Run `PHASE=1` to stop before pgpool, `PHASE=2` to stop before phase 3.
+Run `PHASE=1` to stop before pgpool, `PHASE=2` to stop before phase 3,
+`PHASE=3` to stop before the raft phase.
 
-## Phase 4 (planned)
+## Phase 4 — consensus for real (promotion-authority step 6)
 
-- Partition scenarios that assert *safety* rather than record
-  unsafety — i.e. S13 inverted — once openraft replaces the
-  process-local shadow store. This is step 6's acceptance criteria.
+The same shadow loop, backed by the embedded Raft instead of a
+process-local store: `enabled = true` is appended to the `[raft]` block
+on all three nodes and the agents restarted, which routes the lease
+through `PgAgentRaft` on the peer mTLS listener and a replicated redb
+state machine. Still shadow — nothing promotes — so the assertions are
+about the *decision stream*, and specifically about the two claims the
+per-node phases could only simulate:
+
+- **R0** — post-S13 repair, pgpool stopped (these scenarios are about
+  the agent's own decisions), raft enabled. The daemon restart itself
+  is the validate-env assertion: the packaged unit's ExecStartPre gate
+  now runs the raft prerequisite checks. Before membership exists, all
+  nodes must tick `StoreUnknown` — "cannot read is not vacant" holding
+  on a real consensus store, where the store's answer genuinely is
+  unknown rather than fault-injected.
+- **R1** — `ClusterInit` forms raft membership; a second run reports
+  "already formed" rather than erroring. `--only-node 99` matches no
+  standby, so the run exercises exactly the membership bootstrap.
+- **R2** — steady state through the quorum: the primary retains, both
+  standbys follow, and — the difference from S2 — lease acquisition
+  happens **once cluster-wide**, not once per private store. The suite
+  counts acquisition events across all three journals and requires
+  exactly one.
+- **R3/R3b** — primary death: exactly one standby commits the takeover,
+  now CAS-serialized by the quorum rather than emergent from the
+  node-id tiebreak; the winner cycles `AwaitingPromotion` (nothing
+  promotes in shadow). Primary returns, lease converges back.
+- **R4/R4b** — **S13 inverted at the decision level.** The same
+  partition that produced two primaries under pgpool: the isolated
+  lease holder, unable to complete a linearizable read, decides
+  `WouldDemote` ("quorum contact lost") without ever learning whether a
+  takeover happened — and commits nothing. The majority commits a
+  takeover, and every takeover comes at least `leader_ttl` after the
+  previous one — sequential handoffs are *expected* in shadow mode
+  (nothing promotes, so each winner's lease looks orphaned after its
+  grace window and legally moves on), but a fresh holder's ttl of
+  protection must hold (finding 13 is what happens when it does not).
+  Shadow mode means these are log lines, but they are the decisions
+  that make split brain unreachable once step 7 hands them executors.
+  R4b confirms the partitioned raft node rejoins without a restart and
+  PostgreSQL-level state needed no repair (exactly one primary
+  throughout).
+
+## Still planned
+
 - `detach_false_primary` storm behavior (hook-contract §5.5), which
   needs a false primary manufactured out of band.
 - `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
@@ -267,3 +310,44 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
       a retry against a node that is already primary. The channel
       ceiling is now `LONG_RPC_TIMEOUT`, with fast unary RPCs bounded
       client-side by `short_rpc`.
+
+12. **The consensus plane repeated finding 11's bug — caught by R4's
+    first real partition, fixed.** The HA tick forwards its
+    linearizable read to the raft leader; when that leader is the node
+    that just got isolated, the forwarded RPC sat on a cached channel
+    whose only bound was the 30 s channel ceiling. One tick blocked
+    **34 s** — the entire partition window — while the surviving nodes
+    had re-elected a reachable leader within 1 s. The majority never
+    started its holder-unhealthy clock, so the takeover the scenario
+    exists to observe never happened. `Request::set_timeout` could not
+    help: it writes a header for the server to honour, and the server
+    is precisely who is unreachable. Fixed twice over: leader-forwarded
+    RPCs are bounded client-side by `LEADER_RPC_TIMEOUT` (5 s), and the
+    HA tick bounds `read_state` at `retry_timeout` regardless of what
+    the store behind the trait does — the loop no longer trusts any
+    store to fail fast. Regression-tested with a black-hole peer
+    (accepts TCP, never answers) in `raftnet`; same client-side
+    enforcement added to openraft's replication RPCs via `hard_ttl`.
+    Worth naming the pattern after two occurrences: **any RPC whose
+    failure the caller has a time budget for must carry a client-side
+    deadline; header deadlines evaporate exactly when they matter.**
+
+13. **A new lease holder inherited its predecessor's unhealthy clock —
+    caught by R4's second run, fixed.** During the partition, db2
+    legitimately took the lease after watching the dead holder for
+    `leader_ttl`; seven seconds later db1 deposed it. db1's
+    holder-unhealthy clock had been running against the *previous*
+    holder and was never reset when the lease changed hands, so the
+    brand-new holder started its life already past ttl in db1's eyes.
+    In shadow this is churn in a log; at cutover it voids exactly the
+    window the `grace = leader_ttl` design promises a fresh winner —
+    `pg_promote()` is asynchronous, and a rival with an inherited clock
+    can CAS the lease away mid-promotion, which is the lease-thrash
+    storm of finding 5 wearing consensus clothes. Fixed by keying the
+    clock to the holder it watched (`holder_unhealthy_since: (holder,
+    since)`); unit-regression-tested, and R4's hysteresis assertion
+    (no two takeovers within `leader_ttl`) is the acceptance-level
+    guard. Found because the suite's first "exactly one takeover"
+    assertion was *wrong* — sequential shadow handoffs are legal — and
+    replacing it with the property the ttl actually promises is what
+    exposed the 7-second gap as a violation rather than noise.

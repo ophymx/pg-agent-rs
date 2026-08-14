@@ -82,6 +82,24 @@ pub const RAFT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// plane's 60 s: this is the connection whose silence must be noticed.
 pub const RAFT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Client-side deadline on leader-forwarded RPCs (`Propose`,
+/// `ReadState`).
+///
+/// This exists because of a bug the acceptance suite's R4 scenario
+/// caught on the first real partition: the HA tick forwarded its read
+/// to the raft leader that had just been isolated, over a cached
+/// channel whose only bound was the 30 s channel ceiling — so one tick
+/// blocked 34 s while a 1 s re-election had already moved leadership.
+/// The next tick would have used the new leader; there was no next
+/// tick inside the partition window. Same lesson as the peer plane's
+/// PRECONDITION_TIMEOUT: `Request::set_timeout` only writes a header
+/// for the *server* to honour, and the server is precisely who is
+/// unreachable, so the deadline must be enforced on this side of the
+/// wire. Five seconds is far above a healthy forward (one intra-LAN
+/// round trip plus a ReadIndex quorum round trip) and far below the
+/// smallest sane `retry_timeout` cadence the HA loop runs on.
+pub const LEADER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Raft handle, with this crate's type config already applied.
 pub type PgAgentRaftHandle = Raft<PgAgentTypeConfig>;
 
@@ -331,12 +349,22 @@ impl RaftNetwork<PgAgentTypeConfig> for RaftPeerNetwork {
         let mut request = Request::new(frame);
         request.set_timeout(option.hard_ttl());
 
+        // hard_ttl is enforced HERE, not only via set_timeout above: the
+        // header form is honoured by the server, and a black-holed peer
+        // is exactly the case where there is no server to honour it.
+        let ttl = option.hard_ttl();
         let client = self.client().await?;
-        match client.append_entries(request).await {
-            Ok(reply) => decode_reply(reply.get_ref()),
-            Err(status) => {
+        match tokio::time::timeout(ttl, client.append_entries(request)).await {
+            Ok(Ok(reply)) => decode_reply(reply.get_ref()),
+            Ok(Err(status)) => {
                 self.invalidate();
                 Err(unreachable(TransportError(status.to_string())))
+            }
+            Err(_) => {
+                self.invalidate();
+                Err(unreachable(TransportError(format!(
+                    "no reply within {ttl:?} (client-side deadline)"
+                ))))
             }
         }
     }
@@ -354,12 +382,22 @@ impl RaftNetwork<PgAgentTypeConfig> for RaftPeerNetwork {
         let mut request = Request::new(frame);
         request.set_timeout(option.hard_ttl());
 
+        // hard_ttl is enforced HERE, not only via set_timeout above: the
+        // header form is honoured by the server, and a black-holed peer
+        // is exactly the case where there is no server to honour it.
+        let ttl = option.hard_ttl();
         let client = self.client().await?;
-        match client.vote(request).await {
-            Ok(reply) => decode_reply(reply.get_ref()),
-            Err(status) => {
+        match tokio::time::timeout(ttl, client.vote(request)).await {
+            Ok(Ok(reply)) => decode_reply(reply.get_ref()),
+            Ok(Err(status)) => {
                 self.invalidate();
                 Err(unreachable(TransportError(status.to_string())))
+            }
+            Err(_) => {
+                self.invalidate();
+                Err(unreachable(TransportError(format!(
+                    "no reply within {ttl:?} (client-side deadline)"
+                ))))
             }
         }
     }
@@ -383,12 +421,22 @@ impl RaftNetwork<PgAgentTypeConfig> for RaftPeerNetwork {
         let mut request = Request::new(frame);
         request.set_timeout(option.hard_ttl());
 
+        // hard_ttl is enforced HERE, not only via set_timeout above: the
+        // header form is honoured by the server, and a black-holed peer
+        // is exactly the case where there is no server to honour it.
+        let ttl = option.hard_ttl();
         let client = self.client().await?;
-        match client.install_snapshot(request).await {
-            Ok(reply) => decode_reply(reply.get_ref()),
-            Err(status) => {
+        match tokio::time::timeout(ttl, client.install_snapshot(request)).await {
+            Ok(Ok(reply)) => decode_reply(reply.get_ref()),
+            Ok(Err(status)) => {
                 self.invalidate();
                 Err(unreachable(TransportError(status.to_string())))
+            }
+            Err(_) => {
+                self.invalidate();
+                Err(unreachable(TransportError(format!(
+                    "no reply within {ttl:?} (client-side deadline)"
+                ))))
             }
         }
     }
@@ -409,6 +457,9 @@ impl RaftNetwork<PgAgentTypeConfig> for RaftPeerNetwork {
 pub struct LeaderClient {
     tls: Option<Arc<ClientConfig>>,
     channels: Arc<Mutex<HashMap<String, PgAgentRaftClient<Channel>>>>,
+    /// Client-side bound on every forwarded RPC. See
+    /// [`LEADER_RPC_TIMEOUT`] for why this cannot be a header.
+    deadline: Duration,
 }
 
 impl LeaderClient {
@@ -416,11 +467,18 @@ impl LeaderClient {
         Self {
             tls,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            deadline: LEADER_RPC_TIMEOUT,
         }
     }
 
     pub fn new_dev() -> Self {
         Self::new(None)
+    }
+
+    /// Override the forwarded-RPC deadline (tests).
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     async fn client(&self, addr: &str) -> anyhow::Result<PgAgentRaftClient<Channel>> {
@@ -460,11 +518,19 @@ impl LeaderClient {
         let frame = RaftFrame {
             payload: serde_json::to_vec(cmd)?,
         };
-        match client.propose(Request::new(frame)).await {
-            Ok(reply) => Ok(serde_json::from_slice(&reply.get_ref().payload)?),
-            Err(status) => {
+        match tokio::time::timeout(self.deadline, client.propose(Request::new(frame))).await {
+            Ok(Ok(reply)) => Ok(serde_json::from_slice(&reply.get_ref().payload)?),
+            Ok(Err(status)) => {
                 self.invalidate(addr).await;
                 Err(anyhow::anyhow!("raft propose via {addr}: {status}"))
+            }
+            Err(_) => {
+                self.invalidate(addr).await;
+                Err(anyhow::anyhow!(
+                    "raft propose via {addr}: no reply within {:?} \
+                     (leader unreachable or gone)",
+                    self.deadline
+                ))
             }
         }
     }
@@ -475,11 +541,19 @@ impl LeaderClient {
         let frame = RaftFrame {
             payload: Vec::new(),
         };
-        match client.read_state(Request::new(frame)).await {
-            Ok(reply) => Ok(serde_json::from_slice(&reply.get_ref().payload)?),
-            Err(status) => {
+        match tokio::time::timeout(self.deadline, client.read_state(Request::new(frame))).await {
+            Ok(Ok(reply)) => Ok(serde_json::from_slice(&reply.get_ref().payload)?),
+            Ok(Err(status)) => {
                 self.invalidate(addr).await;
                 Err(anyhow::anyhow!("raft read_state via {addr}: {status}"))
+            }
+            Err(_) => {
+                self.invalidate(addr).await;
+                Err(anyhow::anyhow!(
+                    "raft read_state via {addr}: no reply within {:?} \
+                     (leader unreachable or gone)",
+                    self.deadline
+                ))
             }
         }
     }
@@ -705,6 +779,59 @@ mod tests {
             matches!(err, RPCError::Unreachable(_)),
             "expected Unreachable, got {err:?}"
         );
+    }
+
+    /// A peer that accepts TCP but never answers — the shape of a
+    /// network partition against an established channel, where there is
+    /// no RST and no server to honour a header deadline — must fail at
+    /// the client-side deadline, not the 30 s channel ceiling. This is
+    /// the regression test for the R4 finding: one HA tick blocked 34 s
+    /// on a forwarded read to a just-isolated leader, consuming the
+    /// whole partition window.
+    #[tokio::test]
+    async fn black_holed_leader_fails_at_the_client_side_deadline() {
+        // Accept connections and then say nothing, forever.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let leader = LeaderClient::new_dev().with_deadline(Duration::from_millis(400));
+        let started = std::time::Instant::now();
+        let err = leader
+            .read_state(&addr)
+            .await
+            .expect_err("a silent peer must not look like a leader");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deadline did not bind: took {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("no reply within"),
+            "unexpected error: {err}"
+        );
+
+        // The replication path has the same obligation, via hard_ttl.
+        let mut factory = RaftChannelFactory::new_dev();
+        let mut net = factory.new_client(3, &BasicNode::new(addr.clone())).await;
+        let started = std::time::Instant::now();
+        let err = net
+            .vote(
+                VoteRequest::new(openraft::Vote::new(1, 3), None),
+                RPCOption::new(Duration::from_millis(400)),
+            )
+            .await
+            .expect_err("vote to a silent peer must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hard_ttl did not bind client-side"
+        );
+        assert!(matches!(err, RPCError::Unreachable(_)));
     }
 
     /// A `BasicNode` with no address is a misconfiguration, not a panic.

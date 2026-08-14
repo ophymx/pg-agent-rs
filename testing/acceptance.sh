@@ -462,6 +462,224 @@ if [ "$SPLIT" = yes ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Phase 4 — consensus for real (promotion-authority step 6). The same
+# shadow loop, backed by the embedded Raft instead of a process-local
+# store: PgAgentRaft on the peer mTLS listener, membership formed by
+# ClusterInit, the lease in a replicated state machine. Still shadow —
+# nothing promotes — so what is under test is the decision stream, and
+# the structural claims the in-memory store could only simulate:
+# exactly-one takeover is now CAS-serialized by a quorum, and a
+# partitioned holder *learns* it must demote instead of serving on.
+# ---------------------------------------------------------------------------
+if [ "${PHASE:-all}" = "3" ]; then
+    say "result"; echo "PASS=$PASS FAIL=$FAIL"
+    [ "$FAIL" -gt 0 ] && { printf '  - %s\n' "${FAILURES[@]}"; exit 1; }
+    exit 0
+fi
+
+# log_since <node> <since-ts> <substring> — like log_has, but bounded to
+# journal entries after a captured timestamp. Raft scenarios re-trigger
+# the same decision variants the shadow phases already logged, so
+# whole-journal greps would pass vacuously.
+log_since() {
+    local out
+    out=$(docker exec "pga-$1" journalctl -u pg_agentd --since "$2" --no-pager -o cat 2>/dev/null)
+    [[ "$out" == *"$3"* ]]
+}
+now_ts() { docker exec pga-db0 date '+%Y-%m-%d %H:%M:%S'; }
+
+say "R0: repair after S13, stop pgpool, enable raft on all nodes"
+PRIM=$(current_primary)
+if [ -z "$PRIM" ]; then
+    x db0 "systemctl start postgresql@17-main" >/dev/null 2>&1 || true
+    sleep 10; PRIM=$(current_primary)
+fi
+if [ -n "$PRIM" ]; then ok "primary for the raft phase is $PRIM"; else bad "no primary to start the raft phase from"; fi
+STREAMING=$(xp "$PRIM" "psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\"" 2>/dev/null | tr -d ' ')
+if [ "${STREAMING:-0}" != "2" ]; then
+    repair_cluster "$PRIM"
+    wait_for 180 "cluster repaired for the raft phase" \
+        "[ \"\$(docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | tr -d ' ')\" = 2 ]"
+else
+    ok "cluster already healthy (2 streaming standbys)"
+fi
+# pgpool out of the loop: these scenarios are about the agent's own
+# decisions, and the supervisor is disabled in this harness config so
+# nothing restarts it.
+for n in db0 db1 db2; do x "$n" "systemctl stop pgpool2" >/dev/null 2>&1 || true; done
+
+RAFT_TS=$(now_ts)
+for n in db0 db1 db2; do
+    x "$n" "printf 'enabled             = true\n' >> /etc/pg_agent/config.toml"
+    x "$n" "systemctl restart pg_agentd"
+done
+for n in db0 db1 db2; do
+    # The restart itself is the validate-env assertion: the packaged
+    # unit's ExecStartPre gate now runs the raft prerequisite checks
+    # (pool of 3, mTLS, resolvable node id, writable state dir) and
+    # would keep the daemon down if any refused.
+    wait_for 60 "$n: pg_agentd active with [raft] enabled (validate-env gate passed)" \
+        "docker exec pga-$n systemctl is-active -q pg_agentd"
+    wait_for 30 "$n: raft started" \
+        "docker exec pga-$n journalctl -u pg_agentd --since '$RAFT_TS' --no-pager -o cat | grep -q 'raft: started'"
+done
+# Until ClusterInit forms membership there is no quorum to read
+# through, and the loop must report UNKNOWN — not vacant, and above
+# all not act. Every node ticking StoreUnknown here is the "cannot
+# read is not vacant" rule holding on a real consensus store.
+wait_for 30 "pre-membership: loop reports store unknown (not vacant)" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$RAFT_TS' --no-pager -o cat | grep -q 'StoreUnknown'"
+
+say "R1: ClusterInit forms raft membership, idempotently"
+# --only-node 99 matches no standby: replication work is a no-op, so
+# this exercises exactly the membership bootstrap. Run on the primary
+# (ClusterInit refuses on a standby).
+INIT1=$(xp "$PRIM" "pg_agentctl cluster init --only-node 99" 2>&1)
+if [[ "$INIT1" == *"raft membership initialized (3 nodes)"* ]]; then
+    ok "first init formed the membership"
+else
+    bad "first init did not report membership formation: $INIT1"
+fi
+INIT2=$(xp "$PRIM" "pg_agentctl cluster init --only-node 99" 2>&1)
+if [[ "$INIT2" == *"raft membership already formed"* ]]; then
+    ok "second init reports already formed (idempotent, not an error)"
+else
+    bad "second init did not report already-formed: $INIT2"
+fi
+
+say "R2: consensus-backed steady state — one lease, everyone agrees"
+PRIM_ID="${PRIM#db}"
+wait_for 60 "$PRIM retains the lease through the quorum" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$RAFT_TS' --no-pager -o cat | grep -q 'RetainedLease'"
+for n in db0 db1 db2; do
+    [ "$n" = "$PRIM" ] && continue
+    wait_for 60 "$n follows holder $PRIM_ID (read from the shared state machine)" \
+        "docker exec pga-$n journalctl -u pg_agentd --since '$RAFT_TS' --no-pager -o cat | grep -q 'Following { holder: $PRIM_ID }'"
+done
+# The shared store means lease acquisition happens ONCE, cluster-wide —
+# unlike the per-node phases, where every node adopted into its own
+# private store. Count acquisition events across all three nodes.
+ACQ=0
+for n in db0 db1 db2; do
+    if log_since "$n" "$RAFT_TS" 'TookOver' || log_since "$n" "$RAFT_TS" 'AdoptedObservedPrimary'; then
+        ACQ=$((ACQ+1))
+    fi
+done
+if [ "$ACQ" = "1" ]; then
+    ok "exactly one node acquired the lease (CAS serialized by the quorum)"
+else
+    bad "expected exactly 1 lease acquirer, found $ACQ"
+fi
+
+say "R3: primary death — takeover is now quorum-committed, still exactly one"
+TS3=$(now_ts)
+x "$PRIM" "systemctl stop postgresql@17-main"
+sleep 25   # leader_ttl 10s + loop_wait 2s + margin
+WINNERS=""
+for n in db0 db1 db2; do
+    [ "$n" = "$PRIM" ] && continue
+    if log_since "$n" "$TS3" 'TookOver'; then WINNERS="$WINNERS $n"; fi
+done
+case "$(echo $WINNERS | wc -w)" in
+    1) ok "exactly one standby committed the takeover:$WINNERS" ;;
+    0) bad "no standby took over after leader_ttl" ;;
+    *) bad "multiple standbys logged TookOver:$WINNERS — CAS failed to serialize" ;;
+esac
+W=$(echo $WINNERS | awk '{print $1}')
+if [ -n "$W" ]; then
+    if log_since "$W" "$TS3" 'AwaitingPromotion'; then
+        ok "$W awaits promotion (nothing actually promotes in shadow)"
+    else
+        bad "$W did not log AwaitingPromotion"
+    fi
+fi
+
+say "R3b: primary returns — lease converges back through the quorum"
+TS3B=$(now_ts)
+x "$PRIM" "systemctl start postgresql@17-main"
+wait_for 90 "$PRIM retains the lease again" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$TS3B' --no-pager -o cat | grep -q 'RetainedLease'"
+wait_for 60 "$PRIM sees 2 streaming standbys again" \
+    "docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+
+say "R4: S13 INVERTED at the decision level — partition, no second primary decision"
+# The scenario S13 proved reachable with pgpool deciding: isolated
+# primary keeps serving, majority promotes a second one. Same partition,
+# consensus deciding: the majority commits exactly one takeover, and the
+# isolated holder — unable to complete a linearizable read — decides to
+# DEMOTE ITSELF, without ever learning a takeover happened. Shadow mode
+# means both are decisions in a log, but they are the decisions that
+# make split brain unreachable once step 7 hands them executors.
+TS4=$(now_ts)
+docker network disconnect pga-net "pga-$PRIM" >/dev/null 2>&1
+say "     (isolated $PRIM — current lease holder — from the cluster network)"
+# Budget: the candidates' first read after the partition burns the 5s
+# leader-forward deadline on the vanished raft leader, then re-forwards
+# to the new one; holder-unhealthy then accumulates to leader_ttl 10s
+# before candidacy. ~20s worst case; 45 leaves margin.
+sleep 45
+if log_since "$PRIM" "$TS4" 'quorum contact lost'; then
+    ok "isolated holder decided to demote (store unknown past retry budget)"
+else
+    bad "isolated holder never escalated store-unknown to a demote decision"
+fi
+if log_since "$PRIM" "$TS4" 'TookOver'; then
+    bad "isolated node committed a takeover without a quorum"
+else
+    ok "isolated node committed nothing (no quorum, no writes)"
+fi
+# In shadow mode nothing promotes, so the winner's lease looks orphaned
+# after its grace window and legally moves on — sequential takeovers are
+# EXPECTED here, and asserting "exactly one" was wrong (it also produced
+# a false red that led to finding 13). The property the ttl actually
+# promises is hysteresis: every takeover must come at least leader_ttl
+# after the previous one, because a fresh holder gets a full ttl of
+# protection while its (asynchronous) promotion lands. Finding 13 was a
+# 7-second deposal — a rival's unhealthy clock carried over from the
+# previous holder — and this is the assertion that catches it.
+MAJ_TAKES=$(for n in db0 db1 db2; do
+    [ "$n" = "$PRIM" ] && continue
+    docker exec "pga-$n" journalctl -u pg_agentd --since "$TS4" --no-pager -o short-unix 2>/dev/null \
+        | grep 'TookOver'
+done | awk '{print int($1)}' | sort -n)
+NTAKES=$(echo "$MAJ_TAKES" | grep -c '[0-9]' || true)
+if [ "${NTAKES:-0}" -ge 1 ]; then
+    ok "majority committed a takeover ($NTAKES in the window)"
+else
+    bad "majority never took over the dead holder's lease"
+fi
+GAP_VIOLATION=""
+prev=""
+for t in $MAJ_TAKES; do
+    if [ -n "$prev" ] && [ $((t - prev)) -lt 10 ]; then
+        GAP_VIOLATION="$((t - prev))s"
+    fi
+    prev="$t"
+done
+if [ -z "$GAP_VIOLATION" ]; then
+    ok "every takeover ≥ leader_ttl after the previous (fresh holders kept their ttl)"
+else
+    bad "takeovers $GAP_VIOLATION apart — a new holder was deposed inside its ttl (finding 13 shape)"
+fi
+
+say "R4b: partition heals — one primary throughout, lease converges"
+TS4B=$(now_ts)
+docker network connect pga-net "pga-$PRIM" >/dev/null 2>&1
+# Nothing was promoted (shadow), so PostgreSQL-level state needs no
+# repair: the isolated primary was never demoted, the standbys never
+# promoted. This is also the check that the raft node REJOINS after a
+# partition rather than needing a restart.
+if [ "$(count_primaries)" = "1" ]; then
+    ok "exactly one PostgreSQL primary throughout the partition (shadow)"
+else
+    bad "primary count drifted during the partition: $(count_primaries)"
+fi
+wait_for 120 "$PRIM retains the lease again after rejoining" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$TS4B' --no-pager -o cat | grep -q 'RetainedLease'"
+wait_for 60 "replication intact (2 streaming standbys)" \
+    "docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+
+# ---------------------------------------------------------------------------
 say "result"
 echo "PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then

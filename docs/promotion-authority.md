@@ -1,6 +1,9 @@
 # Promotion authority — relocating the failover decision
 
-**Status:** design handoff, not yet scheduled. Nothing here is implemented.
+**Status:** in implementation. Sequencing steps 1–6 (§10) are landed —
+the HA loop runs against the embedded Raft on the acceptance cluster,
+still in shadow. Step 7 (cutover) has not begun; pgpool still drives
+failover everywhere.
 
 Companion to [SPEC.md](../SPEC.md) (SPEC §5.1),
 [ROADMAP.md](../ROADMAP.md) ("Shared cluster state"), and
@@ -1015,6 +1018,26 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    The election window is derived, not configured: `[raft]` carries one
    upper bound and the daemon randomizes half-to-full, because a single
    value has every node time out together and split the vote.
+
+   **Acceptance coverage** (testing/ phase 4, R0–R4b): the real Raft on
+   the real three-node cluster, still in shadow. S13 — the split-brain
+   baseline this document opens with — is inverted at the decision
+   level: the isolated lease holder decides to demote on lost quorum
+   and commits nothing; the majority commits exactly one
+   quorum-serialized takeover; PostgreSQL state needs zero repair
+   afterwards. Getting there surfaced two partition-path bugs, each
+   invisible to in-process tests (testing/README.md findings 12–13):
+   leader-forwarded reads had no client-side deadline, so one HA tick
+   blocked 34 s on a just-isolated Raft leader — the same header-
+   deadline trap as finding 11, now fixed at three layers (leader
+   client, replication RPCs, and the tick itself, which no longer
+   trusts any store to fail fast); and the holder-unhealthy clock was
+   not keyed to the holder it watched, letting a rival depose a
+   7-second-old lease — voiding exactly the ttl window a fresh winner
+   needs to finish its asynchronous promotion. Both regression-tested.
+   What remains before step 7 is operational, not code: mileage — the
+   `enabled = true, shadow = true` configuration accumulating decision
+   history on the real cluster.
 7. **(M)** Cut over: SPEC §5.1 rewrite, pgpool config contract, watchdog off.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.
