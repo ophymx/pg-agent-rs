@@ -207,6 +207,11 @@ pub struct LocalServer {
     standby: Arc<dyn StandbyOps>,
     node_pool: NodePool,
     pg: PostgresRuntime,
+    /// Present when `[raft] enabled = true`. `ClusterInit` uses it to
+    /// form the Raft cluster's initial membership — the one moment
+    /// where an operator, not the protocol, decides who the members
+    /// are.
+    raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
 }
 
 impl LocalServer {
@@ -238,7 +243,14 @@ impl LocalServer {
             standby,
             node_pool,
             pg,
+            raft: None,
         }
+    }
+
+    /// Let `ClusterInit` bootstrap Raft membership.
+    pub fn with_raft(mut self, raft: Arc<crate::raftconsensus::RaftRuntime>) -> Self {
+        self.raft = Some(raft);
+        self
     }
 
     /// Serve until `shutdown` cancels. `listener` is consumed.
@@ -1256,6 +1268,30 @@ impl PgAgentLocal for LocalServer {
             results.push(res);
         }
 
+        // Form Raft's initial membership from the same pool that just
+        // got its replication set up. ClusterInit is the right place
+        // because it is already the one operator-driven "this is the
+        // cluster" moment; doing it at daemon startup instead would
+        // have every node racing to declare a membership, and doing it
+        // implicitly on first election would mean the set of members
+        // depends on who booted first.
+        //
+        // Never fatal to cluster_init. Replication has by this point
+        // actually been configured, and reporting that as a failure
+        // because consensus bootstrap did not take would send the
+        // operator back to re-run a destructive-ish command over work
+        // that already succeeded.
+        let raft_note = match &self.raft {
+            Some(rt) => match rt.bootstrap_membership().await {
+                Ok(outcome) => Some(outcome.describe()),
+                Err(e) => {
+                    warn!(?e, "cluster_init: raft membership bootstrap failed");
+                    Some(format!("raft membership bootstrap FAILED: {e}"))
+                }
+            },
+            None => None,
+        };
+
         let (ok, message) = match (results.len(), failures) {
             (0, _) => (
                 true,
@@ -1272,6 +1308,11 @@ impl PgAgentLocal for LocalServer {
                 false,
                 format!("cluster_init: {n} of {total} standby(s) failed"),
             ),
+        };
+
+        let message = match raft_note {
+            Some(note) => format!("{message}; {note}"),
+            None => message,
         };
 
         Ok(Response::new(ClusterInitResponse {

@@ -439,12 +439,24 @@ pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaftConfig {
     /// Run the HA loop in **shadow mode**: compute and log role
-    /// decisions every `loop_wait` against a process-local in-memory
-    /// store, taking no action. Off by default. This is sequencing
-    /// step 5's live-cluster validation knob; the decision stream logs
-    /// on the `ha_shadow` tracing target.
+    /// decisions every `loop_wait`, taking no action. Off by default.
+    /// The decision stream logs on the `ha_shadow` tracing target.
+    ///
+    /// Orthogonal to [`enabled`](Self::enabled), which selects *which
+    /// store answers*. Step 6 runs both: real Raft underneath, no
+    /// executors on top. Step 7 turns `shadow` off.
     #[serde(default)]
     pub shadow: Option<bool>,
+    /// Join the embedded Raft cluster: open `<state_dir>/raft/`, serve
+    /// `PgAgentRaft`, and back the HA loop with the replicated state
+    /// machine instead of a process-local one. Off by default.
+    ///
+    /// **Three nodes is a hard minimum.** Under Raft a 2-node cluster
+    /// tolerates zero failures, where the pre-consensus arrangement
+    /// merely degraded badly — `validate-env` refuses a smaller pool
+    /// rather than letting that be discovered during an outage.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub loop_wait_secs: Option<u64>,
     #[serde(default)]
@@ -471,6 +483,9 @@ pub const DEFAULT_RAFT_ELECTION_TIMEOUT_MS: u64 = 5_000;
 impl RaftConfig {
     pub fn effective_shadow(&self) -> bool {
         self.shadow.unwrap_or(false)
+    }
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
     }
     pub fn effective_loop_wait(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.loop_wait_secs.unwrap_or(DEFAULT_RAFT_LOOP_WAIT_SECS))
@@ -1397,6 +1412,36 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("election_timeout"), "{err}");
+    }
+
+    /// Every key `packaging/config.toml.sample` documents under
+    /// `[raft]`, uncommented. A sample that names a field the struct
+    /// does not have is worse than no sample: the operator's config
+    /// parses (serde ignores unknown keys), the setting silently does
+    /// nothing, and the first symptom is behavioural.
+    #[test]
+    fn sample_config_raft_keys_all_exist() {
+        let toml = r#"
+            [raft]
+            shadow                    = false
+            enabled                   = false
+            loop_wait_secs            = 10
+            retry_timeout_secs        = 10
+            leader_ttl_secs           = 30
+            election_timeout_ms       = 5000
+            max_lag_on_failover_bytes = 16777216
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("sample [raft] block must parse");
+        cfg.raft
+            .validate()
+            .expect("the documented defaults must satisfy both invariants");
+        assert!(!cfg.raft.effective_shadow());
+        assert!(!cfg.raft.effective_enabled());
+        assert_eq!(cfg.raft.effective_loop_wait().as_secs(), 10);
+        assert_eq!(cfg.raft.effective_retry_timeout().as_secs(), 10);
+        assert_eq!(cfg.raft.effective_leader_ttl().as_secs(), 30);
+        assert_eq!(cfg.raft.effective_election_timeout().as_millis(), 5000);
+        assert_eq!(cfg.raft.effective_max_lag_on_failover(), 16 * 1024 * 1024);
     }
 
     #[test]

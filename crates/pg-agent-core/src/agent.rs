@@ -108,6 +108,14 @@ pub struct Options {
     /// `[raft] shadow = true` + the `[raft]` timing knobs. `None` (the
     /// default) spawns nothing.
     pub ha_shadow: Option<crate::ha::HaTiming>,
+    /// `Some(runtime)` when `[raft] enabled = true`: this node serves
+    /// `PgAgentRaft` on the peer listener and the HA loop reads the
+    /// replicated state machine instead of a process-local one.
+    ///
+    /// Built before `Agent::new` because it opens redb and starts
+    /// openraft's core task, and `Agent::new` is documented as cheap
+    /// and I/O-free.
+    pub raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
 }
 
 impl Options {
@@ -127,6 +135,7 @@ impl Options {
             supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
             cert_reloader: None,
             ha_shadow: None,
+            raft: None,
         }
     }
 }
@@ -281,12 +290,15 @@ impl Agent {
             let standby = self.deps.standby.clone();
             let pool = self.opts.node_pool.clone();
             let pg = self.opts.postgres.clone();
+            let raft = self.opts.raft.clone();
             js.spawn(async move {
-                LocalServer::new(
+                let mut server = LocalServer::new(
                     me, db, peers, maint, wal, replay, inflight, pcp, sd, standby, pool, pg,
-                )
-                .serve(listeners.unix, s)
-                .await
+                );
+                if let Some(rt) = raft {
+                    server = server.with_raft(rt);
+                }
+                server.serve(listeners.unix, s).await
             });
         }
 
@@ -301,10 +313,13 @@ impl Agent {
             let standby = self.deps.standby.clone();
             let wal = self.deps.wal.clone();
             let inflight = self.deps.inflight.clone();
+            let raft = self.opts.raft.clone();
             js.spawn(async move {
-                PeerServer::new(me, sd, db, standby, wal, inflight)
-                    .serve(listeners.peer, tls, s)
-                    .await
+                let mut server = PeerServer::new(me, sd, db, standby, wal, inflight);
+                if let Some(rt) = raft {
+                    server = server.with_raft(rt.raft.clone(), rt.reader.clone());
+                }
+                server.serve(listeners.peer, tls, s).await
             });
         }
 
@@ -427,8 +442,22 @@ impl Agent {
         // stream is most interesting exactly when the cluster is in a
         // degraded shape.
         if let Some(timing) = self.opts.ha_shadow.clone() {
+            // With Raft running the loop reads a replicated state
+            // machine; without it, a process-local one that is
+            // authoritative for nothing. The loop itself cannot tell
+            // the difference, which is the seam's whole purpose.
+            let store: Arc<dyn crate::consensus::ConsensusStore> = match &self.opts.raft {
+                Some(rt) => {
+                    info!("ha loop: backed by raft consensus store");
+                    rt.store.clone()
+                }
+                None => {
+                    info!("ha loop: backed by the process-local in-memory store");
+                    Arc::new(crate::consensus::InMemoryConsensusStore::new())
+                }
+            };
             let ha = Arc::new(crate::ha::HaLoop::new(
-                Arc::new(crate::consensus::InMemoryConsensusStore::new()),
+                store,
                 self.deps.db.clone(),
                 self.deps.peers.clone(),
                 self.opts.node_pool.clone(),
@@ -1346,6 +1375,7 @@ mod tests {
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
                 ha_shadow: None,
+                raft: None,
             },
         )
     }
@@ -1578,6 +1608,7 @@ mod tests {
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
                 ha_shadow: None,
+                raft: None,
             },
         );
         let shutdown = CancellationToken::new();
@@ -1646,6 +1677,7 @@ mod tests {
                     supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                     cert_reloader: None,
                     ha_shadow: None,
+                    raft: None,
                 },
             );
             let shutdown = CancellationToken::new();
@@ -1708,6 +1740,7 @@ mod tests {
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
                 ha_shadow: None,
+                raft: None,
             },
         );
         let res = agent.serve(listeners, CancellationToken::new()).await;
@@ -1763,6 +1796,7 @@ mod tests {
                 supervisor_pgpool_enabled,
                 cert_reloader: None,
                 ha_shadow: None,
+                raft: None,
             },
         );
         (agent, listeners, tmp)
@@ -1936,6 +1970,7 @@ mod tests {
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
                 ha_shadow: None,
+                raft: None,
             },
         )
     }

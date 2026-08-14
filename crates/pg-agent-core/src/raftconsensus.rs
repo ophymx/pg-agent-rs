@@ -38,15 +38,25 @@
 //! the front door, and an empty `ClusterState` is exactly what a
 //! well-meaning `unwrap_or_default` would produce.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::Utc;
-use openraft::BasicNode;
+use openraft::error::{InitializeError, RaftError};
+use openraft::{BasicNode, Config, Raft};
+use tracing::info;
 
+use crate::config::{NodePool, RaftConfig};
 use crate::consensus::{
     ClusterState, ConsensusStore, Paused, ReleaseOutcome, Switchover, TakeoverOutcome,
 };
-use crate::raftnet::{LeaderClient, PgAgentRaftHandle};
-use crate::raftstore::{ClusterStateReader, CommandResponse, ConsensusCommand};
+use crate::raftnet::{LeaderClient, PgAgentRaftHandle, RaftChannelFactory};
+use crate::raftstore::{
+    database_path, membership_map, open_database, to_raft_node_id, ClusterStateReader,
+    CommandResponse, ConsensusCommand, RaftNodeId, RedbLogStore, RedbStateMachine,
+};
 
 /// A [`ConsensusStore`] backed by this node's Raft.
 pub struct RaftConsensusStore {
@@ -166,6 +176,165 @@ impl ConsensusStore for RaftConsensusStore {
             other => Err(anyhow::anyhow!(
                 "consensus: set_switchover got the wrong response variant: {other:?}"
             )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime — construction and membership bootstrap
+// ---------------------------------------------------------------------------
+
+/// Everything a node needs to participate in consensus, built once at
+/// daemon startup.
+///
+/// Construction is deliberately *not* in `Agent::new` (documented as
+/// cheap, no I/O): this opens a redb file and starts openraft's core
+/// task. It belongs where the daemon can fail loudly and exit.
+pub struct RaftRuntime {
+    pub raft: PgAgentRaftHandle,
+    pub reader: ClusterStateReader,
+    pub store: Arc<RaftConsensusStore>,
+    /// This node, in Raft's id space.
+    pub local_id: RaftNodeId,
+    /// The pool as membership, resolved once at startup. Membership
+    /// changes at runtime are a step-7 concern; today the pool is
+    /// snapshotted at startup everywhere else too.
+    members: BTreeMap<RaftNodeId, BasicNode>,
+}
+
+/// Fraction of the election window used as the heartbeat interval.
+///
+/// openraft wants heartbeats comfortably inside the election window, or
+/// a leader that is merely slow gets replaced. A fifth of the lower
+/// bound leaves room for four missed heartbeats before any follower
+/// starts campaigning — deliberately generous, because this design pays
+/// for a spurious election in database availability.
+const HEARTBEAT_DIVISOR: u64 = 5;
+
+impl RaftRuntime {
+    /// Open the store, start Raft, and build the [`ConsensusStore`].
+    ///
+    /// Does not bootstrap membership — see
+    /// [`bootstrap_membership`](Self::bootstrap_membership). A restarting
+    /// node must *not* re-initialize; it recovers its membership from
+    /// its own log.
+    pub async fn start(
+        state_dir: &Path,
+        node_pool: &NodePool,
+        agent_port: u16,
+        tls: Option<Arc<rustls::ClientConfig>>,
+        cfg: &RaftConfig,
+    ) -> anyhow::Result<Arc<Self>> {
+        let local = node_pool
+            .local_node()
+            .map_err(|e| anyhow::anyhow!("raft: resolve local node: {e}"))?;
+        let local_id = to_raft_node_id(local.id)?;
+
+        let members = membership_map(
+            node_pool
+                .members
+                .iter()
+                .map(|n| (n.id, n.peer_addr(agent_port))),
+        )?;
+
+        let db = open_database(state_dir)?;
+        let reader = ClusterStateReader::new(db.clone());
+        let log = RedbLogStore::new(db.clone());
+        let sm = RedbStateMachine::new(db)?;
+
+        // The `[raft]` block carries one election knob, an upper bound.
+        // openraft wants a randomized range: a single value would have
+        // every node time out together and split the vote repeatedly.
+        let election_max = cfg.effective_election_timeout().as_millis() as u64;
+        let election_min = (election_max / 2).max(1);
+        let raft_config = Arc::new(
+            Config {
+                heartbeat_interval: (election_min / HEARTBEAT_DIVISOR).max(1),
+                election_timeout_min: election_min,
+                election_timeout_max: election_max,
+                ..Default::default()
+            }
+            .validate()
+            .map_err(|e| anyhow::anyhow!("raft: invalid openraft config: {e}"))?,
+        );
+
+        let raft = Raft::new(
+            local_id,
+            raft_config,
+            RaftChannelFactory::new(tls.clone()),
+            log,
+            sm,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("raft: start: {e}"))?;
+
+        let store = Arc::new(RaftConsensusStore::new(
+            raft.clone(),
+            reader.clone(),
+            LeaderClient::new(tls),
+        ));
+
+        info!(
+            node = local_id,
+            members = members.len(),
+            election_ms = election_max,
+            db = %database_path(state_dir).display(),
+            "raft: started"
+        );
+
+        Ok(Arc::new(Self {
+            raft,
+            reader,
+            store,
+            local_id,
+            members,
+        }))
+    }
+
+    /// Form the cluster from the configured node pool.
+    ///
+    /// Idempotent by openraft's own contract: `NotAllowed` means the
+    /// cluster is already formed, which is the goal of calling this, so
+    /// it is reported as "already formed" rather than an error. That
+    /// matters because this runs from `ClusterInit`, which operators
+    /// re-run — and because a second `initialize` on a live cluster
+    /// would otherwise look like something to force past.
+    pub async fn bootstrap_membership(&self) -> anyhow::Result<MembershipBootstrap> {
+        if self.raft.is_initialized().await.unwrap_or(false) {
+            return Ok(MembershipBootstrap::AlreadyFormed);
+        }
+        match self.raft.initialize(self.members.clone()).await {
+            Ok(()) => {
+                info!(
+                    members = self.members.len(),
+                    "raft: cluster membership initialized"
+                );
+                Ok(MembershipBootstrap::Formed {
+                    members: self.members.len(),
+                })
+            }
+            Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
+                Ok(MembershipBootstrap::AlreadyFormed)
+            }
+            Err(e) => Err(anyhow::anyhow!("raft: initialize membership: {e}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipBootstrap {
+    Formed { members: usize },
+    AlreadyFormed,
+}
+
+impl MembershipBootstrap {
+    /// One line for `ClusterInit`'s response message.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Formed { members } => {
+                format!("raft membership initialized ({members} nodes)")
+            }
+            Self::AlreadyFormed => "raft membership already formed".to_string(),
         }
     }
 }
@@ -387,6 +556,103 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    // ----- RaftRuntime ------------------------------------------------
+
+    fn pool(n: i32, local: i32) -> NodePool {
+        NodePool {
+            members: (0..n)
+                .map(|id| crate::config::NodeConfig {
+                    id,
+                    hostname: format!("127.0.0.{}", id + 1),
+                })
+                .collect(),
+            local_node_id: local,
+        }
+    }
+
+    /// Bootstrap is idempotent by openraft's own contract, and it has
+    /// to be: `ClusterInit` is an operator command people re-run, and a
+    /// second `initialize` against a live cluster must read as "already
+    /// formed" rather than as something to force past.
+    #[tokio::test]
+    async fn membership_bootstrap_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let rt = RaftRuntime::start(
+            dir.path(),
+            &pool(3, 0),
+            9701,
+            None,
+            &crate::config::RaftConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rt.bootstrap_membership().await.unwrap(),
+            MembershipBootstrap::Formed { members: 3 }
+        );
+        assert_eq!(
+            rt.bootstrap_membership().await.unwrap(),
+            MembershipBootstrap::AlreadyFormed,
+            "re-running ClusterInit must not be an error"
+        );
+    }
+
+    /// A restarted node recovers membership from its own log. It must
+    /// not re-initialize — that is what `start` deliberately does not
+    /// do, and getting it wrong would let a restart redefine who the
+    /// cluster's members are.
+    #[tokio::test]
+    async fn a_restarted_node_does_not_reform_the_cluster() {
+        let dir = TempDir::new().unwrap();
+        let cfg = crate::config::RaftConfig::default();
+        {
+            let rt = RaftRuntime::start(dir.path(), &pool(3, 0), 9701, None, &cfg)
+                .await
+                .unwrap();
+            rt.bootstrap_membership().await.unwrap();
+            rt.raft.shutdown().await.unwrap();
+        }
+
+        let rt = RaftRuntime::start(dir.path(), &pool(3, 0), 9701, None, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.bootstrap_membership().await.unwrap(),
+            MembershipBootstrap::AlreadyFormed
+        );
+    }
+
+    /// The `[raft]` block carries one election value, an upper bound.
+    /// openraft needs a randomized range — a single value has every
+    /// node time out together and split the vote, repeatedly.
+    #[tokio::test]
+    async fn election_window_is_a_range_not_a_point() {
+        let dir = TempDir::new().unwrap();
+        let cfg = crate::config::RaftConfig {
+            election_timeout_ms: Some(4_000),
+            // The config invariants still have to hold at these values.
+            retry_timeout_secs: Some(5),
+            leader_ttl_secs: Some(30),
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+
+        let rt = RaftRuntime::start(dir.path(), &pool(3, 1), 9701, None, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(rt.local_id, 1);
+        let c = rt.raft.config();
+        assert_eq!(c.election_timeout_max, 4_000);
+        assert_eq!(c.election_timeout_min, 2_000);
+        assert!(
+            c.heartbeat_interval < c.election_timeout_min,
+            "heartbeats must fit comfortably inside the election window: {} vs {}",
+            c.heartbeat_interval,
+            c.election_timeout_min
+        );
     }
 
     /// Pause and switchover ride the same log, so they are subject to

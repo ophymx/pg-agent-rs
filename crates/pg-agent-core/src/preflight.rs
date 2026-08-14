@@ -150,6 +150,7 @@ pub async fn preflight(cfg: &Config, db: Option<Arc<dyn LocalDb>>) -> PreflightR
     fs_pgpool_node_id(cfg, &mut r);
     fs_postgres_home_defaults(cfg, &mut r);
     fs_recovery_tools(cfg, &mut r);
+    raft_prerequisites(cfg, &mut r);
 
     // ---- db-backed checks ----------------------------------------------
     match db {
@@ -459,6 +460,104 @@ async fn db_roles(db: &Arc<dyn LocalDb>, cfg: &Config, r: &mut PreflightReport) 
 }
 
 // ---------------------------------------------------------------------------
+// Consensus prerequisites
+// ---------------------------------------------------------------------------
+
+/// Preconditions for `[raft] enabled = true`
+/// (docs/promotion-authority.md §5).
+///
+/// Silent — not even an OK row — when Raft is off, which is every
+/// deployment before cutover. A checklist that reports on things the
+/// operator has not turned on trains people to skim it.
+///
+/// All three are refusals to start rather than warnings, because each
+/// one's failure mode only becomes visible during an outage, which is
+/// the worst possible time to learn about it.
+fn raft_prerequisites(cfg: &Config, r: &mut PreflightReport) {
+    if !cfg.raft.effective_enabled() {
+        return;
+    }
+
+    // 1. Three nodes is a hard minimum. Under Raft a 2-node cluster
+    //    tolerates zero failures — losing either node loses quorum, so
+    //    the surviving node cannot even confirm it still holds the
+    //    lease and must demote itself. Without Raft, 2 nodes merely
+    //    degraded badly. This is the one place that difference can be
+    //    caught before it matters.
+    let n = cfg.pool.len();
+    if n < 3 {
+        r.checks.push(Check::err(
+            "raft: pool size",
+            format!(
+                "{n} node(s); Raft needs at least 3 — a 2-node Raft cluster \
+                 tolerates zero failures, and the survivor demotes itself \
+                 rather than serving without quorum"
+            ),
+        ));
+    } else {
+        r.checks
+            .push(Check::ok("raft: pool size", format!("{n} nodes")));
+    }
+
+    // 2. The local node must be in the pool it is joining. `local_node_id
+    //    == -1` is config.rs's unresolved sentinel; a node that cannot
+    //    identify itself cannot pick a Raft node id, and everything
+    //    downstream would be guessing.
+    let pool = cfg.to_node_pool();
+    if pool.local_node_id >= 0 {
+        r.checks.push(Check::ok(
+            "raft: local node id",
+            format!("node {}", pool.local_node_id),
+        ));
+    } else {
+        r.checks.push(Check::err(
+            "raft: local node id",
+            "unresolved — local hostname matches no [[pool]] entry, so this \
+             node cannot know which Raft member it is",
+        ));
+    }
+
+    // 3. mTLS. The consensus plane rides the peer listener, so an
+    //    unauthenticated Raft port is an unauthenticated *promotion
+    //    authority*: anyone who can reach it can propose a lease
+    //    takeover. Dev mode's plain TCP is fine for a single node and
+    //    indefensible for a real pool.
+    if cfg.tls.is_configured() {
+        r.checks
+            .push(Check::ok("raft: transport auth", "mTLS (peer listener)"));
+    } else {
+        r.checks.push(Check::err(
+            "raft: transport auth",
+            "no TLS configured — the consensus plane shares the peer \
+             listener, so this would expose lease takeover to anyone who \
+             can reach the port",
+        ));
+    }
+
+    // 4. The state directory has to be writable *now*, not at the first
+    //    election. A vote that cannot be persisted is a vote that can be
+    //    cast twice after a crash, which is two leaders in one term.
+    match cfg.state_dir.as_deref() {
+        Some(dir) => {
+            let raft_dir = dir.join(crate::raftstore::RAFT_SUBDIR);
+            match std::fs::create_dir_all(&raft_dir) {
+                Ok(()) => r
+                    .checks
+                    .push(Check::ok("raft: state dir", raft_dir.display().to_string())),
+                Err(e) => r.checks.push(Check::err(
+                    "raft: state dir",
+                    format!("{}: {e}", raft_dir.display()),
+                )),
+            }
+        }
+        None => r.checks.push(Check::err(
+            "raft: state dir",
+            "state_dir is unset — Raft needs somewhere durable for its log and vote",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -654,5 +753,129 @@ mod tests {
         assert_eq!(j["has_errors"], serde_json::Value::Bool(true));
         assert_eq!(j["checks"][0]["status"], "ERR");
         assert_eq!(j["checks"][0]["name"], "x");
+    }
+
+    // ----- consensus prerequisites -----------------------------------------
+
+    fn raft_checks(cfg: &Config) -> Vec<Check> {
+        let mut r = PreflightReport::default();
+        raft_prerequisites(cfg, &mut r);
+        r.checks
+    }
+
+    fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no check named {name}; got {checks:?}"))
+    }
+
+    /// Silent when Raft is off — which is every deployment before
+    /// cutover. Reporting on features nobody enabled trains operators
+    /// to skim the checklist.
+    #[test]
+    fn raft_checks_are_absent_when_raft_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = make_cfg(&tmp);
+        assert!(raft_checks(&cfg).is_empty());
+    }
+
+    /// Two nodes is the one that matters. Under Raft a 2-node cluster
+    /// tolerates zero failures — losing either loses quorum, so the
+    /// survivor cannot confirm its own lease and demotes. Without Raft
+    /// the same pool merely degraded badly, so this is a regression an
+    /// operator could walk into by flipping one flag.
+    #[test]
+    fn raft_refuses_a_pool_smaller_than_three() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.raft.enabled = Some(true);
+        cfg.pool = vec![
+            NodeConfig {
+                id: 0,
+                hostname: "a".into(),
+            },
+            NodeConfig {
+                id: 1,
+                hostname: "b".into(),
+            },
+        ];
+
+        let checks = raft_checks(&cfg);
+        let c = find(&checks, "raft: pool size");
+        assert_eq!(c.status, CheckStatus::Err);
+        assert!(c.detail.contains("at least 3"), "{}", c.detail);
+    }
+
+    /// The consensus plane rides the peer listener, so no mTLS means
+    /// promotion authority is reachable by anyone who can reach the
+    /// port. Dev mode is fine for one node and indefensible for a pool.
+    #[test]
+    fn raft_refuses_to_run_without_mtls() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.raft.enabled = Some(true);
+        cfg.pool = (0..3)
+            .map(|id| NodeConfig {
+                id,
+                hostname: format!("n{id}"),
+            })
+            .collect();
+
+        let c = find(&raft_checks(&cfg), "raft: transport auth").clone();
+        assert_eq!(c.status, CheckStatus::Err);
+        assert!(c.detail.contains("no TLS configured"), "{}", c.detail);
+    }
+
+    /// A node that cannot identify itself in the pool cannot pick a
+    /// Raft node id, and everything downstream would be guessing.
+    #[test]
+    fn raft_refuses_when_the_local_node_is_unresolved() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.raft.enabled = Some(true);
+        cfg.pool = (0..3)
+            .map(|id| NodeConfig {
+                id,
+                hostname: format!("nowhere-{id}.invalid"),
+            })
+            .collect();
+        cfg.local_node_id = -1;
+
+        let c = find(&raft_checks(&cfg), "raft: local node id").clone();
+        assert_eq!(c.status, CheckStatus::Err);
+    }
+
+    /// A healthy three-node mTLS pool passes, and creates the state
+    /// directory as a side effect — the vote must be persistable before
+    /// the first election, not at it.
+    #[test]
+    fn raft_passes_on_a_healthy_three_node_pool() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.raft.enabled = Some(true);
+        cfg.pool = (0..3)
+            .map(|id| NodeConfig {
+                id,
+                hostname: format!("n{id}"),
+            })
+            .collect();
+        cfg.local_node_id = 1;
+        cfg.tls = TlsConfig {
+            ca_cert: Some(tmp.path().join("ca.pem")),
+            cert: Some(tmp.path().join("cert.pem")),
+            key: Some(tmp.path().join("key.pem")),
+        };
+
+        let checks = raft_checks(&cfg);
+        for c in &checks {
+            assert_eq!(c.status, CheckStatus::Ok, "unexpected: {c:?}");
+        }
+        assert!(cfg
+            .state_dir
+            .as_ref()
+            .unwrap()
+            .join(crate::raftstore::RAFT_SUBDIR)
+            .is_dir());
     }
 }

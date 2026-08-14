@@ -975,9 +975,46 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    than reporting a vacant lease — the §3 hole would otherwise walk back
    in as an `unwrap_or_default`.
 
-   Remaining in this step: Raft construction and membership bootstrap in
-   `ClusterInit`, wiring `with_raft` in `Agent`, and the `validate-env`
-   checks.
+   **Wiring landed** (post-0.7.3), completing this step: `RaftRuntime`
+   (construction + membership bootstrap), `[raft] enabled`, and the
+   `validate-env` checks.
+
+   `enabled` is a separate switch from `shadow`, and they compose:
+   `enabled = true, shadow = true` is this step's configuration — real
+   consensus underneath, no executors on top. Step 7 turns `shadow`
+   off. Both default off, so nothing changes for any deployment that
+   does not opt in.
+
+   Membership is formed by `ClusterInit`, not at daemon startup and not
+   implicitly at first election. It is already the operator-driven
+   "this is the cluster" moment; bootstrapping at startup would have
+   every node racing to declare a membership, and bootstrapping on
+   first election would make the member set depend on who booted first.
+   It is idempotent (openraft's `NotAllowed` means "already formed",
+   which is the goal of calling it) and never fatal to `ClusterInit`:
+   replication has actually been configured by that point, and failing
+   the command over a consensus-bootstrap problem would send the
+   operator back to re-run destructive work that already succeeded. A
+   *restarting* node deliberately does not bootstrap — it recovers
+   membership from its own log, or a restart could redefine who the
+   members are.
+
+   `validate-env` refuses rather than warns on all four preconditions,
+   because each one's failure mode only becomes visible during an
+   outage: a pool smaller than three (a 2-node Raft cluster tolerates
+   zero failures, where the same pool without Raft merely degraded
+   badly — the one place that regression is catchable before it
+   matters), an unresolved local node id, no mTLS (the consensus plane
+   shares the peer listener, so this exposes lease takeover to anyone
+   who can reach the port), and an unwritable state dir (a vote that
+   cannot be persisted is a vote that can be cast twice after a crash).
+   The checks are silent when Raft is off, which is every deployment
+   before cutover — a checklist that reports on things nobody enabled
+   trains operators to skim it.
+
+   The election window is derived, not configured: `[raft]` carries one
+   upper bound and the daemon randomizes half-to-full, because a single
+   value has every node time out together and split the vote.
 7. **(M)** Cut over: SPEC §5.1 rewrite, pgpool config contract, watchdog off.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.

@@ -203,21 +203,11 @@ impl PeerPool {
     /// Build an mTLS pool. Snapshots CA roots from the reloader's current
     /// bundle. Cheap — no I/O. Lazy per-peer dial on first `client()`.
     pub fn new(reloader: Arc<CertReloader>, agent_port: u16) -> anyhow::Result<Arc<Self>> {
-        let bundle = reloader.current();
-        // RootCertStore impls Clone in rustls 0.23; the bundle's Arc is
-        // shared with the inbound side so we clone the contents into a
-        // fresh ClientConfig.
-        let roots = (*bundle.roots).clone();
-        let resolver = Arc::new(ReloadingClientCertResolver::new(reloader.clone()));
-        let mut cfg = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_cert_resolver(resolver);
-        cfg.alpn_protocols = vec![b"h2".to_vec()];
-
+        let cfg = build_client_config(&reloader);
         Ok(Arc::new(Self {
             agent_port,
             cert_reloader: Some(reloader),
-            tls_config: Some(Arc::new(cfg)),
+            tls_config: Some(cfg),
             channels: Mutex::new(HashMap::new()),
             max_age: MAX_CONNECTION_AGE,
         }))
@@ -343,6 +333,28 @@ impl PeerRegistry for PeerPool {
 /// [`Endpoint::connect_with_connector`]'s `Service<Uri>` bound: each
 /// invocation yields a `TokioIo<TlsStream<TcpStream>>` (hyper's Read/Write
 /// traits via the bridge).
+/// Outbound mTLS config: CA roots snapshotted from the reloader's
+/// current bundle, client cert resolved per handshake so a SIGHUP
+/// rotation is picked up without tearing channels down.
+///
+/// Shared with the consensus plane, which dials its own channels but
+/// must present the same identity to the same allowlist — a Raft plane
+/// with its own cert story would be a second thing to rotate and a
+/// second way to be locked out of your own cluster.
+pub fn build_client_config(reloader: &Arc<CertReloader>) -> Arc<ClientConfig> {
+    let bundle = reloader.current();
+    // RootCertStore impls Clone in rustls 0.23; the bundle's Arc is
+    // shared with the inbound side so we clone the contents into a
+    // fresh ClientConfig.
+    let roots = (*bundle.roots).clone();
+    let resolver = Arc::new(ReloadingClientCertResolver::new(reloader.clone()));
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_cert_resolver(resolver);
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
 /// Shared with the consensus plane ([`crate::raftnet`]), which dials its
 /// own channels but over the same mTLS material and the same connector.
 pub(crate) async fn connect_mtls(

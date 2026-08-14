@@ -111,3 +111,52 @@ hostname = "pg3.example.com"
 # [supervisor]
 # pgpool = true
 
+
+# --- consensus / HA loop ----------------------------------------------
+# docs/promotion-authority.md §5. Off by default in every form: until
+# cutover, pgpool's failover_command remains the promotion authority and
+# this block changes nothing about who runs PostgreSQL.
+#
+# Two independent switches:
+#
+# shadow  = run the HA loop and log what it *would* decide, acting on
+#           nothing. Decisions log on the `ha_shadow` tracing target.
+# enabled = join the embedded Raft cluster: open <state_dir>/raft/,
+#           serve PgAgentRaft on the peer listener, and back the loop
+#           with the replicated state machine instead of a
+#           process-local one.
+#
+# They compose. `enabled = true, shadow = true` is the pre-cutover
+# configuration: real consensus underneath, no executors on top.
+#
+# `enabled = true` requires a pool of at least THREE nodes and mTLS —
+# validate-env refuses otherwise. Under Raft a 2-node cluster tolerates
+# zero failures (losing either node loses quorum, so the survivor
+# demotes itself rather than serve without one), where the same pool
+# without Raft merely degraded badly. And because the consensus plane
+# shares the peer listener, running it without mTLS would expose lease
+# takeover to anyone who can reach the port.
+#
+# Timing knobs, with two invariants enforced at config load:
+#   1. leader_ttl >= loop_wait + 2 * retry_timeout
+#      The holder exhausts its retry budget and demotes before any
+#      candidate becomes eligible to take over. Hysteresis, not
+#      correctness: violating it causes unnecessary failovers.
+#   2. retry_timeout > election_timeout
+#      A linearizable read cannot complete while a Raft election is in
+#      flight, so a shorter retry budget turns every re-election into a
+#      demotion of a healthy primary. This is the field failure that got
+#      Patroni's embedded-raft backend deprecated.
+#
+# election_timeout_ms is an upper bound; the daemon derives a randomized
+# window (half that value to that value) so nodes do not all time out
+# together and split the vote. The default is deliberately long, so an
+# Ansible rolling restart of the agents does not cascade into elections.
+# [raft]
+# shadow                 = false
+# enabled                = false
+# loop_wait_secs         = 10
+# retry_timeout_secs     = 10
+# leader_ttl_secs        = 30
+# election_timeout_ms    = 5000
+# max_lag_on_failover_bytes = 16777216

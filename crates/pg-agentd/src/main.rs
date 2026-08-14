@@ -307,6 +307,29 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         wal,
     };
 
+    // Consensus, when `[raft] enabled = true`. Built here rather than
+    // inside the Agent because it opens redb and starts openraft's core
+    // task, and a failure to do either should stop the daemon loudly
+    // instead of degrading into a node that silently is not a member.
+    let raft = if config.raft.effective_enabled() {
+        let rt = pg_agent_core::raftconsensus::RaftRuntime::start(
+            config
+                .state_dir
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("[raft] enabled but state_dir is unset"))?,
+            &node_pool,
+            serve.agent_port,
+            cert_reloader
+                .as_ref()
+                .map(pg_agent_core::peers::build_client_config),
+            &config.raft,
+        )
+        .await?;
+        Some(rt)
+    } else {
+        None
+    };
+
     let opts = Options {
         serve: serve.clone(),
         node_pool,
@@ -325,6 +348,7 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
                 leader_ttl: config.raft.effective_leader_ttl(),
                 max_lag_on_failover: config.raft.effective_max_lag_on_failover(),
             }),
+        raft,
     };
 
     // Bind listeners synchronously — every fd exists once this returns.
