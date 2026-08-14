@@ -11,6 +11,7 @@ repository.workspace   = true
 [dependencies]
 pg-agent-proto    = { workspace = true }
 pg-agent-hookspec = { workspace = true }
+pgman             = { workspace = true }
 
 # Async + IO
 tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "signal", "sync", "time"] }

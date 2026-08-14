@@ -260,11 +260,19 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
     ensure_hook_symlinks(&postgres.data_dir, &pg_agentc_bin)
         .map_err(|e| anyhow::anyhow!("hook symlink setup: {e}"))?;
 
+    // pgman recreates these under $PGDATA after every basebackup
+    // (pg_basebackup skips non-tablespace symlinks). The *list* is the
+    // agent's knowledge — pgman never learns these are pgpool hooks.
+    let restore_symlinks = pg_agent_core::symlinks::hook_restore_symlinks(&pg_agentc_bin);
     let standby = Arc::new(StandbyExec::new(
         config.postgres.pg_install_prefix.clone().unwrap(),
         postgres.data_dir.clone(),
         config.postgres.replication.clone(),
-        pg_agentc_bin,
+        restore_symlinks,
+        // The recovery config's restore_command is the agent's WAL
+        // wrapper — hookspec owns the canonical string; pgman just
+        // writes what it is given.
+        Some(pg_agent_hookspec::restore_command()),
     ));
 
     // State directories under <state_dir>/{replay,maintenance,inflight_ops}/.

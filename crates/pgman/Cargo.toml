@@ -1,0 +1,35 @@
+[package]
+name        = "pgman"
+description = "Management of a single PostgreSQL instance: SQL-surface operations (promote, slots, replication introspection), standby rebuild (pg_basebackup / pg_rewind / recovery config), WAL archive serving, and the process-control seam. No cluster logic, no pgpool, no consensus."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+# Async + IO
+tokio       = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time"] }
+async-trait = { workspace = true }
+
+# SQL surface
+tokio-postgres    = { workspace = true, features = ["with-chrono-0_4"] }
+deadpool-postgres = { workspace = true }
+
+# Config / serde (PgReplicationConfig is part of the operator's TOML)
+serde = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Misc
+anyhow    = { workspace = true }
+regex     = { workspace = true }
+hex       = { workspace = true }
+thiserror = { workspace = true }
+rand      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["macros", "test-util"] }

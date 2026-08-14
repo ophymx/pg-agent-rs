@@ -21,7 +21,6 @@
 
 use crate::agent::NodeInfo;
 use crate::config::{NodeConfig, NodePool, PostgresRuntime};
-use crate::errors::AgentError;
 use crate::localdb::LocalDb;
 use crate::maintenance::{
     MaintenanceIntent as CoreIntent, MaintenancePayload, MaintenanceStatus, MaintenanceStore,
@@ -2808,7 +2807,7 @@ impl LocalServer {
             };
             match self.wal.write_restore(Path::new(dest_path), reader).await {
                 Ok(()) => FetchOutcome::Fetched,
-                Err(AgentError::DestOutsidePgData) => FetchOutcome::Fatal(
+                Err(pgman::walstore::WalStoreError::DestOutsidePgData) => FetchOutcome::Fatal(
                     Status::invalid_argument("restore_wal: dest_path outside pg_data_dir"),
                 ),
                 Err(e) => {
@@ -4407,26 +4406,33 @@ mod tests {
         async fn open_archive(
             &self,
             _: &str,
-        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, AgentError> {
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, pgman::walstore::WalStoreError>
+        {
             // LocalServer doesn't call open_archive — only the inbound
             // PeerServer.FetchWal does, and that path is exercised in
             // peerserver tests.
-            Err(AgentError::WalNotFound("stub: not used here".into()))
+            Err(pgman::walstore::WalStoreError::WalNotFound(
+                "stub: not used here".into(),
+            ))
         }
         async fn write_restore(
             &self,
             dest_path: &Path,
             mut src: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        ) -> Result<(), AgentError> {
+        ) -> Result<(), pgman::walstore::WalStoreError> {
             if self.dest_outside_pgdata.load(Ordering::SeqCst) {
-                return Err(AgentError::DestOutsidePgData);
+                return Err(pgman::walstore::WalStoreError::DestOutsidePgData);
             }
             if self.write_errors.load(Ordering::SeqCst) {
-                return Err(AgentError::WalNotFound("stub: write_restore boom".into()));
+                return Err(pgman::walstore::WalStoreError::WalNotFound(
+                    "stub: write_restore boom".into(),
+                ));
             }
             use tokio::io::AsyncReadExt;
             let mut bytes = Vec::new();
-            src.read_to_end(&mut bytes).await.map_err(AgentError::Io)?;
+            src.read_to_end(&mut bytes)
+                .await
+                .map_err(pgman::walstore::WalStoreError::Io)?;
             self.written
                 .lock()
                 .unwrap()

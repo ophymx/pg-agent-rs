@@ -13,7 +13,9 @@ name = "pg_agentd"
 path = "src/main.rs"
 
 [dependencies]
-pg-agent-core = { workspace = true }
+pg-agent-core     = { workspace = true }
+pg-agent-hookspec = { workspace = true }
+pgman             = { workspace = true }
 
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "fs"] }
 tokio-util         = { workspace = true }

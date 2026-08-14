@@ -74,14 +74,6 @@ pub enum AgentError {
     #[error("config: postgres.replication.sslmode must be one of disable, allow, prefer, require, verify-ca, verify-full")]
     ReplicationSslMode,
 
-    // ----- WAL store ----------------------------------------------------
-    #[error("dest_path is outside pgdata root")]
-    DestOutsidePgData,
-    #[error("WAL segment not found: {0}")]
-    WalNotFound(String),
-    #[error("invalid wal_file {wal_file:?}: {reason}")]
-    WalInvalid { wal_file: String, reason: String },
-
     // ----- Pass-through -------------------------------------------------
     #[error(transparent)]
     Io(#[from] std::io::Error),

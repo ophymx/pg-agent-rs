@@ -36,7 +36,6 @@
 //! failure path the temp file is removed; the hidden + random prefix means
 //! even a leaked temp can never be mistaken for a valid WAL segment.
 
-use crate::errors::AgentError;
 use async_trait::async_trait;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -44,6 +43,23 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tracing::debug;
+
+/// WAL-store failures, typed so transport handlers can map each to a
+/// distinct wire status (absent segment → retryable NotFound, bad name
+/// or escape attempt → InvalidArgument).
+#[derive(Debug, thiserror::Error)]
+pub enum WalStoreError {
+    #[error("dest_path is outside pgdata root")]
+    DestOutsidePgData,
+    #[error("WAL segment not found: {0}")]
+    WalNotFound(String),
+    #[error("invalid wal_file {wal_file:?}: {reason}")]
+    WalInvalid { wal_file: String, reason: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 /// `^([0-9A-F]{24}|[0-9A-F]{8}\.history)$` — accept exactly what
 /// PostgreSQL's `restore_command` legitimately asks for: a 24-char
@@ -59,24 +75,24 @@ fn wal_filename_re() -> &'static regex::Regex {
 #[async_trait]
 pub trait WalStore: Send + Sync {
     /// Open a WAL segment from the local archive directory for streaming.
-    /// Returns [`AgentError::WalNotFound`] when the segment is absent —
+    /// Returns [`WalStoreError::WalNotFound`] when the segment is absent —
     /// the FetchWal handler maps this to gRPC `NotFound` so PostgreSQL
-    /// pauses and retries. Returns [`AgentError::WalInvalid`] for bad
+    /// pauses and retries. Returns [`WalStoreError::WalInvalid`] for bad
     /// filenames (handler maps to gRPC `InvalidArgument`).
     async fn open_archive(
         &self,
         wal_file: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, AgentError>;
+    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, WalStoreError>;
 
     /// Atomically write `src` to `dest_path`. Returns
-    /// [`AgentError::DestOutsidePgData`] when `dest_path` doesn't resolve
+    /// [`WalStoreError::DestOutsidePgData`] when `dest_path` doesn't resolve
     /// inside the configured `pg_data_dir` (handler maps to gRPC
     /// `InvalidArgument`).
     async fn write_restore(
         &self,
         dest_path: &Path,
         src: Box<dyn AsyncRead + Send + Unpin>,
-    ) -> Result<(), AgentError>;
+    ) -> Result<(), WalStoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +114,7 @@ impl FileWalStore {
 
     /// Resolve `dest_path` against the canonicalized `pg_data_dir` and
     /// return the canonical destination path. Errors with
-    /// [`AgentError::DestOutsidePgData`] for any of:
+    /// [`WalStoreError::DestOutsidePgData`] for any of:
     ///
     /// - parent directory doesn't exist or can't be canonicalized
     /// - canonicalized parent isn't a descendant of canonicalized
@@ -106,7 +122,7 @@ impl FileWalStore {
     ///
     /// PostgreSQL's `restore_command` substitutes `%p` with a path
     /// **relative to PGDATA** (PG `chdir`'s there before invoking the
-    /// command). pg_agentc passes that value verbatim as `dest_path`,
+    /// command). The restore wrapper passes that value verbatim as `dest_path`,
     /// so a relative path here is the normal case — we resolve it
     /// against `pg_data_dir`. Absolute paths are also accepted (a
     /// future restore_command might pre-resolve, or an operator might
@@ -117,23 +133,25 @@ impl FileWalStore {
     /// it). The parent always exists during a real `restore_command`
     /// invocation — PostgreSQL writes into `pg_wal/`, which initdb
     /// creates.
-    async fn resolve_dest_path(&self, dest_path: &Path) -> Result<PathBuf, AgentError> {
+    async fn resolve_dest_path(&self, dest_path: &Path) -> Result<PathBuf, WalStoreError> {
         let absolute = if dest_path.is_absolute() {
             dest_path.to_path_buf()
         } else {
             self.pg_data_dir.join(dest_path)
         };
-        let parent = absolute.parent().ok_or(AgentError::DestOutsidePgData)?;
-        let base = absolute.file_name().ok_or(AgentError::DestOutsidePgData)?;
+        let parent = absolute.parent().ok_or(WalStoreError::DestOutsidePgData)?;
+        let base = absolute
+            .file_name()
+            .ok_or(WalStoreError::DestOutsidePgData)?;
 
         let parent_canonical = tokio::fs::canonicalize(parent)
             .await
-            .map_err(|_| AgentError::DestOutsidePgData)?;
+            .map_err(|_| WalStoreError::DestOutsidePgData)?;
         let pg_root_canonical = tokio::fs::canonicalize(&self.pg_data_dir)
             .await
-            .map_err(|_| AgentError::DestOutsidePgData)?;
+            .map_err(|_| WalStoreError::DestOutsidePgData)?;
         if !parent_canonical.starts_with(&pg_root_canonical) {
-            return Err(AgentError::DestOutsidePgData);
+            return Err(WalStoreError::DestOutsidePgData);
         }
         Ok(parent_canonical.join(base))
     }
@@ -144,7 +162,7 @@ impl WalStore for FileWalStore {
     async fn open_archive(
         &self,
         wal_file: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, AgentError> {
+    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, WalStoreError> {
         validate_wal_filename(wal_file)?;
         let path = self.archive_dir.join(wal_file);
         match tokio::fs::File::open(&path).await {
@@ -153,9 +171,9 @@ impl WalStore for FileWalStore {
                 Ok(Box::new(f))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(AgentError::WalNotFound(wal_file.to_string()))
+                Err(WalStoreError::WalNotFound(wal_file.to_string()))
             }
-            Err(e) => Err(AgentError::Io(e)),
+            Err(e) => Err(WalStoreError::Io(e)),
         }
     }
 
@@ -163,13 +181,13 @@ impl WalStore for FileWalStore {
         &self,
         dest_path: &Path,
         mut src: Box<dyn AsyncRead + Send + Unpin>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<(), WalStoreError> {
         let resolved = self.resolve_dest_path(dest_path).await?;
 
-        let dir = resolved.parent().ok_or(AgentError::DestOutsidePgData)?;
+        let dir = resolved.parent().ok_or(WalStoreError::DestOutsidePgData)?;
         let base = resolved
             .file_name()
-            .ok_or(AgentError::DestOutsidePgData)?
+            .ok_or(WalStoreError::DestOutsidePgData)?
             .to_string_lossy()
             .into_owned();
         let suffix = random_hex_suffix()?;
@@ -184,7 +202,7 @@ impl WalStore for FileWalStore {
             .mode(0o600)
             .open(&tmp_path)
             .await
-            .map_err(AgentError::Io)?;
+            .map_err(WalStoreError::Io)?;
 
         // From here on, any failure must remove the temp file. Body is in
         // an async block so we can capture the Result and dispatch
@@ -192,15 +210,15 @@ impl WalStore for FileWalStore {
         let body = async {
             tokio::io::copy(&mut src, &mut tmp_file)
                 .await
-                .map_err(AgentError::Io)?;
-            tmp_file.flush().await.map_err(AgentError::Io)?;
+                .map_err(WalStoreError::Io)?;
+            tmp_file.flush().await.map_err(WalStoreError::Io)?;
             // Drop closes the file before the rename — explicit so the
             // ordering reads obvious. POSIX doesn't strictly require
             // close-before-rename but it makes the lifecycle explicit.
             drop(tmp_file);
             tokio::fs::rename(&tmp_path, &resolved)
                 .await
-                .map_err(AgentError::Io)?;
+                .map_err(WalStoreError::Io)?;
             Ok(())
         }
         .await;
@@ -223,17 +241,17 @@ impl WalStore for FileWalStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn validate_wal_filename(name: &str) -> Result<(), AgentError> {
+fn validate_wal_filename(name: &str) -> Result<(), WalStoreError> {
     // Defense in depth — the regex below also rejects these, but explicit
     // failure modes are self-documenting and survive a regex change.
     if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-        return Err(AgentError::WalInvalid {
+        return Err(WalStoreError::WalInvalid {
             wal_file: name.to_string(),
             reason: "contains path component".to_string(),
         });
     }
     if !wal_filename_re().is_match(name) {
-        return Err(AgentError::WalInvalid {
+        return Err(WalStoreError::WalInvalid {
             wal_file: name.to_string(),
             reason: "must match ^([0-9A-F]{24}|[0-9A-F]{8}\\.history)$".to_string(),
         });
@@ -245,11 +263,11 @@ fn validate_wal_filename(name: &str) -> Result<(), AgentError> {
 /// unguessable so an attacker can't pre-create it and race the EXCL open.
 /// Failure here means the OS RNG is unavailable; bubble up rather than
 /// fall back to a predictable value.
-fn random_hex_suffix() -> Result<String, AgentError> {
+fn random_hex_suffix() -> Result<String, WalStoreError> {
     let mut bytes = [0u8; 4];
     OsRng
         .try_fill_bytes(&mut bytes)
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("walstore: OS RNG: {e}")))?;
+        .map_err(|e| WalStoreError::Other(anyhow::anyhow!("walstore: OS RNG: {e}")))?;
     Ok(hex::encode(bytes))
 }
 
@@ -309,7 +327,7 @@ mod tests {
         ] {
             let e = validate_wal_filename(n).unwrap_err();
             assert!(
-                matches!(e, AgentError::WalInvalid { .. }),
+                matches!(e, WalStoreError::WalInvalid { .. }),
                 "{n:?} should be WalInvalid, got {e:?}"
             );
         }
@@ -325,7 +343,7 @@ mod tests {
 
     /// `Result<Box<dyn AsyncRead + ...>, _>::unwrap_err()` needs `T: Debug`
     /// which the trait object isn't, so route via `.err()`.
-    fn expect_err<T>(r: Result<T, AgentError>) -> AgentError {
+    fn expect_err<T>(r: Result<T, WalStoreError>) -> WalStoreError {
         match r {
             Ok(_) => panic!("expected error, got Ok"),
             Err(e) => e,
@@ -336,14 +354,14 @@ mod tests {
     async fn open_archive_rejects_invalid_filename() {
         let (_tmp, store) = fixture();
         let e = expect_err(store.open_archive("../etc/passwd").await);
-        assert!(matches!(e, AgentError::WalInvalid { .. }));
+        assert!(matches!(e, WalStoreError::WalInvalid { .. }));
     }
 
     #[tokio::test]
     async fn open_archive_returns_not_found_for_missing() {
         let (_tmp, store) = fixture();
         let e = expect_err(store.open_archive("000000010000000000000001").await);
-        assert!(matches!(e, AgentError::WalNotFound(ref n) if n == "000000010000000000000001"));
+        assert!(matches!(e, WalStoreError::WalNotFound(ref n) if n == "000000010000000000000001"));
     }
 
     #[tokio::test]
@@ -391,7 +409,7 @@ mod tests {
             .write_restore(Path::new("pg_wal/000000010000000000000001"), src)
             .await
             .unwrap_err();
-        assert!(matches!(e, AgentError::DestOutsidePgData));
+        assert!(matches!(e, WalStoreError::DestOutsidePgData));
     }
 
     #[tokio::test]
@@ -404,7 +422,7 @@ mod tests {
 
         let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"x"[..]);
         let e = store.write_restore(&dest, src).await.unwrap_err();
-        assert!(matches!(e, AgentError::DestOutsidePgData));
+        assert!(matches!(e, WalStoreError::DestOutsidePgData));
     }
 
     #[tokio::test]
@@ -421,7 +439,7 @@ mod tests {
         let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"x"[..]);
         let e = store.write_restore(&dest, src).await.unwrap_err();
         assert!(
-            matches!(e, AgentError::DestOutsidePgData),
+            matches!(e, WalStoreError::DestOutsidePgData),
             "symlink escape should be rejected, got {e:?}"
         );
     }
@@ -484,7 +502,7 @@ mod tests {
         let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(Failing { yielded: false });
 
         let err = store.write_restore(&dest, src).await.unwrap_err();
-        assert!(matches!(err, AgentError::Io(_)));
+        assert!(matches!(err, WalStoreError::Io(_)));
 
         // Final destination must NOT exist.
         assert!(!dest.exists(), "dest must not exist after a failed write");

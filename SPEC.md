@@ -94,9 +94,12 @@ pg-agent-rs/
 ├── crates/
 │   ├── pg-agent-proto/         # .proto + tonic-build output (re-exports)
 │   ├── pg-agent-hookspec/      # positional-arg schemas (no proto dep)
-│   ├── pg-agent-core/          # Agent, config, peers, db, systemd,
-│   │                           # pgstandby, walstore, maintenance, healthz,
-│   │                           # certreload, preflight (no transport)
+│   ├── pgman/                  # single-instance PostgreSQL management:
+│   │                           # localdb, pgstandby, walstore, process
+│   │                           # (agent-agnostic; see its crate docs)
+│   ├── pg-agent-core/          # Agent, config, peers, systemd, consensus,
+│   │                           # HA loop, maintenance, healthz, certreload,
+│   │                           # preflight (no transport)
 │   ├── pg-agentd/              # daemon binary
 │   ├── pg-agentc/              # hook-client binary
 │   └── pg-agentctl/            # operator CLI binary

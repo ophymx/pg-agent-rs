@@ -15,7 +15,7 @@
 //! This connection is for the AGENT'S work only (failover/checkpoint/slot
 //! management/status). Replication-protocol connections (pg_basebackup,
 //! pg_rewind, primary_conninfo) are a separate code path that uses
-//! [`crate::config::PgReplicationConfig`] for sslmode + libpq's default
+//! [`crate::pgstandby::PgReplicationConfig`] for sslmode + libpq's default
 //! does **not** flow through this pool.
 //!
 //! See SPEC §4.1 for the verbatim SQL each method runs.
@@ -37,7 +37,7 @@ const POOL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Server-side `statement_timeout` applied to every connection in the
 /// pool. The agent's queries are sub-second except `CHECKPOINT` and
-/// `pg_promote()`; 300 s matches [`crate::peers`]' LONG_RPC_TIMEOUT so a
+/// `pg_promote()`; 300 s matches the agent's peer-RPC LONG_RPC_TIMEOUT so a
 /// statement can never outlive the most patient caller budget in the
 /// system. Without this, a hung backend pins the handler that called it
 /// for as long as the backend stays hung.
@@ -531,7 +531,7 @@ mod tests {
     fn allowed_role_name_accepts_safe_identifiers() {
         for n in [
             "repl",
-            "pgpool",
+            "pooler",
             "node0",
             "with_underscore",
             "dot.style",

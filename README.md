@@ -23,8 +23,11 @@ they depend on.
 crates/
 ├── pg-agent-proto/      tonic + prost generated types
 ├── pg-agent-hookspec/   positional-arg schemas (no proto dep)
-├── pg-agent-core/       Agent, config, peers, db, systemd, pgstandby,
-│                        walstore, maintenance, healthz, certreload, preflight
+├── pgman/               single-PostgreSQL-instance management: SQL surface,
+│                        basebackup/rewind/recovery config, WAL archive,
+│                        process-control seam (knows nothing of the agent)
+├── pg-agent-core/       Agent, config, peers, systemd, consensus, HA loop,
+│                        maintenance, healthz, certreload, preflight
 ├── pg-agentd/           daemon binary (runs on every PostgreSQL backend)
 ├── pg-agentc/           pgpool hook client (thin Unix-socket forwarder)
 └── pg-agentctl/         operator CLI

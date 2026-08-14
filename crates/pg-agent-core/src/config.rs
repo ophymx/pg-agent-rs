@@ -83,24 +83,6 @@ pub const ENV_TLS_KEY: &str = "PG_AGENTD_TLS_KEY";
 // Replication-TLS validation
 // ---------------------------------------------------------------------------
 
-/// `sslmode` values libpq recognises.
-/// <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLMODE>
-const ALLOWED_SSLMODES: &[&str] = &[
-    "disable",
-    "allow",
-    "prefer",
-    "require",
-    "verify-ca",
-    "verify-full",
-];
-
-/// Default replication `sslmode`. libpq itself defaults to `prefer`, which
-/// does NOT verify the server cert — insecure. pg-agent always emits an
-/// explicit `sslmode=` in conninfo so the operator either gets
-/// verify-full (secure-by-default) or has consciously chosen something
-/// else via `[postgres.replication].sslmode`.
-pub const DEFAULT_REPL_SSLMODE: &str = "verify-full";
-
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -255,62 +237,10 @@ impl PostgresConfig {
     }
 }
 
-/// `[postgres.replication]` — connection knobs for the replication
-/// conninfo string (basebackup, rewind, `myrecovery.conf`'s
-/// `primary_conninfo`). pg-agent does NOT own the TLS material itself:
-/// libpq looks up cert paths from its own defaults
-/// (`~postgres/.postgresql/{postgresql.crt,postgresql.key,root.crt}`)
-/// or from `PGSSLCERT` / `PGSSLKEY` / `PGSSLROOTCERT` env vars on the
-/// `postgresql@*.service` unit. Ansible provisions cert material into
-/// libpq's default locations; pg-agent only chooses the `sslmode`.
-///
-/// `sslmode` defaults to `verify-full` because libpq's own default is
-/// `prefer`, which silently accepts an MITM — pg-agent always emits an
-/// explicit value so secure-by-default is the standing posture.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PgReplicationConfig {
-    #[serde(default)]
-    pub sslmode: Option<String>,
-}
-
-impl PgReplicationConfig {
-    /// Reject any `sslmode` libpq wouldn't recognise. Other validations
-    /// belong elsewhere — there are no cert paths in this struct.
-    pub fn validate(&self) -> Result<(), AgentError> {
-        if let Some(mode) = self.sslmode.as_deref() {
-            if !ALLOWED_SSLMODES.contains(&mode) {
-                return Err(AgentError::ReplicationSslMode);
-            }
-        }
-        Ok(())
-    }
-
-    /// `sslmode` value to write into `primary_conninfo`. Never empty —
-    /// falls back to [`DEFAULT_REPL_SSLMODE`] when the operator hasn't
-    /// set one. See SPEC §5.10 for why this is always emitted.
-    pub fn effective_sslmode(&self) -> &str {
-        self.sslmode.as_deref().unwrap_or(DEFAULT_REPL_SSLMODE)
-    }
-
-    /// Build a libpq conninfo string. `dbname` is included only when
-    /// non-empty (`pg_basebackup` + `primary_conninfo` speak the
-    /// replication protocol and don't take a dbname; pass `"postgres"`
-    /// for `pg_rewind`, which needs a regular DB connection).
-    ///
-    /// Inputs are trusted — the gRPC handler validates host/port/user at
-    /// the wire boundary. The conninfo carries `sslmode=` only;
-    /// `sslcert`/`sslkey`/`sslrootcert` are picked up from libpq defaults
-    /// (`~postgres/.postgresql/…`) or env vars.
-    pub fn conninfo(&self, host: &str, port: u16, user: &str, dbname: &str) -> String {
-        use std::fmt::Write as _;
-        let mut s = format!("host={host} port={port} user={user}");
-        if !dbname.is_empty() {
-            write!(s, " dbname={dbname}").unwrap();
-        }
-        write!(s, " sslmode={}", self.effective_sslmode()).unwrap();
-        s
-    }
-}
+/// Replication connection knobs live in the `pgman` crate now — the
+/// struct is the instance-management boundary's, parsed here as part of
+/// `[postgres.replication]` and re-exported so existing paths hold.
+pub use pgman::pgstandby::{PgReplicationConfig, DEFAULT_REPL_SSLMODE};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PcpConfig {
@@ -948,7 +878,10 @@ impl Config {
         // local node must resolve to a pool entry.
         self.local_node()?;
 
-        self.postgres.replication.validate()?;
+        self.postgres
+            .replication
+            .validate()
+            .map_err(|_| AgentError::ReplicationSslMode)?;
         self.raft.validate()?;
         Ok(())
     }
@@ -1321,10 +1254,7 @@ mod tests {
         let cfg = PgReplicationConfig {
             sslmode: Some("totally-secure".into()),
         };
-        assert!(matches!(
-            cfg.validate(),
-            Err(AgentError::ReplicationSslMode)
-        ));
+        assert!(cfg.validate().is_err(), "unknown sslmode must be rejected");
     }
 
     #[test]

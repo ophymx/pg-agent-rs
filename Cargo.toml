@@ -15,6 +15,7 @@ repository = "https://github.com/ophymx/pg-agent-rs"
 pg-agent-proto    = { path = "crates/pg-agent-proto" }
 pg-agent-hookspec = { path = "crates/pg-agent-hookspec" }
 pg-agent-core     = { path = "crates/pg-agent-core" }
+pgman             = { path = "crates/pgman" }
 
 # Async runtime
 tokio        = { version = "1.40", default-features = false }

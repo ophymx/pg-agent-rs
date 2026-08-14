@@ -27,7 +27,6 @@
 
 use crate::agent::NodeInfo;
 use crate::certreload::{extract_sans, CertReloader, ReloadingServerCertResolver};
-use crate::errors::AgentError;
 use crate::localdb::LocalDb;
 use crate::pgstandby::{
     allowed_slot_name, BasebackupOpts, ProgressCb, RewindOpts, StandbyOps, WriteRecoveryConfOpts,
@@ -676,10 +675,10 @@ impl PgAgentPeer for PeerServer {
         let file = self.wal.open_archive(&req.wal_file).await.map_err(|e| {
             warn!(?e, wal_file = %req.wal_file, "peer: FetchWal open failed");
             match e {
-                AgentError::WalNotFound(name) => {
+                pgman::walstore::WalStoreError::WalNotFound(name) => {
                     Status::not_found(format!("WAL segment not found: {name}"))
                 }
-                AgentError::WalInvalid { wal_file, reason } => {
+                pgman::walstore::WalStoreError::WalInvalid { wal_file, reason } => {
                     Status::invalid_argument(format!("invalid wal_file {wal_file:?}: {reason}"))
                 }
                 other => Status::internal(format!("open {}: {other}", req.wal_file)),
@@ -1037,10 +1036,10 @@ mod tests {
         async fn open_archive(
             &self,
             wal_file: &str,
-        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, crate::errors::AgentError>
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, pgman::walstore::WalStoreError>
         {
             if self.invalid.lock().unwrap().contains(wal_file) {
-                return Err(crate::errors::AgentError::WalInvalid {
+                return Err(pgman::walstore::WalStoreError::WalInvalid {
                     wal_file: wal_file.to_string(),
                     reason: "stub invalid".to_string(),
                 });
@@ -1052,14 +1051,16 @@ mod tests {
             match content {
                 Some(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))
                     as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-                None => Err(crate::errors::AgentError::WalNotFound(wal_file.to_string())),
+                None => Err(pgman::walstore::WalStoreError::WalNotFound(
+                    wal_file.to_string(),
+                )),
             }
         }
         async fn write_restore(
             &self,
             _: &std::path::Path,
             _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        ) -> Result<(), crate::errors::AgentError> {
+        ) -> Result<(), pgman::walstore::WalStoreError> {
             Ok(())
         }
     }

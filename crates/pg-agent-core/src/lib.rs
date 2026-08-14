@@ -22,14 +22,12 @@ pub mod errors;
 pub mod ha;
 pub mod healthz;
 pub mod inflight_ops;
-pub mod localdb;
 pub mod localserver;
 pub mod maintenance;
 pub mod pcp;
 pub mod peers;
 pub mod peerserver;
 pub mod pgpool_supervisor;
-pub mod pgstandby;
 pub mod preconditions;
 pub mod preflight;
 pub mod raftconsensus;
@@ -40,9 +38,15 @@ pub mod retry;
 pub mod sdnotify;
 pub mod symlinks;
 pub mod systemd;
-pub mod walstore;
 
 pub use errors::{AgentError, Result};
+
+// Instance management now lives in the `pgman` crate (see its docs for
+// scope and the intended `PostgresInstance` evolution). Re-exported as
+// modules so `crate::localdb::…` / `pg_agent_core::localdb::…` paths
+// keep working — the boundary that matters is the dependency direction
+// (pgman knows nothing of the agent), not the import spelling.
+pub use pgman::{localdb, pgstandby, walstore};
 
 // Re-export the proto crate so downstream binaries don't need a separate dep.
 pub use pg_agent_proto as proto;

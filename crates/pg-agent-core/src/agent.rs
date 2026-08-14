@@ -1277,15 +1277,15 @@ mod tests {
         async fn open_archive(
             &self,
             _: &str,
-        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, crate::errors::AgentError>
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, pgman::walstore::WalStoreError>
         {
-            Err(crate::errors::AgentError::WalNotFound("stub".into()))
+            Err(pgman::walstore::WalStoreError::WalNotFound("stub".into()))
         }
         async fn write_restore(
             &self,
             _: &std::path::Path,
             _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        ) -> Result<(), crate::errors::AgentError> {
+        ) -> Result<(), pgman::walstore::WalStoreError> {
             Ok(())
         }
     }

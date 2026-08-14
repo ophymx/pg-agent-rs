@@ -111,6 +111,18 @@ pub(crate) fn find_pg_agentc_in(
     None
 }
 
+/// The pgpool hook symlinks as pgman restore entries: `(name relative
+/// to $PGDATA, target)`. Handed to
+/// [`pgman::pgstandby::StandbyExec::new`] so a basebackup-rebuilt
+/// standby gets its hooks back without pgman knowing what a pgpool
+/// hook is.
+pub fn hook_restore_symlinks(pg_agentc_bin: &Path) -> Vec<(String, PathBuf)> {
+    PGDATA_SYMLINK_HOOKS
+        .iter()
+        .map(|name| (name.to_string(), pg_agentc_bin.to_path_buf()))
+        .collect()
+}
+
 /// Create or repair every symlink in [`PGDATA_SYMLINK_HOOKS`] under
 /// `pg_data_dir`, pointing at `pg_agentc_bin`. Per-symlink rules:
 ///

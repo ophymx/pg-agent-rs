@@ -243,6 +243,26 @@ impl DbusSystemd {
     }
 }
 
+/// The instance-management crate's process seam, implemented over the
+/// same systemd machinery. pgman deliberately ships no process backend
+/// of its own — "a PostgreSQL instance" and "a systemd unit" are
+/// different facts, and this impl is where the agent welds them.
+///
+/// Nothing consumes this yet; the future `PostgresInstance` layer
+/// (pgman's crate docs) is its intended caller.
+#[async_trait]
+impl pgman::process::ProcessControl for DbusSystemd {
+    async fn start(&self) -> anyhow::Result<()> {
+        Systemd::start_postgres(self).await
+    }
+    async fn stop(&self) -> anyhow::Result<()> {
+        Systemd::stop_postgres(self).await
+    }
+    async fn is_active(&self) -> anyhow::Result<bool> {
+        Systemd::status_postgres(self).await
+    }
+}
+
 #[async_trait]
 impl Systemd for DbusSystemd {
     async fn start_postgres(&self) -> anyhow::Result<()> {

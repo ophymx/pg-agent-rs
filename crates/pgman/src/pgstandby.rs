@@ -34,14 +34,92 @@
 //! changed blocks). After: rewind may have copied slot dirs from the
 //! source's role that would crash PG recovery if left in place.
 
-use crate::config::PgReplicationConfig;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Replication connection config
+// ---------------------------------------------------------------------------
+
+/// `sslmode` values libpq recognises.
+/// <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLMODE>
+const ALLOWED_SSLMODES: &[&str] = &[
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
+
+/// Default replication `sslmode`. libpq itself defaults to `prefer`, which
+/// does NOT verify the server cert — insecure. An explicit `sslmode=` is
+/// always emitted in conninfo so the operator either gets verify-full
+/// (secure-by-default) or has consciously chosen something else.
+pub const DEFAULT_REPL_SSLMODE: &str = "verify-full";
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "replication sslmode must be one of disable, allow, prefer, require, verify-ca, verify-full"
+)]
+pub struct InvalidSslMode;
+
+/// Connection knobs for the replication conninfo string (basebackup,
+/// rewind, `myrecovery.conf`'s `primary_conninfo`). This crate does NOT
+/// own the TLS material itself: libpq looks up cert paths from its own
+/// defaults (`~postgres/.postgresql/{postgresql.crt,postgresql.key,root.crt}`)
+/// or from `PGSSLCERT` / `PGSSLKEY` / `PGSSLROOTCERT` env vars on the
+/// server unit. Only the `sslmode` is chosen here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PgReplicationConfig {
+    #[serde(default)]
+    pub sslmode: Option<String>,
+}
+
+impl PgReplicationConfig {
+    /// Reject any `sslmode` libpq wouldn't recognise. Other validations
+    /// belong elsewhere — there are no cert paths in this struct.
+    pub fn validate(&self) -> Result<(), InvalidSslMode> {
+        if let Some(mode) = self.sslmode.as_deref() {
+            if !ALLOWED_SSLMODES.contains(&mode) {
+                return Err(InvalidSslMode);
+            }
+        }
+        Ok(())
+    }
+
+    /// `sslmode` value to write into `primary_conninfo`. Never empty —
+    /// falls back to [`DEFAULT_REPL_SSLMODE`] when the operator hasn't
+    /// set one.
+    pub fn effective_sslmode(&self) -> &str {
+        self.sslmode.as_deref().unwrap_or(DEFAULT_REPL_SSLMODE)
+    }
+
+    /// Build a libpq conninfo string. `dbname` is included only when
+    /// non-empty (`pg_basebackup` + `primary_conninfo` speak the
+    /// replication protocol and don't take a dbname; pass `"postgres"`
+    /// for `pg_rewind`, which needs a regular DB connection).
+    ///
+    /// Inputs are trusted — the caller validates host/port/user at its
+    /// wire boundary. The conninfo carries `sslmode=` only;
+    /// `sslcert`/`sslkey`/`sslrootcert` are picked up from libpq
+    /// defaults (`~postgres/.postgresql/…`) or env vars.
+    pub fn conninfo(&self, host: &str, port: u16, user: &str, dbname: &str) -> String {
+        use std::fmt::Write as _;
+        let mut s = format!("host={host} port={port} user={user}");
+        if !dbname.is_empty() {
+            write!(s, " dbname={dbname}").unwrap();
+        }
+        write!(s, " sslmode={}", self.effective_sslmode()).unwrap();
+        s
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -141,17 +219,17 @@ impl WriteRecoveryConfOpts {
 #[async_trait]
 pub trait StandbyOps: Send + Sync {
     /// Clears `$PGDATA` contents first, then exec's `pg_basebackup`,
-    /// then re-creates the pgpool hook symlinks under `$PGDATA`. Per
-    /// upstream PostgreSQL docs, `pg_basebackup` silently skips
-    /// non-tablespace symlinks — so without the repair tail, the
-    /// freshly-rebuilt standby would have no `recovery_1st_stage` /
-    /// `pgpool_remote_start` symlinks and a later promotion would fire
-    /// hooks at missing paths.
+    /// then recreates the implementation's configured symlinks under
+    /// `$PGDATA` (see [`StandbyExec::restore_symlinks`]). Per upstream
+    /// PostgreSQL docs, `pg_basebackup` silently skips non-tablespace
+    /// symlinks — without the repair tail, whatever the deployment
+    /// keeps as symlinks inside the data directory would silently
+    /// vanish on every rebuild.
     ///
-    /// The repair lives here (not in a separate RPC) because the wipe
+    /// The repair lives here (not in a separate step) because the wipe
     /// and repair are tightly coupled: they're the same code path on
     /// the same node. `rewind` modifies `$PGDATA` in place and doesn't
-    /// affect the hook symlinks; it doesn't need to repair them.
+    /// affect symlinks; it doesn't need to repair them.
     ///
     /// **Caller must have verified PostgreSQL isn't running on this
     /// node** — otherwise we'd wipe a live datadir.
@@ -162,8 +240,8 @@ pub trait StandbyOps: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Clears `pg_replslot/*` before *and* after (see SPEC §17 invariant 5).
-    /// Does NOT touch hook symlinks — rewind modifies pgdata in place,
-    /// and the symlinks (being outside `pg_replslot/`) survive untouched.
+    /// Does NOT touch symlinks — rewind modifies pgdata in place, and
+    /// symlinks (being outside `pg_replslot/`) survive untouched.
     async fn rewind(&self, opts: RewindOpts, progress: Option<ProgressCb>) -> anyhow::Result<()>;
 
     /// Writes `$PGDATA/myrecovery.conf` + creates `$PGDATA/standby.signal`.
@@ -181,12 +259,23 @@ pub struct StandbyExec {
     pub pg_install_prefix: PathBuf,
     pub pg_data_dir: PathBuf,
     pub replication: PgReplicationConfig,
-    /// Path to the `pg_agentc` binary the post-basebackup hook-symlink
-    /// repair should point at. Threaded through from daemon main where
-    /// [`crate::symlinks::find_pg_agentc`] resolves it once at startup.
-    /// See [`StandbyOps::basebackup`] docs for why this lives on
-    /// `StandbyExec` rather than being orchestrated via a separate RPC.
-    pub pg_agentc_bin: PathBuf,
+    /// Symlinks to recreate under `$PGDATA` after every basebackup, as
+    /// `(name relative to $PGDATA, target)`. `pg_basebackup` silently
+    /// skips every non-tablespace symlink, so anything the deployment
+    /// expects inside the data directory has to be restored by whoever
+    /// wiped it — and wipe + restore are one code path on one node,
+    /// which is why this is instance-level configuration rather than a
+    /// separate orchestration step. What the links *mean* is the
+    /// caller's business; the agent passes its pgpool hook symlinks
+    /// here without this crate knowing what pgpool is.
+    pub restore_symlinks: Vec<(String, PathBuf)>,
+    /// `restore_command` line for the generated recovery config, or
+    /// `None` to omit it (streaming-only standby). Caller-provided for
+    /// the same reason as [`restore_symlinks`](Self::restore_symlinks):
+    /// which command fetches archived WAL is the deployment's knowledge
+    /// — the agent passes its own wrapper here without this crate
+    /// knowing the binary exists.
+    pub restore_command: Option<String>,
 }
 
 impl StandbyExec {
@@ -194,13 +283,15 @@ impl StandbyExec {
         pg_install_prefix: PathBuf,
         pg_data_dir: PathBuf,
         replication: PgReplicationConfig,
-        pg_agentc_bin: PathBuf,
+        restore_symlinks: Vec<(String, PathBuf)>,
+        restore_command: Option<String>,
     ) -> Self {
         Self {
             pg_install_prefix,
             pg_data_dir,
             replication,
-            pg_agentc_bin,
+            restore_symlinks,
+            restore_command,
         }
     }
 
@@ -267,13 +358,22 @@ impl StandbyOps for StandbyExec {
             .map_err(|e| anyhow::anyhow!("basebackup: {e}"))?;
 
         // Post-basebackup pgdata repair. pg_basebackup silently skipped
-        // every non-tablespace symlink — re-create the pgpool hook
-        // entries so a later promotion of this node can fire its hooks.
-        // See SPEC §17 invariant: hook symlinks repaired after every
-        // basebackup. Failure here is fatal — the standby is unsafe to
-        // promote without working hook symlinks.
-        crate::symlinks::ensure_hook_symlinks(&self.pg_data_dir, &self.pg_agentc_bin)
-            .map_err(|e| anyhow::anyhow!("basebackup: repair hook symlinks: {e}"))?;
+        // every non-tablespace symlink — recreate the configured ones so
+        // the rebuilt standby carries what the deployment expects inside
+        // $PGDATA. Plain creation, no repair rules: the wipe above
+        // emptied the directory and the clone could not have copied a
+        // symlink, so the name is known-absent. Failure is fatal — the
+        // caller told us the standby is not complete without these.
+        for (name, target) in &self.restore_symlinks {
+            let link = self.pg_data_dir.join(name);
+            std::os::unix::fs::symlink(target, &link).map_err(|e| {
+                anyhow::anyhow!(
+                    "basebackup: restore symlink {} -> {}: {e}",
+                    link.display(),
+                    target.display()
+                )
+            })?;
+        }
 
         info!(datadir = %self.pg_data_dir.display(), "basebackup: completed");
         Ok(())
@@ -333,7 +433,8 @@ impl StandbyOps for StandbyExec {
             self.replication
                 .conninfo(&opts.primary_host, opts.primary_port, &opts.repl_user, "");
 
-        let content = render_recovery_conf(&conninfo, &opts.slot_name)?;
+        let content =
+            render_recovery_conf(&conninfo, &opts.slot_name, self.restore_command.as_deref())?;
 
         atomic_write(
             &self.pg_data_dir.join("myrecovery.conf"),
@@ -653,7 +754,11 @@ async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Resul
 /// quoting. Inputs are validated upstream (regex on host/user/slot,
 /// path regex on TLS cert paths) so reaching the refusal branch
 /// indicates a bug in the conninfo helper, not bad user input.
-fn render_recovery_conf(conninfo: &str, slot_name: &str) -> anyhow::Result<String> {
+fn render_recovery_conf(
+    conninfo: &str,
+    slot_name: &str,
+    restore_command: Option<&str>,
+) -> anyhow::Result<String> {
     if conninfo.is_empty() {
         anyhow::bail!("conninfo is required");
     }
@@ -666,12 +771,21 @@ fn render_recovery_conf(conninfo: &str, slot_name: &str) -> anyhow::Result<Strin
     if !allowed_slot_name().is_match(slot_name) {
         anyhow::bail!("slot_name contains invalid characters");
     }
-    Ok(format!(
-        "# managed by pg_agent\n\
+    let mut out = format!(
+        "# managed by pgman\n\
          primary_conninfo = '{conninfo}'\n\
-         primary_slot_name = '{slot_name}'\n\
-         restore_command = 'pg_agentc restore-wal %f %p'\n"
-    ))
+         primary_slot_name = '{slot_name}'\n"
+    );
+    if let Some(cmd) = restore_command {
+        // Same quoting rules as the conninfo: the value lands inside
+        // single quotes, so anything that could escape them is refused
+        // even though the source is deployment config, not user input.
+        if cmd.contains('\'') || cmd.contains('\r') || cmd.contains('\n') {
+            anyhow::bail!("restore_command contains forbidden characters");
+        }
+        out.push_str(&format!("restore_command = '{cmd}'\n"));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +806,7 @@ fn allowed_repl_user() -> &'static regex::Regex {
 }
 
 /// Replication slot names use the same identifier alphabet.
-pub(crate) fn allowed_slot_name() -> &'static regex::Regex {
+pub fn allowed_slot_name() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"^[A-Za-z0-9_.-]+$").unwrap())
 }
@@ -849,14 +963,38 @@ mod tests {
 
     #[test]
     fn render_recovery_conf_no_tls_matches_template() {
-        let got = render_recovery_conf("host=server1 port=5432 user=repl", "node0").unwrap();
+        let got = render_recovery_conf(
+            "host=server1 port=5432 user=repl",
+            "node0",
+            Some("restore-wrapper %f %p"),
+        )
+        .unwrap();
         assert_eq!(
             got,
-            "# managed by pg_agent\n\
+            "# managed by pgman\n\
              primary_conninfo = 'host=server1 port=5432 user=repl'\n\
              primary_slot_name = 'node0'\n\
-             restore_command = 'pg_agentc restore-wal %f %p'\n"
+             restore_command = 'restore-wrapper %f %p'\n"
         );
+    }
+
+    #[test]
+    fn render_recovery_conf_omits_restore_command_when_unset() {
+        let got = render_recovery_conf("host=x port=5432 user=r", "node0", None).unwrap();
+        assert!(
+            !got.contains("restore_command"),
+            "no restore_command line without one configured: {got}"
+        );
+    }
+
+    #[test]
+    fn render_recovery_conf_rejects_quote_breaking_restore_command() {
+        for bad in ["cmd '; rm -rf /", "cmd\nx", "cmd\rx"] {
+            assert!(
+                render_recovery_conf("host=x", "node0", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -867,21 +1005,23 @@ mod tests {
             "host=server\n port=5432",
             "host=server\rport=5432",
         ] {
-            let err = render_recovery_conf(bad, "node0").unwrap_err().to_string();
+            let err = render_recovery_conf(bad, "node0", None)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("forbidden characters"), "got {err:?}");
         }
     }
 
     #[test]
     fn render_recovery_conf_rejects_empty_inputs() {
-        assert!(render_recovery_conf("", "node0").is_err());
-        assert!(render_recovery_conf("host=x", "").is_err());
+        assert!(render_recovery_conf("", "node0", None).is_err());
+        assert!(render_recovery_conf("host=x", "", None).is_err());
     }
 
     #[test]
     fn render_recovery_conf_rejects_bad_slot_name() {
-        assert!(render_recovery_conf("host=x", "bad slot name").is_err());
-        assert!(render_recovery_conf("host=x", "drop;").is_err());
+        assert!(render_recovery_conf("host=x", "bad slot name", None).is_err());
+        assert!(render_recovery_conf("host=x", "drop;", None).is_err());
     }
 
     // ----- WriteRecoveryConfOpts::validate ---------------------------------
@@ -1049,16 +1189,20 @@ mod tests {
         let pgdata = tmp.path().join("pgdata");
         std::fs::create_dir_all(&pgdata).unwrap();
 
-        // Fake `pg_agentc` binary. The repair tail creates symlinks
-        // under pgdata pointing at this.
-        let agentc_bin = tmp.path().join("pg_agentc");
-        std::fs::write(&agentc_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        // Fake hook binary. The repair tail creates the configured
+        // symlinks under pgdata pointing at it.
+        let hook_bin = tmp.path().join("hook-target");
+        std::fs::write(&hook_bin, "#!/bin/sh\nexit 0\n").unwrap();
 
         let exec = StandbyExec::new(
             pg_install_prefix,
             pgdata.clone(),
             PgReplicationConfig::default(),
-            agentc_bin.clone(),
+            vec![
+                ("hook_a".to_string(), hook_bin.clone()),
+                ("hook_b".to_string(), hook_bin.clone()),
+            ],
+            None,
         );
 
         exec.basebackup(
@@ -1073,20 +1217,12 @@ mod tests {
         .await
         .expect("stub basebackup should succeed");
 
-        // Both hook symlinks must now exist under pgdata pointing at
-        // pg_agentc. ensure_hook_symlinks' own tests cover the per-symlink
-        // rules; here we just verify the wiring fires.
-        for name in pg_agent_hookspec::PGDATA_SYMLINK_HOOKS {
+        // Both configured symlinks must now exist under pgdata,
+        // pointing at the target — the whole restore contract.
+        for name in ["hook_a", "hook_b"] {
             let target = std::fs::read_link(pgdata.join(name))
                 .unwrap_or_else(|e| panic!("symlink {name} missing: {e}"));
-            assert_eq!(target, agentc_bin);
+            assert_eq!(target, hook_bin);
         }
     }
-
-    // Failure-propagation through `?` is trivial Rust — exercising it
-    // here would require pre-staging state that `clear_pgdata_contents`
-    // wouldn't wipe, which means mocking the wipe step. The symlinks
-    // module's own tests cover ensure_hook_symlinks' failure modes
-    // directly; the happy-path wiring test above is sufficient to
-    // verify the call site fires.
 }

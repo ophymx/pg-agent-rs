@@ -1637,6 +1637,7 @@ dependencies = [
  "openraft",
  "pg-agent-hookspec",
  "pg-agent-proto",
+ "pgman",
  "prost",
  "prost-types",
  "rand 0.8.6",
@@ -1725,6 +1726,8 @@ dependencies = [
  "chrono",
  "clap",
  "pg-agent-core",
+ "pg-agent-hookspec",
+ "pgman",
  "rustls",
  "sd-notify",
  "serde_json",
@@ -1732,6 +1735,24 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pgman"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "deadpool-postgres",
+ "hex",
+ "rand 0.8.6",
+ "regex",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]
