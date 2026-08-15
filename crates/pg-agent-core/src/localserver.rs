@@ -62,6 +62,18 @@ use tracing::{debug, info, warn};
 /// still letting an unresponsive peer fail fast.
 const RESTORE_WAL_PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// After a peer times out (or errors) on FetchWal, skip it for this
+/// long. PostgreSQL invokes `restore_command` once per file, back to
+/// back — at promotion, several times in a row — and without a
+/// cooldown each invocation re-pays the full timeout for the same
+/// partitioned peer. Acceptance E2 measured the cost: a promotion
+/// stalled ~40 s re-probing an isolated node, wide enough for a rival
+/// to depose the winner and promote a second primary. The cooldown is
+/// process-local and short: a peer that recovers is retried within
+/// seconds, and a false skip only means the segment comes from another
+/// peer or the primary.
+const RESTORE_WAL_PEER_COOLDOWN: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Handoff phase ladder
 // ---------------------------------------------------------------------------
@@ -207,6 +219,9 @@ pub struct LocalServer {
     standby: Arc<dyn StandbyOps>,
     node_pool: NodePool,
     pg: PostgresRuntime,
+    /// Peers recently failed/timed out on FetchWal, and when. See
+    /// [`RESTORE_WAL_PEER_COOLDOWN`].
+    wal_peer_cooldown: std::sync::Mutex<std::collections::HashMap<i32, std::time::Instant>>,
     /// Present when `[raft] enabled = true`. `ClusterInit` uses it to
     /// form the Raft cluster's initial membership — the one moment
     /// where an operator, not the protocol, decides who the members
@@ -243,6 +258,7 @@ impl LocalServer {
             standby,
             node_pool,
             pg,
+            wal_peer_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
             raft: None,
         }
     }
@@ -1172,6 +1188,15 @@ impl PgAgentLocal for LocalServer {
         for node in &self.node_pool.members {
             if node.id == local_id {
                 continue;
+            }
+            {
+                let cooldown = self.wal_peer_cooldown.lock().unwrap();
+                if let Some(since) = cooldown.get(&node.id) {
+                    if since.elapsed() < RESTORE_WAL_PEER_COOLDOWN {
+                        debug!(peer = %node.hostname, "restore_wal: peer in cooldown; skipping");
+                        continue;
+                    }
+                }
             }
             match self
                 .try_fetch_wal_from_peer(node, &req.wal_file, &req.dest_path)
@@ -2843,6 +2868,10 @@ impl LocalServer {
                 }
                 Err(e) => {
                     warn!(?e, peer = %node.hostname, "restore_wal: fetch RPC failed");
+                    self.wal_peer_cooldown
+                        .lock()
+                        .unwrap()
+                        .insert(node.id, std::time::Instant::now());
                     return FetchOutcome::TryNext;
                 }
             };
@@ -2861,6 +2890,10 @@ impl LocalServer {
             Ok(outcome) => outcome,
             Err(_) => {
                 warn!(peer = %node.hostname, "restore_wal: per-peer timeout");
+                self.wal_peer_cooldown
+                    .lock()
+                    .unwrap()
+                    .insert(node.id, std::time::Instant::now());
                 FetchOutcome::TryNext
             }
         }
@@ -4027,6 +4060,7 @@ mod tests {
         wal_content: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
         /// Make fetch_wal err out (transport/RPC failure shape).
         fetch_wal_errors: AtomicBool,
+        fetch_wal_calls: AtomicUsize,
         /// Hang fetch_wal indefinitely — exercises the per-peer timeout.
         fetch_wal_hangs: AtomicBool,
         // FollowPrimary surface — counters + failure switches per method.
@@ -4146,6 +4180,7 @@ mod tests {
             &self,
             wal_file: &str,
         ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+            self.fetch_wal_calls.fetch_add(1, Ordering::SeqCst);
             if self.fetch_wal_hangs.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
@@ -6847,6 +6882,48 @@ mod tests {
             .into_inner();
         assert!(resp.ok);
         assert!(resp.message.contains("peer2.local"));
+    }
+
+    /// A peer that just failed a fetch is skipped for
+    /// RESTORE_WAL_PEER_COOLDOWN. PostgreSQL calls restore_command once
+    /// per file back to back — at promotion, several times in a row —
+    /// and without the cooldown every invocation re-pays the full
+    /// per-peer timeout for the same partitioned peer. Acceptance E2
+    /// measured that as a ~40 s promotion stall, wide enough for a
+    /// rival to depose the winner (finding 14).
+    #[tokio::test]
+    async fn restore_wal_cools_down_a_failed_peer_across_invocations() {
+        let (s, _db, peers, _maint, _wal) = make_server_3();
+        peers
+            .default_client
+            .fetch_wal_errors
+            .store(true, Ordering::SeqCst);
+        let peer2_client = Arc::new(StubPeerClient::default());
+        peer2_client.stage_wal("000000010000000000000001", b"_".to_vec());
+        peers.override_client(2, peer2_client);
+
+        let resp = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        let calls_after_first = peers.default_client.fetch_wal_calls.load(Ordering::SeqCst);
+        assert_eq!(calls_after_first, 1, "failing peer probed once");
+
+        // Second restore_command invocation, immediately after: the
+        // failed peer must be in cooldown and not probed again.
+        let resp = s
+            .restore_wal(Request::new(valid_restore_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(
+            peers.default_client.fetch_wal_calls.load(Ordering::SeqCst),
+            calls_after_first,
+            "cooldown must skip the peer that just failed"
+        );
     }
 
     // ----- follow_primary -------------------------------------------------

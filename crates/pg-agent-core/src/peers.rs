@@ -179,6 +179,12 @@ pub const LONG_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 /// liveness signal that surfaces a partition before it bites a real RPC.
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Client-side bound on establishing a `FetchWal` stream. Five seconds,
+/// matching PRECONDITION_TIMEOUT's reasoning: evidence (here, a WAL
+/// segment) we cannot *start* receiving in five seconds is on a peer we
+/// should skip — the fan-out tries the next one.
+pub const FETCH_WAL_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Production [`PeerRegistry`]. mTLS when `cert_reloader.is_some()`,
 /// plain TCP otherwise (only valid in `--dev` / single-node deployments;
 /// the daemon's preflight rejects mixed remote-peer + no-TLS configs).
@@ -506,7 +512,23 @@ impl PeerClient for PeerChannel {
         let req = FetchWalRequest {
             wal_file: wal_file.to_string(),
         };
-        match client.fetch_wal(req).await {
+        // Client-side bound on establishing the stream (the same
+        // partition trap as PRECONDITION_TIMEOUT and the consensus
+        // plane's LEADER_RPC_TIMEOUT — third occurrence of the class,
+        // found by acceptance E2): without it, a black-holed peer holds
+        // this call to the 300 s channel ceiling, and this call sits on
+        // the promotion-critical path via restore_command. Bounds the
+        // setup only; the data stream, once flowing, is governed by the
+        // channel and HTTP/2 keepalive.
+        let established = tokio::time::timeout(FETCH_WAL_SETUP_TIMEOUT, client.fetch_wal(req))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "peer fetch_wal: no response within {FETCH_WAL_SETUP_TIMEOUT:?} \
+                     (peer unreachable?)"
+                )
+            })?;
+        match established {
             Ok(resp) => {
                 let stream = resp.into_inner();
                 // Map gRPC stream items to bytes::Bytes (Buf) + io::Error

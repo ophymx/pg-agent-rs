@@ -1072,9 +1072,23 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    bootstrap (idempotent, CAS-on-vacancy — losing means a holder
    exists, which is the goal).
 
-   Remaining in this step: acceptance scenarios that complete the S13
-   inversion with real executors, then the pgpool contract flip + SPEC
-   §5.1 rewrite + `gen-pgpool` canonical block.
+   **Acceptance landed** (testing/ phase 5, E0–E2b): the executors on
+   the real cluster. E1 promotes for real on lease takeover (journaled,
+   survivor re-points and streams); E2 runs the S13 partition with
+   executors and asserts the ending this document exists for — the
+   isolated holder fences itself, the majority promotes exactly one
+   standby, and **exactly one primary is on the wire during and after
+   the partition**. Getting there surfaced findings 14 and 15
+   (testing/README.md): the third member of the unbounded-RPC-on-
+   partition class was sitting on the promotion-critical path
+   (`restore_command` → `FetchWal`, now bounded and cooled down, with
+   `pg_promote(false)` putting the whole wait under the caller's
+   deadline), and a surviving standby can diverge past the new
+   primary's fork point — repaired via the operator path per demote
+   policy, with executor-side detection tracked in TODO.md.
+
+   Remaining in this step: the pgpool contract flip + SPEC §5.1
+   rewrite + `gen-pgpool` canonical block.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.
 

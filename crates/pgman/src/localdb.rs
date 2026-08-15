@@ -157,7 +157,15 @@ impl PgLocalDb {
 impl LocalDb for PgLocalDb {
     async fn promote(&self) -> anyhow::Result<()> {
         let conn = self.get_conn().await?;
-        conn.execute("SELECT pg_promote()", &[])
+        // wait := false — fire the signal and return. The default
+        // (wait = true) blocks server-side for up to 60 s, which put
+        // the wait outside any caller's deadline: the acceptance
+        // suite's E2 watched a promotion stall 40 s inside this call
+        // (recovery-end blocked on restore_command against a
+        // partitioned peer) while promote_and_wait's deadline sat
+        // powerless around it. The caller owns the wait; this call
+        // only owns the signal.
+        conn.execute("SELECT pg_promote(false)", &[])
             .await
             .map_err(|e| anyhow::anyhow!("localdb: pg_promote: {}", describe_pg(&e)))?;
         Ok(())

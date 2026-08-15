@@ -151,6 +151,31 @@ per-node phases could only simulate:
   PostgreSQL-level state needed no repair (exactly one primary
   throughout).
 
+## Phase 5 — EXECUTE (promotion-authority step 7)
+
+`shadow = false`: the same decisions, now driving PostgreSQL. Everything
+before this phase proves the loop decides correctly; this phase proves
+the executors act on it.
+
+- **E0** — executors attach. The holder retains; both standbys converge
+  onto it through the executor's follow path (slot prep via peer RPC,
+  conf rewrite, reload) — the mechanism that replaces pgpool's
+  `follow_primary_command`.
+- **E1/E1b** — primary death: the lease is deposed after `leader_ttl`
+  and the takeover **actually promotes** (journaled — `ops list` shows
+  the promote op). The surviving standby re-points onto the new primary
+  and streams. The dead ex-primary is asserted to have stayed stopped —
+  demote policy is never-automatic-rejoin — and is then rebuilt by the
+  operator path (`cluster recover`).
+- **E2/E2b** — **S13, executed.** The same partition that measured two
+  primaries in phase 3: the isolated holder escalates quorum loss to a
+  demote decision and the executor **fences it** (PostgreSQL actually
+  stopped); the majority promotes exactly one standby. After the
+  partition heals: **one primary on the wire**, no phantom-check
+  restart, no operator, no coincidence — the regression test
+  promotion-authority §2.1 said must invert, inverted. The fenced node
+  stays down until `cluster recover` rejoins it.
+
 ## Still planned
 
 - `detach_false_primary` storm behavior (hook-contract §5.5), which
@@ -351,3 +376,49 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     assertion was *wrong* — sequential shadow handoffs are legal — and
     replacing it with the property the ttl actually promises is what
     exposed the 7-second gap as a violation rather than noise.
+
+14. **A real promotion stalled 40 s on the partitioned peer — two
+    primaries existed for ~2 s. Caught by E2's first run, fixed at
+    three layers.** The E2 partition's takeover winner issued
+    `pg_promote()` and PostgreSQL, finishing recovery, ran
+    `restore_command` — which fans `FetchWal` out to peers *including
+    the isolated one*. Three compounding defects: `fetch_wal` had no
+    client-side bound at all (the one peer RPC that had escaped the
+    finding 11/12 sweep — third occurrence of the class, and the one
+    on the promotion-critical path); each back-to-back
+    `restore_command` invocation re-paid the full 30 s per-peer
+    timeout for the same dead peer; and `pg_promote()` defaults to
+    `wait := true`, so the server-side wait sat *outside*
+    `promote_and_wait`'s deadline entirely. Both blocked promotions
+    completed within 120 ms of each other at the instant the partition
+    healed; in the ~2 s before the loser's executor fenced it ("runs
+    as primary but node 0 holds the lease"), two primaries served.
+    The CAS + fence contained it — the containment working is worth as
+    much as the bug — but the window is now closed at the source:
+    `FETCH_WAL_SETUP_TIMEOUT` (5 s) bounds stream establishment,
+    `RESTORE_WAL_PEER_COOLDOWN` (10 s) stops re-probing a peer that
+    just failed, and `pg_promote(false)` puts the entire wait under
+    the caller's deadline. Under partition a promotion now stalls
+    ≤ ~7 s, inside every ttl. Bonus finding: the suite's own E2
+    asserts were false-negatives — `journalctl | grep -q` under
+    `set -o pipefail`, the exact footgun `log_has`'s comment warns
+    about, re-learned and re-fixed with the helpers.
+
+15. **A surviving standby diverged 120 bytes past the new primary's
+    fork point and wedged — candidate selection is a sampled-position
+    race.** In E2, db0 had been rebuilt seconds earlier (E1b) and was
+    still catching up when the partition hit; at candidacy time its
+    position read behind/unknown, so db2 legitimately won the CAS —
+    but by promote time db0 had replayed slightly *more* of the old
+    timeline. A standby ahead of the fork point cannot follow the new
+    timeline by streaming: PostgreSQL loops "new timeline forked off
+    before current recovery point" and the executor's light-follow,
+    having successfully rewritten the conf and reloaded, believes it
+    converged while the walreceiver flaps underneath. Patroni has the
+    same fundamental race; the answer there and here is `pg_rewind` —
+    which v1 demote policy reserves for the operator, so E2b now
+    detects the non-streaming survivor and repairs it via `cluster
+    recover` (the operator path, exercised). Product follow-ups in
+    TODO.md: the executor should *detect* a wedged follow (standby
+    confirmed-following but not streaming past a grace) and say so
+    loudly, and opt-in auto-rewind is the eventual closure.

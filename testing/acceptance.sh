@@ -13,7 +13,14 @@ PASS=0
 FAIL=0
 declare -a FAILURES=()
 
-say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+SUITE_T0=$SECONDS
+LAST_SAY_T=$SECONDS
+say()  {
+    local now=$SECONDS
+    printf '\n\033[1m== %s\033[0m \033[90m[+%ss, t=%ss]\033[0m\n' \
+        "$*" "$((now - LAST_SAY_T))" "$((now - SUITE_T0))"
+    LAST_SAY_T=$now
+}
 ok()   { PASS=$((PASS+1)); printf '   \033[32mPASS\033[0m %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); FAILURES+=("$*"); printf '   \033[31mFAIL\033[0m %s\n' "$*"; }
 
@@ -36,11 +43,23 @@ agent_log() { docker exec "pga-$1" journalctl -u pg_agentd --no-pager -o cat; }
 # makes a *successful* match look like a failed command.
 log_has() { local out; out=$(agent_log "$1" 2>/dev/null); [[ "$out" == *"$2"* ]]; }
 
+# probe <seconds> <command...> — wait_for without the verdict: polls
+# until success (0) or budget exhausted (1), reporting nothing. For
+# conditions with a fallback path where a timeout is not a failure.
+probe() {
+    local budget="$1"; shift
+    local waited=0
+    until bash -c "$*" >/dev/null 2>&1; do
+        sleep 1; waited=$((waited+1))
+        if [ "$waited" -ge "$budget" ]; then return 1; fi
+    done
+}
+
 wait_for() { # wait_for <seconds> <desc> <command...>
     local budget="$1" desc="$2"; shift 2
     local waited=0
     until bash -c "$*" >/dev/null 2>&1; do
-        sleep 2; waited=$((waited+2))
+        sleep 1; waited=$((waited+1))
         if [ "$waited" -ge "$budget" ]; then bad "timeout: $desc"; return 1; fi
     done
     ok "$desc"
@@ -108,13 +127,13 @@ done
 # ---------------------------------------------------------------------------
 say "S3: primary death → exactly one shadow takeover (tiebreak)"
 x db0 "systemctl stop postgresql@17-main"
-# leader_ttl 10s + loop_wait 2s + margin
-sleep 25
-if log_has db1 'TookOver'; then
-    ok "db1 (lower id) shadow-took the lease"
-else
-    bad "db1 did not log TookOver"
-fi
+# Poll for the takeover (fires at ~leader_ttl), then hold a short
+# derived window: the negative asserts below ("db2 did NOT take over")
+# need real time in which db2 COULD have acted - a couple of ticks
+# past db1's commit is that window; 25 s of it was inertia.
+wait_for 30 "db1 (lower id) shadow-took the lease" \
+    "docker exec pga-db1 journalctl -u pg_agentd --no-pager -o cat | grep TookOver"
+sleep 5
 if log_has db2 'TookOver'; then
     bad "db2 also logged TookOver — tiebreak failed"
 else
@@ -151,9 +170,13 @@ lsn_diff() { xp db1 "psql -tAc \"select pg_wal_lsn_diff('$1'::pg_lsn,'$2'::pg_ls
 
 xp db2 "psql -tAc 'select pg_wal_replay_pause()'" >/dev/null 2>&1
 xp db0 "psql -q -c 'create table if not exists bulk(id int, pad text)' \
-        -c 'insert into bulk select g, repeat(chr(97+(g%26)),200) from generate_series(1,300000) g' \
+        -c 'insert into bulk select g, repeat(chr(97+(g%26)),200) from generate_series(1,120000) g' \
         -c 'checkpoint' -c 'select pg_switch_wal()'" >/dev/null 2>&1
-sleep 12
+# ~24 MB of WAL - comfortably past the 16 MiB gate without the old
+# 60 MB. Poll for db1 having replayed it while paused db2 trails.
+wait_for 30 "db1 replayed the bulk WAL (lag gate arrangement ready)" \
+    "[ \"\$(docker exec -u postgres pga-db1 psql -tAc \"select pg_wal_lsn_diff(pg_last_wal_replay_lsn(),'0/0')::bigint\" | tr -d ' ')\" -gt 25000000 ]"
+sleep 2
 LAG=$(lsn_diff "$(replay_lsn db1)" "$(replay_lsn db2)")
 if [ -n "$LAG" ] && [ "$LAG" -gt $((16*1024*1024)) ]; then
     ok "db2 trails db1 by ${LAG} bytes (> 16 MiB threshold)"
@@ -250,7 +273,7 @@ say "S8: detach does not propagate between pgpool instances (hook-contract §3)"
 # failover_command, which the agent must refuse (db2 is a healthy
 # streaming standby).
 xp db0 "pcp_detach_node -h localhost -p 9898 -U pgpool -w -n 2" >/dev/null 2>&1 || true
-sleep 8
+sleep 4
 assert "db0's pgpool now shows node 2 down" \
     "docker exec -u postgres pga-db0 pcp_node_info -h localhost -p 9898 -U pgpool -w -n 2 | grep -q down"
 assert "db1's pgpool still shows node 2 up (no propagation)" \
@@ -373,9 +396,9 @@ fi
 
 say "S11: pgpool_status is sticky across a pgpool restart (hook-contract §5.3)"
 xp "$PRIM" "pcp_detach_node -h localhost -p 9898 -U pgpool -w -n 2" >/dev/null 2>&1 || true
-sleep 5
+sleep 3
 x "$PRIM" "systemctl restart pgpool2"
-sleep 8
+sleep 5
 if xp "$PRIM" "pcp_node_info -h localhost -p 9898 -U pgpool -w -n 2" 2>/dev/null | grep -q down; then
     ok "node 2 still down after restart (status file survived; no leader to correct it)"
 else
@@ -389,11 +412,15 @@ say "S12: follow_primary_command non-empty degenerates healthy standbys (§5.4)"
 for n in db0 db1 db2; do
     x "$n" "FOLLOW_PRIMARY=/bin/true /usr/local/sbin/pg-agent-pgpool-setup" >/dev/null 2>&1
 done
-sleep 8
+sleep 4
 wait_for 60 "pgpool healthy again with the non-empty hook configured" \
     "docker exec -u postgres pga-$PRIM pcp_node_info -h localhost -p 9898 -U pgpool -w -a | grep -c ' up ' | grep -qx 3"
 x "$PRIM" "systemctl stop postgresql@17-main"
-sleep 40
+# Poll for the degeneration (detection + hook fan-out), then settle a
+# few extra seconds so the count below is stable, not racing the hook.
+wait_for 60 "pgpool marked backends down after the primary stop" \
+    "docker exec -u postgres pga-db0 pcp_node_info -h localhost -p 9898 -U pgpool -w -a | grep -c down | grep -qxE '[2-9]'"
+sleep 5
 DOWN=$(xp db0 "pcp_node_info -h localhost -p 9898 -U pgpool -w -a" 2>/dev/null | grep -c down || true)
 echo "     backends marked down on db0's instance: ${DOWN:-?} of 3"
 if [ "${DOWN:-0}" -ge 2 ]; then
@@ -432,7 +459,7 @@ while [ "$waited" -lt 150 ]; do
         fi
     done
     [ -n "$MAJ_PRIMARY" ] && break
-    sleep 10; waited=$((waited+10))
+    sleep 5; waited=$((waited+5))
 done
 ISO_PRIMARY=no
 if xp "$PRIM" "psql -tAc 'select pg_is_in_recovery()'" 2>/dev/null | grep -qx f; then ISO_PRIMARY=yes; fi
@@ -445,16 +472,12 @@ else
     SPLIT=no
 fi
 docker network connect pga-net "pga-$PRIM" >/dev/null 2>&1
-sleep 10
+sleep 5
 if [ "$SPLIT" = yes ]; then
     say "S13b: the existing mitigation — phantom check stops the stale primary"
     x "$PRIM" "systemctl restart pg_agentd" || true
-    sleep 20
-    if log_has "$PRIM" 'phantom-primary check: detected'; then
-        ok "restarted agent detected the phantom primary"
-    else
-        bad "phantom check did not flag the stale primary"
-    fi
+    if wait_for 30 "restarted agent detected the phantom primary" \
+        "docker exec pga-$PRIM journalctl -u pg_agentd --no-pager -o cat | grep 'phantom-primary check: detected'"; then :; fi
     wait_for 60 "stale primary's PostgreSQL was stopped" \
         "! docker exec pga-$PRIM systemctl is-active -q postgresql@17-main"
     echo "     NOTE: the mitigation needs an agent restart to fire — nothing"
@@ -556,25 +579,32 @@ for n in db0 db1 db2; do
     wait_for 60 "$n follows holder $PRIM_ID (read from the shared state machine)" \
         "docker exec pga-$n journalctl -u pg_agentd --since '$RAFT_TS' --no-pager -o cat | grep -q 'Following { holder: $PRIM_ID }'"
 done
-# The shared store means lease acquisition happens ONCE, cluster-wide —
-# unlike the per-node phases, where every node adopted into its own
-# private store. Count acquisition events across all three nodes.
+# The shared store means lease acquisition happens ONCE, cluster-wide.
+# Since the executor work, ClusterInit SEEDS the lease at membership
+# bootstrap — so the legitimate acquisition paths are exactly two: the
+# seed (reported in R1's init output), or one decision-level
+# acquisition. Anything else — multiple acquirers, or a lease with no
+# acquisition story at all — is a serialization failure.
 ACQ=0
 for n in db0 db1 db2; do
     if log_since "$n" "$RAFT_TS" 'TookOver' || log_since "$n" "$RAFT_TS" 'AdoptedObservedPrimary'; then
         ACQ=$((ACQ+1))
     fi
 done
-if [ "$ACQ" = "1" ]; then
-    ok "exactly one node acquired the lease (CAS serialized by the quorum)"
+SEEDED=no
+if [[ "$INIT1" == *"lease seeded"* || "$INIT1" == *"lease already held"* ]]; then SEEDED=yes; fi
+if [ "$ACQ" -le 1 ] && { [ "$ACQ" = "1" ] || [ "$SEEDED" = "yes" ]; }; then
+    ok "one lease acquisition, cluster-wide (seeded=$SEEDED, decision-acquirers=$ACQ)"
 else
-    bad "expected exactly 1 lease acquirer, found $ACQ"
+    bad "lease acquisition not serialized: seeded=$SEEDED decision-acquirers=$ACQ"
 fi
 
 say "R3: primary death — takeover is now quorum-committed, still exactly one"
 TS3=$(now_ts)
 x "$PRIM" "systemctl stop postgresql@17-main"
-sleep 25   # leader_ttl 10s + loop_wait 2s + margin
+wait_for 30 "a standby committed the takeover (raft CAS)" \
+    "for n in db0 db1 db2; do [ \"\$n\" = \"$PRIM\" ] && continue; docker exec pga-\$n journalctl -u pg_agentd --since '$TS3' --no-pager -o cat 2>/dev/null | grep TookOver && exit 0; done; exit 1"
+sleep 4   # a couple of ticks: AwaitingPromotion + the rival's window
 WINNERS=""
 for n in db0 db1 db2; do
     [ "$n" = "$PRIM" ] && continue
@@ -613,16 +643,15 @@ say "R4: S13 INVERTED at the decision level — partition, no second primary dec
 TS4=$(now_ts)
 docker network disconnect pga-net "pga-$PRIM" >/dev/null 2>&1
 say "     (isolated $PRIM — current lease holder — from the cluster network)"
-# Budget: the candidates' first read after the partition burns the 5s
-# leader-forward deadline on the vanished raft leader, then re-forwards
-# to the new one; holder-unhealthy then accumulates to leader_ttl 10s
-# before candidacy. ~20s worst case; 45 leaves margin.
-sleep 45
-if log_since "$PRIM" "$TS4" 'quorum contact lost'; then
-    ok "isolated holder decided to demote (store unknown past retry budget)"
-else
-    bad "isolated holder never escalated store-unknown to a demote decision"
-fi
+# Poll the two positive signals, then hold the window open for
+# leader_ttl + margin: the hysteresis assertion below ("no two
+# takeovers within ttl") is only meaningful over a window in which a
+# second takeover COULD have happened.
+if wait_for 30 "isolated holder escalated to a demote decision" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$TS4' --no-pager -o cat | grep 'quorum contact lost'"; then :; fi
+if wait_for 45 "majority committed a takeover" \
+    "for n in db0 db1 db2; do [ \"\$n\" = \"$PRIM\" ] && continue; docker exec pga-\$n journalctl -u pg_agentd --since '$TS4' --no-pager -o cat 2>/dev/null | grep TookOver && exit 0; done; exit 1"; then :; fi
+sleep 13   # leader_ttl 10 + margin: the second-takeover window
 if log_since "$PRIM" "$TS4" 'TookOver'; then
     bad "isolated node committed a takeover without a quorum"
 else
@@ -678,6 +707,187 @@ wait_for 120 "$PRIM retains the lease again after rejoining" \
     "docker exec pga-$PRIM journalctl -u pg_agentd --since '$TS4B' --no-pager -o cat | grep -q 'RetainedLease'"
 wait_for 60 "replication intact (2 streaming standbys)" \
     "docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+
+# ---------------------------------------------------------------------------
+# Phase 5 — EXECUTE (promotion-authority step 7). shadow = false: the
+# same decisions, now driving PostgreSQL. Everything before this point
+# proved the loop decides correctly; this phase proves the executors
+# act on it — real promotion on lease takeover, real fencing on lost
+# quorum, real re-pointing of survivors — and that the S13 partition
+# now ends with ONE primary on the wire instead of two.
+# ---------------------------------------------------------------------------
+if [ "${PHASE:-all}" = "4" ]; then
+    say "result"; echo "PASS=$PASS FAIL=$FAIL"
+    [ "$FAIL" -gt 0 ] && { printf '  - %s\n' "${FAILURES[@]}"; exit 1; }
+    exit 0
+fi
+
+say "E0: flip shadow off — executors attach"
+PRIM=$(current_primary)
+if [ -n "$PRIM" ]; then ok "primary entering execute mode: $PRIM"; else bad "no primary before execute phase"; fi
+E0_TS=$(now_ts)
+for n in db0 db1 db2; do
+    x "$n" "sed -i 's/^shadow              = true/shadow              = false/' /etc/pg_agent/config.toml"
+    x "$n" "systemctl restart pg_agentd"
+done
+for n in db0 db1 db2; do
+    wait_for 60 "$n: pg_agentd active with shadow off" \
+        "docker exec pga-$n systemctl is-active -q pg_agentd"
+    wait_for 30 "$n: EXECUTE mode logged" \
+        "docker exec pga-$n journalctl -u pg_agentd --since '$E0_TS' --no-pager -o cat | grep -q 'EXECUTE mode'"
+done
+# The holder retains; the standbys converge onto it through the
+# executor (slot prep via peer RPC + conf rewrite + reload) — the
+# follow path that replaces pgpool's follow_primary_command.
+wait_for 60 "$PRIM retains the lease in execute mode" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$E0_TS' --no-pager -o cat | grep -q 'RetainedLease'"
+for n in db0 db1 db2; do
+    [ "$n" = "$PRIM" ] && continue
+    wait_for 60 "$n executor converged onto the holder" \
+        "docker exec pga-$n journalctl -u pg_agentd --since '$E0_TS' --no-pager -o cat | grep -q 'now following lease holder'"
+done
+wait_for 30 "replication intact after the follows (2 streaming)" \
+    "docker exec -u postgres pga-$PRIM psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+
+say "E1: primary death → the takeover PROMOTES for real"
+E1_TS=$(now_ts)
+x "$PRIM" "systemctl stop postgresql@17-main"
+# Deposal after leader_ttl, then a fast promotion — poll for it rather
+# than sleeping a fixed window. NOTE: log matching goes through
+# log_since, never `journalctl | grep -q` in this shell — pipefail
+# turns grep -q's early exit into a false failure (the log_has comment
+# at the top of this file; re-learned the hard way in E2's first run).
+wait_for 60 "a standby completed a real promotion" \
+    "for n in db0 db1 db2; do [ \"\$n\" = \"$PRIM\" ] && continue; docker exec pga-\$n journalctl -u pg_agentd --since '$E1_TS' --no-pager -o cat 2>/dev/null | grep 'promotion complete' && exit 0; done; exit 1"
+sleep 3   # let the loop's next tick settle roles
+E1_WINNER=""
+for n in db0 db1 db2; do
+    [ "$n" = "$PRIM" ] && continue
+    if log_since "$n" "$E1_TS" 'roleexec: promotion complete'; then
+        E1_WINNER="$n"
+    fi
+done
+if [ -n "$E1_WINNER" ]; then ok "$E1_WINNER promoted on lease takeover"; else bad "no node completed a promotion"; fi
+if [ "$(count_primaries)" = "1" ]; then
+    ok "exactly one PostgreSQL primary after failover"
+else
+    bad "expected 1 primary, found $(count_primaries)"
+fi
+if [ -n "$E1_WINNER" ]; then
+    assert "promotion is journaled (ops list shows a done promote op)" \
+        "docker exec -u postgres pga-$E1_WINNER pg_agentctl ops list | grep promote | grep -qi done"
+    # The surviving standby re-points onto the new primary.
+    E1_SURVIVOR=""
+    for n in db0 db1 db2; do
+        [ "$n" = "$PRIM" ] && continue
+        [ "$n" = "$E1_WINNER" ] && continue
+        E1_SURVIVOR="$n"
+    done
+    wait_for 90 "$E1_SURVIVOR re-pointed and streams from $E1_WINNER" \
+        "docker exec -u postgres pga-$E1_WINNER psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 1"
+fi
+
+say "E1b: operator rejoins the dead ex-primary (demote policy: never automatic)"
+# The fenced/stopped ex-primary must NOT have been restarted or rebuilt
+# by the executor while we watched.
+assert "ex-primary $PRIM stayed stopped (no automatic rejoin)" \
+    "! docker exec pga-$PRIM systemctl is-active -q postgresql@17-main"
+PRIM_ID="${PRIM#db}"
+xp "$E1_WINNER" "pg_agentctl cluster recover --target $PRIM_ID --stop-target-pg" \
+    > /tmp/e1b-recover.log 2>&1 || true
+wait_for 180 "ex-primary rebuilt; $E1_WINNER has 2 streaming standbys" \
+    "docker exec -u postgres pga-$E1_WINNER psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+if [ "$(count_primaries)" = "1" ]; then
+    ok "still exactly one primary after the rejoin"
+else
+    bad "primary count drifted during rejoin: $(count_primaries)"
+fi
+# cluster recover may have started pgpool on the target; keep this
+# phase pgpool-free.
+for n in db0 db1 db2; do x "$n" "systemctl stop pgpool2" >/dev/null 2>&1 || true; done
+
+say "E2: S13 EXECUTED — the partition that used to make two primaries"
+PRIM=$E1_WINNER
+E2_TS=$(now_ts)
+docker network disconnect pga-net "pga-$PRIM" >/dev/null 2>&1
+say "     (isolated $PRIM — current primary and lease holder)"
+# The isolated holder FENCES ITSELF: quorum loss escalates to a demote
+# decision and the executor stops PostgreSQL — §3's dilemma resolved
+# the safe way, on the node that cannot know what the majority is
+# doing. Poll for it (fires within ~retry_timeout + a tick).
+if wait_for 30 "isolated holder fenced itself (quorum loss → stop)" \
+    "docker exec pga-$PRIM journalctl -u pg_agentd --since '$E2_TS' --no-pager -o cat | grep FENCING"; then :; fi
+assert "isolated $PRIM PostgreSQL is actually stopped" \
+    "! docker exec pga-$PRIM systemctl is-active -q postgresql@17-main"
+# Majority: deposal after leader_ttl, then a promotion that must NOT
+# stall on the partitioned peer (finding 14: restore_command re-probing
+# the isolated node held a promotion for ~40 s — now bounded by
+# FETCH_WAL_SETUP_TIMEOUT + the restore_wal peer cooldown).
+if wait_for 60 "majority completed a real promotion" \
+    "for n in db0 db1 db2; do [ \"\$n\" = \"$PRIM\" ] && continue; docker exec pga-\$n journalctl -u pg_agentd --since '$E2_TS' --no-pager -o cat 2>/dev/null | grep 'promotion complete' && exit 0; done; exit 1"; then :; fi
+E2_WINNER=""
+for n in db0 db1 db2; do
+    [ "$n" = "$PRIM" ] && continue
+    if log_since "$n" "$E2_TS" 'roleexec: promotion complete'; then
+        E2_WINNER="$n"
+    fi
+done
+if [ -n "$E2_WINNER" ]; then ok "majority promoted $E2_WINNER"; else bad "majority never promoted"; fi
+
+docker network connect pga-net "pga-$PRIM" >/dev/null 2>&1
+sleep 5
+# THE assertion this whole design exists for. S13 measured two
+# primaries under the same partition; with the lease deciding and
+# executors acting, the answer is one — during the partition AND after
+# it heals, with no phantom-check restart, no operator, no
+# coincidence.
+if [ "$(count_primaries)" = "1" ]; then
+    ok "S13 INVERTED: exactly one primary on the wire, partition and all"
+else
+    bad "S13 NOT inverted: $(count_primaries) primaries after the partition"
+fi
+assert "fenced ex-holder stays down after reconnect (demote policy)" \
+    "! docker exec pga-$PRIM systemctl is-active -q postgresql@17-main"
+
+say "E2b: operator repairs; cluster whole again"
+if [ -z "$E2_WINNER" ]; then
+    # Without a winner there is nothing meaningful to repair from —
+    # E2's failures already tell the story; don't cascade noise.
+    bad "skipping E2b (no majority winner to repair from)"
+else
+PRIM_ID="${PRIM#db}"
+xp "$E2_WINNER" "pg_agentctl cluster recover --target $PRIM_ID --stop-target-pg" \
+    > /tmp/e2b-recover.log 2>&1 || true
+# The fenced node is rebuilt above. The SURVIVING standby may also need
+# repair: candidate selection samples moving WAL positions, so the
+# survivor can end up a few bytes past the new primary's fork point —
+# unable to follow the new timeline by streaming, wedged in a
+# walreceiver retry loop (finding 15). Diverged-standby repair is
+# rewind territory, which v1 demote policy reserves for the operator —
+# so the operator path is what this exercises.
+if probe 90 \
+    "docker exec -u postgres pga-$E2_WINNER psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"; then
+    ok "$E2_WINNER has 2 streaming standbys"
+else
+    for n in db0 db1 db2; do
+        [ "$n" = "$E2_WINNER" ] && continue
+        if xp "$n" "psql -tAc \"select pg_stat_wal_receiver.status from pg_stat_wal_receiver\"" 2>/dev/null | grep -qx streaming; then
+            continue
+        fi
+        echo "     NOTE: $n not streaming (diverged past the fork point?) — operator recover"
+        NID="${n#db}"
+        xp "$E2_WINNER" "pg_agentctl cluster recover --target $NID --stop-target-pg" \
+            > "/tmp/e2b-recover-$NID.log" 2>&1 || true
+    done
+    wait_for 180 "$E2_WINNER has 2 streaming standbys (after diverged-standby repair)" \
+        "docker exec -u postgres pga-$E2_WINNER psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+fi
+if [ "$(count_primaries)" = "1" ]; then
+    ok "exactly one primary at the end of the execute phase"
+else
+    bad "primary count wrong at end: $(count_primaries)"
+fi
+fi   # E2_WINNER guard
 
 # ---------------------------------------------------------------------------
 say "result"

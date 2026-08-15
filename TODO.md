@@ -76,6 +76,26 @@ scheduled. Items roughly in priority order within each section.
   then recover, then re-attach. The acceptance harness does exactly
   this in `repair_cluster`.
 
+### Executor: detect a wedged follow (finding 15)
+
+- **Where:** `crates/pg-agent-core/src/roleexec.rs` `converge_follow` /
+  `crates/pgman/src/instance.rs` `state()`.
+- **Why:** after a failover, a surviving standby can be a few bytes
+  ahead of the new primary's fork point (candidate selection samples
+  moving WAL positions — testing/README.md finding 15). The light
+  follow rewrites the conf and reloads successfully, the executor marks
+  the holder confirmed, and PostgreSQL loops "new timeline forked off
+  before current recovery point" underneath — `Standby { streaming:
+  false }` forever, silently.
+- **Fix shape:** the executor re-checks `state()` on `Following` ticks
+  even when confirmed; `Standby { streaming: false }` persisting past a
+  grace (≈ leader_ttl) clears the confirmation, logs at error naming
+  the likely divergence, and surfaces in `/healthz`. Actually *fixing*
+  it needs `pg_rewind` — `rebuild_as_standby` exists and is
+  deliberately operator-gated (demote policy); an opt-in
+  auto-rewind-only mode (never the basebackup fallback, bounded blast
+  radius) is the eventual closure.
+
 ### `gen-pgpool` emits hooks the agent-led target contract forbids
 
 - **Where:** `crates/pg-agent-hookspec/src/lib.rs::pgpool_hooks()` (the
