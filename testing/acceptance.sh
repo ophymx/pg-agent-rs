@@ -255,16 +255,31 @@ done
 wait_for 30 "db0: /healthz reports ready" \
     "docker exec pga-db0 curl -sf localhost:9702/healthz | grep -q '\"ready\":true'"
 
-say "S7: gen-pgpool's canonical hook block vs the target contract"
-# check-hooks compares pgpool.conf against the canonical block. We
-# deliberately override follow_primary_command to empty (the target
-# contract), so a *detected* difference is the correct outcome — and
-# proves the tool notices drift.
+say "S7: check-hooks agrees with the agent-led contract (and --legacy dissents)"
+# Post-cutover, the canonical block IS the agent-led contract, so this
+# conf — follow_primary empty, watchdog off, the decision-critical
+# settings — should check clean except for one known deviation: the
+# harness routes failover_command through the counting probe wrapper
+# (S9's per-instance measurements). Exactly that drift, nothing else.
 CH=$(xp db0 "pg_agentctl check-hooks /etc/pgpool2/pgpool.conf" 2>&1 || true)
-if echo "$CH" | grep -qi "follow_primary"; then
-    ok "check-hooks flags follow_primary_command drift (canonical vs target)"
+if echo "$CH" | grep 'ERR' | grep -q 'failover_command'; then
+    ok "check-hooks flags the probe wrapper (drift detection works)"
 else
-    bad "check-hooks did not flag the deliberate follow_primary_command override"
+    bad "check-hooks missed the failover_command probe deviation"
+fi
+if echo "$CH" | grep 'ERR' | grep -qE 'follow_primary|use_watchdog|auto_failback|detach_false_primary'; then
+    bad "check-hooks flagged contract keys that match: $(echo "$CH" | grep ERR)"
+else
+    ok "follow_primary + decision-critical settings check clean"
+fi
+# The legacy block must now read this conf as drifted — that is the
+# point of the flag: pre-cutover deployments keep a canonical to check
+# against, and the two contracts are distinguishable.
+CHL=$(xp db0 "pg_agentctl check-hooks --legacy /etc/pgpool2/pgpool.conf" 2>&1 || true)
+if echo "$CHL" | grep 'ERR' | grep -q 'follow_primary'; then
+    ok "--legacy dissents on follow_primary_command (blocks are distinct)"
+else
+    bad "--legacy did not flag empty follow_primary_command"
 fi
 
 say "S8: detach does not propagate between pgpool instances (hook-contract §3)"
@@ -888,6 +903,50 @@ else
     bad "primary count wrong at end: $(count_primaries)"
 fi
 fi   # E2_WINNER guard
+
+say "E3: full cutover shape — pgpool routes, the lease decides"
+# The production end-state: pgpool up in the agent-led contract on all
+# three nodes, execute mode on. Kill the primary: pgpool fires its
+# notify-only failover_command, the handler answers ADVISORY (no
+# promotion from the hook — SPEC §5.1 lease-mode), the HA loop
+# promotes, and pgpool discovers the new primary through sr_check.
+# Failure detection and routing stay pgpool's; authority does not.
+for n in db0 db1 db2; do
+    x "$n" "/usr/local/sbin/pg-agent-pgpool-setup" >/dev/null 2>&1 || true
+done
+E3_PRIM=$(current_primary)
+for n in db0 db1 db2; do
+    wait_for 60 "$n: pgpool shows 3 backends up" \
+        "docker exec -u postgres pga-$n pcp_node_info -h localhost -p 9898 -U pgpool -w -a | grep -c ' up ' | grep -qx 3"
+done
+E3_TS=$(now_ts)
+x "$E3_PRIM" "systemctl stop postgresql@17-main"
+wait_for 30 "failover hook answered advisory (the lease decides, not the hook)" \
+    "for n in db0 db1 db2; do docker exec pga-\$n journalctl -u pg_agentd --since '$E3_TS' --no-pager -o cat 2>/dev/null | grep 'failover: advisory' && exit 0; done; exit 1"
+wait_for 60 "the lease promoted a standby" \
+    "for n in db0 db1 db2; do [ \"\$n\" = \"$E3_PRIM\" ] && continue; docker exec pga-\$n journalctl -u pg_agentd --since '$E3_TS' --no-pager -o cat 2>/dev/null | grep 'promotion complete' && exit 0; done; exit 1"
+sleep 3
+if [ "$(count_primaries)" = "1" ]; then
+    ok "exactly one primary after the hook-announced, lease-decided failover"
+else
+    bad "primary count wrong after cutover-shape failover: $(count_primaries)"
+fi
+E3_NEW=$(current_primary)
+E3_NEW_ID="${E3_NEW#db}"
+wait_for 60 "pgpool discovered the new primary via sr_check (no follow hook needed)" \
+    "docker exec -u postgres pga-$E3_NEW pcp_node_info -h localhost -p 9898 -U pgpool -w -n $E3_NEW_ID | grep -qi primary"
+# Operator repair of the dead node — with pgpool live this time, so
+# cluster recover's attach fan-out actually attaches.
+E3_DEAD_ID="${E3_PRIM#db}"
+xp "$E3_NEW" "pg_agentctl cluster recover --target $E3_DEAD_ID --stop-target-pg" \
+    > /tmp/e3-recover.log 2>&1 || true
+wait_for 180 "cluster whole again ($E3_NEW + 2 streaming standbys)" \
+    "docker exec -u postgres pga-$E3_NEW psql -tAc \"select count(*) from pg_stat_replication where state='streaming'\" | grep -qx 2"
+if [ "$(count_primaries)" = "1" ]; then
+    ok "exactly one primary at the end of the suite"
+else
+    bad "primary count wrong at suite end: $(count_primaries)"
+fi
 
 # ---------------------------------------------------------------------------
 say "result"

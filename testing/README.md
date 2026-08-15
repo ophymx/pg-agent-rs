@@ -69,8 +69,11 @@ watchdog **off**, `failover_command` as an advisory poke,
 
 - **S6** — pgpool starts on all three; every instance shows all three
   backends up; `/healthz` reports ready.
-- **S7** — `check-hooks` detects drift between `gen-pgpool`'s canonical
-  block and the target contract (see finding 8).
+- **S7** — post-cutover: the canonical block IS the agent-led contract,
+  so the conf checks clean except the harness's deliberate
+  failover-probe wrapper (drift detection proven on a known deviation),
+  and `check-hooks --legacy` dissents — the two contracts are
+  distinguishable. (Closes finding 8.)
 - **S8** — detach does **not** propagate between instances, and the
   detach-fired hook is refused by the precondition check because the
   "failed" standby is still streaming (hook-contract §5, item 2).
@@ -150,6 +153,13 @@ per-node phases could only simulate:
   R4b confirms the partitioned raft node rejoins without a restart and
   PostgreSQL-level state needed no repair (exactly one primary
   throughout).
+- **E3** — the production end-state: pgpool up in the agent-led
+  contract, execute mode on. The primary dies; pgpool fires its
+  notify-only `failover_command`, the handler answers **advisory** (no
+  promotion from the hook), the lease promotes exactly one standby, and
+  pgpool discovers it through `sr_check` — routing stays pgpool's,
+  authority does not. `cluster recover` then rejoins the dead node with
+  the pcp attach fan-out live.
 
 ## Phase 5 — EXECUTE (promotion-authority step 7)
 

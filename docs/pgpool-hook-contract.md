@@ -1,11 +1,15 @@
 # pgpool hooks under agent-led failover
 
-**Status:** scoping for [promotion-authority.md](promotion-authority.md) §6
-(the pgpool configuration contract). Researched against the
+**Status:** implemented — §4's block is the canonical contract
+(`pg_agentctl gen-pgpool` emits it, `check-hooks` verifies it, the
+pre-cutover block lives behind `--legacy`), and the one open choice in
+it is resolved: `failover_command` is kept as a notify-only poke, with
+the handler answering "advisory" under lease-driven roles (SPEC §5.1).
+Researched against the
 [pgpool-II 4.6 documentation](https://www.pgpool.net/docs/46/en/html/index.html)
 (the version SPEC §"PROXY protocol" is already verified against),
 2026-08; quotes verified against a local mirror of the 4.6 docs
-(`~/src/pgpool-4.6-docs`). Nothing here is implemented.
+(`~/src/pgpool-4.6-docs`).
 
 The question this answers: **when `use_watchdog = off`, which hooks does
 pgpool actually fire, what do they mean, and what must the agent do about

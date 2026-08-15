@@ -227,6 +227,13 @@ pub struct LocalServer {
     /// where an operator, not the protocol, decides who the members
     /// are.
     raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
+    /// True in execute mode (`enabled = true, shadow = false`): the
+    /// lease drives roles, and pgpool's `failover_command` becomes the
+    /// notify-only poke the agent-led contract documents. The
+    /// primary-down branch then promotes nothing — the HA loop decides
+    /// — while the standby-down branch (slot hygiene, mechanism not
+    /// authority) keeps working.
+    lease_drives_roles: bool,
 }
 
 impl LocalServer {
@@ -260,7 +267,16 @@ impl LocalServer {
             pg,
             wal_peer_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
             raft: None,
+            lease_drives_roles: false,
         }
+    }
+
+    /// Cutover switch for the hook contract: `failover_command`'s
+    /// primary-down branch becomes advisory. Set alongside the
+    /// executor (same `enabled && !shadow` condition).
+    pub fn with_lease_driven_roles(mut self, lease_drives_roles: bool) -> Self {
+        self.lease_drives_roles = lease_drives_roles;
+        self
     }
 
     /// Let `ClusterInit` bootstrap Raft membership.
@@ -364,6 +380,33 @@ impl PgAgentLocal for LocalServer {
             return Ok(Response::new(OpResult {
                 ok: false,
                 message: "no standby candidates available".into(),
+            }));
+        }
+
+        // Agent-led contract (promotion-authority §6, the cutover):
+        // pgpool's failure report is a hint, not an order. Answered
+        // BEFORE the replay-marker check on purpose — the advisory is
+        // stateless, and a marker left by a legacy-mode failover (24 h
+        // TTL, so entirely plausible mid-migration) must not decide
+        // what the cutover contract answers. Run 8's E3 hit exactly
+        // that: S9's marker key matched E3's announcement verbatim and
+        // the "replay detected" skip masked the advisory. Only the
+        // PRIMARY-DOWN case is authority — standby-down slot hygiene
+        // below keeps its guards and keeps working.
+        if self.lease_drives_roles && detached_ref.id == old_primary_ref.id {
+            info!(
+                detached = %detached_ref.hostname,
+                pgpool_pick = %new_main_ref.hostname,
+                "failover: advisory under lease-driven roles; no action \
+                 (the HA loop decides promotion)"
+            );
+            return Ok(Response::new(OpResult {
+                ok: true,
+                message: format!(
+                    "failover: advisory — lease-driven roles; pgpool announced \
+                     {} down (pick {}), promotion is the HA loop's decision",
+                    detached_ref.hostname, new_main_ref.hostname
+                ),
             }));
         }
 
@@ -5014,6 +5057,88 @@ mod tests {
     }
 
     const GATE_BASE_LSN: u64 = 1 << 32;
+
+    /// The cutover contract: under lease-driven roles the primary-down
+    /// branch is a notify-only poke — no promotion, no slot drop, the
+    /// HA loop decides. The standby-down branch is mechanism, not
+    /// authority, and must keep working unchanged.
+    #[tokio::test]
+    async fn failover_primary_down_is_advisory_under_lease_driven_roles() {
+        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
+        let s = s.with_lease_driven_roles(true);
+        let new_main_client = Arc::new(StubPeerClient::default());
+        peers.override_client(0, new_main_client.clone());
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "advisory answer must be ok=true: {}", resp.message);
+        assert!(resp.message.contains("advisory"), "{}", resp.message);
+        assert_eq!(
+            new_main_client.promote_calls.load(Ordering::SeqCst),
+            0,
+            "the hook must not promote under lease-driven roles"
+        );
+        assert!(
+            new_main_client.drop_slot_calls.lock().unwrap().is_empty(),
+            "no slot action from the advisory branch"
+        );
+        // No replay marker either: the advisory answer is stateless and
+        // re-firing it is free.
+        assert!(!replay
+            .has("failover", "detached=1,new_main=0,old_primary=1")
+            .await
+            .unwrap());
+    }
+
+    /// A replay marker from a legacy-mode failover (same key — pgpool
+    /// re-announces the same detached/new_main/old_primary shape) must
+    /// not mask the advisory: run 8's E3 hit exactly this, with S9's
+    /// marker answering "already processed" where the cutover contract
+    /// should have said "advisory".
+    #[tokio::test]
+    async fn failover_advisory_wins_over_a_stale_legacy_replay_marker() {
+        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
+        replay
+            .mark_done("failover", "detached=1,new_main=0,old_primary=1")
+            .await
+            .unwrap();
+        let s = s.with_lease_driven_roles(true);
+        let new_main_client = Arc::new(StubPeerClient::default());
+        peers.override_client(0, new_main_client.clone());
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(
+            resp.message.contains("advisory"),
+            "marker masked the advisory: {}",
+            resp.message
+        );
+        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failover_standby_down_still_drops_slot_under_lease_driven_roles() {
+        let (s, db, _peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
+        let s = s.with_lease_driven_roles(true);
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(
+            db.dropped_slots.lock().unwrap().as_slice(),
+            ["node1"],
+            "standby-down slot hygiene is mechanism and survives the cutover"
+        );
+    }
 
     #[tokio::test]
     async fn failover_lag_gate_refuses_when_survivor_far_ahead() {

@@ -96,7 +96,17 @@ scheduled. Items roughly in priority order within each section.
   auto-rewind-only mode (never the basebackup fallback, bounded blast
   radius) is the eventual closure.
 
-### `gen-pgpool` emits hooks the agent-led target contract forbids
+### ~~`gen-pgpool` emits hooks the agent-led target contract forbids~~ — FIXED
+
+> Closed at the cutover (promotion-authority §10 step 7): the canonical
+> block IS the agent-led contract now — `follow_primary_command` empty,
+> `wd_*` hooks gone, decision-critical settings included — and the
+> pre-cutover block lives behind `gen-pgpool --legacy` /
+> `check-hooks --legacy`, exactly the shape this item proposed.
+> Acceptance S7 asserts the target conf checks clean and that
+> `--legacy` dissents. Original report below.
+
+### (historical) `gen-pgpool` emits hooks the agent-led target contract forbids
 
 - **Where:** `crates/pg-agent-hookspec/src/lib.rs::pgpool_hooks()` (the
   canonical block), consumed by `gen-pgpool` and `check-hooks`.

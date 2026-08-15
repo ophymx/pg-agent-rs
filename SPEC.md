@@ -369,6 +369,20 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
 
 ### 5.1 `Failover(detached, new_main, old_primary, old_main)`
 
+> **Lease-driven roles (`[raft] enabled = true, shadow = false`):** the
+> primary-down branch below (step 4) does not run. pgpool's failure
+> report is a hint, not an order — the handler logs the announcement
+> and returns `ok=true` ("advisory"), and promotion is the HA loop's
+> decision (§5.15): the lease holder is watched for `leader_ttl`, a
+> quorum-serialized CAS picks the successor, and the winner's executor
+> promotes. Steps 1–3 (resolution, and the standby-down slot hygiene
+> with its cross-op consult and preconditions) apply in both modes —
+> slot lifecycle is mechanism, not authority. The behavior below is the
+> **legacy (pgpool-led) mode**, which remains the default until a
+> deployment opts into the lease
+> ([docs/promotion-authority.md](docs/promotion-authority.md) §10
+> step 7).
+
 1. If `new_main.id == -1` → no candidates available. Log critical error,
    return `OpResult { ok=false, message="no standby candidates available" }`.
    Do **not** error the RPC.
@@ -504,6 +518,11 @@ Invoked by `pgpool_recovery` on the primary.
 
 Both map to the same RPC (`Escalation`). No-op: HAProxy replaces VIP
 management. Returning ok keeps watchdog happy.
+
+Retired under the agent-led contract: `use_watchdog = off` means the
+`wd_*` hooks never fire, and `gen-pgpool` no longer emits them (they
+remain in `gen-pgpool --legacy`). The RPC stays for compatibility with
+legacy-mode deployments.
 
 ### 5.6 `RestoreWal(wal_file, dest_path)`
 
@@ -786,6 +805,47 @@ must still complete. Use a detached, time-bounded context:
 30s budget is enough for one local `DropSlot` and one maintenance append.
 
 ---
+
+### 5.15 Lease-driven roles (agent-led failover)
+
+Active when `[raft] enabled = true` and `shadow = false`. The full
+design, its invariants, and its history live in
+[docs/promotion-authority.md](docs/promotion-authority.md); this
+section is the behavioral contract.
+
+**Decision layer** (`ha` module): every `loop_wait`, each node performs
+a linearizable read of the replicated lease and emits one decision.
+"Cannot read" is *unknown*, never vacant; a holder that cannot confirm
+its lease within `retry_timeout` decides to demote. A dead holder is
+watched for `leader_ttl` before any candidate proposes a CAS takeover
+(most-advanced WAL check, node-id tiebreak within
+`max_lag_on_failover_bytes`). Terms are fencing tokens, minted
+monotonically; the lease is seeded by `ClusterInit` at bootstrap.
+
+**Execution layer** (`roleexec` module): shadow mode is the executor's
+absence. With `shadow = false`:
+
+- Winning a takeover → journaled promotion (`inflight_ops` `promote`
+  op), `pg_promote(false)` + a poll bounded by `leader_ttl`.
+- A demote decision → **fence**: stop local PostgreSQL. Never gated on
+  journaling. A node running as primary while another holds the lease
+  is fenced the same way.
+- A holder change → re-point the local standby: replication slot
+  ensured on the holder (peer RPC), recovery config rewritten, reload
+  (`primary_conninfo` is reloadable). This replaces pgpool's
+  `follow_primary_command`.
+- **Demote policy: stop and wait.** A fenced node stays stopped;
+  rejoining (rewind/reclone) is `cluster recover` — operator-driven,
+  never automatic.
+
+**pgpool's place after the cutover** (the §6 contract of
+[docs/promotion-authority.md](docs/promotion-authority.md)): watchdog
+off, `failover_command` a notify-only poke, `follow_primary_command`
+empty, `detach_false_primary` on, `auto_failback` off. pgpool remains
+the router and learns the primary through `sr_check`; it commands
+nothing. `pg_agentctl gen-pgpool` emits this contract (`--legacy` for
+the pre-cutover block) and `check-hooks` verifies it, including the
+decision-critical settings.
 
 ## 6. Hook contract (positional args / format tokens)
 

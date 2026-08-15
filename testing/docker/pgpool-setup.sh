@@ -116,7 +116,13 @@ chmod 0600 /var/lib/postgresql/.pcppass
 # Discard any cached backend status: this is a config-changing restart,
 # and down-status is otherwise sticky with no watchdog leader to correct
 # it (measured in S11 / hook-contract §5.3). Equivalent to `pgpool -D`.
+# Stop FIRST: pgpool rewrites pgpool_status from its in-memory map on
+# shutdown, so an rm while it runs is silently undone by the restart's
+# stop phase — a freshly "cleared" instance then boots with the stale
+# backend states anyway (bit E3 on its first run: a mid-repair "down"
+# survived the rm and wedged the 3-backends-up wait).
+systemctl stop pgpool2.service 2>/dev/null || true
 rm -f /var/log/postgresql/pgpool_status
 systemctl unmask pgpool2.service
-systemctl restart pgpool2.service
+systemctl start pgpool2.service
 echo "pgpool-setup: started on $(hostname)"

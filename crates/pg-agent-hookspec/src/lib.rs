@@ -339,9 +339,29 @@ pub struct PgpoolHookEntry {
     pub value: String,
 }
 
-/// Build every directive in the canonical `pgpool.conf` hook block. Values
-/// are derived from the schema definitions so token order is always
-/// consistent with what `HookSchema::parse` expects.
+/// Build every directive in the canonical `pgpool.conf` hook block —
+/// the **agent-led contract** (docs/pgpool-hook-contract.md §4, the
+/// promotion-authority cutover). Values are derived from the schema
+/// definitions so token order is always consistent with what
+/// `HookSchema::parse` expects.
+///
+/// The two decisions this block encodes:
+///
+/// - `failover_command` is **kept, as a notify-only poke**. The handler
+///   under lease-driven roles logs the announcement and promotes
+///   nothing — the HA loop decides — but the poke buys detection
+///   latency over waiting for the next `loop_wait` tick. Its arguments
+///   are advisory forever; that trade is deliberate (promotion-authority
+///   open question 4, resolved at cutover).
+/// - `follow_primary_command` is **empty, not notify-only**: a
+///   non-empty value makes pgpool degenerate every healthy standby
+///   after a primary failover (hook-contract §5.4, measured in
+///   acceptance S12). The agent re-points standbys off the lease
+///   instead.
+///
+/// The `wd_*` escalation hooks are gone with the watchdog. The legacy
+/// (pgpool-led) block survives as [`pgpool_hooks_legacy`] for
+/// deployments that have not cut over.
 ///
 /// `recovery_1st_stage_command` and `pgpool_remote_start` are fixed-arg
 /// hooks invoked by the `pgpool_recovery` C extension — only the script
@@ -349,6 +369,59 @@ pub struct PgpoolHookEntry {
 /// itself. `restore_command` lives in postgresql.conf, not pgpool.conf, and
 /// is therefore excluded from this list (see [`restore_command`]).
 pub fn pgpool_hooks() -> Vec<PgpoolHookEntry> {
+    vec![
+        PgpoolHookEntry {
+            key: "failover_command",
+            value: pgpool_cmd(HOOK_FAILOVER, &SCHEMA_FAILOVER),
+        },
+        PgpoolHookEntry {
+            key: "follow_primary_command",
+            value: String::new(),
+        },
+        PgpoolHookEntry {
+            key: "recovery_1st_stage_command",
+            value: HOOK_RECOVERY_1ST_STAGE.to_string(),
+        },
+    ]
+}
+
+/// Non-hook `pgpool.conf` directives the agent-led contract requires
+/// (promotion-authority §6). Emitted by `gen-pgpool` and verified by
+/// `check-hooks` alongside the hook block: each of these is
+/// decision-critical, not tuning — a wrong value here re-opens a
+/// specific defect (watchdog on = a second failover authority;
+/// auto_failback on = pgpool re-attaching nodes whose slots the agent
+/// manages; detach_false_primary off = routing to an incoherent
+/// primary).
+///
+/// Deliberately absent: `sr_check_period`, `health_check_*` — detection
+/// cadence is the operator's tuning, not the contract's.
+pub fn pgpool_settings() -> Vec<PgpoolHookEntry> {
+    vec![
+        PgpoolHookEntry {
+            key: "use_watchdog",
+            value: "off".to_string(),
+        },
+        PgpoolHookEntry {
+            key: "detach_false_primary",
+            value: "on".to_string(),
+        },
+        PgpoolHookEntry {
+            key: "auto_failback",
+            value: "off".to_string(),
+        },
+        PgpoolHookEntry {
+            key: "failover_on_backend_error",
+            value: "on".to_string(),
+        },
+    ]
+}
+
+/// The pre-cutover (pgpool-led) hook block: `follow_primary_command`
+/// populated, watchdog escalation hooks present. Correct only while
+/// pgpool's `failover_command` is still the promotion authority —
+/// `gen-pgpool --legacy` / `check-hooks --legacy` select it.
+pub fn pgpool_hooks_legacy() -> Vec<PgpoolHookEntry> {
     vec![
         PgpoolHookEntry {
             key: "failover_command",

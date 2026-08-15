@@ -1,9 +1,10 @@
 # Promotion authority — relocating the failover decision
 
-**Status:** in implementation. Sequencing steps 1–6 (§10) are landed —
-the HA loop runs against the embedded Raft on the acceptance cluster,
-still in shadow. Step 7 (cutover) has not begun; pgpool still drives
-failover everywhere.
+**Status:** implemented through step 7 (§10). The HA loop, embedded
+Raft, executors, and the flipped pgpool contract are all landed and
+exercised on the acceptance cluster; `[raft] enabled = true, shadow =
+false` is the cutover switch, off by default — deployments opt in.
+Step 8 (role-aware `/healthz` + the HAProxy split) remains.
 
 Companion to [SPEC.md](../SPEC.md) (SPEC §5.1),
 [ROADMAP.md](../ROADMAP.md) ("Shared cluster state"), and
@@ -796,9 +797,14 @@ Decisions to make before implementation, not blockers to the design:
    Note it does not stand alone: the second lease invariant chains
    `election_timeout < retry_timeout` and the first chains `retry_timeout`
    into the `leader_ttl` floor, so these three tune together or not at all.
-4. **`failover_command`: removed, or notify-only?** Notify-only buys
+4. **`failover_command`: removed, or notify-only?** ~~Notify-only buys
    detection latency at the cost of a hook path that must be documented
-   as non-authoritative forever.
+   as non-authoritative forever.~~ **Resolved at cutover: notify-only.**
+   The handler under lease-driven roles answers "advisory" and promotes
+   nothing (SPEC §5.1); the non-authoritative contract is documented in
+   the canonical block itself, and acceptance E3 exercises the full
+   shape — hook fires, handler declines, lease promotes, `sr_check`
+   discovers.
 5. **Synchronous replication.** Patroni's `synchronous_mode` maintains
    `synchronous_standby_names` and refuses to promote a node that was not
    in sync — trading write latency for zero-data-loss failover. Do we
@@ -1087,8 +1093,24 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    primary's fork point — repaired via the operator path per demote
    policy, with executor-side detection tracked in TODO.md.
 
-   Remaining in this step: the pgpool contract flip + SPEC §5.1
-   rewrite + `gen-pgpool` canonical block.
+   **Contract flipped** (post-0.7.3), completing this step. The
+   canonical `pgpool.conf` block is now the §6 target: `failover_command`
+   kept as a notify-only poke (open question 4, resolved),
+   `follow_primary_command` empty, `wd_*` hooks gone, plus the
+   decision-critical settings (`use_watchdog off`,
+   `detach_false_primary on`, `auto_failback off`,
+   `failover_on_backend_error on`) emitted by `gen-pgpool` and verified
+   by `check-hooks` — with `--legacy` selecting the pre-cutover block
+   for deployments that have not moved. On the product side,
+   `Failover`'s primary-down branch is advisory under lease-driven
+   roles (`enabled = true, shadow = false`): log and `ok=true`, no
+   promotion, while standby-down slot hygiene — mechanism, not
+   authority — keeps its guards and keeps working. SPEC §5.1 carries
+   the lease-mode contract and §5.15 the behavioral summary.
+   Acceptance E3 validates the production end-state: pgpool up in the
+   target contract, primary killed, hook answers advisory, the lease
+   promotes exactly one standby, and pgpool discovers it through
+   `sr_check` with no follow hook at all.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.
 
