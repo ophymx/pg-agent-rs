@@ -116,6 +116,14 @@ pub struct Options {
     /// openraft's core task, and `Agent::new` is documented as cheap
     /// and I/O-free.
     pub raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
+    /// `Some` = **execute mode**: the HA loop gets a
+    /// [`crate::roleexec::RoleExecutor`] over this instance and acts on
+    /// its decisions. `None` = shadow (decisions log, nothing moves).
+    /// Built by daemon main only when `[raft] enabled = true` and
+    /// `shadow = false` — executing against a process-local store is
+    /// structurally impossible because the instance is only constructed
+    /// alongside a real Raft.
+    pub pg_instance: Option<Arc<dyn pgman::instance::PostgresInstance>>,
 }
 
 impl Options {
@@ -136,6 +144,7 @@ impl Options {
             cert_reloader: None,
             ha_shadow: None,
             raft: None,
+            pg_instance: None,
         }
     }
 }
@@ -442,6 +451,18 @@ impl Agent {
         // stream is most interesting exactly when the cluster is in a
         // degraded shape.
         if let Some(timing) = self.opts.ha_shadow.clone() {
+            let executor = self.opts.pg_instance.clone().map(|instance| {
+                Arc::new(crate::roleexec::RoleExecutor::new(
+                    instance,
+                    self.deps.peers.clone(),
+                    self.opts.node_pool.clone(),
+                    self.deps.inflight.clone(),
+                    // Promote budget = leader_ttl: the clock rivals run
+                    // against a fresh holder (see roleexec docs).
+                    timing.leader_ttl,
+                    &self.opts.postgres,
+                ))
+            });
             // With Raft running the loop reads a replicated state
             // machine; without it, a process-local one that is
             // authoritative for nothing. The loop itself cannot tell
@@ -456,13 +477,18 @@ impl Agent {
                     Arc::new(crate::consensus::InMemoryConsensusStore::new())
                 }
             };
-            let ha = Arc::new(crate::ha::HaLoop::new(
+            let mut ha = crate::ha::HaLoop::new(
                 store,
                 self.deps.db.clone(),
                 self.deps.peers.clone(),
                 self.opts.node_pool.clone(),
                 timing,
-            ));
+            );
+            if let Some(executor) = executor {
+                info!("ha loop: EXECUTE mode — decisions act on local PostgreSQL");
+                ha = ha.with_executor(executor);
+            }
+            let ha = Arc::new(ha);
             let s = shutdown.clone();
             js.spawn(async move {
                 ha.run(s).await;
@@ -1376,6 +1402,7 @@ mod tests {
                 cert_reloader: None,
                 ha_shadow: None,
                 raft: None,
+                pg_instance: None,
             },
         )
     }
@@ -1609,6 +1636,7 @@ mod tests {
                 cert_reloader: None,
                 ha_shadow: None,
                 raft: None,
+                pg_instance: None,
             },
         );
         let shutdown = CancellationToken::new();
@@ -1678,6 +1706,7 @@ mod tests {
                     cert_reloader: None,
                     ha_shadow: None,
                     raft: None,
+                    pg_instance: None,
                 },
             );
             let shutdown = CancellationToken::new();
@@ -1741,6 +1770,7 @@ mod tests {
                 cert_reloader: None,
                 ha_shadow: None,
                 raft: None,
+                pg_instance: None,
             },
         );
         let res = agent.serve(listeners, CancellationToken::new()).await;
@@ -1797,6 +1827,7 @@ mod tests {
                 cert_reloader: None,
                 ha_shadow: None,
                 raft: None,
+                pg_instance: None,
             },
         );
         (agent, listeners, tmp)
@@ -1971,6 +2002,7 @@ mod tests {
                 cert_reloader: None,
                 ha_shadow: None,
                 raft: None,
+                pg_instance: None,
             },
         )
     }

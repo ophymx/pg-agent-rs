@@ -305,11 +305,11 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
     };
 
     let deps = AgentDeps {
-        db,
+        db: db.clone(),
         peers,
-        standby,
+        standby: standby.clone(),
         pcp,
-        sd,
+        sd: sd.clone(),
         replay,
         inflight,
         wal,
@@ -338,6 +338,32 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         None
     };
 
+    // HA-loop mode matrix (promotion-authority §10):
+    //   shadow=true,  enabled=false → loop over the in-memory store (step 5)
+    //   shadow=true,  enabled=true  → loop over real Raft, log-only (step 6)
+    //   shadow=false, enabled=true  → EXECUTE (step 7): decisions act
+    //   shadow=false, enabled=false → no loop at all (pre-consensus default)
+    let ha_execute = config.raft.effective_enabled() && !config.raft.effective_shadow();
+    let ha_timing =
+        (config.raft.effective_shadow() || ha_execute).then(|| pg_agent_core::ha::HaTiming {
+            loop_wait: config.raft.effective_loop_wait(),
+            retry_timeout: config.raft.effective_retry_timeout(),
+            leader_ttl: config.raft.effective_leader_ttl(),
+            max_lag_on_failover: config.raft.effective_max_lag_on_failover(),
+        });
+    // The executor's instance is only ever built here, alongside a real
+    // Raft — executing against a process-local store is not a
+    // configuration that exists.
+    let pg_instance: Option<Arc<dyn pgman::instance::PostgresInstance>> = if ha_execute {
+        Some(Arc::new(pgman::instance::Instance::new(
+            sd.clone(),
+            db.clone(),
+            standby.clone(),
+        )))
+    } else {
+        None
+    };
+
     let opts = Options {
         serve: serve.clone(),
         node_pool,
@@ -347,16 +373,9 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         phantom_check_required_peers: config.startup.effective_required_peers(),
         supervisor_pgpool_enabled: config.supervisor.effective_pgpool_enabled(),
         cert_reloader: cert_reloader.clone(),
-        ha_shadow: config
-            .raft
-            .effective_shadow()
-            .then(|| pg_agent_core::ha::HaTiming {
-                loop_wait: config.raft.effective_loop_wait(),
-                retry_timeout: config.raft.effective_retry_timeout(),
-                leader_ttl: config.raft.effective_leader_ttl(),
-                max_lag_on_failover: config.raft.effective_max_lag_on_failover(),
-            }),
+        ha_shadow: ha_timing,
         raft,
+        pg_instance,
     };
 
     // Bind listeners synchronously — every fd exists once this returns.

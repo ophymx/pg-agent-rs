@@ -35,6 +35,7 @@ pub mod raftnet;
 pub mod raftstore;
 pub mod replay_markers;
 pub mod retry;
+pub mod roleexec;
 pub mod sdnotify;
 pub mod symlinks;
 pub mod systemd;

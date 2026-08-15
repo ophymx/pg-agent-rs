@@ -21,6 +21,7 @@
 
 use crate::agent::NodeInfo;
 use crate::config::{NodeConfig, NodePool, PostgresRuntime};
+use crate::consensus::ConsensusStore as _;
 use crate::localdb::LocalDb;
 use crate::maintenance::{
     MaintenanceIntent as CoreIntent, MaintenancePayload, MaintenanceStatus, MaintenanceStore,
@@ -1282,7 +1283,35 @@ impl PgAgentLocal for LocalServer {
         // that already succeeded.
         let raft_note = match &self.raft {
             Some(rt) => match rt.bootstrap_membership().await {
-                Ok(outcome) => Some(outcome.describe()),
+                Ok(outcome) => {
+                    // Seed the lease for this primary (promotion-authority
+                    // step 7: seeding replaces shadow-only vacant
+                    // adoption as the bootstrap). CAS on observed
+                    // vacancy: losing means a holder already exists,
+                    // which is the goal state, not an error — exactly
+                    // the membership-bootstrap idempotency argument
+                    // again.
+                    let seed = match rt.store.try_takeover(primary_id, None).await {
+                        Ok(crate::consensus::TakeoverOutcome::Won { lease }) => {
+                            info!(
+                                term = lease.term,
+                                "cluster_init: lease seeded for this primary"
+                            );
+                            format!("lease seeded (node {primary_id}, term {})", lease.term)
+                        }
+                        Ok(crate::consensus::TakeoverOutcome::Lost { current }) => format!(
+                            "lease already held{}",
+                            current
+                                .map(|l| format!(" (node {}, term {})", l.holder, l.term))
+                                .unwrap_or_default()
+                        ),
+                        Err(e) => {
+                            warn!(?e, "cluster_init: lease seeding failed");
+                            format!("lease seeding FAILED: {e}")
+                        }
+                    };
+                    Some(format!("{}; {seed}", outcome.describe()))
+                }
                 Err(e) => {
                     warn!(?e, "cluster_init: raft membership bootstrap failed");
                     Some(format!("raft membership bootstrap FAILED: {e}"))
@@ -1904,6 +1933,18 @@ impl PgAgentLocal for LocalServer {
             // in an unknown state, which `cluster recover` already does
             // correctly from the top. Point the operator at that rather
             // than pretending to resume.
+            // A promote op has nothing to resume: the HA loop re-derives
+            // its decision every tick and re-issues the (idempotent)
+            // promotion if it is still the holder. The journal entry is
+            // the record, not the driver.
+            crate::inflight_ops::InflightPayload::Promote { .. } => Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "op {} is a promotion; nothing to resume — the HA loop \
+                     re-issues it while the lease is held",
+                    op.id
+                ),
+            })),
             crate::inflight_ops::InflightPayload::Recovery {
                 standby_node_id, ..
             } => Ok(Response::new(OpResult {

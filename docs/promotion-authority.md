@@ -1039,6 +1039,42 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    `enabled = true, shadow = true` configuration accumulating decision
    history on the real cluster.
 7. **(M)** Cut over: SPEC §5.1 rewrite, pgpool config contract, watchdog off.
+
+   **Executors landed** (post-0.7.3): `pgman::instance::PostgresInstance`
+   (the concern layer: `promote_and_wait`, `ensure_stopped`, `follow`,
+   `rebuild_as_standby`, one authoritative `InstanceState`) and
+   `roleexec::RoleExecutor`, which consumes the decision stream. The
+   loop stays a pure decision function; **shadow mode is the executor's
+   absence** — `[raft] shadow = false, enabled = true` is the execute
+   switch, and the instance is only ever constructed alongside a real
+   Raft, so executing against a process-local store is not a
+   configuration that exists.
+
+   Decisions map to convergent actions: takeover → journaled
+   promotion (deadline = `leader_ttl`, the same clock rivals run
+   against a fresh holder); demote → fence (`ensure_stopped`, never
+   gated on journaling — a broken journal must not stand between the
+   loop and stopping a lease-less primary); holder change → re-point
+   the standby (slot prepped on the holder via peer RPC, then a
+   conf-rewrite + reload). The executor also closes the stale-primary
+   half of §2.1 from the other side: a node running as primary while
+   someone else holds the lease is fenced, even though the decision
+   layer only says `Following`.
+
+   **Demote policy: stop and wait.** A fenced node stays stopped;
+   rejoining (`cluster recover`) is the operator's call. The executor
+   never runs a destructive rebuild — `rebuild_as_standby` exists for
+   the peer-RPC handlers to converge on and for a future opt-in.
+
+   Shadow-only vacant adoption is now gated off in execute mode, as
+   this step requires: the primary claims the lease for itself through
+   the shared store, and `ClusterInit` seeds it deterministically at
+   bootstrap (idempotent, CAS-on-vacancy — losing means a holder
+   exists, which is the goal).
+
+   Remaining in this step: acceptance scenarios that complete the S13
+   inversion with real executors, then the pgpool contract flip + SPEC
+   §5.1 rewrite + `gen-pgpool` canonical block.
 8. **(S)** `/healthz` role reporting + the role-aware HAProxy split in
    home-ansible.
 

@@ -166,6 +166,19 @@ pub enum InflightPayload {
         /// Slot created on the primary for the standby to stream through.
         slot_name: String,
     },
+    /// The HA loop's executor promoting local PostgreSQL after winning
+    /// the lease (promotion-authority §5: "the CAS is the gate;
+    /// `inflight_ops` remains the record — a promotion is still a
+    /// journaled orchestration"). Owns no target node: the slot-drop
+    /// guards protect nodes being rebuilt, and a promotion rebuilds
+    /// nothing.
+    Promote {
+        /// The node promoting (always the local node).
+        node_id: i32,
+        /// The lease term the promotion executes for — ties the journal
+        /// entry to the exact CAS win that authorized it.
+        term: u64,
+    },
 }
 
 impl InflightPayload {
@@ -176,6 +189,7 @@ impl InflightPayload {
             Self::Handoff { .. } => "handoff",
             Self::FollowPrimary { .. } => "follow_primary",
             Self::Recovery { .. } => "recovery",
+            Self::Promote { .. } => "promote",
         }
     }
 
@@ -200,6 +214,7 @@ impl InflightPayload {
                 standby_node_id,
                 ..
             } => format!("primary={primary_node_id},standby={standby_node_id}"),
+            Self::Promote { node_id, term } => format!("node={node_id},term={term}"),
         }
     }
 
@@ -216,6 +231,7 @@ impl InflightPayload {
             Self::Recovery {
                 standby_node_id, ..
             } => Some(*standby_node_id),
+            Self::Promote { .. } => None,
         }
     }
 }

@@ -11,8 +11,11 @@
 //!
 //! The current implementation computes decisions and logs them; it
 //! **cannot** act on PostgreSQL. This is not a runtime flag — the
-//! struct simply holds no `Systemd`, no `Pcp`, no `StandbyOps`, and
-//! never dials a peer mutation RPC. Its only writes go to the
+//! struct holds no `Systemd`, no `Pcp`, no `StandbyOps`, and
+//! never dials a peer mutation RPC — unless an executor is attached
+//! ([`HaLoop::with_executor`], the step-7 cutover switch), in which
+//! case every decision is handed to [`crate::roleexec::RoleExecutor`]
+//! after logging. Without one, the loop's only writes go to the
 //! [`ConsensusStore`], which today is the process-local
 //! [`InMemoryConsensusStore`](crate::consensus::InMemoryConsensusStore)
 //! — private bookkeeping, authoritative for
@@ -174,6 +177,20 @@ pub struct HaLoop {
     pool: NodePool,
     timing: HaTiming,
     state: Mutex<TickState>,
+    /// `Some` = execute mode: every tick's decision is handed to the
+    /// executor after logging. `None` = shadow — the decision stream
+    /// is the entire output, which is the structural guarantee shadow
+    /// mode has always rested on, now expressed as this field's
+    /// absence.
+    executor: Option<Arc<crate::roleexec::RoleExecutor>>,
+    /// Shadow-only vacant-lease adoption (see the module docs). Off in
+    /// execute mode: with a shared store the primary claims the lease
+    /// for itself (`TookOver { already_primary: true }`) and everyone
+    /// else reads it — adoption existed for per-node stores where each
+    /// standby had to seed its own private view, and promotion-authority
+    /// step 7 removes it from the real path. `ClusterInit` seeding is
+    /// the deterministic bootstrap.
+    vacant_adoption: bool,
 }
 
 impl HaLoop {
@@ -199,7 +216,26 @@ impl HaLoop {
                 held_since: None,
                 last_logged: None,
             }),
+            executor: None,
+            vacant_adoption: true,
         }
+    }
+
+    /// Attach the executor: every decision is now acted on, and
+    /// shadow-only vacant adoption turns off. This is the cutover
+    /// switch — a loop without this call can only ever write to its
+    /// store and its log.
+    pub fn with_executor(mut self, executor: Arc<crate::roleexec::RoleExecutor>) -> Self {
+        self.executor = Some(executor);
+        self.vacant_adoption = false;
+        self
+    }
+
+    /// Test-only: execute mode's adoption gating without an executor.
+    #[cfg(test)]
+    fn without_vacant_adoption(mut self) -> Self {
+        self.vacant_adoption = false;
+        self
     }
 
     /// Continuous loop: tick every `loop_wait` until shutdown. Decisions
@@ -220,6 +256,14 @@ impl HaLoop {
             }
             let decision = self.tick_once().await;
             self.log_decision(&decision);
+            if let Some(executor) = &self.executor {
+                // Inline, not spawned: a promotion blocking the loop for
+                // up to its deadline is by design — the deadline equals
+                // leader_ttl, the same clock rivals run against us, so
+                // there is nothing useful for this node's loop to decide
+                // while the promotion is in flight.
+                executor.apply(&decision).await;
+            }
         }
     }
 
@@ -394,6 +438,19 @@ impl HaLoop {
                     observed.push(local_id);
                 }
                 match observed.as_slice() {
+                    [only] if *only != local_id && !self.vacant_adoption => {
+                        // Execute mode: never write a lease on another
+                        // node's behalf. The primary claims for itself
+                        // (or ClusterInit seeds), and until one of those
+                        // happens a vacant lease with a live primary is
+                        // a bootstrap gap to report, not to paper over.
+                        HaDecision::StoodDown {
+                            reason: format!(
+                                "lease vacant but node {only} runs as primary; \
+                                 waiting for it to claim (or ClusterInit to seed)"
+                            ),
+                        }
+                    }
                     [only] if *only != local_id => {
                         let node = *only;
                         match self.store.try_takeover(node, None).await {
@@ -897,6 +954,43 @@ mod tests {
         );
         assert_eq!(f.store.snapshot().lease.unwrap().holder, 0);
         assert_eq!(f.ha.tick_once().await, HaDecision::Following { holder: 0 });
+    }
+
+    /// Execute mode: adoption is off. A standby seeing a vacant lease
+    /// with a live primary elsewhere must never write a lease on that
+    /// primary's behalf — the primary claims for itself through the
+    /// shared store (or ClusterInit seeds), and until then the honest
+    /// decision is standing down, not papering over the bootstrap gap.
+    #[tokio::test]
+    async fn execute_mode_reports_the_bootstrap_gap_instead_of_adopting() {
+        let f = fixture(1, StubDb::standby(2, BASE));
+        let ha = HaLoop::new(
+            f.store.clone(),
+            Arc::new(StubDb::standby(2, BASE)),
+            f.peers.clone(),
+            pool3(1),
+            timing(),
+        )
+        .without_vacant_adoption();
+        f.peers.set(0, primary_status(2, BASE + 100));
+        f.peers.set(2, standby_status(2, BASE));
+
+        match ha.tick_once().await {
+            HaDecision::StoodDown { reason } => {
+                assert!(reason.contains("vacant"), "{reason}");
+                assert!(reason.contains("ClusterInit"), "{reason}");
+            }
+            other => panic!("expected StoodDown, got {other:?}"),
+        }
+        assert!(
+            f.store.snapshot().lease.is_none(),
+            "no lease may be written on another node's behalf"
+        );
+
+        // And once the primary's own claim lands (as the shared store
+        // delivers it), the standby follows normally.
+        f.store.try_takeover(0, None).await.unwrap();
+        assert_eq!(ha.tick_once().await, HaDecision::Following { holder: 0 });
     }
 
     #[tokio::test]
