@@ -62,13 +62,21 @@ phantom_check_required_peers = 0
 [supervisor]
 pgpool = false
 
-# Shadow-mode HA loop with test-friendly timing.
-# Invariants: leader_ttl >= loop_wait + 2*retry_timeout (10 >= 2+6);
-# retry_timeout > election_timeout (3s > 1s).
+# HA loop with test-friendly timing.
+# Invariants: leader_ttl >= loop_wait + 2*retry_timeout (10 >= 1+4);
+# retry_timeout > election_timeout (2s > 1s).
+#
+# leader_ttl deliberately stays at 10 s. A partition-time promotion
+# legitimately stalls ~5-7 s on its first probe of the dead peer
+# (FETCH_WAL_SETUP_TIMEOUT before the cooldown kicks in, finding 14);
+# a tighter ttl would put rival deposal inside a healthy promotion
+# window - the churn finding 13 exists to prevent. The suite's speed
+# comes from cadence and detection, not from shaving the safety
+# window.
 [raft]
 shadow              = true
-loop_wait_secs      = 2
-retry_timeout_secs  = 3
+loop_wait_secs      = 1
+retry_timeout_secs  = 2
 leader_ttl_secs     = 10
 election_timeout_ms = 1000
 EOF

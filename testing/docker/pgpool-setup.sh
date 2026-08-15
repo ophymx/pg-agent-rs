@@ -53,17 +53,17 @@ log_min_messages = 'info'
 # Streaming-replication check: how pgpool LEARNS which backend is
 # primary. Kept (hook-contract §4) — we cut the causing, not the
 # learning.
-sr_check_period = 5
+sr_check_period = 2
 sr_check_user = 'pgpool'
 sr_check_password = ''
 sr_check_database = 'postgres'
 
-health_check_period = 5
-health_check_timeout = 5
+health_check_period = 2
+health_check_timeout = 3
 health_check_user = 'pgpool'
 health_check_password = ''
 health_check_database = 'postgres'
-health_check_max_retries = 2
+health_check_max_retries = 1
 health_check_retry_delay = 1
 connect_timeout = 3000
 
