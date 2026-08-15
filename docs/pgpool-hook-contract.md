@@ -1,10 +1,11 @@
 # pgpool hooks under agent-led failover
 
 **Status:** implemented — §4's block is the canonical contract
-(`pg_agentctl gen-pgpool` emits it, `check-hooks` verifies it, the
-pre-cutover block lives behind `--legacy`), and the one open choice in
-it is resolved: `failover_command` is kept as a notify-only poke, with
-the handler answering "advisory" under lease-driven roles (SPEC §5.1).
+(`pg_agentctl gen-pgpool` emits it, `check-hooks` verifies it; the
+pre-cutover block and its `--legacy` flag are deleted along with the
+pgpool-led promote path), and the one open choice in it is resolved:
+`failover_command` is kept as a notify-only poke, with the handler
+always answering "advisory" on primary-down (SPEC §5.1).
 Researched against the
 [pgpool-II 4.6 documentation](https://www.pgpool.net/docs/46/en/html/index.html)
 (the version SPEC §"PROXY protocol" is already verified against),

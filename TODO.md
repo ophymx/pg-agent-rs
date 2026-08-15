@@ -76,7 +76,43 @@ scheduled. Items roughly in priority order within each section.
   then recover, then re-attach. The acceptance harness does exactly
   this in `repair_cluster`.
 
-### Executor: detect a wedged follow (finding 15)
+### `cluster recover` should fan out the pgpool attach (hook-contract §3)
+
+- **Where:** `crates/pg-agent-core/src/localserver.rs` recovery/attach
+  tail; `crate::pcp` only talks to the local pgpool.
+- **Why:** with the watchdog gone, backend status does not propagate —
+  attach is per-instance, and hook-contract §3 priced exactly this
+  fan-out obligation. Today recover attaches only through the local
+  pcp, so after a failover + rejoin every OTHER instance still routes
+  around the recovered node until an operator attaches it there (the
+  greenfield acceptance run surfaced it: a later detach-fired hook
+  arrived with `%m = -1` because the primary's own instance believed
+  no standby was alive). Deployment-relevant.
+- **Fix shape:** recover's attach step loops the pool via a peer RPC
+  (`StartPgpool`-style: each agent attaches on its own instance), or a
+  dedicated `AttachNode` peer RPC; the harness's
+  `pcp_attach_everywhere` documents the interim operator action.
+- **Also (finding 16, urgency): the executor's post-promote step must
+  ensure the winner's own backend is attached on its local pgpool.**
+  `failover_on_backend_error` can degenerate the new primary on its own
+  instance during the promotion window; with `auto_failback off` that
+  instance blackholes writes indefinitely, and later attaches wedge in
+  `find_primary_node_repeatedly` (300 s) because the map holds no up
+  primary. In a pgpool-routed deployment, self-attach is part of what
+  "promote" means.
+
+### Executor: detect a wedged follow (finding 15) — URGENCY UPGRADED
+
+> Greenfield acceptance runs show the diverged survivor is the COMMON
+> post-takeover case, not the rare one: both surviving standbys stream
+> the same WAL until the primary dies, so the takeover loser is a coin
+> flip to be past the winner's fork point — and the light follow wedges
+> every time it is. In production this is failover MTTR: redundancy
+> stays degraded until an operator notices and runs `cluster recover`.
+> Detection (below) is the minimum; the rewind-only auto-repair is
+> likely worth pulling forward.
+
+### (details) Executor: detect a wedged follow (finding 15)
 
 - **Where:** `crates/pg-agent-core/src/roleexec.rs` `converge_follow` /
   `crates/pgman/src/instance.rs` `state()`.
@@ -100,11 +136,11 @@ scheduled. Items roughly in priority order within each section.
 
 > Closed at the cutover (promotion-authority §10 step 7): the canonical
 > block IS the agent-led contract now — `follow_primary_command` empty,
-> `wd_*` hooks gone, decision-critical settings included — and the
-> pre-cutover block lives behind `gen-pgpool --legacy` /
-> `check-hooks --legacy`, exactly the shape this item proposed.
-> Acceptance S7 asserts the target conf checks clean and that
-> `--legacy` dissents. Original report below.
+> `wd_*` hooks gone, decision-critical settings included. The
+> pre-cutover block briefly survived behind `gen-pgpool --legacy` /
+> `check-hooks --legacy`; both flag and block were then deleted with
+> the rest of the pgpool-led path (greenfield deployment made them dead
+> code). Original report below.
 
 ### (historical) `gen-pgpool` emits hooks the agent-led target contract forbids
 
@@ -221,6 +257,10 @@ Two related issues around handoff's replication-slot management on the new prima
 ### Replay marker 24h TTL surprises long-gap re-runs (non-handoff ops)
 
 - `crates/pg-agent-core/src/replay_markers.rs`. Handoff moved to `inflight_ops` (7d retention) in 0.6.0. `failover`, `recovery_first_stage`, `cluster_recover` still use 24h replay markers — an operator who re-runs `cluster recover --target N` 25 hours after a successful run will trigger the destructive reclone again. Mitigated by each handler's own state checks (basebackup refuses non-empty pgdata, slot create is duplicate-OK, etc.) so the failure mode is soft. Fix: bump retention to 7 days to match inflight_ops, or migrate these handlers to `inflight_ops` too if the contract grows phased state.
+
+### Escalation hook constants + Escalation RPC are vestigial
+
+- `crates/pg-agent-hookspec/src/lib.rs` still defines `HOOK_ESCALATION` / `HOOK_DE_ESCALATION` (and `pg_agentc` still dispatches them, backed by the Escalation RPC) even though the watchdog — the only thing that ever fired `wd_escalation_command` — is off in the agent-led contract and the legacy hook block that referenced them is deleted. Kept for now because removing a proto RPC is a wire-compat decision, not a code-hygiene one. Decide separately whether to rip the constants, the `pg_agentc` dispatch arm, and the RPC together.
 
 ### `slot_name` captured at orchestration start (hypothetical)
 

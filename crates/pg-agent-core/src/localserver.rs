@@ -108,19 +108,6 @@ pub(crate) fn handoff_phase_index(phase: &str) -> Option<usize> {
     HANDOFF_PHASES.iter().position(|p| *p == phase)
 }
 
-/// True if `actual` is at or past `threshold` in the handoff ladder.
-/// Returns `false` for unknown phases. Used by the failover handler
-/// to decide whether handoff has already claimed a resource (e.g.
-/// "phase >= slot_created" means the slot exists on the new primary
-/// and the failover handler must NOT drop it).
-#[allow(dead_code)] // consumed by C3
-pub(crate) fn handoff_phase_at_or_past(actual: &str, threshold: &str) -> bool {
-    match (handoff_phase_index(actual), handoff_phase_index(threshold)) {
-        (Some(a), Some(t)) => a >= t,
-        _ => false,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // FollowPrimary phase ladder (journaled / resumable)
 // ---------------------------------------------------------------------------
@@ -227,13 +214,6 @@ pub struct LocalServer {
     /// where an operator, not the protocol, decides who the members
     /// are.
     raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
-    /// True in execute mode (`enabled = true, shadow = false`): the
-    /// lease drives roles, and pgpool's `failover_command` becomes the
-    /// notify-only poke the agent-led contract documents. The
-    /// primary-down branch then promotes nothing — the HA loop decides
-    /// — while the standby-down branch (slot hygiene, mechanism not
-    /// authority) keeps working.
-    lease_drives_roles: bool,
 }
 
 impl LocalServer {
@@ -267,16 +247,7 @@ impl LocalServer {
             pg,
             wal_peer_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
             raft: None,
-            lease_drives_roles: false,
         }
-    }
-
-    /// Cutover switch for the hook contract: `failover_command`'s
-    /// primary-down branch becomes advisory. Set alongside the
-    /// executor (same `enabled && !shadow` condition).
-    pub fn with_lease_driven_roles(mut self, lease_drives_roles: bool) -> Self {
-        self.lease_drives_roles = lease_drives_roles;
-        self
     }
 
     /// Let `ClusterInit` bootstrap Raft membership.
@@ -341,22 +312,17 @@ impl PgAgentLocal for LocalServer {
     /// `failover_command` — pgpool fires this on a surviving node when
     /// a backend goes down. Two branches:
     ///
+    /// **Primary down** (`detached.id == old_primary.id`): advisory,
+    /// period. pgpool's failure report is a hint, never an order —
+    /// promotion is the lease's decision (the HA loop), so this branch
+    /// logs and returns `ok=true` without touching cluster state.
+    ///
     /// **Standby down** (`detached.id != old_primary.id`): we're the
     /// primary; drop the detached standby's replication slot from our
-    /// local PG. No promotion involved.
-    ///
-    /// **Primary down** (`detached.id == old_primary.id`): the detached
-    /// node IS the failed primary. Dial `new_main` (the chosen
-    /// successor), run it through `Self::failover_lag_gate` (pgpool
-    /// picks `%m` by lowest alive node id, not WAL position — refuse
-    /// while a strictly more-advanced surviving node is reachable),
-    /// tell it to `Promote()`, then drop the old primary's slot on the
-    /// newly-promoted node.
-    ///
-    /// Either branch returns `Ok` (with replay marker written) even
-    /// when the slot drop itself fails — the drop is queued to
-    /// maintenance for retry. pgpool doesn't need to re-fire the hook
-    /// just because a slot cleanup got hung up.
+    /// local PG — mechanism, not authority. Returns `Ok` (with replay
+    /// marker written) even when the slot drop itself fails — the drop
+    /// is queued to maintenance for retry. pgpool doesn't need to
+    /// re-fire the hook just because a slot cleanup got hung up.
     ///
     /// The one early-out without a marker: `new_main.id == -1` means
     /// pgpool found no standby candidates. We return `OpResult { ok =
@@ -383,17 +349,15 @@ impl PgAgentLocal for LocalServer {
             }));
         }
 
-        // Agent-led contract (promotion-authority §6, the cutover):
-        // pgpool's failure report is a hint, not an order. Answered
-        // BEFORE the replay-marker check on purpose — the advisory is
-        // stateless, and a marker left by a legacy-mode failover (24 h
-        // TTL, so entirely plausible mid-migration) must not decide
-        // what the cutover contract answers. Run 8's E3 hit exactly
-        // that: S9's marker key matched E3's announcement verbatim and
-        // the "replay detected" skip masked the advisory. Only the
-        // PRIMARY-DOWN case is authority — standby-down slot hygiene
-        // below keeps its guards and keeps working.
-        if self.lease_drives_roles && detached_ref.id == old_primary_ref.id {
+        // The primary-down announcement is ALWAYS advisory: pgpool's
+        // failure report is a hint, never an order, and the pgpool-led
+        // promote path is gone — the lease decides who is primary
+        // (promotion-authority §6; the legacy mode was removed
+        // wholesale once greenfield deployment made it dead code).
+        // Answered before the replay-marker check because the advisory
+        // is stateless. Only standby-down slot hygiene below is real
+        // work, and it keeps its guards.
+        if detached_ref.id == old_primary_ref.id {
             info!(
                 detached = %detached_ref.hostname,
                 pgpool_pick = %new_main_ref.hostname,
@@ -451,282 +415,83 @@ impl PgAgentLocal for LocalServer {
 
         let slot_name = detached.slot_name();
 
-        if detached.id != old_primary.id {
-            // §1: standby down. We're the primary; drop the slot locally.
-            //
-            // Cross-op consult first: an in-flight orchestration that
-            // owns this node's slot (recovery, follow_primary, handoff)
-            // deliberately stops its target's PostgreSQL, which is what
-            // made pgpool fire this hook. Dropping the slot now destroys
-            // the one that orchestration created and leaves a standby
-            // that can never stream — observed in the acceptance suite
-            // before this consult existed.
-            if let Some(owner) = self.inflight_owner_of(detached.id).await {
-                info!(
-                    detached = %detached.hostname,
-                    slot = %slot_name,
-                    op = %owner.payload.op_name(),
-                    id = %owner.id,
-                    phase = %owner.phase,
-                    "failover: in-flight op owns this node; skipping slot drop"
-                );
-                return self
-                    .write_replay_marker_then_ok(
-                        "failover",
-                        &replay_key,
-                        format!(
-                            "standby failover: slot {slot_name} retained — in-flight {} \
-                             (id={}, phase={}) owns node {}",
-                            owner.payload.op_name(),
-                            owner.id,
-                            owner.phase,
-                            detached.id
-                        ),
-                    )
-                    .await;
-            }
-            //
-            // Defense in depth, not the fix (promotion-authority §3): if
-            // the announced-dead standby is reachable and demonstrably
-            // streaming, pgpool's failure report is wrong and dropping
-            // its slot would break healthy replication.
-            match crate::preconditions::validate_cluster_preconditions(
-                self.peers.clone(),
-                crate::preconditions::ClusterIntent::DropSlotBecauseStandbyDown { detached },
-            )
-            .await
-            {
-                crate::preconditions::PreconditionOutcome::Refuse { message } => {
-                    warn!(detached = %detached.hostname, %message, "failover: precondition refused");
-                    return Ok(Response::new(OpResult { ok: false, message }));
-                }
-                crate::preconditions::PreconditionOutcome::Unverifiable { reason } => {
-                    crate::preconditions::log_unverifiable("standby_down", &reason);
-                }
-                crate::preconditions::PreconditionOutcome::Pass => {}
-            }
+        // Standby down: the detached node is a standby whose slot on
+        // this primary needs dropping (unless a guard says otherwise).
+        // The advisory early-return above means this is the only path
+        // that reaches here.
+        // §1: standby down. We're the primary; drop the slot locally.
+        //
+        // Cross-op consult first: an in-flight orchestration that
+        // owns this node's slot (recovery, follow_primary, handoff)
+        // deliberately stops its target's PostgreSQL, which is what
+        // made pgpool fire this hook. Dropping the slot now destroys
+        // the one that orchestration created and leaves a standby
+        // that can never stream — observed in the acceptance suite
+        // before this consult existed.
+        if let Some(owner) = self.inflight_owner_of(detached.id).await {
             info!(
                 detached = %detached.hostname,
                 slot = %slot_name,
-                "failover: standby down, dropping replication slot"
+                op = %owner.payload.op_name(),
+                id = %owner.id,
+                phase = %owner.phase,
+                "failover: in-flight op owns this node; skipping slot drop"
             );
-            let message = match self.db.drop_slot(&slot_name).await {
-                Ok(()) => format!("standby failover: slot {slot_name} dropped"),
-                Err(drop_err) => {
-                    self.queue_drop_slot_cleanup(
-                        &slot_name,
-                        &old_primary.hostname,
-                        "standby_down_local_drop_error",
-                        &drop_err,
-                    )
-                    .await
-                }
-            };
             return self
-                .write_replay_marker_then_ok("failover", &replay_key, message)
+                .write_replay_marker_then_ok(
+                    "failover",
+                    &replay_key,
+                    format!(
+                        "standby failover: slot {slot_name} retained — in-flight {} \
+                         (id={}, phase={}) owns node {}",
+                        owner.payload.op_name(),
+                        owner.id,
+                        owner.phase,
+                        detached.id
+                    ),
+                )
                 .await;
         }
-
-        // Primary down — promote new main, then drop old primary's slot
-        // on the newly promoted node.
-        info!(
-            new_main = %new_main.hostname,
-            "failover: primary down, promoting new main"
-        );
-
-        // Cross-op consult: is a `cluster handoff` orchestration in
-        // flight that conflicts with pgpool's pick?
         //
-        // The handoff handler (which runs from the OLD primary's
-        // daemon — the same daemon that handles this failover RPC
-        // when pgpool invokes failover_command after local PG goes
-        // down) journals every phase. If we find an InProgress
-        // handoff whose target matches `new_main`, we know the
-        // handoff already promoted it and we should NOT redundantly
-        // promote (HIGH #5 from the 0.5.0 review) or drop the slot
-        // the handoff just created on it (HIGH #1 from the review).
-        //
-        // If we find an InProgress handoff whose target does NOT
-        // match pgpool's `new_main`, the two orchestrations
-        // disagree — refuse the failover rather than promote a
-        // second primary (HIGH #6).
-        let inflight_handoff = match self
-            .inflight
-            .list(&[crate::inflight_ops::InflightStatus::InProgress])
-            .await
+        // Defense in depth, not the fix (promotion-authority §3): if
+        // the announced-dead standby is reachable and demonstrably
+        // streaming, pgpool's failure report is wrong and dropping
+        // its slot would break healthy replication.
+        match crate::preconditions::validate_cluster_preconditions(
+            self.peers.clone(),
+            crate::preconditions::ClusterIntent::DropSlotBecauseStandbyDown { detached },
+        )
+        .await
         {
-            Ok((ops, _)) => ops.into_iter().find(|o| o.payload.op_name() == "handoff"),
-            Err(e) => {
-                warn!(
-                    ?e,
-                    "failover: inflight list failed; proceeding without cross-op consult"
-                );
-                None
+            crate::preconditions::PreconditionOutcome::Refuse { message } => {
+                warn!(detached = %detached.hostname, %message, "failover: precondition refused");
+                return Ok(Response::new(OpResult { ok: false, message }));
             }
-        };
-        let handoff_targets_new_main =
-            inflight_handoff.as_ref().is_some_and(|o| match &o.payload {
-                crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } => {
-                    *to_node_id == new_main.id
-                }
-                _ => false,
-            });
-        if let Some(ref h) = inflight_handoff {
-            if !handoff_targets_new_main {
-                if let crate::inflight_ops::InflightPayload::Handoff { to_node_id, .. } = &h.payload
-                {
-                    warn!(
-                        handoff_id = %h.id,
-                        handoff_to = to_node_id,
-                        pgpool_new_main = new_main.id,
-                        "failover: in-flight handoff targets different node than pgpool's pick; refusing"
-                    );
-                    return Ok(Response::new(OpResult {
-                        ok: false,
-                        message: format!(
-                            "failover: in-flight handoff (id={}, phase={}) targets node {}, \
-                             but pgpool's failover_command picked node {} as new_main; refusing \
-                             to promote a second primary. Resolve the handoff first with \
-                             `pg_agentctl ops resume {}` or `pg_agentctl ops abandon {}`.",
-                            h.id, h.phase, to_node_id, new_main.id, h.id, h.id
-                        ),
-                    }));
-                }
+            crate::preconditions::PreconditionOutcome::Unverifiable { reason } => {
+                crate::preconditions::log_unverifiable("standby_down", &reason);
             }
+            crate::preconditions::PreconditionOutcome::Pass => {}
         }
-
-        // Defense in depth, not the fix (promotion-authority §3): if the
-        // announced-failed primary is reachable and still running as
-        // primary, pgpool's report is wrong — this is the 2026-06-11
-        // incident shape (health-check false positive during a brief
-        // agent restart), and promoting would create split-brain.
-        // Skipped when a cooperating handoff targets new_main: the
-        // handoff briefly holds both nodes primary mid-flight by design,
-        // and its own six refusal cases + lag gate own safety there.
-        if !handoff_targets_new_main {
-            match crate::preconditions::validate_cluster_preconditions(
-                self.peers.clone(),
-                crate::preconditions::ClusterIntent::PromoteBecausePrimaryDown { detached },
-            )
-            .await
-            {
-                crate::preconditions::PreconditionOutcome::Refuse { message } => {
-                    warn!(detached = %detached.hostname, %message, "failover: precondition refused");
-                    return Ok(Response::new(OpResult { ok: false, message }));
-                }
-                crate::preconditions::PreconditionOutcome::Unverifiable { reason } => {
-                    crate::preconditions::log_unverifiable("primary_down", &reason);
-                }
-                crate::preconditions::PreconditionOutcome::Pass => {}
-            }
-        }
-
-        let peer = self.peers.client(new_main).await.map_err(|e| {
-            internal(anyhow::anyhow!(
-                "failover: peer client for {}: {e}",
-                new_main.hostname
-            ))
-        })?;
-
-        // Short-circuit when new_main has already promoted (e.g. an
-        // operator-driven `cluster handoff` ran first and pgpool's
-        // failover_command is now racing in behind it). `pg_promote()`
-        // errors on a node that's already a primary with "recovery is
-        // not in progress", which would otherwise surface as a noisy
-        // failover failure even though the post-condition we wanted
-        // (new_main is primary) already holds.
-        //
-        // HIGH #5 fix: when get_status itself errors but the inflight
-        // handoff records that we've already past target_promoted, we
-        // trust the journal rather than falling through to "promote
-        // anyway" — the latter defeats the short-circuit in exactly the
-        // adverse-network conditions where it matters most.
-        let candidate_status = peer.get_status().await;
-        let already_primary = match &candidate_status {
-            Ok(s) => s.is_postgres_running && !s.is_in_recovery,
-            Err(e) => {
-                let trust_journal = handoff_targets_new_main
-                    && inflight_handoff
-                        .as_ref()
-                        .map(|h| handoff_phase_at_or_past(&h.phase, HANDOFF_PHASE_TARGET_PROMOTED))
-                        .unwrap_or(false);
-                warn!(
-                    new_main = %new_main.hostname,
-                    ?e,
-                    trust_journal,
-                    "failover: peer get_status failed; consulting inflight handoff"
-                );
-                trust_journal
-            }
-        };
-        if already_primary {
-            info!(
-                new_main = %new_main.hostname,
-                "failover: new main is already primary; skipping promote"
-            );
-        } else {
-            // Lag gate — docs/promotion-authority.md §2.2 / §10 step 1.
-            // pgpool picks %m by lowest alive node id, not WAL position,
-            // so the candidate it hands us can be arbitrarily behind a
-            // surviving standby it didn't pick. Promoting the lagging
-            // one discards the difference. Refuse while a strictly
-            // better reachable candidate exists; no replay marker is
-            // written, so a retry after the operator promotes the right
-            // node (or the condition clears) is not suppressed.
-            if let Some(refusal) = self
-                .failover_lag_gate(detached, new_main, candidate_status.as_ref().ok())
+        info!(
+            detached = %detached.hostname,
+            slot = %slot_name,
+            "failover: standby down, dropping replication slot"
+        );
+        let message = match self.db.drop_slot(&slot_name).await {
+            Ok(()) => format!("standby failover: slot {slot_name} dropped"),
+            Err(drop_err) => {
+                self.queue_drop_slot_cleanup(
+                    &slot_name,
+                    &old_primary.hostname,
+                    "standby_down_local_drop_error",
+                    &drop_err,
+                )
                 .await
-            {
-                return Ok(Response::new(refusal));
-            }
-            if let Err(e) = peer.promote().await {
-                return Err(internal(anyhow::anyhow!(
-                    "failover: promote {}: {e}",
-                    new_main.hostname
-                )));
-            }
-        }
-
-        // HIGH #1: when a handoff targeting this new_main has already
-        // passed the slot_created phase, the slot we're about to drop
-        // is the one the handoff created for the demoting old primary
-        // to rebase via. Dropping it now would orphan the rebase. The
-        // handoff's own complete()/abandon() path is responsible for
-        // the slot's lifecycle — leave it alone.
-        let skip_slot_drop = handoff_targets_new_main
-            && inflight_handoff
-                .as_ref()
-                .map(|h| handoff_phase_at_or_past(&h.phase, HANDOFF_PHASE_SLOT_CREATED))
-                .unwrap_or(false);
-        let message = if skip_slot_drop {
-            info!(
-                slot = %slot_name,
-                on = %new_main.hostname,
-                handoff_id = inflight_handoff.as_ref().map(|h| h.id.as_str()).unwrap_or(""),
-                "failover: handoff in flight has staked this slot; skipping drop"
-            );
-            "primary failover: promoted; slot retained for in-flight handoff".to_string()
-        } else {
-            info!(
-                slot = %slot_name,
-                on = %new_main.hostname,
-                "failover: dropping old primary's replication slot on new primary"
-            );
-            match peer.drop_slot(&slot_name).await {
-                Ok(()) => "primary failover: promoted and slot dropped".to_string(),
-                Err(drop_err) => {
-                    self.queue_drop_slot_cleanup(
-                        &slot_name,
-                        &new_main.hostname,
-                        "rpc_error",
-                        &drop_err,
-                    )
-                    .await
-                }
             }
         };
-        self.write_replay_marker_then_ok("failover", &replay_key, message)
-            .await
+        return self
+            .write_replay_marker_then_ok("failover", &replay_key, message)
+            .await;
     }
 
     /// `follow_primary_command` — pgpool runs this on the new primary
@@ -2340,138 +2105,6 @@ impl LocalServer {
     /// the race it guards.
     async fn inflight_owner_of(&self, node_id: i32) -> Option<crate::inflight_ops::InflightOp> {
         crate::inflight_ops::owner_of_node(self.inflight.as_ref(), node_id, CROSS_OP_GRACE).await
-    }
-
-    /// The reactive-failover lag gate (docs/promotion-authority.md §2.2,
-    /// sequencing step 1). Compares the promotion candidate's WAL
-    /// position against every *other* surviving node and returns a
-    /// refusal when one of them is strictly ahead — on a newer timeline,
-    /// or more than [`crate::config::MAX_HANDOFF_LAG_BYTES`] ahead on
-    /// the same timeline (the same threshold the planned
-    /// `cluster_handoff` path applies).
-    ///
-    /// Best-effort by design: unknown candidate position, unreachable
-    /// comparison peers, or a blown fan-out budget all *skip* the gate
-    /// rather than block the failover. Refusing on missing evidence
-    /// would recreate the §3 dilemma (unavailable during exactly the
-    /// partition the failover exists to survive); this gate only acts
-    /// on positive evidence that a better candidate is reachable right
-    /// now.
-    async fn failover_lag_gate(
-        &self,
-        detached: &crate::config::NodeConfig,
-        new_main: &crate::config::NodeConfig,
-        candidate_status: Option<&NodeStatus>,
-    ) -> Option<OpResult> {
-        use crate::cluster_view::{collect_statuses, WalPosition, STATUS_FANOUT_BUDGET};
-
-        let Some(candidate_pos) = candidate_status.and_then(WalPosition::from_status) else {
-            warn!(
-                new_main = %new_main.hostname,
-                "failover: candidate WAL position unknown; lag gate skipped"
-            );
-            return None;
-        };
-
-        // Everyone except the candidate and the detached (dead) primary.
-        // Includes the local node when it is itself a surviving standby —
-        // its own PeerServer answers the status call.
-        let others: Vec<crate::config::NodeConfig> = self
-            .node_pool
-            .members
-            .iter()
-            .filter(|n| n.id != new_main.id && n.id != detached.id)
-            .cloned()
-            .collect();
-        if others.is_empty() {
-            return None;
-        }
-
-        let views = match collect_statuses(self.peers.clone(), &others, STATUS_FANOUT_BUDGET).await
-        {
-            Ok(v) => v,
-            Err(_) => {
-                warn!("failover: lag-gate fan-out exceeded budget; gate skipped");
-                return None;
-            }
-        };
-
-        let mut best: Option<(crate::config::NodeConfig, WalPosition)> = None;
-        for view in views {
-            match view.status {
-                Ok(s) => {
-                    if let Some(pos) = WalPosition::from_status(&s) {
-                        if best.as_ref().is_none_or(|(_, b)| pos > *b) {
-                            best = Some((view.node, pos));
-                        }
-                    }
-                }
-                Err(e) => warn!(
-                    peer = %view.node.hostname,
-                    ?e,
-                    "failover: lag gate: peer status unavailable; excluded from comparison"
-                ),
-            }
-        }
-        let (ahead_node, ahead_pos) = best?;
-
-        if ahead_pos.timeline > candidate_pos.timeline {
-            warn!(
-                new_main = %new_main.hostname,
-                candidate_pos = %candidate_pos,
-                ahead = %ahead_node.hostname,
-                ahead_pos = %ahead_pos,
-                "failover: refusing — candidate is on an older timeline than a surviving node"
-            );
-            return Some(OpResult {
-                ok: false,
-                message: format!(
-                    "failover: refusing to promote node {} ({}): node {} ({}) is on a newer \
-                     timeline ({} vs {}). Promoting the stale candidate would fork history. \
-                     Promote the most-advanced node instead (pcp_promote_node -n {}).",
-                    new_main.id,
-                    new_main.hostname,
-                    ahead_node.id,
-                    ahead_node.hostname,
-                    ahead_pos,
-                    candidate_pos,
-                    ahead_node.id
-                ),
-            });
-        }
-
-        let lag = candidate_pos.lag_behind(&ahead_pos)?;
-        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
-        if lag > max {
-            warn!(
-                new_main = %new_main.hostname,
-                candidate_pos = %candidate_pos,
-                ahead = %ahead_node.hostname,
-                ahead_pos = %ahead_pos,
-                lag_bytes = lag,
-                max_lag_bytes = max,
-                "failover: refusing — candidate lags a surviving node beyond the threshold"
-            );
-            return Some(OpResult {
-                ok: false,
-                message: format!(
-                    "failover: refusing to promote node {} ({}): node {} ({}) has more WAL \
-                     ({} vs {}; {} bytes ahead, limit {}). Promoting the lagging candidate \
-                     would discard that WAL. Promote the most-advanced node instead \
-                     (pcp_promote_node -n {}), or retry once the condition clears.",
-                    new_main.id,
-                    new_main.hostname,
-                    ahead_node.id,
-                    ahead_node.hostname,
-                    ahead_pos,
-                    candidate_pos,
-                    lag,
-                    max,
-                    ahead_node.id
-                ),
-            });
-        }
-        None
     }
 
     /// Queue a `DropSlotCleanup` maintenance intent after a slot drop
@@ -4114,15 +3747,12 @@ mod tests {
         /// Used by the handoff lag check after 0.6.1; tests set this
         /// to a non-zero value to bypass the "cannot measure lag" guard.
         current_wal_lsn: std::sync::atomic::AtomicU64,
-        /// Peer's live timeline. Defaults to 0 (= unknown), which keeps
-        /// the failover lag gate out of tests that aren't about it —
-        /// `WalPosition::from_status` requires both fields known.
+        /// Peer's live timeline. Defaults to 0 (= unknown).
         timeline_id: std::sync::atomic::AtomicI32,
         /// `pg_stat_wal_receiver.status` as reported via GetStatus.
         /// Defaults to "" (= no receiver), which keeps the standby-down
         /// precondition check passing in tests that aren't about it.
         replication_state: StdMutex<String>,
-        get_status_fails: AtomicBool,
         stop_calls: AtomicUsize,
         stop_fails: AtomicBool,
         rewind_calls: AtomicUsize,
@@ -4134,7 +3764,6 @@ mod tests {
         configure_standby_opts: StdMutex<Vec<WriteRecoveryConfOpts>>,
         // Failover surface.
         promote_calls: AtomicUsize,
-        promote_fails: AtomicBool,
         drop_slot_calls: StdMutex<Vec<String>>,
         drop_slot_fails: AtomicBool,
         create_slot_calls: StdMutex<Vec<String>>,
@@ -4164,12 +3793,6 @@ mod tests {
         /// Standby's `pg_last_wal_replay_lsn()` as a 64-bit value.
         fn set_replay_lsn(&self, lsn: u64) -> &Self {
             self.current_wal_lsn.store(lsn, Ordering::SeqCst);
-            self
-        }
-        /// Peer's live timeline — needed (with a non-zero LSN) for the
-        /// peer to contribute a `WalPosition` to the failover lag gate.
-        fn set_timeline(&self, tl: i32) -> &Self {
-            self.timeline_id.store(tl, Ordering::SeqCst);
             self
         }
         /// Mark the peer as actively streaming (healthy standby) — the
@@ -4236,9 +3859,6 @@ mod tests {
             }))
         }
         async fn get_status(&self) -> anyhow::Result<NodeStatus> {
-            if self.get_status_fails.load(Ordering::SeqCst) {
-                anyhow::bail!("stub peer get_status boom");
-            }
             let running = self.is_running.load(Ordering::SeqCst);
             let in_recovery = self.is_in_recovery.load(Ordering::SeqCst);
             let lag = self.replication_lag_bytes.load(Ordering::SeqCst);
@@ -4288,9 +3908,6 @@ mod tests {
         }
         async fn promote(&self) -> anyhow::Result<()> {
             self.promote_calls.fetch_add(1, Ordering::SeqCst);
-            if self.promote_fails.load(Ordering::SeqCst) {
-                anyhow::bail!("stub peer promote boom");
-            }
             Ok(())
         }
     }
@@ -5009,63 +4626,13 @@ mod tests {
             .unwrap());
     }
 
-    /// Two-peer pool where peer1 acts as the new main. detached=peer1
-    /// and old_primary=peer1 simulates "the primary went down and we're
-    /// running on the *other* standby that's becoming new_main". The
-    /// pool's local node (id 0) is the new_main target — so we override
-    /// id=0's peer client. (`peers.client()` is called for new_main.)
+    /// The hook contract: the primary-down branch is a notify-only
+    /// poke — no promotion, no slot drop, the HA loop decides. The
+    /// standby-down branch is mechanism, not authority, and must keep
+    /// working unchanged.
     #[tokio::test]
-    async fn failover_primary_down_promotes_and_drops_slot() {
-        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        peers.override_client(0, new_main_client.clone());
-
-        // detached=1 (the failed primary), new_main=0, old_primary=1.
-        // detached.id == old_primary.id → primary-down branch.
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok);
-        assert!(resp.message.contains("promoted and slot dropped"));
-        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *new_main_client.drop_slot_calls.lock().unwrap(),
-            vec!["node1".to_string()]
-        );
-        // Local drop_slot was NOT called — drop happens on the peer.
-        assert!(db.dropped_slots.lock().unwrap().is_empty());
-        assert!(replay
-            .has("failover", "detached=1,new_main=0,old_primary=1")
-            .await
-            .unwrap());
-    }
-
-    // ----- failover lag gate (promotion-authority §2.2 / §10 step 1) --------
-
-    /// 3-node pool: detached/old_primary = 2, candidate new_main = 0,
-    /// surviving comparison standby = 1. Returns the two standby stubs.
-    fn lag_gate_fixture(peers: &StubPeers) -> (Arc<StubPeerClient>, Arc<StubPeerClient>) {
-        let candidate = Arc::new(StubPeerClient::default());
-        candidate.mark_standby();
-        let survivor = Arc::new(StubPeerClient::default());
-        survivor.mark_standby();
-        peers.override_client(0, candidate.clone());
-        peers.override_client(1, survivor.clone());
-        (candidate, survivor)
-    }
-
-    const GATE_BASE_LSN: u64 = 1 << 32;
-
-    /// The cutover contract: under lease-driven roles the primary-down
-    /// branch is a notify-only poke — no promotion, no slot drop, the
-    /// HA loop decides. The standby-down branch is mechanism, not
-    /// authority, and must keep working unchanged.
-    #[tokio::test]
-    async fn failover_primary_down_is_advisory_under_lease_driven_roles() {
+    async fn failover_primary_down_is_always_advisory() {
         let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let s = s.with_lease_driven_roles(true);
         let new_main_client = Arc::new(StubPeerClient::default());
         peers.override_client(0, new_main_client.clone());
 
@@ -5105,7 +4672,6 @@ mod tests {
             .mark_done("failover", "detached=1,new_main=0,old_primary=1")
             .await
             .unwrap();
-        let s = s.with_lease_driven_roles(true);
         let new_main_client = Arc::new(StubPeerClient::default());
         peers.override_client(0, new_main_client.clone());
 
@@ -5124,9 +4690,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_standby_down_still_drops_slot_under_lease_driven_roles() {
+    async fn failover_standby_down_still_drops_slot() {
         let (s, db, _peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let s = s.with_lease_driven_roles(true);
         let resp = s
             .failover(Request::new(failover_req(1, 0, 0)))
             .await
@@ -5140,157 +4705,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn failover_lag_gate_refuses_when_survivor_far_ahead() {
-        let (s, _db, peers, _maint, _wal) = make_server_3();
-        let (candidate, survivor) = lag_gate_fixture(&peers);
-        let max = crate::config::MAX_HANDOFF_LAG_BYTES as u64;
-        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN);
-        survivor
-            .set_timeline(2)
-            .set_replay_lsn(GATE_BASE_LSN + max + 1);
-
-        let resp = s
-            .failover(Request::new(failover_req(2, 0, 2)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
-        assert!(resp.message.contains("has more WAL"), "{}", resp.message);
-        assert!(
-            resp.message.contains("pcp_promote_node -n 1"),
-            "{}",
-            resp.message
-        );
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn failover_lag_gate_allows_within_threshold() {
-        let (s, _db, peers, _maint, _wal) = make_server_3();
-        let (candidate, survivor) = lag_gate_fixture(&peers);
-        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN);
-        survivor
-            .set_timeline(2)
-            .set_replay_lsn(GATE_BASE_LSN + 1024);
-
-        let resp = s
-            .failover(Request::new(failover_req(2, 0, 2)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "expected promote, got: {}", resp.message);
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn failover_lag_gate_refuses_on_newer_timeline() {
-        let (s, _db, peers, _maint, _wal) = make_server_3();
-        let (candidate, survivor) = lag_gate_fixture(&peers);
-        // Survivor is on TL3 with *less* WAL by raw LSN — timeline
-        // dominates; raw-LSN comparison across timelines would get
-        // this exactly wrong.
-        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN * 2);
-        survivor.set_timeline(3).set_replay_lsn(GATE_BASE_LSN);
-
-        let resp = s
-            .failover(Request::new(failover_req(2, 0, 2)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
-        assert!(resp.message.contains("newer timeline"), "{}", resp.message);
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn failover_lag_gate_skips_when_survivor_unreachable() {
-        // Best-effort: no reachable comparison evidence → the gate must
-        // NOT block the failover (refusing on absence-of-evidence is
-        // §3's unavailability branch).
-        let (s, _db, peers, _maint, _wal) = make_server_3();
-        let (candidate, _survivor) = lag_gate_fixture(&peers);
-        candidate.set_timeline(2).set_replay_lsn(GATE_BASE_LSN);
-        peers.mark_unreachable(1);
-
-        let resp = s
-            .failover(Request::new(failover_req(2, 0, 2)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "expected promote, got: {}", resp.message);
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn failover_lag_gate_skips_when_candidate_position_unknown() {
-        // Candidate reports timeline 0 (probe failure / pre-feature
-        // peer) — no position, no gate, failover proceeds as before.
-        let (s, _db, peers, _maint, _wal) = make_server_3();
-        let (candidate, survivor) = lag_gate_fixture(&peers);
-        candidate.set_replay_lsn(GATE_BASE_LSN); // timeline stays 0
-        survivor.set_timeline(2).set_replay_lsn(GATE_BASE_LSN * 3);
-
-        let resp = s
-            .failover(Request::new(failover_req(2, 0, 2)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "expected promote, got: {}", resp.message);
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
-    }
-
     // ----- failover preconditions (defense in depth, TODO.md / §3) ----------
-
-    #[tokio::test]
-    async fn failover_refuses_when_detached_primary_still_alive() {
-        // The 2026-06-11 incident shape: pgpool announces the primary as
-        // failed while it is reachable and healthy. Promoting would
-        // create a second primary.
-        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let detached_client = Arc::new(StubPeerClient::default());
-        detached_client.mark_running(); // running, NOT in recovery = live primary
-        peers.override_client(1, detached_client);
-        let candidate = Arc::new(StubPeerClient::default());
-        peers.override_client(0, candidate.clone());
-
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!resp.ok, "expected refusal, got: {}", resp.message);
-        assert!(
-            resp.message.contains("running as primary"),
-            "{}",
-            resp.message
-        );
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 0);
-        // No marker — a retry after the operator stops the node must run.
-        assert!(!replay
-            .has("failover", "detached=1,new_main=0,old_primary=1")
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn failover_proceeds_when_detached_primary_unreachable() {
-        // Unverifiable is NOT refusal: under a real partition the dead
-        // primary is unreachable, and refusing would make the cluster
-        // unavailable during exactly the event failover exists for.
-        let (s, _db, peers, _maint, _wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
-        peers.mark_unreachable(1);
-        let candidate = Arc::new(StubPeerClient::default());
-        peers.override_client(0, candidate.clone());
-
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "expected promote, got: {}", resp.message);
-        assert_eq!(candidate.promote_calls.load(Ordering::SeqCst), 1);
-    }
 
     #[tokio::test]
     async fn failover_skips_slot_drop_while_a_recovery_owns_the_node() {
@@ -5444,76 +4859,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_primary_down_promote_failure_is_internal_no_marker() {
-        let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        new_main_client.promote_fails.store(true, Ordering::SeqCst);
-        peers.override_client(0, new_main_client.clone());
-
-        let err = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Internal);
-        assert!(err.message().contains("promote"));
-        // No marker — pgpool re-fires the hook so we can retry promote.
-        assert!(!replay
-            .has("failover", "detached=1,new_main=0,old_primary=1")
-            .await
-            .unwrap());
-        // No drop_slot since promote failed.
-        assert!(new_main_client.drop_slot_calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failover_primary_down_drop_slot_failure_queues_maintenance() {
-        let (s, _db, peers, maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        new_main_client
-            .drop_slot_fails
-            .store(true, Ordering::SeqCst);
-        peers.override_client(0, new_main_client.clone());
-
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        // Hook returns Ok — promote succeeded, drop cleanup queued.
-        assert!(resp.ok);
-        assert!(resp.message.contains("queued maintenance"));
-        {
-            let intents = maint.intents.lock().unwrap();
-            assert_eq!(intents.len(), 1);
-            match &intents[0].payload {
-                MaintenancePayload::DropSlotCleanup { cause, .. } => {
-                    assert_eq!(cause, "rpc_error");
-                }
-            }
-        }
-        // Marker IS written — promote succeeded; only slot cleanup is async.
-        assert!(replay
-            .has("failover", "detached=1,new_main=0,old_primary=1")
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
     async fn failover_skips_when_replay_marker_present() {
-        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        peers.override_client(0, new_main_client.clone());
-        replay.mark("failover", "detached=1,new_main=0,old_primary=1");
+        // Markers only matter for the standby-down branch now — the
+        // primary-down advisory is stateless and answers before the
+        // marker check.
+        let (s, db, _peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
+        replay.mark("failover", "detached=1,new_main=0,old_primary=0");
 
         let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
+            .failover(Request::new(failover_req(1, 0, 0)))
             .await
             .unwrap()
             .into_inner();
         assert!(resp.ok);
         assert!(resp.message.contains("already processed"));
         // No downstream calls happened.
-        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
         assert!(db.dropped_slots.lock().unwrap().is_empty());
     }
 
@@ -6424,168 +5784,6 @@ mod tests {
             .into_inner();
         assert!(resp.ok, "{}", resp.message);
         assert!(resp.message.contains("attach failed"));
-    }
-
-    #[tokio::test]
-    async fn failover_short_circuits_promote_when_target_already_primary() {
-        // Same setup as the existing primary-down failover test, but
-        // mark new_main as already-primary (mark_running with in_recovery
-        // staying false) — the short-circuit must skip peer.promote.
-        let (s, db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        new_main_client.mark_running(); // is_postgres_running=true, is_in_recovery=false
-        peers.override_client(0, new_main_client.clone());
-
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "{}", resp.message);
-        // promote was NOT called because target was already primary.
-        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
-        // Slot cleanup still happened.
-        assert_eq!(
-            *new_main_client.drop_slot_calls.lock().unwrap(),
-            vec!["node1".to_string()]
-        );
-        // Replay marker written.
-        assert!(replay
-            .has("failover", "detached=1,new_main=0,old_primary=1")
-            .await
-            .unwrap());
-        // db unused on the primary-down path.
-        let _ = db;
-    }
-
-    // ----- failover ⇄ inflight handoff cross-op consult -----------------
-
-    #[tokio::test]
-    async fn failover_refuses_when_inflight_handoff_targets_different_node() {
-        // pgpool's failover_command fires with new_main=0, but there's
-        // an InProgress handoff targeting node 2 — that's a clear
-        // cross-target conflict; refuse rather than promote two
-        // primaries.
-        let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        peers.override_client(0, new_main_client.clone());
-        let now = chrono::Utc::now();
-        inflight.seed(crate::inflight_ops::InflightOp {
-            id: "live-handoff".into(),
-            status: crate::inflight_ops::InflightStatus::InProgress,
-            payload: crate::inflight_ops::InflightPayload::Handoff {
-                from_node_id: 1,
-                to_node_id: 2,
-                to_hostname: "peer2.local".into(),
-                slot_name: "node1".into(),
-                allow_lag: false,
-            },
-            phase: HANDOFF_PHASE_TARGET_PROMOTED.into(),
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-            last_error: None,
-        });
-
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!resp.ok);
-        assert!(
-            resp.message.contains("in-flight handoff (id=live-handoff"),
-            "unexpected: {}",
-            resp.message
-        );
-        // Promote was NOT called; the failover refused before getting there.
-        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
-        // No slot drop either.
-        assert!(new_main_client.drop_slot_calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failover_skips_slot_drop_when_handoff_owns_slot() {
-        // Handoff is in flight at phase=slot_created targeting the same
-        // new_main that pgpool just picked. The slot belongs to the
-        // handoff's demoting old primary; failover must NOT drop it.
-        let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        new_main_client.mark_running(); // already promoted
-        peers.override_client(0, new_main_client.clone());
-        let now = chrono::Utc::now();
-        inflight.seed(crate::inflight_ops::InflightOp {
-            id: "handoff-mid-flight".into(),
-            status: crate::inflight_ops::InflightStatus::InProgress,
-            payload: crate::inflight_ops::InflightPayload::Handoff {
-                from_node_id: 1,
-                to_node_id: 0,
-                to_hostname: "peer1.local".into(),
-                slot_name: "node1".into(),
-                allow_lag: false,
-            },
-            phase: HANDOFF_PHASE_SLOT_CREATED.into(),
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-            last_error: None,
-        });
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "{}", resp.message);
-        // Promote skipped (already_primary=true via get_status).
-        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
-        // Slot drop SKIPPED — the slot belongs to the in-flight handoff.
-        assert!(
-            new_main_client.drop_slot_calls.lock().unwrap().is_empty(),
-            "failover dropped the slot the handoff just created"
-        );
-        assert!(resp.message.contains("retained for in-flight handoff"));
-    }
-
-    #[tokio::test]
-    async fn failover_get_status_error_with_handoff_promoted_trusts_journal() {
-        // peer.get_status errors transiently. Without the journal we'd
-        // fall through to false and try to promote — but the journal
-        // says we already promoted past target_promoted, so trust it
-        // and skip promote.
-        let (s, _db, peers, _maint, _replay, _wal, _pcp, _sd, _standby, inflight) = make_server();
-        let new_main_client = Arc::new(StubPeerClient::default());
-        new_main_client
-            .get_status_fails
-            .store(true, Ordering::SeqCst);
-        peers.override_client(0, new_main_client.clone());
-        let now = chrono::Utc::now();
-        inflight.seed(crate::inflight_ops::InflightOp {
-            id: "in-progress".into(),
-            status: crate::inflight_ops::InflightStatus::InProgress,
-            payload: crate::inflight_ops::InflightPayload::Handoff {
-                from_node_id: 1,
-                to_node_id: 0,
-                to_hostname: "peer1.local".into(),
-                slot_name: "node1".into(),
-                allow_lag: false,
-            },
-            phase: HANDOFF_PHASE_SLOT_CREATED.into(),
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-            last_error: None,
-        });
-        let resp = s
-            .failover(Request::new(failover_req(1, 0, 1)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.ok, "{}", resp.message);
-        // Even with get_status erroring, the journal said target was
-        // already primary — so promote was NOT called.
-        assert_eq!(new_main_client.promote_calls.load(Ordering::SeqCst), 0);
-        // Slot drop still skipped (handoff owns it).
-        assert!(new_main_client.drop_slot_calls.lock().unwrap().is_empty());
     }
 
     // ----- inflight ops RPCs + resume -----------------------------------

@@ -62,8 +62,12 @@ phantom_check_required_peers = 0
 [supervisor]
 pgpool = false
 
-# HA loop with test-friendly timing.
-# Invariants: leader_ttl >= loop_wait + 2*retry_timeout (10 >= 1+4);
+# EXECUTE MODE FROM FIRST BOOT - the greenfield deployment shape the
+# suite validates. This is the only supported shape: the pgpool-led
+# path (shadow on / enabled off) is deleted.
+#
+# Test-friendly timing. Invariants:
+# leader_ttl >= loop_wait + 2*retry_timeout (10 >= 1+4);
 # retry_timeout > election_timeout (2s > 1s).
 #
 # leader_ttl deliberately stays at 10 s. A partition-time promotion
@@ -74,7 +78,8 @@ pgpool = false
 # comes from cadence and detection, not from shaving the safety
 # window.
 [raft]
-shadow              = true
+enabled             = true
+shadow              = false
 loop_wait_secs      = 1
 retry_timeout_secs  = 2
 leader_ttl_secs     = 10

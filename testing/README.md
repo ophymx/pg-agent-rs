@@ -6,16 +6,19 @@ nfpm-built `.deb`, the packaged systemd unit (sd_notify, ExecStartPre
 PostgreSQL 17 streaming replication — three systemd-booted Debian 13
 containers on a compose network.
 
-This harness is the substitute for live-cluster shadow validation
-(promotion-authority §10 step 5): the live cluster's existing behavior
-is not a useful oracle, so robustness is demonstrated here instead —
-and this same harness is where step 6 (openraft) gets its
-partition/restart acceptance scenarios.
+**The model under test is lease-driven roles.** `acceptance.sh` boots
+every node in execute mode (`[raft] enabled = true, shadow = false`) —
+the greenfield deployment shape — and runs deploy, failure, and
+recovery scenarios entirely under the raft consensus lease, with pgpool
+present strictly as the router it is post-cutover. There is no
+migration narrative: the pgpool-led promote path is deleted from the
+codebase, and the staged-migration suite that regression-tested it
+went with it (see "The migration suite" below).
 
 ## Run
 
 ```
-testing/acceptance.sh              # build .deb, up, all scenarios, down
+testing/acceptance.sh              # build .deb, up, greenfield suite, down
 KEEP=1 testing/acceptance.sh       # keep the cluster running afterwards
 SKIP_BUILD=1 testing/acceptance.sh # reuse dist/ .deb
 ```
@@ -35,156 +38,59 @@ bash`, `journalctl -u pg_agentd`).
 | `gen-certs.sh` | one CA + per-node certs, SAN = compose hostname (matches the peer SAN allowlist) |
 | `acceptance.sh` | scenario driver + assertions |
 
-## Scenarios (phase 1)
+## Mainline scenarios (`acceptance.sh`, greenfield lease-driven)
 
-- **S0** — all three daemons pass `validate-env` and come up; standby
-  PostgreSQLs deliberately down pre-init.
-- **S1** — `pg_agentctl cluster init` from db0: slots, basebackups,
-  standbys streaming; `cluster status` renders the topology.
-- **S2** — shadow HA loop steady state: db0 retains a self-claimed
-  lease; db1/db2 adopt the observed primary and follow.
-- **S3** — primary death: both standbys watch the holder for
-  `leader_ttl`, then **exactly one** (db1, node-id tiebreak at equal
-  WAL positions) shadow-takes the lease; db2 stands down. Primary
-  returns → shadow converges back (nothing was actually promoted).
-- **S3c** — lag gate with *real* WAL lag: replay paused on db2, ~80 MB
-  of WAL generated, primary stopped, then the handler is handed the
-  lagging node as `new_main`. Refused, naming db1 as the better
-  candidate. Runs before pgpool exists so nothing else reacts to the
-  primary going down.
-- **S4** — the 2026-06-11 incident replayed: `pg_agentc failover`
-  announcing the healthy primary as dead → refused
-  ("running as primary"), nothing promoted.
-- **S5** — agent restart on the primary: phantom check confirms, no
-  conservative stop, PG untouched.
+- **G0** — greenfield boot: all nodes come up in execute mode through
+  the validate-env gate (raft checks included). Pre-membership the loop
+  ticks `StoreUnknown` — no quorum, no action: executors attached to a
+  store that answers "unknown" do nothing.
+- **G1/G1b** — `cluster init` does replication + raft membership + lease
+  seeding in one operator command (idempotent on re-run); executors
+  converge the standbys; pgpool comes up in the agent-led contract and
+  `/healthz` reports ready.
+- **G2** — `check-hooks` passes fully clean on the deployed conf: the
+  canonical `gen-pgpool` block IS what's deployed, no overrides.
+- **G2b** — pgpool stays a router: a detach neither propagates between
+  instances nor breaks replication (the agent refuses the slot drop for
+  a streaming standby); explicit attach clears it.
+- **G3** — primary death: the failover hook answers **advisory**, the
+  lease promotes exactly one standby (journaled), the survivor
+  re-points, pgpool discovers the new primary via `sr_check`.
+- **G4/G4b** — operator rejoin: the dead ex-primary stayed stopped
+  (demote policy), `cluster recover` rebuilds it with the
+  recover/failover-hook slot race guarded (finding 9's cross-op
+  consult, unchanged under the lease — G4b exercises the live race on
+  a running standby), diverged survivors repaired via the operator
+  path (finding 15).
+- **G5/G5b** — partition of the holder: the isolated node fences
+  itself, the majority commits exactly one takeover (hysteresis
+  asserted: no two takeovers within `leader_ttl`), **one primary
+  during and after the partition**, rejoin via recover.
+- **G6** — agent restarts are non-events: phantom check confirms, the
+  lease survives, no takeover churn, replication uninterrupted.
+- **G7** — **§2.2 under the lease**: real WAL lag (replay paused,
+  ~24 MB written), primary killed — the caught-up standby wins, the
+  lagging one stands down naming the gap. This is the candidate-
+  selection defect the design exists to close, tested in the decision
+  layer that now owns it.
 
-## Phase 2 — pgpool in the loop
+---
 
-pgpool-II 4.6 on all three nodes, configured per
-[docs/pgpool-hook-contract.md](../docs/pgpool-hook-contract.md) §4:
-watchdog **off**, `failover_command` as an advisory poke,
-`follow_primary_command` **empty**, `detach_false_primary` on,
-`auto_failback` off. `docker/pgpool-setup.sh` plays BOOTSTRAP Phase 1.4
-+ 3.1 and is run by the driver after `cluster init`.
+# The migration suite (deleted)
 
-- **S6** — pgpool starts on all three; every instance shows all three
-  backends up; `/healthz` reports ready.
-- **S7** — post-cutover: the canonical block IS the agent-led contract,
-  so the conf checks clean except the harness's deliberate
-  failover-probe wrapper (drift detection proven on a known deviation),
-  and `check-hooks --legacy` dissents — the two contracts are
-  distinguishable. (Closes finding 8.)
-- **S8** — detach does **not** propagate between instances, and the
-  detach-fired hook is refused by the precondition check because the
-  "failed" standby is still streaming (hook-contract §5, item 2).
-- **S9** — real primary failover driven by pgpool, with every
-  `failover_command` invocation recorded per instance (hook-contract
-  §5, item 1). Asserts a single primary afterwards.
+The staged-migration suite validated the path from pgpool-led failover
+to the lease: shadow-mode phases (S0–S13, including the split-brain
+baseline), raft-in-shadow (R0–R4b), and execute-mode cutover (E0–E3).
+It was deleted together with the pgpool-led promote path it
+regression-tested — there was never a trusted pgpool-led deployment,
+so the repo validates the greenfield shape only. It was the previous
+incarnation of `testing/acceptance.sh` and lives in that file's git
+history (last complete at commit `22b266b`).
 
-Run `PHASE=1 testing/acceptance.sh` to stop before pgpool comes up.
-
-## Phase 3 — repair, the rest of the hook contract, and the baseline
-
-- **S10** — post-failover repair with the agent's own commands
-  (`cluster recover` per surviving node, then the pgpool attach
-  fan-out). Asserts the cluster returns to one primary + two streaming
-  standbys. This is the scenario that exposed finding 9.
-- **S11** — `pgpool_status` is sticky across a pgpool restart
-  (hook-contract §5.3): a detached backend stays detached, and only an
-  explicit attach clears it.
-- **S12** — `follow_primary_command` non-empty degenerates healthy
-  standbys (hook-contract §5.4), the claim that made the contract say
-  *remove* rather than *notify-only*. Sets the hook to `/bin/true`,
-  fails the primary over, and counts the backends pgpool marks down.
-- **S13** — **the split-brain baseline.** Partitions the primary off
-  the network (`docker network disconnect`) and checks whether the
-  majority promotes while the isolated node keeps running as primary.
-  This scenario **records unsafety, and is expected to**: it is the
-  empirical form of promotion-authority §2.1, and it is the regression
-  test that must invert once the lease lands. **S13b** then shows the
-  one mitigation that exists today — restarting the agent on the stale
-  primary makes the phantom check stop it — and how narrow it is
-  (nothing fires while the stale primary just keeps running).
-
-Run `PHASE=1` to stop before pgpool, `PHASE=2` to stop before phase 3,
-`PHASE=3` to stop before the raft phase.
-
-## Phase 4 — consensus for real (promotion-authority step 6)
-
-The same shadow loop, backed by the embedded Raft instead of a
-process-local store: `enabled = true` is appended to the `[raft]` block
-on all three nodes and the agents restarted, which routes the lease
-through `PgAgentRaft` on the peer mTLS listener and a replicated redb
-state machine. Still shadow — nothing promotes — so the assertions are
-about the *decision stream*, and specifically about the two claims the
-per-node phases could only simulate:
-
-- **R0** — post-S13 repair, pgpool stopped (these scenarios are about
-  the agent's own decisions), raft enabled. The daemon restart itself
-  is the validate-env assertion: the packaged unit's ExecStartPre gate
-  now runs the raft prerequisite checks. Before membership exists, all
-  nodes must tick `StoreUnknown` — "cannot read is not vacant" holding
-  on a real consensus store, where the store's answer genuinely is
-  unknown rather than fault-injected.
-- **R1** — `ClusterInit` forms raft membership; a second run reports
-  "already formed" rather than erroring. `--only-node 99` matches no
-  standby, so the run exercises exactly the membership bootstrap.
-- **R2** — steady state through the quorum: the primary retains, both
-  standbys follow, and — the difference from S2 — lease acquisition
-  happens **once cluster-wide**, not once per private store. The suite
-  counts acquisition events across all three journals and requires
-  exactly one.
-- **R3/R3b** — primary death: exactly one standby commits the takeover,
-  now CAS-serialized by the quorum rather than emergent from the
-  node-id tiebreak; the winner cycles `AwaitingPromotion` (nothing
-  promotes in shadow). Primary returns, lease converges back.
-- **R4/R4b** — **S13 inverted at the decision level.** The same
-  partition that produced two primaries under pgpool: the isolated
-  lease holder, unable to complete a linearizable read, decides
-  `WouldDemote` ("quorum contact lost") without ever learning whether a
-  takeover happened — and commits nothing. The majority commits a
-  takeover, and every takeover comes at least `leader_ttl` after the
-  previous one — sequential handoffs are *expected* in shadow mode
-  (nothing promotes, so each winner's lease looks orphaned after its
-  grace window and legally moves on), but a fresh holder's ttl of
-  protection must hold (finding 13 is what happens when it does not).
-  Shadow mode means these are log lines, but they are the decisions
-  that make split brain unreachable once step 7 hands them executors.
-  R4b confirms the partitioned raft node rejoins without a restart and
-  PostgreSQL-level state needed no repair (exactly one primary
-  throughout).
-- **E3** — the production end-state: pgpool up in the agent-led
-  contract, execute mode on. The primary dies; pgpool fires its
-  notify-only `failover_command`, the handler answers **advisory** (no
-  promotion from the hook), the lease promotes exactly one standby, and
-  pgpool discovers it through `sr_check` — routing stays pgpool's,
-  authority does not. `cluster recover` then rejoins the dead node with
-  the pcp attach fan-out live.
-
-## Phase 5 — EXECUTE (promotion-authority step 7)
-
-`shadow = false`: the same decisions, now driving PostgreSQL. Everything
-before this phase proves the loop decides correctly; this phase proves
-the executors act on it.
-
-- **E0** — executors attach. The holder retains; both standbys converge
-  onto it through the executor's follow path (slot prep via peer RPC,
-  conf rewrite, reload) — the mechanism that replaces pgpool's
-  `follow_primary_command`.
-- **E1/E1b** — primary death: the lease is deposed after `leader_ttl`
-  and the takeover **actually promotes** (journaled — `ops list` shows
-  the promote op). The surviving standby re-points onto the new primary
-  and streams. The dead ex-primary is asserted to have stayed stopped —
-  demote policy is never-automatic-rejoin — and is then rebuilt by the
-  operator path (`cluster recover`).
-- **E2/E2b** — **S13, executed.** The same partition that measured two
-  primaries in phase 3: the isolated holder escalates quorum loss to a
-  demote decision and the executor **fences it** (PostgreSQL actually
-  stopped); the majority promotes exactly one standby. After the
-  partition heals: **one primary on the wire**, no phantom-check
-  restart, no operator, no coincidence — the regression test
-  promotion-authority §2.1 said must invert, inverted. The fenced node
-  stays down until `cluster recover` rejoins it.
+The findings below keep their original scenario references (S…, R…,
+E…) as provenance. Those scenarios are no longer runnable, but every
+load-bearing behavior they proved is asserted by the greenfield suite
+above.
 
 ## Still planned
 
@@ -432,3 +338,25 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     TODO.md: the executor should *detect* a wedged follow (standby
     confirmed-following but not streaming past a grace) and say so
     loudly, and opt-in auto-rewind is the eventual closure.
+
+16. **After a lease-driven promotion, the winner's own pgpool instance
+    can blackhole the primary — and pcp operations wedge behind it.
+    Caught by the greenfield suite's router scenario running
+    post-failover.** ~20 s after a promotion, the new primary's own
+    pgpool degenerated *its own primary backend*
+    (`failover_on_backend_error` on a transient connection error),
+    leaving `new primary node: -1` — and the §4 contract makes that
+    permanent: `auto_failback off`, and pgpool never health-checks a
+    down backend. That instance then routes no writes, and any
+    subsequent attach on it enters `find_primary_node_repeatedly`
+    (`search_primary_node_timeout`, 300 s) hunting for a primary its
+    map doesn't contain — queueing every later pcp request behind it.
+    The §4 annotation "failover_on_backend_error = on: per-instance
+    routing reaction, self-limiting" is wrong for exactly the node
+    that just won: it is not self-limiting there. Product answer
+    (TODO.md, attach fan-out item): the executor's post-promote step
+    should ensure its own backend is attached on the local instance —
+    in a pgpool-routed deployment that is part of what "promote"
+    means. Harness answer meanwhile: router semantics are asserted in
+    steady state (G2b), and `pcp_attach_everywhere` attaches the
+    primary's backend first so failbacks can find a primary.

@@ -41,6 +41,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -202,6 +203,12 @@ pub struct RaftRuntime {
     members: BTreeMap<RaftNodeId, BasicNode>,
 }
 
+/// How long [`RaftRuntime::bootstrap_membership`] waits for a first
+/// leader before returning. Comfortably above any healthy election
+/// (sub-second at the defaults); callers proposing immediately after
+/// bootstrap depend on it.
+const LEADER_WAIT_AFTER_BOOTSTRAP: Duration = Duration::from_secs(10);
+
 /// Fraction of the election window used as the heartbeat interval.
 ///
 /// openraft wants heartbeats comfortably inside the election window, or
@@ -300,24 +307,50 @@ impl RaftRuntime {
     /// re-run — and because a second `initialize` on a live cluster
     /// would otherwise look like something to force past.
     pub async fn bootstrap_membership(&self) -> anyhow::Result<MembershipBootstrap> {
-        if self.raft.is_initialized().await.unwrap_or(false) {
-            return Ok(MembershipBootstrap::AlreadyFormed);
-        }
-        match self.raft.initialize(self.members.clone()).await {
-            Ok(()) => {
+        let outcome = if self.raft.is_initialized().await.unwrap_or(false) {
+            MembershipBootstrap::AlreadyFormed
+        } else {
+            match self.raft.initialize(self.members.clone()).await {
+                Ok(()) => {
+                    info!(
+                        members = self.members.len(),
+                        "raft: cluster membership initialized"
+                    );
+                    MembershipBootstrap::Formed {
+                        members: self.members.len(),
+                    }
+                }
+                Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
+                    MembershipBootstrap::AlreadyFormed
+                }
+                Err(e) => return Err(anyhow::anyhow!("raft: initialize membership: {e}")),
+            }
+        };
+
+        // Don't return into a leaderless gap. `initialize()` commits the
+        // membership and only then does the first election run; a caller
+        // that immediately proposes (ClusterInit seeds the lease on the
+        // next line) loses that race with "no leader known" — the
+        // greenfield acceptance suite hit exactly this on its first run,
+        // where the same code had won the race in every staged-migration
+        // run before it. Bounded: elections are sub-second here, and a
+        // cluster that cannot elect within this window has a problem the
+        // caller should hear about from its own next step.
+        let deadline = tokio::time::Instant::now() + LEADER_WAIT_AFTER_BOOTSTRAP;
+        loop {
+            if self.raft.metrics().borrow().current_leader.is_some() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
                 info!(
-                    members = self.members.len(),
-                    "raft: cluster membership initialized"
+                    "raft: no leader within {:?} after membership bootstrap; proceeding",
+                    LEADER_WAIT_AFTER_BOOTSTRAP
                 );
-                Ok(MembershipBootstrap::Formed {
-                    members: self.members.len(),
-                })
+                break;
             }
-            Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
-                Ok(MembershipBootstrap::AlreadyFormed)
-            }
-            Err(e) => Err(anyhow::anyhow!("raft: initialize membership: {e}")),
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Ok(outcome)
     }
 }
 
@@ -579,9 +612,12 @@ mod tests {
     #[tokio::test]
     async fn membership_bootstrap_is_idempotent() {
         let dir = TempDir::new().unwrap();
+        // Single-node membership: the post-bootstrap leader wait needs
+        // an electable cluster, and the two peers of a 3-pool are never
+        // spawned in this test.
         let rt = RaftRuntime::start(
             dir.path(),
-            &pool(3, 0),
+            &pool(1, 0),
             9701,
             None,
             &crate::config::RaftConfig::default(),
@@ -591,7 +627,7 @@ mod tests {
 
         assert_eq!(
             rt.bootstrap_membership().await.unwrap(),
-            MembershipBootstrap::Formed { members: 3 }
+            MembershipBootstrap::Formed { members: 1 }
         );
         assert_eq!(
             rt.bootstrap_membership().await.unwrap(),
@@ -609,14 +645,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = crate::config::RaftConfig::default();
         {
-            let rt = RaftRuntime::start(dir.path(), &pool(3, 0), 9701, None, &cfg)
+            let rt = RaftRuntime::start(dir.path(), &pool(1, 0), 9701, None, &cfg)
                 .await
                 .unwrap();
             rt.bootstrap_membership().await.unwrap();
             rt.raft.shutdown().await.unwrap();
         }
 
-        let rt = RaftRuntime::start(dir.path(), &pool(3, 0), 9701, None, &cfg)
+        let rt = RaftRuntime::start(dir.path(), &pool(1, 0), 9701, None, &cfg)
             .await
             .unwrap();
         assert_eq!(

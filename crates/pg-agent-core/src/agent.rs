@@ -300,12 +300,10 @@ impl Agent {
             let pool = self.opts.node_pool.clone();
             let pg = self.opts.postgres.clone();
             let raft = self.opts.raft.clone();
-            let lease_drives = self.opts.pg_instance.is_some();
             js.spawn(async move {
                 let mut server = LocalServer::new(
                     me, db, peers, maint, wal, replay, inflight, pcp, sd, standby, pool, pg,
-                )
-                .with_lease_driven_roles(lease_drives);
+                );
                 if let Some(rt) = raft {
                     server = server.with_raft(rt);
                 }

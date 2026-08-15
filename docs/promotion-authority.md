@@ -1100,13 +1100,15 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    decision-critical settings (`use_watchdog off`,
    `detach_false_primary on`, `auto_failback off`,
    `failover_on_backend_error on`) emitted by `gen-pgpool` and verified
-   by `check-hooks` — with `--legacy` selecting the pre-cutover block
-   for deployments that have not moved. On the product side,
-   `Failover`'s primary-down branch is advisory under lease-driven
-   roles (`enabled = true, shadow = false`): log and `ok=true`, no
-   promotion, while standby-down slot hygiene — mechanism, not
-   authority — keeps its guards and keeps working. SPEC §5.1 carries
-   the lease-mode contract and §5.15 the behavioral summary.
+   by `check-hooks`. The pre-cutover block briefly survived behind a
+   `--legacy` flag; flag, block, and the pgpool-led promote path itself
+   were then deleted — the repo validates greenfield deployments only,
+   and there was never a trusted pgpool-led deployment to migrate. On
+   the product side, `Failover`'s primary-down branch is always
+   advisory: log and `ok=true`, no promotion, while standby-down slot
+   hygiene — mechanism, not authority — keeps its guards and keeps
+   working. SPEC §5.1 carries the hook contract and §5.15 the
+   behavioral summary.
    Acceptance E3 validates the production end-state: pgpool up in the
    target contract, primary killed, hook answers advisory, the lease
    promotes exactly one standby, and pgpool discovers it through

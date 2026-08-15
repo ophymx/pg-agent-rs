@@ -369,26 +369,27 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
 
 ### 5.1 `Failover(detached, new_main, old_primary, old_main)`
 
-> **Lease-driven roles (`[raft] enabled = true, shadow = false`):** the
-> primary-down branch below (step 4) does not run. pgpool's failure
+> **The primary-down branch is advisory, period.** pgpool's failure
 > report is a hint, not an order — the handler logs the announcement
-> and returns `ok=true` ("advisory"), and promotion is the HA loop's
-> decision (§5.15): the lease holder is watched for `leader_ttl`, a
-> quorum-serialized CAS picks the successor, and the winner's executor
-> promotes. Steps 1–3 (resolution, and the standby-down slot hygiene
-> with its cross-op consult and preconditions) apply in both modes —
-> slot lifecycle is mechanism, not authority. The behavior below is the
-> **legacy (pgpool-led) mode**, which remains the default until a
-> deployment opts into the lease
-> ([docs/promotion-authority.md](docs/promotion-authority.md) §10
-> step 7).
+> and returns `ok=true` ("advisory") without touching cluster state.
+> Promotion is the HA loop's decision (§5.15): the lease holder is
+> watched for `leader_ttl`, a quorum-serialized CAS picks the
+> successor, and the winner's executor promotes. Only the standby-down
+> slot hygiene below is real work — slot lifecycle is mechanism, not
+> authority. (The pgpool-led promote path this hook once carried was
+> deleted wholesale; see
+> [docs/promotion-authority.md](docs/promotion-authority.md) §10
+> step 7.)
 
 1. If `new_main.id == -1` → no candidates available. Log critical error,
    return `OpResult { ok=false, message="no standby candidates available" }`.
    Do **not** error the RPC.
-2. Resolve `detached`, `new_main`, `old_primary` from topology
+2. **Primary down** (`detached.id == old_primary.id`): answer the
+   advisory (log + `ok=true`) before the replay-marker check — the
+   advisory is stateless and re-firing it is free. Nothing else runs.
+3. Resolve `detached`, `new_main`, `old_primary` from topology
    (hostname-authoritative — see §8.2).
-3. **Standby down** (`detached.id != old_primary.id`):
+4. **Standby down** (the only path that reaches here):
    - **Cross-op consult:** if an `inflight_ops` entry owns `detached`
      (recovery, follow_primary, or handoff — matched via
      `InflightPayload::target_node_id`), retain the slot and return
@@ -411,34 +412,12 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
      decoupled from the hook ctx).
    - On error: enqueue `drop_slot_cleanup` maintenance intent; still return
      `ok=true` with a descriptive message.
-4. **Primary down** (`detached.id == old_primary.id`):
-   - **Precondition** (defense in depth, the 2026-06-11 check): if
-     `detached` is reachable and running as primary
-     (`is_postgres_running && !is_in_recovery`), the failure report is
-     wrong — refuse with `ok=false` rather than promote a second
-     primary. Unreachable/unverifiable → log and proceed (under a real
-     partition, refusing here would be an availability outage — this
-     check narrows the split-brain window; it does not close it).
-     Skipped when a cooperating in-flight handoff targets `new_main`.
-   - **Lag gate** (see [docs/promotion-authority.md](docs/promotion-authority.md)
-     §2.2): compare `new_main`'s `(timeline, lsn)` against every other
-     surviving node's `GetStatus`. If a reachable node is on a newer
-     timeline, or ahead by more than `MAX_HANDOFF_LAG_BYTES` on the same
-     timeline, refuse with `ok=false` naming the better candidate — pgpool
-     picks `%m` by lowest alive node id, not WAL position, and promoting
-     the lagging pick would discard the difference. Best-effort: unknown
-     positions or unreachable comparison peers skip the gate rather than
-     block the failover.
-   - `peers[new_main].Promote()`.
-   - `peers[new_main].DropSlot(detached.slot_name)`.
-   - On DropSlot failure: enqueue maintenance intent; still mark done.
 
-> No replay marker for `Failover` — every operation in this flow is
-> naturally near-idempotent: `pg_promote()` on an already-primary fails
-> harmlessly, slot drops have 42710-ignore baked in (and failure routes
-> to the maintenance queue rather than re-running). The worst a re-fire
-> does is generate a few lines of warn-level log noise. See §5.12 for
-> the rationale on which hooks earn a replay marker.
+> The standby-down branch carries a replay marker (key
+> `detached={id},new_main={id},old_primary={id}`) so a re-fired hook
+> skips as "already processed". The primary-down advisory answers
+> *before* the marker check and never writes one — a stale marker from
+> the same key shape must not mask the advisory. See §5.12.
 
 The slot name is always `node{id}` (e.g. `node2`).
 
@@ -520,9 +499,10 @@ Both map to the same RPC (`Escalation`). No-op: HAProxy replaces VIP
 management. Returning ok keeps watchdog happy.
 
 Retired under the agent-led contract: `use_watchdog = off` means the
-`wd_*` hooks never fire, and `gen-pgpool` no longer emits them (they
-remain in `gen-pgpool --legacy`). The RPC stays for compatibility with
-legacy-mode deployments.
+`wd_*` hooks never fire, and `gen-pgpool` does not emit them (the
+legacy hook block that carried them is deleted). The RPC and the
+`pg_agentc` dispatch arm are vestigial — kept only because removing a
+proto RPC is a wire-compat decision (see TODO).
 
 ### 5.6 `RestoreWal(wal_file, dest_path)`
 
@@ -682,8 +662,9 @@ an in-flight orchestration to `Failover`'s cross-op consult (§5.1 step
 3), without which stopping a recovery target made pgpool fire a hook
 that dropped the slot the recovery had just created.
 
-`Failover` deliberately has no marker — its operations are
-naturally-near-idempotent (see §5.1's note).
+`Failover`'s standby-down branch carries a marker (§5.1's note); the
+primary-down advisory is stateless, answers before the marker check,
+and never writes one.
 
 **Stored under `<state_dir>/replay/`** (NOT under `$PGDATA`). Operators
 inspecting `$PGDATA` should see PostgreSQL's files, not agent bookkeeping.
@@ -843,9 +824,10 @@ absence. With `shadow = false`:
 off, `failover_command` a notify-only poke, `follow_primary_command`
 empty, `detach_false_primary` on, `auto_failback` off. pgpool remains
 the router and learns the primary through `sr_check`; it commands
-nothing. `pg_agentctl gen-pgpool` emits this contract (`--legacy` for
-the pre-cutover block) and `check-hooks` verifies it, including the
-decision-critical settings.
+nothing. `pg_agentctl gen-pgpool` emits this contract and
+`check-hooks` verifies it, including the decision-critical settings.
+This is the only contract; the pre-cutover (pgpool-led) block and its
+`--legacy` flags are deleted.
 
 ## 6. Hook contract (positional args / format tokens)
 
@@ -857,14 +839,18 @@ written down.
 ### 6.1 pgpool-templated hooks
 
 Operator-configurable format strings — order is whatever appears in
-`pgpool.conf`. The canonical lines `pg_agentctl print-hooks` emits:
+`pgpool.conf`. The canonical contract (`pg_agentctl print-hooks`) sets
+`failover_command` and leaves `follow_primary_command` empty; the
+command lines `pg_agentc` can parse, and their token order:
 
 ```
 failover_command           = 'pg_agentc failover       %d %h %p %D %m %H %M %P %r %R %N %S'
-follow_primary_command     = 'pg_agentc follow_primary %d %h %p %D %m %H %M %P %r %R %N %S'
-wd_escalation_command      = 'pg_agentc escalation'
-wd_de_escalation_command   = 'pg_agentc de_escalation'
+follow_primary_command     = ''   # MUST stay empty (hook-contract §5.4)
 ```
+
+(`pg_agentc follow_primary %d %h %p %D %m %H %M %P %r %R %N %S` remains
+a parseable command for the `FollowPrimary` RPC's sake, but no contract
+wires it into `pgpool.conf`.)
 
 Token meaning (pgpool tokens, *not* postgres tokens):
 

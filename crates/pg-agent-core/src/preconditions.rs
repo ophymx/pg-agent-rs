@@ -12,10 +12,11 @@
 //!
 //! What it *does* buy: when the announced-dead node is reachable and
 //! demonstrably healthy, the failure report is provably wrong and the
-//! destructive action is refused on positive evidence. The 2026-06-11
-//! split-brain (pgpool announced a healthy primary as failed during a
-//! brief agent restart; the handler promoted a second primary) is
-//! exactly this case, and this check would have prevented it.
+//! destructive action is refused on positive evidence. (The original
+//! motivating case — refusing to promote over a healthy primary, the
+//! 2026-06-11 split-brain — is gone along with the pgpool-led promote
+//! path itself: promotion is the lease's decision now, and the hook's
+//! only destructive action left is the standby-down slot drop.)
 //!
 //! Callers map [`PreconditionOutcome::Unverifiable`] to "log and
 //! proceed" — the evidence-gathering failed, and refusing on absent
@@ -47,10 +48,6 @@ pub const PRECONDITION_TIMEOUT: Duration = Duration::from_secs(5);
 /// follow_primary / recover / handoff preflights are candidates to
 /// converge here).
 pub enum ClusterIntent<'a> {
-    /// Reactive failover, primary-down branch: promote a successor
-    /// because `detached` — the announced-failed primary — is presumed
-    /// dead. Wrong when `detached` is alive and still primary.
-    PromoteBecausePrimaryDown { detached: &'a NodeConfig },
     /// Reactive failover, standby-down branch: drop `detached`'s
     /// replication slot because the standby is presumed dead. Wrong
     /// when `detached` is alive and actively streaming — dropping the
@@ -77,8 +74,7 @@ pub async fn validate_cluster_preconditions(
     intent: ClusterIntent<'_>,
 ) -> PreconditionOutcome {
     let detached = match &intent {
-        ClusterIntent::PromoteBecausePrimaryDown { detached }
-        | ClusterIntent::DropSlotBecauseStandbyDown { detached } => *detached,
+        ClusterIntent::DropSlotBecauseStandbyDown { detached } => *detached,
     };
 
     let probe = async {
@@ -106,20 +102,6 @@ pub async fn validate_cluster_preconditions(
     };
 
     match intent {
-        ClusterIntent::PromoteBecausePrimaryDown { detached } => {
-            if status.is_postgres_running && !status.is_in_recovery {
-                return PreconditionOutcome::Refuse {
-                    message: format!(
-                        "failover: refusing to promote: announced-failed primary node {} ({}) \
-                         is reachable and running as primary — the failure report is wrong \
-                         (likely a health-check false positive, e.g. a brief agent restart), \
-                         and promoting a second primary would create split-brain. No action \
-                         taken; if node {} really must be replaced, stop it first.",
-                        detached.id, detached.hostname, detached.id
-                    ),
-                };
-            }
-        }
         ClusterIntent::DropSlotBecauseStandbyDown { detached } => {
             if status.is_postgres_running
                 && status.is_in_recovery
@@ -232,7 +214,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let outcome = validate_cluster_preconditions(
             Arc::new(HangingRegistry),
-            ClusterIntent::PromoteBecausePrimaryDown { detached: &node },
+            ClusterIntent::DropSlotBecauseStandbyDown { detached: &node },
         )
         .await;
         // Auto-advanced virtual clock: assert the bound, not wall time.

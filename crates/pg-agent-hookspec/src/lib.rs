@@ -359,9 +359,7 @@ pub struct PgpoolHookEntry {
 ///   acceptance S12). The agent re-points standbys off the lease
 ///   instead.
 ///
-/// The `wd_*` escalation hooks are gone with the watchdog. The legacy
-/// (pgpool-led) block survives as [`pgpool_hooks_legacy`] for
-/// deployments that have not cut over.
+/// The `wd_*` escalation hooks are gone with the watchdog.
 ///
 /// `recovery_1st_stage_command` and `pgpool_remote_start` are fixed-arg
 /// hooks invoked by the `pgpool_recovery` C extension — only the script
@@ -413,35 +411,6 @@ pub fn pgpool_settings() -> Vec<PgpoolHookEntry> {
         PgpoolHookEntry {
             key: "failover_on_backend_error",
             value: "on".to_string(),
-        },
-    ]
-}
-
-/// The pre-cutover (pgpool-led) hook block: `follow_primary_command`
-/// populated, watchdog escalation hooks present. Correct only while
-/// pgpool's `failover_command` is still the promotion authority —
-/// `gen-pgpool --legacy` / `check-hooks --legacy` select it.
-pub fn pgpool_hooks_legacy() -> Vec<PgpoolHookEntry> {
-    vec![
-        PgpoolHookEntry {
-            key: "failover_command",
-            value: pgpool_cmd(HOOK_FAILOVER, &SCHEMA_FAILOVER),
-        },
-        PgpoolHookEntry {
-            key: "follow_primary_command",
-            value: pgpool_cmd(HOOK_FOLLOW_PRIMARY, &SCHEMA_FOLLOW_PRIMARY),
-        },
-        PgpoolHookEntry {
-            key: "recovery_1st_stage_command",
-            value: HOOK_RECOVERY_1ST_STAGE.to_string(),
-        },
-        PgpoolHookEntry {
-            key: "wd_escalation_command",
-            value: format!("pg_agentc {HOOK_ESCALATION}"),
-        },
-        PgpoolHookEntry {
-            key: "wd_de_escalation_command",
-            value: format!("pg_agentc {HOOK_DE_ESCALATION}"),
         },
     ]
 }

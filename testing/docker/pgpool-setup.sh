@@ -13,26 +13,10 @@
 #   - enable_pool_hba = off and trust auth everywhere. Avoids the
 #     pg_enc / .pgpoolkey / AES pool_passwd machinery, which is
 #     orthogonal to the failover behavior under test.
-#   - failover_command routes through /usr/local/bin/failover-probe so
-#     each invocation's argv is recorded before pg_agentc runs — that
-#     recording is the measurement for hook-contract §5.1.
 set -euo pipefail
 
 PCP_PASSWORD="${PCP_PASSWORD:-pcpsecret}"
 CONF=/etc/pgpool2/pgpool.conf
-FOLLOW_PRIMARY="${FOLLOW_PRIMARY:-}"   # non-empty only for the §5.4 probe
-
-# --- failover argv recorder -------------------------------------------
-cat > /usr/local/bin/failover-probe <<'EOF'
-#!/bin/sh
-# Record this invocation, then run the real hook client. One line per
-# firing: "<iso8601> <hostname> <argv...>".
-printf '%s %s %s\n' "$(date -Is)" "$(hostname)" "$*" >> /var/log/failover-probe.log
-exec /usr/bin/pg_agentc failover "$@"
-EOF
-chmod 0755 /usr/local/bin/failover-probe
-: > /var/log/failover-probe.log
-chmod 0666 /var/log/failover-probe.log
 
 # --- base config -------------------------------------------------------
 cat > "$CONF" <<EOF
@@ -85,25 +69,10 @@ recovery_1st_stage_command = 'recovery_1st_stage'
 EOF
 
 # --- backends + canonical hook block, from the agent itself ------------
+# This IS the deployed contract: failover_command as the advisory poke,
+# follow_primary_command empty, decision-critical settings included.
+# No overrides — check-hooks must pass on this file verbatim.
 runuser -u postgres -- pg_agentctl gen-pgpool >> "$CONF"
-
-# --- hook overrides for the target contract ----------------------------
-cat >> "$CONF" <<EOF
-
-# --- target hook contract (docs/pgpool-hook-contract.md §4) ---
-# Later directives win in pgpool.conf, so these override the canonical
-# block above.
-#
-# failover_command: kept as an advisory poke, routed through the probe
-# so every firing is recorded.
-failover_command = '/usr/local/bin/failover-probe %d %h %p %D %m %H %M %P %r %R %N %S'
-# follow_primary_command: MUST be empty. A non-empty value makes pgpool
-# degenerate every healthy standby after a primary failover.
-follow_primary_command = '$FOLLOW_PRIMARY'
-# Watchdog is off, so these never fire; kept blank to match.
-wd_escalation_command = ''
-wd_de_escalation_command = ''
-EOF
 
 # --- PCP auth ----------------------------------------------------------
 printf 'pgpool:%s\n' "$(pg_md5 "$PCP_PASSWORD")" > /etc/pgpool2/pcp.conf
