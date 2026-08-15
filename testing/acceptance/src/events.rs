@@ -1,0 +1,191 @@
+//! The suite's event backbone: every agent-journal and PostgreSQL-log
+//! line from every node, tailed live into one ordered in-memory log.
+//!
+//! This replaces the bash suite's `journalctl --since <timestamp>`
+//! re-queries and point-in-time greps with ordering primitives:
+//!
+//! - a [`Cursor`] marks "now" in the stream (replacing wall-clock
+//!   `--since` bounds — scenario windows are event-ordered, not timed);
+//! - [`EventLog::await_matching`] blocks until a matching event exists
+//!   at or after a cursor (or a liveness budget expires);
+//! - [`EventLog::find`] scans history non-blockingly, which is what
+//!   absence assertions and post-hoc audits use — over the whole
+//!   window, not at a sample instant.
+//!
+//! Tails run over `docker exec`, which rides the API socket, not
+//! `pga-net` — a partitioned node's events keep flowing, which is
+//! exactly when they matter most. Each tail restarts itself (without
+//! replaying history) if its exec dies.
+
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::Notify;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    Agent,
+    Postgres,
+}
+
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub node: &'static str,
+    pub source: Source,
+    pub line: String,
+    /// Host receipt time. Tail latency is milliseconds; fine for
+    /// second-granularity liveness measurements (e.g. the takeover
+    /// hysteresis gaps), never used as a safety bound.
+    pub at: Instant,
+}
+
+/// Position in the event stream. Obtained BEFORE causing something, so
+/// "did X happen" is always asked about the events after the cause.
+#[derive(Clone, Copy, Debug)]
+pub struct Cursor(pub usize);
+
+#[derive(Default)]
+struct Inner {
+    events: Vec<Event>,
+}
+
+pub struct EventLog {
+    inner: Mutex<Inner>,
+    notify: Notify,
+}
+
+impl EventLog {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Inner::default()),
+            notify: Notify::new(),
+        })
+    }
+
+    fn append(&self, ev: Event) {
+        self.inner.lock().unwrap().events.push(ev);
+        self.notify.notify_waiters();
+    }
+
+    /// Marks "now": events appended after this call have seq >= the
+    /// returned cursor.
+    pub fn cursor(&self) -> Cursor {
+        Cursor(self.inner.lock().unwrap().events.len())
+    }
+
+    /// Non-blocking scan of `[from..]` for the first match.
+    pub fn find<F>(&self, from: Cursor, pred: F) -> Option<Event>
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let inner = self.inner.lock().unwrap();
+        inner.events[from.0.min(inner.events.len())..]
+            .iter()
+            .find(|e| pred(e))
+            .cloned()
+    }
+
+    /// All matches in `[from..]` (for multi-event audits).
+    pub fn find_all<F>(&self, from: Cursor, pred: F) -> Vec<Event>
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let inner = self.inner.lock().unwrap();
+        inner.events[from.0.min(inner.events.len())..]
+            .iter()
+            .filter(|e| pred(e))
+            .cloned()
+            .collect()
+    }
+
+    /// Block until an event at/after `from` matches, or `budget`
+    /// expires. The budget is a liveness bound on the wait, never part
+    /// of the match criteria.
+    pub async fn await_matching<F>(&self, from: Cursor, budget: Duration, pred: F) -> Option<Event>
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let deadline = Instant::now() + budget;
+        let mut scanned = from.0;
+        loop {
+            {
+                let inner = self.inner.lock().unwrap();
+                let upto = inner.events.len();
+                if let Some(ev) = inner.events[scanned.min(upto)..upto]
+                    .iter()
+                    .find(|e| pred(e))
+                {
+                    return Some(ev.clone());
+                }
+                scanned = upto;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let _ = tokio::time::timeout(deadline - now, self.notify.notified()).await;
+        }
+    }
+
+    /// Spawn the tails for one node: the pg_agentd journal and the
+    /// PostgreSQL server log. History is replayed once (`-n all` /
+    /// `-n +1`) so the log covers everything since container start;
+    /// respawns after a died exec resume tail-only.
+    pub fn spawn_node_tails(self: &Arc<Self>, node: &'static str) {
+        self.spawn_tail(
+            node,
+            Source::Agent,
+            "journalctl -u pg_agentd -f -n all --no-pager -o cat".to_string(),
+            "journalctl -u pg_agentd -f -n 0 --no-pager -o cat".to_string(),
+        );
+        self.spawn_tail(
+            node,
+            Source::Postgres,
+            "tail -F -n +1 /var/log/postgresql/postgresql-17-main.log 2>/dev/null".to_string(),
+            "tail -F -n 0 /var/log/postgresql/postgresql-17-main.log 2>/dev/null".to_string(),
+        );
+    }
+
+    fn spawn_tail(
+        self: &Arc<Self>,
+        node: &'static str,
+        source: Source,
+        first_cmd: String,
+        respawn_cmd: String,
+    ) {
+        let log = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut cmd = first_cmd;
+            loop {
+                let child = Command::new("docker")
+                    .args(["exec", &format!("pga-{node}"), "bash", "-c", &cmd])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn();
+                if let Ok(mut child) = child {
+                    if let Some(stdout) = child.stdout.take() {
+                        let mut lines = BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            log.append(Event {
+                                node,
+                                source,
+                                line,
+                                at: Instant::now(),
+                            });
+                        }
+                    }
+                    let _ = child.wait().await;
+                }
+                // Exec died (container recreate, docker hiccup). Tail
+                // from "now" — history is already in the log.
+                cmd = respawn_cmd.clone();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+}

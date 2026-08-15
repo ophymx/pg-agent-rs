@@ -36,7 +36,8 @@ bash`, `journalctl -u pg_agentd`).
 | `docker/pgpool-setup.sh` | operator-run pgpool config + start (BOOTSTRAP Phase 1.4 + 3.1), in the target hook-contract shape |
 | `docker/50-pg-agent.rules` | polkit grant (postgres user → manage PG/pgpool units) |
 | `gen-certs.sh` | one CA + per-node certs, SAN = compose hostname (matches the peer SAN allowlist) |
-| `acceptance.sh` | scenario driver + assertions |
+| `acceptance.sh` | thin launcher for the Rust harness below |
+| `acceptance/` | the scenario driver (Rust, workspace member): tails every node's agent journal + PostgreSQL log into one ordered event log, holds live `tokio-postgres` connections to each node over the docker bridge (pg_hba trusts the isolated compose subnet), and asserts on event ORDER — scenario windows are event cursors, "did X happen" awaits the event log, and absence claims cover windows bounded by awaited events rather than sampled instants |
 
 ## Mainline scenarios (`acceptance.sh`, greenfield lease-driven)
 
