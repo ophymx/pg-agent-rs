@@ -25,6 +25,11 @@ use async_trait::async_trait;
 pub trait ProcessControl: Send + Sync {
     async fn start(&self) -> anyhow::Result<()>;
     async fn stop(&self) -> anyhow::Result<()>;
+    /// Reload if running, start if not. The light path for config
+    /// changes PostgreSQL honours on SIGHUP — `primary_conninfo` is
+    /// reloadable since PG 13, which is what lets a standby re-point
+    /// to a new upstream without dropping its sessions.
+    async fn reload_or_restart(&self) -> anyhow::Result<()>;
     /// True when the process manager considers the instance running or
     /// in startup. This is process-level liveness only — whether
     /// PostgreSQL is *answering* is [`crate::localdb`]'s to say, and

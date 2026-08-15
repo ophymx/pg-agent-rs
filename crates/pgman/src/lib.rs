@@ -34,48 +34,20 @@
 //! silently skips non-tablespace symlinks — a PostgreSQL fact), without
 //! knowing they are pgpool hooks (an agent fact).
 //!
-//! # Intended evolution: `PostgresInstance`
+//! # The concern layer: [`instance`]
 //!
-//! The traits here are **mechanism seams** — grouped by *how* they act
+//! The traits above are **mechanism seams** — grouped by *how* they act
 //! (SQL, subprocess, filesystem, init system), which is what makes them
-//! individually mockable. What they do not provide is a concern seam:
-//! "drive this instance to a role" today lives in each caller, composed
-//! out of these traits with ordering invariants enforced by convention
-//! (stop → wipe/clone or rewind → recovery config → start), and the
-//! instance's lifecycle state machine exists only implicitly across
-//! those call sites.
-//!
-//! The planned shape — not yet built, recorded here so the next layer
-//! is written against it rather than around it:
-//!
-//! ```ignore
-//! /// One authoritative view of the local instance.
-//! enum InstanceState {
-//!     Down,
-//!     Starting,
-//!     Standby { streaming: bool },
-//!     Promoting,          // pg_promote() issued, still in recovery
-//!     Primary,
-//!     Rebuilding { phase: RebuildPhase },
-//! }
-//!
-//! trait PostgresInstance {
-//!     async fn state(&self) -> InstanceState;
-//!     /// Promote and wait until recovery actually ends (pg_promote is
-//!     /// asynchronous; every caller today re-implements the wait).
-//!     async fn promote_and_wait(&self, deadline: Duration) -> Result<()>;
-//!     /// Converge on "standby of `primary`", choosing rewind vs full
-//!     /// clone, owning the stop/wipe/configure/start ordering that
-//!     /// callers currently each spell out.
-//!     async fn ensure_standby_of(&self, primary: &ConnTarget) -> Result<()>;
-//! }
-//! ```
-//!
-//! The mechanism traits stay — `PostgresInstance` composes them, it
-//! does not replace them.
+//! individually mockable. [`instance::PostgresInstance`] is the concern
+//! seam on top: intent-level, convergent operations (`promote_and_wait`,
+//! `ensure_stopped`, `follow`, `rebuild_as_standby`) plus one
+//! authoritative [`instance::InstanceState`], composing the mechanism
+//! traits rather than replacing them. Its shape is derived from the HA
+//! loop's step-7 executors — see the module docs.
 
 #![forbid(unsafe_code)]
 
+pub mod instance;
 pub mod localdb;
 pub mod pgstandby;
 pub mod process;

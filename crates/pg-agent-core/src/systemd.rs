@@ -261,6 +261,9 @@ impl pgman::process::ProcessControl for DbusSystemd {
     async fn is_active(&self) -> anyhow::Result<bool> {
         Systemd::status_postgres(self).await
     }
+    async fn reload_or_restart(&self) -> anyhow::Result<()> {
+        Systemd::reload_or_restart_postgres(self).await
+    }
 }
 
 #[async_trait]
