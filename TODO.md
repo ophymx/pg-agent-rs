@@ -92,14 +92,15 @@ scheduled. Items roughly in priority order within each section.
   (`StartPgpool`-style: each agent attaches on its own instance), or a
   dedicated `AttachNode` peer RPC; the harness's
   `pcp_attach_everywhere` documents the interim operator action.
-- **Also (finding 16, urgency): the executor's post-promote step must
-  ensure the winner's own backend is attached on its local pgpool.**
-  `failover_on_backend_error` can degenerate the new primary on its own
-  instance during the promotion window; with `auto_failback off` that
-  instance blackholes writes indefinitely, and later attaches wedge in
-  `find_primary_node_repeatedly` (300 s) because the map holds no up
-  primary. In a pgpool-routed deployment, self-attach is part of what
-  "promote" means.
+- ~~**Also (finding 16, urgency): the executor's post-promote step must
+  ensure the winner's own backend is attached on its local pgpool.**~~
+  — DONE: `roleexec` now runs a convergent self-attach probe on
+  primary-holder ticks (spawned off-tick, single-flight, 10 s cadence)
+  and after each promotion; a backend the local pgpool marks down is
+  re-attached. Convergent rather than one-shot because the observed
+  degeneration (`failover_on_backend_error` on a transient error) hit
+  ~20 s *after* the promotion. The cross-instance fan-out above is
+  still open — self-attach fixes only the winner's own instance.
 
 ### Executor: detect a wedged follow (finding 15) — URGENCY UPGRADED
 

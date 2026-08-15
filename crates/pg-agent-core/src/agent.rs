@@ -457,6 +457,7 @@ impl Agent {
                     self.deps.peers.clone(),
                     self.opts.node_pool.clone(),
                     self.deps.inflight.clone(),
+                    self.deps.pcp.clone(),
                     // Promote budget = leader_ttl: the clock rivals run
                     // against a fresh holder (see roleexec docs).
                     timing.leader_ttl,

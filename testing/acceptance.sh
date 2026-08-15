@@ -340,6 +340,14 @@ wait_for 90 "the surviving standby re-pointed and streams from $W1" \
 W1_ID="${W1#db}"
 wait_for 60 "pgpool discovered the new primary via sr_check (no follow hook)" \
     "docker exec -u postgres pga-$W1 pcp_node_info -h localhost -p 9898 -U pgpool -w -n $W1_ID | grep -qi primary"
+# Finding 16: failover_on_backend_error can degenerate the winner's own
+# backend on its own instance (~20 s post-promote), and auto_failback
+# off makes that permanent — unless the executor's self-attach probe
+# converges it. Role alone (above) doesn't prove routability; status
+# must be up. 60 s comfortably covers the degeneration window plus one
+# 10 s probe interval.
+wait_for 60 "the winner's own pgpool routes to it (backend up — finding 16)" \
+    "docker exec -u postgres pga-$W1 pcp_node_info -h localhost -p 9898 -U pgpool -w -n $W1_ID | grep -q ' up '"
 
 # ---------------------------------------------------------------------------
 say "G4: operator rejoin — demote policy, the slot-race guard, repair"

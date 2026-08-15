@@ -808,6 +808,15 @@ absence. With `shadow = false`:
 
 - Winning a takeover → journaled promotion (`inflight_ops` `promote`
   op), `pg_promote(false)` + a poll bounded by `leader_ttl`.
+- Holding as primary → **pgpool self-attach convergence** (finding 16):
+  a probe — spawned off the tick, single-flight, 10 s cadence — reads
+  the local pgpool's map and re-attaches this node's own backend if
+  marked down. `failover_on_backend_error` can degenerate the winner on
+  its own instance after promotion, and `auto_failback off` makes that
+  permanent; in a pgpool-routed deployment self-attach is part of what
+  "promote" means. Probe failures are debug-level (pgpool legitimately
+  down is routine); the cross-instance attach fan-out stays an open
+  TODO.
 - A demote decision → **fence**: stop local PostgreSQL. Never gated on
   journaling. A node running as primary while another holds the lease
   is fenced the same way.

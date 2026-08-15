@@ -40,6 +40,27 @@
 //! (`cluster recover`) is the operator's call. The executor never
 //! performs a destructive rebuild.
 //!
+//! # pgpool self-attach (testing/README.md finding 16)
+//!
+//! In a pgpool-routed deployment, part of what "primary" means is that
+//! the local pgpool routes to it. `failover_on_backend_error` can
+//! degenerate the new primary's backend *on its own instance* (observed
+//! ~20 s **after** a promotion, on a transient connection error during
+//! the takeover churn), and the §4 contract makes that permanent:
+//! `auto_failback off`, and pgpool never health-checks a down backend.
+//! That instance then blackholes writes, and later pcp attaches wedge
+//! in `find_primary_node_repeatedly` because its map holds no primary.
+//!
+//! So the holder converges this too: on primary-holder ticks (and after
+//! a promotion completes) the executor probes the local pgpool's view
+//! of its own backend and re-attaches it when marked down. The probe is
+//! **spawned off the tick** — a wedged pgpool must never stall the HA
+//! loop past `retry_timeout`/`leader_ttl` (the finding 11/12/14 class:
+//! rivals would depose a healthy holder) — single-flight, and
+//! rate-limited to `SELF_ATTACH_PROBE_INTERVAL`. Probe failures are
+//! debug-level (pgpool legitimately down is a normal state); a backend
+//! found down is warn-level and acted on.
+//!
 //! # What journaling must never do
 //!
 //! Fencing is not journaled and must never be gated on journaling: a
@@ -50,16 +71,25 @@
 //! to a warning — the promotion proceeds, because the alternative is a
 //! cluster that cannot fail over while a journal is broken.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pgman::instance::{InstanceState, PostgresInstance, UpstreamSpec};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{NodePool, PostgresRuntime};
 use crate::ha::HaDecision;
 use crate::inflight_ops::{InflightOpStore, InflightPayload};
+use crate::pcp::Pcp;
 use crate::peers::PeerRegistry;
+
+/// How often a primary holder re-probes the local pgpool's view of its
+/// own backend (module docs, "pgpool self-attach"). The observed
+/// degeneration hit ~20 s after a promotion, so a 10 s cadence keeps
+/// the blackhole window to one probe interval while staying far below
+/// the healthz snapshotter's ~1 s `pcp_node_info` cadence in cost.
+const SELF_ATTACH_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Executes [`HaDecision`]s against the local instance.
 pub struct RoleExecutor {
@@ -67,6 +97,9 @@ pub struct RoleExecutor {
     peers: Arc<dyn PeerRegistry>,
     pool: NodePool,
     inflight: Arc<dyn InflightOpStore>,
+    /// Local pgpool control plane, for the self-attach convergence
+    /// (module docs, "pgpool self-attach").
+    pcp: Arc<dyn Pcp>,
     /// Budget for [`PostgresInstance::promote_and_wait`]. Set to
     /// `leader_ttl` deliberately: that is exactly how long rivals must
     /// watch the new holder before they may depose it (the finding-13
@@ -83,6 +116,12 @@ pub struct RoleExecutor {
     /// restart — the cost of a restart is one redundant (idempotent)
     /// follow.
     confirmed_upstream: Mutex<Option<i32>>,
+    /// Single-flight guard for the spawned self-attach probe. `Arc` so
+    /// the spawned task can clear it without holding the executor.
+    self_attach_in_flight: Arc<AtomicBool>,
+    /// When the last self-attach probe was *spawned* (not when it
+    /// finished) — the rate limit is on spawn cadence.
+    self_attach_last_probe: Mutex<Option<Instant>>,
 }
 
 impl RoleExecutor {
@@ -91,6 +130,7 @@ impl RoleExecutor {
         peers: Arc<dyn PeerRegistry>,
         pool: NodePool,
         inflight: Arc<dyn InflightOpStore>,
+        pcp: Arc<dyn Pcp>,
         promote_deadline: Duration,
         pg: &PostgresRuntime,
     ) -> Self {
@@ -99,10 +139,13 @@ impl RoleExecutor {
             peers,
             pool,
             inflight,
+            pcp,
             promote_deadline,
             pg_port: pg.port,
             repl_user: pg.repl_user.clone(),
             confirmed_upstream: Mutex::new(None),
+            self_attach_in_flight: Arc::new(AtomicBool::new(false)),
+            self_attach_last_probe: Mutex::new(None),
         }
     }
 
@@ -137,6 +180,7 @@ impl RoleExecutor {
                 // Primary steady state; any remembered upstream is
                 // stale the moment we hold the lease as primary.
                 *self.confirmed_upstream.lock().unwrap() = None;
+                self.ensure_self_attached();
             }
 
             // Watching states — acting on any of them would be acting
@@ -191,6 +235,10 @@ impl RoleExecutor {
                         warn!(?e, id, "roleexec: promote journal complete failed");
                     }
                 }
+                // In a pgpool-routed deployment, self-attach is part of
+                // what "promote" means (finding 16) — and the holder's
+                // steady-state ticks keep converging it afterwards.
+                self.ensure_self_attached();
             }
             Err(e) => {
                 // Deadline or hard failure. The lease's own clock has
@@ -255,6 +303,42 @@ impl RoleExecutor {
         }
     }
 
+    /// Converge the local pgpool onto this primary: spawn a probe that
+    /// re-attaches our own backend if the local instance marks it down
+    /// (module docs, "pgpool self-attach"). Never blocks the tick;
+    /// single-flight; rate-limited to [`SELF_ATTACH_PROBE_INTERVAL`].
+    fn ensure_self_attached(&self) {
+        {
+            let mut last = self.self_attach_last_probe.lock().unwrap();
+            if let Some(t) = *last {
+                if t.elapsed() < SELF_ATTACH_PROBE_INTERVAL {
+                    return;
+                }
+            }
+            if self.self_attach_in_flight.swap(true, Ordering::SeqCst) {
+                return; // previous probe (or its attach) still running
+            }
+            *last = Some(Instant::now());
+        }
+        let pcp = self.pcp.clone();
+        let local_id = self.pool.local_node_id;
+        let in_flight = self.self_attach_in_flight.clone();
+        tokio::spawn(async move {
+            match self_attach_probe(pcp.as_ref(), local_id).await {
+                Ok(true) => info!(
+                    local_id,
+                    "roleexec: self-attach complete — local pgpool routes to this primary again"
+                ),
+                Ok(false) => {}
+                // pgpool being down/unreachable is a legitimate state
+                // (masked pre-bootstrap, operator maintenance) — noise
+                // at warn level would page on every quiet minute of it.
+                Err(e) => debug!(local_id, err = %e, "roleexec: pgpool self-attach probe failed"),
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
+    }
+
     /// The follow itself: prepare the upstream (slot on the holder,
     /// via peer RPC — the cross-node half stays agent-side), then
     /// re-point the local standby.
@@ -278,6 +362,38 @@ impl RoleExecutor {
             })
             .await
     }
+}
+
+/// One self-attach probe: read the local pgpool's backend map and
+/// re-attach `local_id` if it is marked down. Returns whether an attach
+/// was issued. Split from the spawn wrapper so the decision logic is
+/// unit-testable without a runtime-spawned task.
+async fn self_attach_probe(pcp: &dyn Pcp, local_id: i32) -> anyhow::Result<bool> {
+    let nodes = pcp.node_info_all().await?;
+    let Some(me) = nodes.iter().find(|n| n.id == local_id) else {
+        anyhow::bail!(
+            "local backend {local_id} missing from pcp_node_info output ({} rows)",
+            nodes.len()
+        );
+    };
+    if me.is_up() {
+        return Ok(false);
+    }
+    warn!(
+        local_id,
+        status = %me.status_name,
+        "roleexec: local pgpool marks this primary's own backend down \
+         (finding 16 — failover_on_backend_error + auto_failback off \
+         makes that permanent); self-attaching"
+    );
+    if let Err(e) = pcp.attach_node(local_id).await {
+        // The one probe failure that is NOT routine: we saw the backend
+        // down and could not fix it. Warn here; the wrapper's debug is
+        // for the routine pgpool-not-running case.
+        warn!(local_id, err = %e, "roleexec: self-attach failed; retrying next probe interval");
+        return Err(anyhow::anyhow!("self-attach of backend {local_id}: {e}"));
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -408,6 +524,67 @@ mod tests {
         }
     }
 
+    // ----- stub pcp ---------------------------------------------------------
+
+    /// Scripted local-pgpool view. `backend_up` drives what
+    /// `node_info_all` reports for every backend; `node_info_fails`
+    /// scripts the pgpool-not-running case. Attaches are recorded and
+    /// flip `backend_up` back to true (a real attach does exactly that
+    /// to pgpool's map).
+    #[derive(Default)]
+    struct StubPcp {
+        backend_up: StdMutex<bool>,
+        node_info_fails: StdMutex<bool>,
+        attach_calls: StdMutex<Vec<i32>>,
+    }
+
+    impl StubPcp {
+        fn all_up() -> Arc<Self> {
+            Arc::new(Self {
+                backend_up: StdMutex::new(true),
+                ..Default::default()
+            })
+        }
+        fn row(&self, id: i32) -> crate::pcp::NodeInfo {
+            let up = *self.backend_up.lock().unwrap();
+            crate::pcp::NodeInfo {
+                id,
+                hostname: format!("db{id}"),
+                port: 5432,
+                status_code: if up { 2 } else { 3 },
+                lb_weight: 0.33,
+                status_name: if up { "up" } else { "down" }.into(),
+                actual_status: "up".into(),
+                role: "standby".into(),
+                actual_role: "standby".into(),
+                replication_delay: "0".into(),
+                replication_state: "none".into(),
+                sync_state: "none".into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::pcp::Pcp for StubPcp {
+        async fn attach_node(&self, node_id: i32) -> anyhow::Result<()> {
+            self.attach_calls.lock().unwrap().push(node_id);
+            *self.backend_up.lock().unwrap() = true;
+            Ok(())
+        }
+        async fn detach_node(&self, _: i32) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn node_count(&self) -> anyhow::Result<i32> {
+            unreachable!()
+        }
+        async fn node_info_all(&self) -> anyhow::Result<Vec<crate::pcp::NodeInfo>> {
+            if *self.node_info_fails.lock().unwrap() {
+                anyhow::bail!("scripted: pgpool not running")
+            }
+            Ok((0..3).map(|id| self.row(id)).collect())
+        }
+    }
+
     /// Registry wrapper so the fixture can hand `Arc<dyn PeerRegistry>`
     /// while tests keep a typed handle to the shared `StubPeers`.
     struct StubRegistry(Arc<StubPeers>);
@@ -444,12 +621,14 @@ mod tests {
         instance: Arc<ScriptedInstance>,
         peers: Arc<StubPeers>,
         inflight: Arc<InMemoryInflightOpStore>,
+        pcp: Arc<StubPcp>,
     }
 
     fn fixture(local: i32, state: InstanceState) -> Fixture {
         let instance = ScriptedInstance::new(state);
         let peers = Arc::new(StubPeers::default());
         let inflight = Arc::new(InMemoryInflightOpStore::new());
+        let pcp = StubPcp::all_up();
         let pg = PostgresRuntime {
             port: 5432,
             data_dir: std::path::PathBuf::from("/nonexistent"),
@@ -460,6 +639,7 @@ mod tests {
             Arc::new(StubRegistry(peers.clone())),
             pool3(local),
             inflight.clone(),
+            pcp.clone(),
             Duration::from_secs(30),
             &pg,
         );
@@ -468,7 +648,20 @@ mod tests {
             instance,
             peers,
             inflight,
+            pcp,
         }
+    }
+
+    /// Wait (bounded) for the spawned self-attach task to finish — its
+    /// completion is observable as the single-flight flag clearing.
+    async fn drain_self_attach(f: &Fixture) {
+        for _ in 0..200 {
+            if !f.exec.self_attach_in_flight.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("self-attach task did not finish");
     }
 
     // ----- scenarios --------------------------------------------------------
@@ -615,5 +808,106 @@ mod tests {
             f.exec.apply(&d).await;
         }
         assert!(f.instance.calls().is_empty());
+    }
+
+    // ----- pgpool self-attach (finding 16) ----------------------------------
+
+    #[tokio::test]
+    async fn probe_attaches_when_local_backend_marked_down() {
+        let pcp = StubPcp::all_up();
+        *pcp.backend_up.lock().unwrap() = false;
+        let attached = self_attach_probe(pcp.as_ref(), 1).await.unwrap();
+        assert!(attached);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn probe_leaves_a_healthy_backend_alone() {
+        let pcp = StubPcp::all_up();
+        let attached = self_attach_probe(pcp.as_ref(), 1).await.unwrap();
+        assert!(!attached);
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_errors_when_local_backend_missing_from_map() {
+        // Rows come back but none carries our id — pgpool.conf drift.
+        // Refusing beats attaching a backend number that means another
+        // node.
+        let pcp = StubPcp::all_up();
+        let err = self_attach_probe(pcp.as_ref(), 7).await.unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn holder_steady_state_self_attaches_a_degenerated_backend() {
+        // The finding-16 shape: the winner is primary and holding, and
+        // ~20 s later its own pgpool has degenerated its backend. The
+        // steady-state tick must converge it back.
+        let f = fixture(1, InstanceState::Primary);
+        *f.pcp.backend_up.lock().unwrap() = false;
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        drain_self_attach(&f).await;
+        assert_eq!(*f.pcp.attach_calls.lock().unwrap(), vec![1]);
+        // The probe is pcp-only — it must not touch PostgreSQL.
+        assert!(f.instance.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn promotion_completion_triggers_a_self_attach_probe() {
+        let f = fixture(1, InstanceState::Standby { streaming: true });
+        *f.pcp.backend_up.lock().unwrap() = false;
+        f.exec
+            .apply(&HaDecision::TookOver {
+                term: 2,
+                already_primary: false,
+            })
+            .await;
+        drain_self_attach(&f).await;
+        assert_eq!(f.instance.calls(), vec!["promote"]);
+        assert_eq!(*f.pcp.attach_calls.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn self_attach_probes_are_rate_limited() {
+        let f = fixture(1, InstanceState::Primary);
+        *f.pcp.backend_up.lock().unwrap() = false;
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        drain_self_attach(&f).await;
+        // Stub attach flipped the backend up; break it again and tick
+        // immediately — inside the probe interval, nothing may fire.
+        *f.pcp.backend_up.lock().unwrap() = false;
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        drain_self_attach(&f).await;
+        assert_eq!(
+            *f.pcp.attach_calls.lock().unwrap(),
+            vec![1],
+            "second tick inside the probe interval must not re-probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_attach_survives_pgpool_being_down() {
+        // pgpool not running is a routine state: the probe fails, the
+        // executor keeps ticking, PostgreSQL is untouched.
+        let f = fixture(1, InstanceState::Primary);
+        *f.pcp.node_info_fails.lock().unwrap() = true;
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        drain_self_attach(&f).await;
+        assert!(f.pcp.attach_calls.lock().unwrap().is_empty());
+        assert!(f.instance.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn followers_never_probe_pgpool() {
+        let f = fixture(2, InstanceState::Standby { streaming: true });
+        *f.pcp.backend_up.lock().unwrap() = false;
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await;
+        drain_self_attach(&f).await;
+        assert!(
+            f.pcp.attach_calls.lock().unwrap().is_empty(),
+            "self-attach is the holder's convergence, not a follower's"
+        );
     }
 }

@@ -353,10 +353,13 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     map doesn't contain — queueing every later pcp request behind it.
     The §4 annotation "failover_on_backend_error = on: per-instance
     routing reaction, self-limiting" is wrong for exactly the node
-    that just won: it is not self-limiting there. Product answer
-    (TODO.md, attach fan-out item): the executor's post-promote step
-    should ensure its own backend is attached on the local instance —
-    in a pgpool-routed deployment that is part of what "promote"
-    means. Harness answer meanwhile: router semantics are asserted in
-    steady state (G2b), and `pcp_attach_everywhere` attaches the
+    that just won: it is not self-limiting there. **FIXED in
+    `roleexec`:** the holder now runs a convergent self-attach probe
+    (off-tick, single-flight, 10 s cadence) on primary-holder ticks
+    and after each promotion, re-attaching its own backend when the
+    local pgpool marks it down — convergent rather than post-promote
+    one-shot because the degeneration hit ~20 s *after* promotion. G3
+    asserts the winner's own pgpool ends up routing to it. The
+    cross-instance attach fan-out (other nodes' instances) remains
+    open in TODO.md; `pcp_attach_everywhere` still attaches the
     primary's backend first so failbacks can find a primary.
