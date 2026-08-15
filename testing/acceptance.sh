@@ -61,18 +61,6 @@ log_since() {
 }
 now_ts() { docker exec pga-db0 date '+%Y-%m-%d %H:%M:%S'; }
 
-# probe <seconds> <command...> — wait_for without the verdict: polls
-# until success (0) or budget exhausted (1), reporting nothing. For
-# conditions with a fallback path where a timeout is not a failure.
-probe() {
-    local budget="$1"; shift
-    local waited=0
-    until bash -c "$*" >/dev/null 2>&1; do
-        sleep 1; waited=$((waited+1))
-        if [ "$waited" -ge "$budget" ]; then return 1; fi
-    done
-}
-
 wait_for() { # wait_for <seconds> <desc> <command...>
     local budget="$1" desc="$2"; shift 2
     local waited=0
@@ -80,7 +68,9 @@ wait_for() { # wait_for <seconds> <desc> <command...>
         sleep 1; waited=$((waited+1))
         if [ "$waited" -ge "$budget" ]; then bad "timeout: $desc"; return 1; fi
     done
-    ok "$desc"
+    # Annotate actual wait so a slow run profiles per-check, not
+    # per-scenario ([+Ns] on the say headers is too coarse).
+    if [ "$waited" -gt 0 ]; then ok "$desc (${waited}s)"; else ok "$desc"; fi
 }
 
 # Which node is currently primary? Echoes db0|db1|db2, or nothing.
@@ -151,31 +141,99 @@ pcp_attach_everywhere() {
 # moving WAL positions, so a survivor can end up past the new primary's
 # fork point and wedge — rewind territory, reserved for the operator by
 # demote policy, which is exactly the path this exercises.
+PGLOG=/var/log/postgresql/postgresql-17-main.log
+# Per-node PG-log line counts, consumed at each proven convergence.
+# The wedge scan below greps only lines AFTER a node's mark, so a wedge
+# that began any time since the cluster was last known-good is visible
+# no matter when repair_standbys is entered — ordering, not clocks.
+# (The log lives outside $PGDATA and survives recloning, so a
+# whole-file grep would resurrect long-repaired wedges; a capture-at-
+# entry mark missed wedges that flapped 'streaming' during the very
+# first sample — both failure modes were observed.)
+declare -A WEDGE_MARK
+
+consume_wedge_marks() { # consume_wedge_marks <primary>
+    local m
+    for m in db0 db1 db2; do
+        [ "$m" = "$1" ] && continue
+        WEDGE_MARK[$m]=$(x "$m" "wc -l < $PGLOG" 2>/dev/null | tr -d '[:space:]')
+        WEDGE_MARK[$m]=${WEDGE_MARK[$m]:-0}
+    done
+}
+
+streaming_standbys() { # streaming_standbys <primary> — count on stdout
+    docker exec -u postgres "pga-$1" psql -tAc \
+        "select count(*) from pg_stat_replication where state='streaming' and application_name <> 'pg_basebackup'" \
+        2>/dev/null | tr -d ' '
+}
+
 repair_standbys() {
     local prim="$1" ctx="$2" n nid
-    # Short probe on purpose: a healthy re-point streams within ~10 s,
-    # and the diverged-survivor wedge (finding 15) is the COMMON
-    # post-takeover case — both majority standbys stream the same WAL
-    # until the cut, so the non-winner is a coin flip to be past the
-    # winner's fork point. Waiting longer just delays the repair the
-    # operator path exists to run.
-    if probe 20 \
-        "[ \"\$(docker exec -u postgres pga-$prim psql -tAc \"select count(*) from pg_stat_replication where state='streaming' and application_name <> 'pg_basebackup'\" | tr -d ' ')\" = 2 ]"; then
-        ok "$prim has 2 streaming standbys ($ctx)"
-        return
-    fi
+    # One convergence loop, wedge-scan FIRST each iteration: a wedged
+    # standby (finding 15 — past the new primary's fork point) loops
+    # "new timeline ... forked off ..." in its PG log while its
+    # walreceiver flaps through 'streaming', so a bare streaming==2
+    # sample can declare victory on a flap (observed: the un-repaired
+    # wedge then broke the NEXT two scenarios). Success requires the
+    # count AND a clean scan. A wedged node is recovered the moment
+    # its signature appears — the wedge is the COMMON post-takeover
+    # case, and no amount of waiting streams it — while a merely-slow
+    # node keeps its convergence window and is never re-cloned for
+    # being slow.
+    # ~20 iterations ≈ 25-30 s wall (each iteration costs a few docker
+    # execs). Expiry doesn't punish anyone by itself — the fallback
+    # below reclones only non-progressing nodes.
+    local waited=0 recovered=""
+    while [ "$waited" -lt 20 ]; do
+        for n in db0 db1 db2; do
+            [ "$n" = "$prim" ] && continue
+            case " $recovered " in *" $n "*) continue ;; esac
+            if x "$n" "tail -n +$(( ${WEDGE_MARK[$n]:-0} + 1 )) $PGLOG" 2>/dev/null | grep -q 'forked off'; then
+                echo "     NOTE: $n shows the timeline-fork wedge (${waited}s) — recovering it now"
+                nid="${n#db}"
+                xp "$prim" "pg_agentctl cluster recover --target $nid --stop-target-pg" \
+                    > "/tmp/recover-$ctx-$nid.log" 2>&1 || true
+                WEDGE_MARK[$n]=$(x "$n" "wc -l < $PGLOG" 2>/dev/null | tr -d '[:space:]')
+                WEDGE_MARK[$n]=${WEDGE_MARK[$n]:-0}
+                recovered="$recovered $n"
+            fi
+        done
+        if [ "$(streaming_standbys "$prim")" = 2 ]; then
+            consume_wedge_marks "$prim"
+            ok "$prim has 2 streaming standbys ($ctx, ${waited}s${recovered:+, recovered:$recovered})"
+            return
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    # Out of budget: decide per node by PROGRESS, not by patience. A
+    # node still replaying toward the fork point (e.g. G7's lagging
+    # standby resuming 24 MB of paused replay) has an advancing
+    # replay_lsn and will converge — recloning it wastes a basebackup
+    # and hides nothing. A node that is neither streaming nor advancing
+    # is genuinely stuck and gets the operator path.
     for n in db0 db1 db2; do
         [ "$n" = "$prim" ] && continue
+        case " $recovered " in *" $n "*) continue ;; esac
         if xp "$n" "psql -tAc \"select status from pg_stat_wal_receiver\"" 2>/dev/null | grep -qx streaming; then
             continue
         fi
-        echo "     NOTE: $n not streaming — operator recover ($ctx)"
+        local l1 l2
+        l1=$(xp "$n" "psql -tAc 'select pg_last_wal_replay_lsn()'" 2>/dev/null | tr -d ' ')
+        sleep 3
+        l2=$(xp "$n" "psql -tAc 'select pg_last_wal_replay_lsn()'" 2>/dev/null | tr -d ' ')
+        if [ -n "$l1" ] && [ -n "$l2" ] && [ "$l1" != "$l2" ]; then
+            echo "     NOTE: $n not streaming but replay is advancing ($l1 -> $l2) — letting it converge ($ctx)"
+            continue
+        fi
+        echo "     NOTE: $n not streaming and not advancing — operator recover ($ctx)"
         nid="${n#db}"
         xp "$prim" "pg_agentctl cluster recover --target $nid --stop-target-pg" \
             > "/tmp/recover-$ctx-$nid.log" 2>&1 || true
     done
-    wait_for 180 "$prim has 2 streaming standbys ($ctx, after repair)" \
-        "[ \"\$(docker exec -u postgres pga-$prim psql -tAc \"select count(*) from pg_stat_replication where state='streaming' and application_name <> 'pg_basebackup'\" | tr -d ' ')\" = 2 ]"
+    if wait_for 180 "$prim has 2 streaming standbys ($ctx, after repair)" \
+        "[ \"\$(docker exec -u postgres pga-$prim psql -tAc \"select count(*) from pg_stat_replication where state='streaming' and application_name <> 'pg_basebackup'\" | tr -d ' ')\" = 2 ]"; then
+        consume_wedge_marks "$prim"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -297,8 +355,7 @@ say "G2b: pgpool stays a router — detach neither propagates nor breaks replica
 # territory, exercised by the failover scenarios themselves.
 G2B_TS=$(now_ts)
 xp db0 "pcp_detach_node -h localhost -p 9898 -U pgpool -w -n 2" >/dev/null 2>&1 || true
-sleep 4
-assert "db0's pgpool shows node 2 down" \
+wait_for 15 "db0's pgpool shows node 2 down" \
     "docker exec -u postgres pga-db0 pcp_node_info -h localhost -p 9898 -U pgpool -w -n 2 | grep -q down"
 assert "db1's pgpool still shows node 2 up (no propagation)" \
     "docker exec -u postgres pga-db1 pcp_node_info -h localhost -p 9898 -U pgpool -w -n 2 | grep -q ' up '"
@@ -322,7 +379,8 @@ wait_for 30 "failover hook answered advisory (notify-only, as contracted)" \
     "for n in db0 db1 db2; do docker exec pga-\$n journalctl -u pg_agentd --since '$G3_TS' --no-pager -o cat 2>/dev/null | grep 'failover: advisory' && exit 0; done; exit 1"
 wait_for 60 "the lease promoted a standby" \
     "for n in db1 db2; do docker exec pga-\$n journalctl -u pg_agentd --since '$G3_TS' --no-pager -o cat 2>/dev/null | grep 'promotion complete' && exit 0; done; exit 1"
-sleep 3
+# No settle needed: the winner scan below greps the same journal line
+# the wait_for just matched.
 W1=""
 for n in db1 db2; do
     if log_since "$n" "$G3_TS" 'roleexec: promotion complete'; then W1="$n"; fi
@@ -430,7 +488,10 @@ fi
 
 say "G5b: partition heals — one primary throughout, operator rejoins"
 docker network connect pga-net "pga-$W1" >/dev/null 2>&1
-sleep 5
+# Short settle for the veth to come up before recover dials the healed
+# node's agent; the primary-count check itself needs none (the fenced
+# node's PostgreSQL is verified stopped right below).
+sleep 2
 if [ "$(count_primaries)" = "1" ]; then
     ok "exactly one PostgreSQL primary during and after the partition"
 else
