@@ -69,6 +69,7 @@ pub async fn run_all(cx: &mut Ctx) {
     g5b(cx, w1, w2, &mut marks).await;
     g6(cx, w2).await;
     g7(cx, w2, &mut marks).await;
+    crate::audit::run(cx);
 }
 
 async fn g0(cx: &mut Ctx) {

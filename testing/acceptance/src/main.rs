@@ -12,6 +12,7 @@
 //!   KEEP=1 testing/acceptance.sh       # leave the cluster running
 //!   SKIP_BUILD=1 testing/acceptance.sh # reuse dist/.deb + image
 
+mod audit;
 mod checks;
 mod cluster;
 mod events;

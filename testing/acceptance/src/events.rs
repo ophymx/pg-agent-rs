@@ -31,14 +31,42 @@ pub enum Source {
     Postgres,
 }
 
+/// Drop ANSI CSI escape sequences (`ESC [ ... <final byte>`); any
+/// other lone ESC is dropped too.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for t in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&t) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 pub struct Event {
+    /// Position in the suite-wide stream — the ordering the auditor
+    /// reasons with. Cross-node order is receipt order, which is
+    /// real-time order for live events (tail latency is milliseconds);
+    /// only the initial history replay interleaves arbitrarily across
+    /// nodes, and no audited claim spans two nodes' replayed history.
+    pub seq: usize,
     pub node: &'static str,
     pub source: Source,
     pub line: String,
-    /// Host receipt time. Tail latency is milliseconds; fine for
-    /// second-granularity liveness measurements (e.g. the takeover
-    /// hysteresis gaps), never used as a safety bound.
+    /// Host receipt time. Fine for second-granularity liveness
+    /// measurements (e.g. the takeover hysteresis gaps), never used as
+    /// a safety bound.
     pub at: Instant,
 }
 
@@ -65,8 +93,19 @@ impl EventLog {
         })
     }
 
-    fn append(&self, ev: Event) {
-        self.inner.lock().unwrap().events.push(ev);
+    fn append(&self, mut ev: Event) {
+        // The daemon's tracing formatter styles field NAMES with ANSI
+        // escapes, and journald stores the raw bytes — so a line can
+        // contain `\x1b[3mterm\x1b[0m\x1b[2m=\x1b[0m2`, which no
+        // substring or field parser should have to know about.
+        // Normalize once at ingestion.
+        if ev.line.contains('\x1b') {
+            ev.line = strip_ansi(&ev.line);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        ev.seq = inner.events.len();
+        inner.events.push(ev);
+        drop(inner);
         self.notify.notify_waiters();
     }
 
@@ -172,6 +211,7 @@ impl EventLog {
                         let mut lines = BufReader::new(stdout).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
                             log.append(Event {
+                                seq: 0, // assigned in append
                                 node,
                                 source,
                                 line,
