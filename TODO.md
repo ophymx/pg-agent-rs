@@ -5,7 +5,7 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
-### Quorum commit — make the lease's terms bind writes (designed)
+### ~~Quorum commit — make the lease's terms bind writes~~ — DONE (all four phases)
 
 - **Design:** [docs/quorum-commit.md](docs/quorum-commit.md). The gap:
   terms fence *promotion* flawlessly (the acceptance auditor proves it
@@ -278,6 +278,10 @@ Two related issues around handoff's replication-slot management on the new prima
 ### Replay marker 24h TTL surprises long-gap re-runs (non-handoff ops)
 
 - `crates/pg-agent-core/src/replay_markers.rs`. Handoff moved to `inflight_ops` (7d retention) in 0.6.0. `failover`, `recovery_first_stage`, `cluster_recover` still use 24h replay markers — an operator who re-runs `cluster recover --target N` 25 hours after a successful run will trigger the destructive reclone again. Mitigated by each handler's own state checks (basebackup refuses non-empty pgdata, slot create is duplicate-OK, etc.) so the failure mode is soft. Fix: bump retention to 7 days to match inflight_ops, or migrate these handlers to `inflight_ops` too if the contract grows phased state.
+
+### Peer channel pool: evict on transport error (finding 20)
+
+- `crates/pg-agent-core/src/peers.rs` `client()` — channels are cached with age-based eviction only, so a connection broken by a partition keeps being served until `MAX_CONNECTION_AGE`, and the first RPC after the heal fails with a transport error (observed: G5b's `cluster recover` precheck dying on `http2 error`, leaving the fenced node unrebuilt). tonic redials on the next use, so callers that retry once succeed — but callers shouldn't have to know that. Fix shape: the `PeerChannel` wrapper marks its pool entry dead on tonic transport-class errors (connection refused / h2 gone / broken pipe), so the next `client()` redials; or replace age eviction with a health-checked pool. Cheap and localized.
 
 ### Fence latency: fast shutdown drains walsenders toward `wal_sender_timeout` (finding 17) — urgency drops once quorum commit lands
 

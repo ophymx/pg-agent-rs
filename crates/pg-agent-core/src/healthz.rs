@@ -151,6 +151,26 @@ pub struct ReplicationProbe {
 /// In-memory snapshot fed by the background probe loop and read by the
 /// HTTP handler. `timestamp` is not on the wire — it's used to compute
 /// `snapshot_age_ms` and the stale-gate verdict at request time.
+/// Quorum-commit posture (docs/quorum-commit.md §5), primaries only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncCommitState {
+    /// Standby / role unknown / probe failed — no claim.
+    #[default]
+    #[serde(rename = "n/a")]
+    NotApplicable,
+    /// `synchronous_standby_names` empty: bootstrap pre-first-standby,
+    /// or the operator's allow-async escape hatch. Acknowledged writes
+    /// are single-copy promises while this shows.
+    Disarmed,
+    /// Armed and at least one member standby connected: acknowledged
+    /// commits are on ≥ 2 nodes.
+    Armed,
+    /// Armed with NO member standby connected: commits are hanging.
+    /// This is a page.
+    Blocked,
+}
+
 #[derive(Debug, Clone)]
 pub struct HealthSnapshot {
     pub timestamp: DateTime<Utc>,
@@ -158,6 +178,7 @@ pub struct HealthSnapshot {
     pub postgres: PostgresProbe,
     pub pgpool: PgpoolProbe,
     pub replication: ReplicationProbe,
+    pub sync_commit: SyncCommitState,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,12 +265,39 @@ async fn build_snapshot(
         probe_pgpool(pcp, probe_timeout),
     );
     let (role, postgres, replication) = pg_result;
+    let sync_commit = if role == HealthRole::Primary {
+        probe_sync_commit(db, probe_timeout).await
+    } else {
+        SyncCommitState::NotApplicable
+    };
     HealthSnapshot {
         timestamp: Utc::now(),
         role,
         postgres,
         pgpool: pgpool_probe,
         replication,
+        sync_commit,
+    }
+}
+
+/// Quorum-commit posture on a primary: `disarmed` when
+/// `synchronous_standby_names` is empty, otherwise `armed` iff at
+/// least one member standby is connected — `blocked` means commits
+/// are currently hanging for want of an ack source. Inferred from
+/// state, never probed with a write.
+async fn probe_sync_commit(db: &dyn LocalDb, probe_timeout: Duration) -> SyncCommitState {
+    let names =
+        match tokio::time::timeout(probe_timeout, db.setting("synchronous_standby_names")).await {
+            Ok(Ok(v)) => v,
+            _ => return SyncCommitState::NotApplicable,
+        };
+    if names.trim().is_empty() {
+        return SyncCommitState::Disarmed;
+    }
+    match tokio::time::timeout(probe_timeout, db.connected_standby_names()).await {
+        Ok(Ok(connected)) if !connected.is_empty() => SyncCommitState::Armed,
+        Ok(Ok(_)) => SyncCommitState::Blocked,
+        _ => SyncCommitState::NotApplicable,
     }
 }
 
@@ -380,6 +428,7 @@ struct HealthBody {
     postgres: PostgresProbe,
     pgpool: PgpoolProbe,
     replication: ReplicationProbe,
+    sync_commit: SyncCommitState,
 }
 
 /// Pure verdict + body builder — tests call this directly without
@@ -399,6 +448,7 @@ fn compute_health(
                 postgres: PostgresProbe::default(),
                 pgpool: PgpoolProbe::default(),
                 replication: ReplicationProbe::default(),
+                sync_commit: SyncCommitState::NotApplicable,
             },
         );
     };
@@ -422,6 +472,7 @@ fn compute_health(
         postgres: s.postgres.clone(),
         pgpool: s.pgpool.clone(),
         replication: s.replication.clone(),
+        sync_commit: s.sync_commit,
     };
     (status, body)
 }
@@ -442,6 +493,7 @@ async fn handle_healthz(State(state): State<HealthState>) -> Response {
             postgres: PostgresProbe::default(),
             pgpool: PgpoolProbe::default(),
             replication: ReplicationProbe::default(),
+            sync_commit: SyncCommitState::NotApplicable,
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
@@ -545,6 +597,12 @@ mod tests {
         async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
+        async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
         async fn is_in_recovery(&self) -> anyhow::Result<bool> {
             match self.in_recovery.lock().unwrap().clone() {
                 Ok(v) => Ok(v),
@@ -579,7 +637,9 @@ mod tests {
             unreachable!()
         }
         async fn setting(&self, _: &str) -> anyhow::Result<String> {
-            unreachable!()
+            // The sync-commit probe reads synchronous_standby_names on
+            // primaries; empty = disarmed is the neutral answer.
+            Ok(String::new())
         }
         async fn extension_exists(&self, _: &str) -> anyhow::Result<bool> {
             unreachable!()
@@ -770,6 +830,7 @@ mod tests {
                 ],
             },
             replication: ReplicationProbe::default(),
+            sync_commit: SyncCommitState::Armed,
         })
     }
 

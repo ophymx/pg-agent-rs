@@ -128,6 +128,12 @@ message GetInflightOpRequest {
   string id = 1; // min_len 1
 }
 
+// The quorum-commit escape hatch (docs/quorum-commit.md §5): clears
+// synchronous_standby_names on the current primary so commits stop
+// requiring a standby ack. Journaled; the executor re-arms the moment
+// a standby attaches. There is deliberately no permanent-async knob.
+message AllowAsyncRequest {}
+
 message AbandonInflightOpRequest {
   string id     = 1; // min_len 1
   string reason = 2; // free-form operator note; preserved in last_error
@@ -263,4 +269,9 @@ service PgAgentLocal {
   rpc GetInflightOp     (GetInflightOpRequest)     returns (InflightOp);
   rpc AbandonInflightOp (AbandonInflightOpRequest) returns (OpResult);
   rpc ResumeInflightOp  (ResumeInflightOpRequest)  returns (OpResult);
+
+  // Operator escape hatch: disarm quorum commit on the current primary
+  // (emergency writes with no standby available). Journaled; auto
+  // re-armed on the next standby attach. See AllowAsyncRequest.
+  rpc AllowAsync (AllowAsyncRequest) returns (OpResult);
 }

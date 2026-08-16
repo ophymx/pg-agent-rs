@@ -43,25 +43,89 @@ async fn pcp_backends_up(node: &str) -> usize {
         .count()
 }
 
+/// Commit a sentinel row on `node` — the write whose survival the
+/// scenario asserts after the induced failure. With quorum commit
+/// armed, the acknowledgment itself proves the row is on ≥ 2 nodes
+/// (docs/quorum-commit.md §3); this returning at all is part of the
+/// test.
+async fn write_sentinel(cx: &mut Ctx, node: &'static str, label: &str) {
+    let res = cx
+        .pg
+        .execute(
+            node,
+            &format!(
+                "create table if not exists sentinel(label text primary key, at timestamptz); \
+                 insert into sentinel(label, at) values ('{label}', now()) \
+                 on conflict (label) do update set at = now()"
+            ),
+        )
+        .await;
+    cx.check(
+        &format!("sentinel '{label}' committed on {node} (quorum-acked)"),
+        res.is_ok(),
+    );
+}
+
+/// The suite's data-survival assertion: an ACKNOWLEDGED write from
+/// before the failure must exist on the post-failover primary. Before
+/// quorum commit, nothing asserted this — a lost sentinel was exactly
+/// the acknowledged-write loss findings 17/18 priced.
+async fn check_sentinel(cx: &mut Ctx, node: &'static str, label: &str) {
+    let found = cx
+        .pg
+        .scalar(
+            node,
+            &format!("select count(*)::text from sentinel where label = '{label}'"),
+        )
+        .await;
+    cx.check(
+        &format!("sentinel '{label}' survived onto {node} (acked write not lost)"),
+        found.as_deref().map(|v| v == "1").unwrap_or(false),
+    );
+}
+
+/// Healthz-reported quorum-commit posture on `node`.
+async fn sync_commit_state(node: &str) -> String {
+    exec(node, "curl -sf localhost:9702/healthz")
+        .await
+        .ok()
+        .and_then(|body| {
+            body.split("\"sync_commit\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 async fn cluster_recover(cx: &Ctx, via: &str, target: &str) {
-    let res = exec_pg(
-        via,
-        &format!(
-            "pg_agentctl cluster recover --target {} --stop-target-pg",
-            node_id(target)
-        ),
-    )
-    .await;
-    // A failed recover is not itself an assert (the convergence checks
-    // downstream fail the suite), but a silent one costs an hour of
-    // journal forensics — surface the tail.
-    if let Err(e) = res {
-        let text = e.to_string();
-        let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let tail = tail[tail.len().saturating_sub(3)..].join(" | ");
-        cx.note(&format!(
-            "cluster recover of {target} via {via} FAILED: {tail}"
-        ));
+    // One retry after a pause, like the operator it models: the first
+    // RPC after a partition heals can ride a cached-but-broken peer
+    // channel (finding 20 — the pool evicts by age, not on error) and
+    // fail with a transport error; tonic redials underneath and the
+    // retry succeeds.
+    for attempt in 0..2 {
+        match exec_pg(
+            via,
+            &format!(
+                "pg_agentctl cluster recover --target {} --stop-target-pg",
+                node_id(target)
+            ),
+        )
+        .await
+        {
+            Ok(_) => return,
+            Err(e) => {
+                let text = e.to_string();
+                let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let tail = tail[tail.len().saturating_sub(3)..].join(" | ");
+                cx.note(&format!(
+                    "cluster recover of {target} via {via} failed (attempt {}): {tail}",
+                    attempt + 1
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -209,6 +273,15 @@ async fn g1b(cx: &mut Ctx) {
             .unwrap_or(false)
     })
     .await;
+    // Quorum commit arms at the first-standby-attached event
+    // (docs/quorum-commit.md §5) — by now both standbys stream, so the
+    // executor's next probe must have armed ANY 1.
+    cx.wait_until(
+        30,
+        "db0: quorum commit armed (healthz sync_commit)",
+        || async { sync_commit_state("db0").await == "armed" },
+    )
+    .await;
 }
 
 async fn g2(cx: &mut Ctx) {
@@ -265,6 +338,7 @@ async fn g2b(cx: &mut Ctx) {
 
 async fn g3(cx: &mut Ctx) -> &'static str {
     cx.say("G3: primary death — hook advises, the lease decides, pgpool discovers");
+    write_sentinel(cx, "db0", "g3").await;
     let since = cx.log.cursor();
     let _ = exec("db0", "systemctl stop postgresql@17-main").await;
     cx.await_event(
@@ -335,6 +409,13 @@ async fn g3(cx: &mut Ctx) -> &'static str {
         || async move { pcp_node_info(w1, wid).await.contains(" up ") },
     )
     .await;
+    check_sentinel(cx, w1, "g3").await;
+    cx.wait_until(
+        60,
+        &format!("{w1}: quorum commit re-armed after the failover"),
+        || async move { sync_commit_state(w1).await == "armed" },
+    )
+    .await;
     w1
 }
 
@@ -377,6 +458,7 @@ async fn g4b(cx: &mut Ctx, w1: &'static str, marks: &mut HashMap<&'static str, C
 
 async fn g5(cx: &mut Ctx, w1: &'static str) -> &'static str {
     cx.say("G5: partition of the holder — fence + one takeover + one primary");
+    write_sentinel(cx, w1, "g5").await;
     let since = cx.log.cursor();
     cluster::network_disconnect(w1).await;
     cx.say(&format!(
@@ -478,6 +560,7 @@ async fn g5b(
     repair_standbys(cx, w2, "g5", marks).await;
     let primaries = cx.pg.count_primaries().await;
     cx.check("exactly one primary after the rejoin", primaries == 1);
+    check_sentinel(cx, w2, "g5").await;
 }
 
 async fn g6(cx: &mut Ctx, w2: &'static str) {
@@ -607,6 +690,7 @@ async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cu
         },
     )
     .await;
+    write_sentinel(cx, w2, "g7").await;
     let since = cx.log.cursor();
     let _ = exec(w2, "systemctl stop postgresql@17-main").await;
     cx.await_event(
@@ -656,6 +740,7 @@ async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cu
         "exactly one primary after the lag-gated failover + rejoin",
         primaries == 1,
     );
+    check_sentinel(cx, actual, "g7").await;
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —
@@ -738,6 +823,18 @@ async fn repair_standbys(
             .await
             .unwrap_or_default();
         if receiver == "streaming" {
+            continue;
+        }
+        // A node whose PostgreSQL is not even answering is the
+        // operator-path case, full stop — no gate applies. (A fenced
+        // node with a STALE follow event once slipped past the
+        // follow-gate below and was never rebuilt.)
+        if cx.pg.is_in_recovery(n).await.is_none() {
+            cx.note(&format!(
+                "{n} PostgreSQL unreachable — operator recover ({ctxname})"
+            ));
+            cluster_recover(cx, prim, n).await;
+            marks.insert(n, cx.log.cursor());
             continue;
         }
         // Executor re-pointed this node since its last proven

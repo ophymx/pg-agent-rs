@@ -423,3 +423,17 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     severing the standby's walreceiver path (PG port only — the agent
     stays reachable so the node still participates in candidacy and
     the lag gate is what refuses it).
+
+20. **The peer channel pool serves a partition-broken connection until
+    it ages out — the first RPC after a heal fails.** The pool evicts
+    cached channels by `MAX_CONNECTION_AGE` only, never on error, so
+    G5b's `cluster recover` of the healed ex-holder died on
+    "peer get_status: http2 error" from the stale channel, the node
+    was never rebuilt, and three scenarios cascaded. tonic redials
+    underneath on the NEXT use, so a single retry succeeds — the
+    harness's `cluster_recover` now retries once (as the operator it
+    models would), and the repair fallback recovers any node whose
+    PostgreSQL is unreachable instead of letting a stale follow event
+    shield it. Product follow-up in TODO.md: evict (or probation-mark)
+    a pooled channel on transport error so post-heal first-RPCs stop
+    paying the broken-connection tax.

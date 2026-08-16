@@ -815,6 +815,17 @@ absence. With `shadow = false`:
 
 - Winning a takeover → journaled promotion (`inflight_ops` `promote`
   op), `pg_promote(false)` + a poll bounded by `leader_ttl`.
+- Holding as primary → **quorum-commit convergence**
+  (docs/quorum-commit.md): `synchronous_standby_names = ANY 1
+  (members minus self)` armed at the first-standby-attached event and
+  repaired on membership drift — never auto-disarmed; the operator's
+  `cluster allow-async --confirm` (journaled) is the only disarm, and
+  the next attach re-arms over it. Acknowledging a commit thereby
+  requires a standby that follows the lease: a deposed primary's
+  commits hang unacknowledged the moment its standbys re-point,
+  independent of fence latency. `/healthz` reports `sync_commit:
+  armed|disarmed|blocked|n/a` (`blocked` = armed with no connected
+  standby — commits hanging — a page).
 - Holding as primary → **pgpool self-attach convergence** (finding 16):
   a probe — spawned off the tick, single-flight, 10 s cadence — reads
   the local pgpool's map and re-attaches this node's own backend if

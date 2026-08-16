@@ -110,6 +110,22 @@ pub trait LocalDb: Send + Sync {
     /// `SHOW`-equivalent. Empty string + Ok(_) when the setting doesn't exist.
     async fn setting(&self, name: &str) -> anyhow::Result<String>;
 
+    /// `ALTER SYSTEM SET synchronous_standby_names = '<value>'` +
+    /// `pg_reload_conf()` (SIGHUP-context GUC — no restart). The
+    /// quorum-commit arm/disarm primitive (docs/quorum-commit.md §6):
+    /// the executor writes `ANY 1 (<members minus self>)` on the
+    /// primary; `""` is the operator's `allow-async` escape hatch.
+    /// The caller builds the value from validated slot names; this
+    /// method refuses quote/control characters as defense in depth.
+    async fn set_synchronous_standby_names(&self, value: &str) -> anyhow::Result<()>;
+
+    /// `application_name`s of member standbys currently connected via
+    /// walsender (`pg_stat_replication`, names matching the `node{id}`
+    /// convention — `pg_basebackup`'s stream never matches). The
+    /// "first standby attached" arming event reads this; healthz uses
+    /// it to distinguish `armed` from `blocked`.
+    async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>>;
+
     async fn extension_exists(&self, name: &str) -> anyhow::Result<bool>;
     async fn role_exists(&self, name: &str) -> anyhow::Result<bool>;
 
@@ -406,6 +422,47 @@ impl LocalDb for PgLocalDb {
             })?;
         let v: Option<String> = row.get(0);
         Ok(v.unwrap_or_default())
+    }
+
+    async fn set_synchronous_standby_names(&self, value: &str) -> anyhow::Result<()> {
+        // ALTER SYSTEM takes no bind parameters; the value is inlined
+        // inside single quotes, so anything that could escape them is
+        // refused. Callers build it from slot names (`[a-z0-9_]`), so
+        // this never fires in practice.
+        if value.contains('\'') || value.contains('\\') || value.contains(char::is_control) {
+            anyhow::bail!("synchronous_standby_names value contains forbidden characters");
+        }
+        let conn = self.get_conn().await?;
+        conn.execute(
+            &format!("ALTER SYSTEM SET synchronous_standby_names = '{value}'"),
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "localdb: alter system set synchronous_standby_names: {}",
+                describe_pg(&e)
+            )
+        })?;
+        conn.execute("SELECT pg_reload_conf()", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_reload_conf: {}", describe_pg(&e)))?;
+        Ok(())
+    }
+
+    async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.get_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT DISTINCT application_name FROM pg_stat_replication \
+                 WHERE application_name ~ '^node[0-9]+$'",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("localdb: connected_standby_names: {}", describe_pg(&e))
+            })?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
     async fn extension_exists(&self, name: &str) -> anyhow::Result<bool> {

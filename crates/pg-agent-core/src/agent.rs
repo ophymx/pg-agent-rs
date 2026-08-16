@@ -992,6 +992,12 @@ mod tests {
         async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
+        async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             Ok(())
         }

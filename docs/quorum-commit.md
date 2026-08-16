@@ -1,11 +1,17 @@
 # Quorum commit: making the lease's terms bind writes
 
-**Status:** phases 1–2 implemented (`application_name` in
+**Status:** implemented, all four phases. 1–2: `application_name` in
 `primary_conninfo`, `last_flush_lsn` in `NodeStatus`,
 `LocalDb::flush_lsn`, candidacy on flush positions, G7 reworked to
-flush lag). Phases 3–4 (executor arms `ANY 1`, healthz tri-state,
-escape hatch, sentinel write-survival asserts) not yet implemented;
-TODO.md tracks them.
+flush lag. 3: the executor arms `ANY 1 (members minus self)` at the
+first-standby-attached event, repairs membership drift, never writes
+the empty string; `/healthz` reports `sync_commit:
+armed|disarmed|blocked|n/a`; `pg_agentctl cluster allow-async
+--confirm` is the journaled escape hatch, auto-re-armed on the next
+attach. 4: the acceptance suite commits a sentinel row before every
+induced failure (G3, G5, G7) and asserts it exists on the
+post-failover primary — the suite's first data-survival assertions —
+plus armed-state checks after bootstrap and after failovers.
 
 ## 1. The gap this closes
 

@@ -91,6 +91,11 @@ use crate::peers::PeerRegistry;
 /// the healthz snapshotter's ~1 s `pcp_node_info` cadence in cost.
 const SELF_ATTACH_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often a primary holder re-checks quorum-commit convergence
+/// (docs/quorum-commit.md §5-6). Same reasoning as the self-attach
+/// cadence; a promotion forces an immediate check regardless.
+const SYNC_ARM_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Executes [`HaDecision`]s against the local instance.
 pub struct RoleExecutor {
     instance: Arc<dyn PostgresInstance>,
@@ -122,6 +127,8 @@ pub struct RoleExecutor {
     /// When the last self-attach probe was *spawned* (not when it
     /// finished) — the rate limit is on spawn cadence.
     self_attach_last_probe: Mutex<Option<Instant>>,
+    /// Rate limit for the quorum-commit convergence check.
+    sync_arm_last_probe: Mutex<Option<Instant>>,
 }
 
 impl RoleExecutor {
@@ -146,6 +153,7 @@ impl RoleExecutor {
             confirmed_upstream: Mutex::new(None),
             self_attach_in_flight: Arc::new(AtomicBool::new(false)),
             self_attach_last_probe: Mutex::new(None),
+            sync_arm_last_probe: Mutex::new(None),
         }
     }
 
@@ -180,6 +188,7 @@ impl RoleExecutor {
                 // Primary steady state; any remembered upstream is
                 // stale the moment we hold the lease as primary.
                 *self.confirmed_upstream.lock().unwrap() = None;
+                self.ensure_quorum_commit(false).await;
                 self.ensure_self_attached();
             }
 
@@ -238,6 +247,9 @@ impl RoleExecutor {
                 // In a pgpool-routed deployment, self-attach is part of
                 // what "promote" means (finding 16) — and the holder's
                 // steady-state ticks keep converging it afterwards.
+                // Likewise quorum commit: arm as soon as evidence
+                // allows, forced past the rate limit.
+                self.ensure_quorum_commit(true).await;
                 self.ensure_self_attached();
             }
             Err(e) => {
@@ -300,6 +312,78 @@ impl RoleExecutor {
             InstanceState::Down => {}
             // No evidence, no action.
             InstanceState::Unknown => {}
+        }
+    }
+
+    /// Converge quorum commit on this primary (docs/quorum-commit.md
+    /// §5-6): arm `synchronous_standby_names = ANY 1 (members minus
+    /// self)` at the first-standby-attached event, and repair
+    /// membership drift in an already-armed value. NEVER writes the
+    /// empty string — disarming is the operator's `allow-async` escape
+    /// hatch alone, and the next standby attach re-arms over it.
+    ///
+    /// Inline on the tick like `observe_local`'s queries (bounded
+    /// local SQL), rate-limited to [`SYNC_ARM_PROBE_INTERVAL`];
+    /// `force` (post-promotion) skips the rate limit so a fresh
+    /// primary arms as soon as evidence allows.
+    async fn ensure_quorum_commit(&self, force: bool) {
+        {
+            let mut last = self.sync_arm_last_probe.lock().unwrap();
+            if !force {
+                if let Some(t) = *last {
+                    if t.elapsed() < SYNC_ARM_PROBE_INTERVAL {
+                        return;
+                    }
+                }
+            }
+            *last = Some(Instant::now());
+        }
+        let mut others: Vec<String> = self
+            .pool
+            .members
+            .iter()
+            .filter(|n| n.id != self.pool.local_node_id)
+            .map(|n| n.slot_name())
+            .collect();
+        if others.is_empty() {
+            return; // single-node pool: quorum commit has no quorum
+        }
+        others.sort();
+        let desired = format!("ANY 1 ({})", others.join(", "));
+        let current = match self.instance.sync_standby_names().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(err = %e, "roleexec: sync_standby_names read failed; retrying next probe");
+                return;
+            }
+        };
+        if current == desired {
+            return; // armed and converged
+        }
+        if current.is_empty() {
+            // Disarmed (bootstrap, or operator allow-async). Arm only
+            // on the first-standby-attached EVENT: arming with nobody
+            // connected would hang every commit before a follower can
+            // possibly exist (e.g. mid cluster-init, before the first
+            // basebackup child comes up).
+            match self.instance.connected_member_standbys().await {
+                Ok(names) if !names.is_empty() => {}
+                Ok(_) => return, // nobody attached yet — stay disarmed
+                Err(e) => {
+                    debug!(err = %e, "roleexec: connected_member_standbys failed; retrying");
+                    return;
+                }
+            }
+        }
+        // Arm, or repair membership drift in an armed value.
+        match self.instance.set_sync_standby_names(&desired).await {
+            Ok(()) => info!(
+                value = %desired,
+                was = %current,
+                "roleexec: quorum commit ARMED — acknowledged commits now require a \
+                 lease-following standby (docs/quorum-commit.md)"
+            ),
+            Err(e) => warn!(err = %e, "roleexec: arming quorum commit failed; retrying next probe"),
         }
     }
 
@@ -412,6 +496,10 @@ mod tests {
         state: StdMutex<InstanceState>,
         calls: StdMutex<Vec<String>>,
         promote_fails: bool,
+        /// Scripted `synchronous_standby_names` GUC; set_sync writes it.
+        sync_names: StdMutex<String>,
+        /// Scripted `pg_stat_replication` member application_names.
+        connected: StdMutex<Vec<String>>,
     }
 
     impl ScriptedInstance {
@@ -420,6 +508,8 @@ mod tests {
                 state: StdMutex::new(state),
                 calls: StdMutex::new(Vec::new()),
                 promote_fails: false,
+                sync_names: StdMutex::new(String::new()),
+                connected: StdMutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> Vec<String> {
@@ -454,6 +544,17 @@ mod tests {
         }
         async fn rebuild_as_standby(&self, _: &UpstreamSpec) -> anyhow::Result<()> {
             panic!("v1 executor must never rebuild — demote policy is operator rejoin");
+        }
+        async fn sync_standby_names(&self) -> anyhow::Result<String> {
+            Ok(self.sync_names.lock().unwrap().clone())
+        }
+        async fn set_sync_standby_names(&self, value: &str) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("set_sync:{value}"));
+            *self.sync_names.lock().unwrap() = value.to_string();
+            Ok(())
+        }
+        async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>> {
+            Ok(self.connected.lock().unwrap().clone())
         }
     }
 
@@ -897,6 +998,82 @@ mod tests {
         drain_self_attach(&f).await;
         assert!(f.pcp.attach_calls.lock().unwrap().is_empty());
         assert!(f.instance.calls().is_empty());
+    }
+
+    // ----- quorum commit arming (docs/quorum-commit.md §5-6) ---------------
+
+    #[tokio::test]
+    async fn holder_arms_quorum_commit_when_first_standby_attaches() {
+        let f = fixture(0, InstanceState::Primary);
+        f.instance.connected.lock().unwrap().push("node1".into());
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        assert!(
+            f.instance
+                .calls()
+                .contains(&"set_sync:ANY 1 (node1, node2)".to_string()),
+            "first attach must arm ANY 1 over the other members: {:?}",
+            f.instance.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn holder_stays_disarmed_until_a_standby_attaches() {
+        // Bootstrap shape: no follower exists yet — arming now would
+        // hang every commit before a follower could possibly attach.
+        let f = fixture(0, InstanceState::Primary);
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        assert!(
+            !f.instance.calls().iter().any(|c| c.starts_with("set_sync")),
+            "must not arm with nobody attached: {:?}",
+            f.instance.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn holder_repairs_membership_drift_in_an_armed_value() {
+        // Already armed (e.g. inherited via basebackup from the old
+        // primary — names include self, exclude the old primary):
+        // rewrite to the correct set WITHOUT requiring a fresh attach.
+        let f = fixture(0, InstanceState::Primary);
+        *f.instance.sync_names.lock().unwrap() = "ANY 1 (node0, node2)".into();
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        assert!(
+            f.instance
+                .calls()
+                .contains(&"set_sync:ANY 1 (node1, node2)".to_string()),
+            "armed-but-drifted names must be repaired: {:?}",
+            f.instance.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn armed_and_converged_is_a_no_op() {
+        let f = fixture(0, InstanceState::Primary);
+        *f.instance.sync_names.lock().unwrap() = "ANY 1 (node1, node2)".into();
+        f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
+        assert!(
+            !f.instance.calls().iter().any(|c| c.starts_with("set_sync")),
+            "converged value must not be rewritten: {:?}",
+            f.instance.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_forces_an_immediate_arming_check() {
+        let f = fixture(1, InstanceState::Standby { streaming: true });
+        f.instance.connected.lock().unwrap().push("node2".into());
+        f.exec
+            .apply(&HaDecision::TookOver {
+                term: 2,
+                already_primary: false,
+            })
+            .await;
+        let calls = f.instance.calls();
+        assert!(calls.contains(&"promote".to_string()));
+        assert!(
+            calls.contains(&"set_sync:ANY 1 (node0, node2)".to_string()),
+            "promotion must arm as soon as evidence allows: {calls:?}"
+        );
     }
 
     #[tokio::test]

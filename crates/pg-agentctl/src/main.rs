@@ -170,6 +170,21 @@ enum ClusterCmd {
         #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
+    /// EMERGENCY: disarm quorum commit on the current primary
+    /// (clears synchronous_standby_names) so commits stop waiting for
+    /// a standby ack. Use only when no standby can be brought back
+    /// and the business accepts single-copy writes. Journaled (`ops
+    /// list` shows the disarm); the agent re-arms automatically the
+    /// moment a standby attaches; /healthz shows
+    /// sync_commit=disarmed until then.
+    AllowAsync {
+        /// Required: acknowledge that acknowledged writes become
+        /// single-copy promises until a standby attaches.
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
     // v1.x roadmap items (placeholders so the surface is reserved):
     // Pause      — set cluster paused=true via shared-state RPC
     // Resume     — clear pause flag
@@ -227,6 +242,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
                 allow_lag,
                 config,
             } => cluster_handoff(config, target, allow_lag, cli.socket.as_deref(), cli.json).await,
+            ClusterCmd::AllowAsync { confirm, config } => {
+                cluster_allow_async(config, confirm, cli.socket.as_deref(), cli.json).await
+            }
         },
     }
 }
@@ -420,6 +438,44 @@ async fn cluster_recover(
 /// daemon resolves the local node as the current primary and refuses
 /// if it's a standby. Same wire shape as `cluster recover` — JSON or
 /// human-readable output, exit code reflects `resp.ok`.
+async fn cluster_allow_async(
+    config_path: PathBuf,
+    confirm: bool,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::AllowAsyncRequest;
+
+    if !confirm {
+        eprintln!(
+            "allow-async disarms quorum commit: until a standby attaches, every \
+             acknowledged write exists on ONE node only and dies with it. \
+             Re-run with --confirm to proceed."
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .allow_async(AllowAsyncRequest {})
+        .await
+        .map_err(|s| rpc_failed("AllowAsync", s))?
+        .into_inner();
+    if json {
+        let payload = serde_json::json!({ "ok": resp.ok, "message": resp.message });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if resp.ok {
+        println!("OK: {}", resp.message);
+    } else {
+        eprintln!("cluster allow-async: {}", resp.message);
+    }
+    if resp.ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
 async fn cluster_handoff(
     config_path: PathBuf,
     target: i32,

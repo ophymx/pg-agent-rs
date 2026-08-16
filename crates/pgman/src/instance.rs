@@ -142,6 +142,19 @@ pub trait PostgresInstance: Send + Sync {
     /// convergence loop — poll [`Self::state`] for
     /// `Standby { streaming: true }`.
     async fn rebuild_as_standby(&self, upstream: &UpstreamSpec) -> anyhow::Result<()>;
+
+    /// Current `synchronous_standby_names` value ("" = quorum commit
+    /// disarmed). See docs/quorum-commit.md §5-6.
+    async fn sync_standby_names(&self) -> anyhow::Result<String>;
+
+    /// Write `synchronous_standby_names` (+ reload). The executor's
+    /// quorum-commit arm/converge primitive; `""` is written only by
+    /// the operator's allow-async path, never by the executor.
+    async fn set_sync_standby_names(&self, value: &str) -> anyhow::Result<()>;
+
+    /// `application_name`s of member standbys currently connected via
+    /// walsender — the "first standby attached" arming event.
+    async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +320,18 @@ impl PostgresInstance for Instance {
             .await
             .map_err(|e| anyhow::anyhow!("rebuild: start: {e}"))
     }
+
+    async fn sync_standby_names(&self) -> anyhow::Result<String> {
+        self.db.setting("synchronous_standby_names").await
+    }
+
+    async fn set_sync_standby_names(&self, value: &str) -> anyhow::Result<()> {
+        self.db.set_synchronous_standby_names(value).await
+    }
+
+    async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>> {
+        self.db.connected_standby_names().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +408,12 @@ mod tests {
         }
         async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
             Ok(false)
+        }
+        async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
         }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             unreachable!()

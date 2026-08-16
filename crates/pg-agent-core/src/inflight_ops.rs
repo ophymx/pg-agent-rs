@@ -179,6 +179,15 @@ pub enum InflightPayload {
         /// entry to the exact CAS win that authorized it.
         term: u64,
     },
+    /// The operator's quorum-commit escape hatch
+    /// (docs/quorum-commit.md §5): synchronous_standby_names cleared
+    /// on this primary. Journaled for incident review — the window in
+    /// which acknowledged writes were single-copy promises is exactly
+    /// this op's begin → the executor's next re-arm. Owns no node.
+    AllowAsync {
+        /// The primary the operator disarmed (always the local node).
+        node_id: i32,
+    },
 }
 
 impl InflightPayload {
@@ -190,6 +199,7 @@ impl InflightPayload {
             Self::FollowPrimary { .. } => "follow_primary",
             Self::Recovery { .. } => "recovery",
             Self::Promote { .. } => "promote",
+            Self::AllowAsync { .. } => "allow_async",
         }
     }
 
@@ -215,6 +225,7 @@ impl InflightPayload {
                 ..
             } => format!("primary={primary_node_id},standby={standby_node_id}"),
             Self::Promote { node_id, term } => format!("node={node_id},term={term}"),
+            Self::AllowAsync { node_id } => format!("node={node_id}"),
         }
     }
 
@@ -232,6 +243,7 @@ impl InflightPayload {
                 standby_node_id, ..
             } => Some(*standby_node_id),
             Self::Promote { .. } => None,
+            Self::AllowAsync { .. } => None,
         }
     }
 }

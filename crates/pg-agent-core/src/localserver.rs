@@ -36,10 +36,10 @@ use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
-    AbandonInflightOpRequest, ClusterHandoffRequest, ClusterInitRequest, ClusterInitResponse,
-    ClusterInitStandbyResult, ClusterRecoverRequest, ClusterStatusEntry, ClusterStatusRequest,
-    ClusterStatusResponse, EscalationRequest, FailoverRequest, FollowPrimaryRequest,
-    GetInflightOpRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
+    AbandonInflightOpRequest, AllowAsyncRequest, ClusterHandoffRequest, ClusterInitRequest,
+    ClusterInitResponse, ClusterInitStandbyResult, ClusterRecoverRequest, ClusterStatusEntry,
+    ClusterStatusRequest, ClusterStatusResponse, EscalationRequest, FailoverRequest,
+    FollowPrimaryRequest, GetInflightOpRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
     GetPgpoolBackendsResponse, GetStatusRequest, InflightOp as ProtoInflightOp,
     ListInflightOpsRequest, ListInflightOpsResponse, ListMaintenanceRequest,
     ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
@@ -1735,6 +1735,63 @@ impl PgAgentLocal for LocalServer {
         }))
     }
 
+    /// The quorum-commit escape hatch (docs/quorum-commit.md §5):
+    /// clear `synchronous_standby_names` on the current primary so
+    /// commits stop requiring a standby ack. Journaled in
+    /// `inflight_ops` for incident review — the executor re-arms at
+    /// the next standby attach, which is what ends the window.
+    async fn allow_async(
+        &self,
+        _req: Request<AllowAsyncRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        match self.db.is_in_recovery().await {
+            Ok(false) => {}
+            Ok(true) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: "allow-async: local node is not the primary (in recovery); \
+                              run this on the current primary"
+                        .into(),
+                }));
+            }
+            Err(e) => {
+                return Err(internal(anyhow::anyhow!(
+                    "allow-async: is_in_recovery: {e}"
+                )));
+            }
+        }
+        let op = self
+            .inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::AllowAsync {
+                    node_id: self.node_pool.local_node_id,
+                },
+                "disarming",
+                false,
+            )
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("allow-async: journal begin: {e}")))?;
+        if let Err(e) = self.db.set_synchronous_standby_names("").await {
+            let _ = self.inflight.abandon(&op.id, &e.to_string()).await;
+            return Err(internal(anyhow::anyhow!("allow-async: disarm: {e}")));
+        }
+        if let Err(e) = self.inflight.complete(&op.id).await {
+            warn!(?e, id = %op.id, "allow-async: journal complete failed");
+        }
+        warn!(
+            id = %op.id,
+            "allow-async: QUORUM COMMIT DISARMED by operator — acknowledged writes are \
+             single-copy promises until a standby attaches and the executor re-arms"
+        );
+        Ok(Response::new(OpResult {
+            ok: true,
+            message: "quorum commit disarmed (synchronous_standby_names cleared). The \
+                      executor re-arms automatically when a standby attaches; /healthz \
+                      shows sync_commit=disarmed until then."
+                .into(),
+        }))
+    }
+
     async fn resume_inflight_op(
         &self,
         req: Request<ResumeInflightOpRequest>,
@@ -1784,6 +1841,18 @@ impl PgAgentLocal for LocalServer {
                     op.id
                 ),
             })),
+            // Allow-async is a single applied action; the "resume" of
+            // its state is the executor re-arming on standby attach.
+            crate::inflight_ops::InflightPayload::AllowAsync { .. } => {
+                Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "op {} is an allow-async disarm; nothing to resume — the \
+                         executor re-arms quorum commit when a standby attaches",
+                        op.id
+                    ),
+                }))
+            }
             crate::inflight_ops::InflightPayload::Recovery {
                 standby_node_id, ..
             } => Ok(Response::new(OpResult {
@@ -3474,6 +3543,12 @@ mod tests {
         }
         async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
             Ok(self.slot_is_active.load(Ordering::SeqCst))
+        }
+        async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
         }
         async fn flush_lsn(&self) -> anyhow::Result<u64> {
             Ok(self.current_wal_lsn.load(Ordering::SeqCst))
