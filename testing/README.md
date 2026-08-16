@@ -95,9 +95,41 @@ above.
 
 ## Still planned
 
-- `detach_false_primary` storm behavior (hook-contract §5.5), which
-  needs a false primary manufactured out of band.
-- `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
+Failure-coverage gaps, roughly ordered by expected bug yield (the
+suite today covers clean, single, scripted failures on an idle
+cluster; the discovery rate on new probes says these will pay):
+
+1. **Holder AGENT death with PostgreSQL healthy** (`kill -9
+   pg_agentd`, no restart): the one deposal path with no fence — the
+   design's answer is ack starvation once the standbys re-point, which
+   has never been observed. Highest value.
+2. **Crash-shape death** (SIGKILL the postmaster): no shutdown
+   checkpoint, none of the log events the harness and auditor key on,
+   crash recovery on rejoin.
+3. **Full-cluster cold restart of an ESTABLISHED cluster** (the site
+   power blip): persisted lease in the raft store, three phantom
+   checks racing, executors reconciling stale roles. G0/G1 only cover
+   greenfield boot.
+4. **Write load through the failover**: a continuous ledger upgrades
+   data-survival from "one at-rest sentinel survived" to "every
+   acknowledged row survived" (the actual quorum-commit invariant),
+   and lets the deposed primary's hanging-commit behavior be OBSERVED
+   rather than assumed.
+5. **Built-but-never-entered states**: `sync_commit=blocked` (both
+   standbys down → commits hang → recover → unblock), the
+   `allow-async` disarm/auto-re-arm lifecycle, and a deliberately
+   provoked `follow_wedged` to prove the tripwire fires.
+6. **Asymmetric / partial partitions** (A-sees-B-not-vice-versa;
+   agent-mesh-up-PG-mesh-down and inverse) — finding 18's class,
+   found by accident once.
+7. **Double faults + soak**: primary death mid-rebuild of the only
+   other standby; agent restart during basebackup; an N-cycle
+   failover loop (slot debris, timeline growth, term growth, leaks);
+   disk-full on the WAL partition; raft-store deletion recovery
+   (documented as rm-and-re-replicate, never exercised).
+8. `detach_false_primary` storm behavior (hook-contract §5.5), which
+   needs a false primary manufactured out of band.
+9. `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
 
 ## Findings log
 
