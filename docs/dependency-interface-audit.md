@@ -1,9 +1,17 @@
 # Dependency-interface audit — readiness for the HA loop
 
-**Status:** scoping companion to
+**Status: HISTORICAL.** Scoping companion to
 [promotion-authority.md](promotion-authority.md) and
-[pgpool-hook-contract.md](pgpool-hook-contract.md). Audited 2026-08 at
-workspace v0.7.3. Nothing here is implemented; line numbers will drift.
+[pgpool-hook-contract.md](pgpool-hook-contract.md), audited 2026-08 at
+workspace v0.7.3 BEFORE implementation. Everything it scoped has since
+landed (and some of it been deleted again): the demote primitive is
+`PostgresInstance::ensure_stopped`, self-promotion is
+`promote_and_wait`, the comparator is `cluster_view` (per-peer
+degradation, flush-position key), the safety-critical timeouts landed
+through findings 11/12/14, shadow mode is gone with the legacy rip,
+and the reactive-failover lag gate was built and then deleted with the
+pgpool-led promote path. Kept as the record of what the gaps were;
+read nothing below as current.
 
 The question this answers: **do the interfaces to our external
 dependencies (PostgreSQL, PCP, pg_* tools, systemd, the peer mesh)

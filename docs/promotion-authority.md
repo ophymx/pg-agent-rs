@@ -100,11 +100,12 @@ documentation, `%m` (new main node) is selected as:
 **Lowest alive node ID.** Not most-advanced WAL. Not least lag. Not "is
 it even caught up."
 
-SPEC §5.1 promotes that pick with no lag gate. `MAX_HANDOFF_LAG_BYTES` guards
-`cluster_handoff` — the *planned* path — not reactive failover. So even
-in the case where pgpool is entirely correct that the primary is down, it
-can hand us a candidate that is arbitrarily far behind, and we promote it
-and drop the WAL delta on the floor.
+SPEC §5.1 *at the time* promoted that pick with no lag gate — so even
+when pgpool was entirely correct that the primary was down, it could
+hand us a candidate arbitrarily far behind, and we promoted it and
+dropped the WAL delta on the floor. (Historical: the hook's promote
+path is deleted; candidate selection now belongs to the lease's
+candidacy, strict flush-max per docs/quorum-commit.md §4.)
 
 Patroni picks by WAL position and refuses candidates past
 `maximum_lag_on_failover` (default 1 MiB).
@@ -781,7 +782,8 @@ Decisions to make before implementation, not blockers to the design:
 1. **Storage engine: `redb` or RocksDB?** Recommended `redb`; see §5. The
    decision is genuinely reversible behind the trait, and the conformance
    suite matters more than the answer. Settle it by writing the `redb`
-   impl and seeing whether it fights back.
+   impl and seeing whether it fights back. *(Settled: `redb` shipped and
+   has not fought back.)*
 2. **Membership: static or dynamic?** Committed Raft membership must agree
    with the configured `NodePool`, which is snapshotted at startup and not
    reassigned at runtime today. Simplest coherent answer: membership
@@ -805,15 +807,19 @@ Decisions to make before implementation, not blockers to the design:
    the canonical block itself, and acceptance E3 exercises the full
    shape — hook fires, handler declines, lease promotes, `sr_check`
    discovers.
-5. **Synchronous replication.** Patroni's `synchronous_mode` maintains
+5. **Synchronous replication.** ~~Patroni's `synchronous_mode` maintains
    `synchronous_standby_names` and refuses to promote a node that was not
    in sync — trading write latency for zero-data-loss failover. Do we
-   want an equivalent, and is it v1 of this work or later?
-6. **Migration path.** Can a cluster move from hook-driven to lease-driven
-   in place, or does it need a maintenance window? A cluster where some
-   nodes have the HA loop and some do not has no safe semantics — this
-   likely needs `cluster pause` (already on the ROADMAP) as a
-   prerequisite, making pause/resume a dependency rather than a peer.
+   want an equivalent, and is it v1 of this work or later?~~
+   **Resolved and shipped:** [quorum-commit.md](quorum-commit.md) — the
+   executor arms `ANY 1` at the first-standby-attached event, candidacy
+   selects by strict flush-max, and the acceptance suite asserts
+   sentinel write survival across every induced failure.
+6. **Migration path.** ~~Can a cluster move from hook-driven to
+   lease-driven in place?~~ **Mooted by the greenfield rip:** there was
+   never a trusted hook-driven deployment to migrate; the pgpool-led
+   path and its staged-migration suite are deleted. The repo validates
+   greenfield lease-driven deployments only.
 7. **Verify under `use_watchdog=off`:** pgpool docs describe
    `failover_command` as running "once per failover event," but that is
    written for single-instance semantics. Confirm empirically how many
@@ -841,6 +847,10 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    candidate-selection primitive. Refuses only on positive evidence that
    a strictly better candidate is reachable; missing evidence skips the
    gate (refusing there would be §3's unavailability branch).
+   **Then deleted with the pgpool-led promote path itself** (greenfield
+   rip): §2.2's concern lives on in the HA loop's candidacy, upgraded
+   to strict flush-max comparison — see docs/quorum-commit.md §4 and
+   testing/README.md findings 15/19.
 2. **(S)** Land `validate_cluster_preconditions` with the
    `detached`-is-actually-down check, per TODO. Closes the known trigger
    now. Label it defense-in-depth in the code comment.
@@ -886,13 +896,16 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
 
    **Loop landed** (post-0.7.3): `ha` module — one `HaDecision` per
    `loop_wait` tick covering retain / follow / holder-watch / candidacy
-   (most-advanced check, node-id tiebreak within `max_lag_on_failover`,
-   jittered backoff), demote-on-quorum-loss and demote-on-not-primary,
-   with "cannot read ≠ vacant" enforced. Shadow-safety is structural:
-   the loop holds no Systemd/Pcp/StandbyOps and can only write to its
-   process-local store. Enabled by `[raft] shadow = true`; decisions log
-   on the `ha_shadow` target. One shadow-only artifact to remove at
-   cutover: vacant-lease adoption of the single observed primary.
+   (originally most-advanced check with a node-id tiebreak within
+   `max_lag_on_failover`; since upgraded to STRICT flush-max with id
+   breaking exact ties only — the band was an acknowledged-write hole
+   under quorum commit and finding 15's wedge cause), jittered backoff,
+   demote-on-quorum-loss and demote-on-not-primary, with "cannot read ≠
+   vacant" enforced. Shadow-safety is structural: the loop holds no
+   Systemd/Pcp/StandbyOps and can only write to its process-local
+   store. The shadow-only vacant-lease adoption artifact is gated off
+   whenever an executor is attached (execute mode), which is the only
+   deployed shape post-rip.
    The mode itself stays past this step — it is how the acceptance suite
    exercises the loop (S2, S3) without promoting anything, and how step 6
    runs the loop over a real store before step 7 hands it executors.

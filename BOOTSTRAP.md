@@ -186,10 +186,15 @@ agent's `[[pool]]` so both stay in sync):
 ```
 /etc/pgpool2/pgpool.conf
   backend_hostname0 = ...                # one per [[pool]] entry
+  # Canonical agent-led hook block (docs/pgpool-hook-contract.md §4 —
+  # gen-pgpool emits it verbatim, check-hooks verifies it):
   failover_command  = 'pg_agentc failover %d %h %p %D %m %H %M %P %r %R %N %S'
-  follow_primary_command = 'pg_agentc follow_primary ...'
+  follow_primary_command = ''            # MUST stay empty (§5.4)
   recovery_1st_stage_command = 'recovery_1st_stage'  # exec'd from $PGDATA
-  wd_escalation_command  = 'pg_agentc escalation'
+  use_watchdog = off                     # the lease is the authority
+  detach_false_primary = on
+  auto_failback = off
+  failover_on_backend_error = on
   enable_pool_hba = on                   # required (see pool_hba.conf below)
   pool_hba_file   = '/etc/pgpool2/pool_hba.conf'   # pin explicitly
   pool_passwd     = 'pool_passwd'        # relative → /etc/pgpool2/pool_passwd

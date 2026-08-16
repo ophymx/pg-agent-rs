@@ -134,13 +134,14 @@ dependency, so we need a lightweight equivalent:
 > believe they won and reconcile only *after* both have been primary.
 > That is acceptable for a `paused` flag and fatal for "who is primary."
 >
-> **Likely superseded.**
-> [docs/promotion-authority.md](docs/promotion-authority.md) proposes
-> embedding Raft (openraft) in `pg_agentd` so the agents replicate their
-> own log — no external DCS. Its state machine already holds `paused`,
-> scheduled switchover, and a generation counter, so it subsumes this
-> item outright. Prefer deleting this in favour of that; the scope limit
-> above stands for as long as both are on the board.
+> **Superseded in fact.** The embedded Raft
+> ([docs/promotion-authority.md](docs/promotion-authority.md) §5)
+> shipped and now serializes role assignment (the lease, terms as
+> fencing tokens) — the part the LWW scheme below could never do. What
+> remains of THIS item is only the small shared document (`paused`
+> flag, scheduled switchover) as additional state on the existing raft
+> state machine; the gossip/LWW design below is dead and kept for the
+> record.
 
 - **Cluster-state RPC + gossip** *(M)* — extend `PgAgentPeer` with
   `GetClusterState` / `ProposeClusterState(version, payload)`. State is a

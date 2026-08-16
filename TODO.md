@@ -216,7 +216,7 @@ scheduled. Items roughly in priority order within each section.
 
 - **Where:** `crates/pg-agent-core/src/localserver.rs::cluster_recover` (recovery_1st_stage path). Observed live 2026-06-12: recover --target 2 returned `OK: recovery complete for db2.home.ophymx.com; postgres start failed: ...; pgpool started; attached node 2 in pgpool`. The peer start error was concatenated into the message but the response was `ok=true` and `pcp_attach_node` ran anyway.
 - **Why it bites:** pgpool now routes to a backend whose PG is down. Health-check eventually flags it, but in the meantime any write trying that backend errors out, and the operator sees `READY=yes` ish lines in `cluster status` that misrepresent the real state.
-- **Fix shape:** treat "start failed" as terminal for the recover. Don't `pcp_attach_node`. Return `ok=false` with the underlying systemd error verbatim so the operator immediately sees what to fix. The slot + basebackup work that DID succeed stays on disk; the next `cluster recover` re-run picks up from there if we ever wire recover into `inflight_ops` (currently uses replay markers).
+- **Fix shape:** treat "start failed" as terminal for the recover. Don't `pcp_attach_node`. Return `ok=false` with the underlying systemd error verbatim so the operator immediately sees what to fix. The slot + basebackup work that DID succeed stays on disk; recovery is journaled in `inflight_ops` now, so a phased re-entry is designable (today the re-run restarts from the top, which is correct if wasteful).
 - **Pairs with:** the recover-completion auto-attach work from 0.4.0 — the auto-attach is correct when the start succeeded; it just needs to be gated on `start_ok`.
 
 ### ~~`recovery_first_stage`: migrate replay markers to `inflight_ops`~~ — DONE
@@ -260,12 +260,14 @@ Two related issues around handoff's replication-slot management on the new prima
 
 > **Landed in part (post-0.7.3):** `crates/pg-agent-core/src/preconditions.rs`
 > — `validate_cluster_preconditions(intent)` with the
-> `detached`-is-actually-down check, wired into both `Failover` branches
-> (primary-down: refuse when the announced-failed primary is reachable
-> and running as primary; standby-down: refuse when the announced-failed
-> standby is reachable and streaming). Labeled defense-in-depth in the
-> module docs, per the caveat below, which remains in force. Still open
-> from the sketch: converging the other handlers' ad-hoc preflights
+> `detached`-is-actually-down check. Post-rip, only the STANDBY-DOWN
+> intent survives (refuse the slot drop when the announced-failed
+> standby is reachable and streaming): the primary-down variant was
+> deleted with the pgpool-led promote path — promotion authority is the
+> lease's, and the 2026-06-11 incident class below is closed at the
+> root by the quorum CAS rather than narrowed by a precondition.
+> Labeled defense-in-depth in the module docs. Still open from the
+> sketch: converging the other handlers' ad-hoc preflights
 > (`follow_primary`, `cluster_recover`, `cluster_handoff`) onto the
 > intent enum, and the slot-state-consistency check.
 
@@ -294,7 +296,7 @@ Two related issues around handoff's replication-slot management on the new prima
 
 ### Replay marker 24h TTL surprises long-gap re-runs (non-handoff ops)
 
-- `crates/pg-agent-core/src/replay_markers.rs`. Handoff moved to `inflight_ops` (7d retention) in 0.6.0. `failover`, `recovery_first_stage`, `cluster_recover` still use 24h replay markers — an operator who re-runs `cluster recover --target N` 25 hours after a successful run will trigger the destructive reclone again. Mitigated by each handler's own state checks (basebackup refuses non-empty pgdata, slot create is duplicate-OK, etc.) so the failure mode is soft. Fix: bump retention to 7 days to match inflight_ops, or migrate these handlers to `inflight_ops` too if the contract grows phased state.
+- `crates/pg-agent-core/src/replay_markers.rs`. Handoff moved to `inflight_ops` (7d retention) in 0.6.0; `recovery_first_stage` followed (24h dedup via `RECOVERY_DEDUP_WINDOW` on the journaled op, not a marker). Still on 24h replay markers: `FollowPrimary` and `failover`'s standby-down branch (SPEC §5.12). The `FollowPrimary` one is the destructive-if-expired case (conditional basebackup); failover's is soft (slot drops are guarded several ways over). Fix: fold `FollowPrimary` into `inflight_ops` as part of the follow_primary unification item.
 
 ### ~~Peer channel pool: evict on transport error (finding 20)~~ — FIXED
 
@@ -331,5 +333,5 @@ These came up multiple times during the recent feature work as "v2 / future" but
 
 - **Maintenance-mode pause/resume.** Cluster-wide flag that disables reactive failover + pgpool-driven hooks so the operator can do planned work without races. Closes "operator stops pgpool for maintenance, pg-agent's supervisor restarts it" friction. Pairs with auto-resume gating.
 - **Auto-resume on startup (opt-in).** `[startup] auto_resume_inflight_ops = true` so a crashed daemon picks up where it left off after a clean restart instead of waiting for operator-typed `ops resume <id>`. Gated off by default until verify-then-resume has cluster-trial mileage.
-- **Cluster-state RPC + gossip plane.** Already on `ROADMAP.md` ("Shared cluster state (the foundation switchover and pause need)"). The per-daemon `inflight_ops` journal closes local race windows; cross-node coordination still depends on pgpool's hooks. Switchover/pause as proper features want cluster-wide consensus on "is anything in flight."
-- **follow_primary unification.** The existing `PgAgentLocal::FollowPrimary` RPC handler (pgpool hook) and the post-handoff fan-out's `drive_follow_primary` share the same end state but currently coexist as two implementations. Converge them: orchestration shouldn't care which node pulled the trigger. Sub-steps: (a) add a `Checkpoint` peer RPC so the slot's `restart_lsn` can be freshened from any node, (b) migrate the existing RPC's binary replay marker to the inflight journal so it shares the phase ladder + resume, (c) collapse the cleanup helpers (`cleanup_slot_after_failure` vs `cleanup_peer_slot_after_failure`) into one that picks local-vs-peer based on the recorded `new_primary` id. End shape: one driver, two triggers (pgpool hook + handoff fan-out + future explicit `pg_agentctl follow-primary` CLI).
+- **Shared cluster document on the raft state machine.** The raft lease landed and serializes role assignment (ROADMAP's gossip/LWW design is superseded — see the annotation there); what remains is the small operational document (`paused` flag, scheduled switchover) as additional replicated state, which the maintenance-mode item above needs. The HA loop already reads the state machine every tick, so the plumbing is a state-machine field plus two ctl verbs.
+- **follow_primary unification.** The `PgAgentLocal::FollowPrimary` RPC handler (no longer wired into pgpool — the follow hook is empty post-cutover; the RPC survives for direct invocation), the executor's light-follow path, and the post-handoff fan-out's `drive_follow_primary` share the same end state but coexist as three implementations. Converge them: orchestration shouldn't care who pulled the trigger. Sub-steps: (a) add a `Checkpoint` peer RPC so the slot's `restart_lsn` can be freshened from any node, (b) migrate the RPC's binary replay marker to the inflight journal so it shares the phase ladder + resume (also closes the FollowPrimary half of the replay-TTL deferred item), (c) collapse the cleanup helpers (`cleanup_slot_after_failure` vs `cleanup_peer_slot_after_failure`) into one that picks local-vs-peer based on the recorded `new_primary` id. End shape: one driver, N triggers (executor, handoff fan-out, direct RPC, future `pg_agentctl follow-primary` CLI).

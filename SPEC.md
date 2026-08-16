@@ -430,9 +430,16 @@ The slot name is always `node{id}` (e.g. `node2`).
 
 ### 5.2 `FollowPrimary(detached, new_primary, …)`
 
-Called by pgpool per-down-non-primary in a forked child (concurrent
-invocations targeting different nodes are normal). Also fires on
-`pcp_promote_node`. Not called when only a standby went down.
+> **Not wired into pgpool post-cutover**: `follow_primary_command` is
+> empty in the canonical contract (§5.15 / hook-contract §5.4 — a
+> non-empty value makes pgpool degenerate healthy standbys), and the
+> executor's follow path replaces this flow for lease-driven role
+> changes. The RPC and handler remain for `pcp_promote_node`-style
+> direct invocation and for the planned "follow_primary unification"
+> (TODO.md), which will converge it with the executor's driver.
+
+When invoked, the behavior is: per-down-non-primary in a forked child
+(concurrent invocations targeting different nodes are normal).
 
 1. Replay key: `detached={id},new_primary={id}`. If already done → skip.
 2. Resolve both nodes.
@@ -656,11 +663,13 @@ into libpq's conninfo and redirect a basebackup to an attacker host.
 
 ### 5.12 Replay markers (idempotency)
 
-**Scope:** only `FollowPrimary` (the pgpool-hook handler) still carries
-replay markers. It runs `pg_basebackup` conditionally, which **wipes
-`$PGDATA` before streaming the primary's data**; re-running a
-fully-completed flow would clobber a healthy standby's data dir, and the
-marker makes the second invocation a fast no-op.
+**Scope:** two handlers still carry replay markers: `FollowPrimary`
+(which runs `pg_basebackup` conditionally — **wiping `$PGDATA` before
+streaming**; re-running a completed flow would clobber a healthy
+standby's data dir, and the marker makes the second invocation a fast
+no-op) and `Failover`'s standby-down branch (§5.1's note: a re-fired
+hook skips as "already processed"; the primary-down advisory answers
+before the marker check and never writes one).
 
 `RecoveryFirstStage` **moved off markers** to `inflight_ops` (§5.3): it
 gets the same post-completion dedup, plus two things a binary marker
@@ -805,9 +814,11 @@ section is the behavioral contract.
 a linearizable read of the replicated lease and emits one decision.
 "Cannot read" is *unknown*, never vacant; a holder that cannot confirm
 its lease within `retry_timeout` decides to demote. A dead holder is
-watched for `leader_ttl` before any candidate proposes a CAS takeover
-(most-advanced WAL check, node-id tiebreak within
-`max_lag_on_failover_bytes`). Terms are fencing tokens, minted
+watched for `leader_ttl` before any candidate proposes a CAS takeover.
+Candidate selection is STRICT flush-max (docs/quorum-commit.md §4):
+any reachable peer with more flushed WAL outranks, byte-for-byte, and
+node id breaks exact ties only — `max_lag_on_failover_bytes` is
+accepted in config but vestigial. Terms are fencing tokens, minted
 monotonically; the lease is seeded by `ClusterInit` at bootstrap.
 
 **Execution layer** (`roleexec` module): shadow mode is the executor's
