@@ -38,10 +38,10 @@ use futures_core::Stream;
 use pg_agent_proto::pgagentpb::{
     pg_agent_peer_server::{PgAgentPeer, PgAgentPeerServer},
     pg_agent_raft_server::PgAgentRaftServer,
-    BasebackupRequest, ConfigureStandbyRequest, CreateSlotRequest, DropSlotRequest,
-    FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse, NodeStatus,
-    OpProgress, OpResult, PromoteRequest, ReloadPgpoolRequest, ReloadRequest, RemoveVipRequest,
-    RewindRequest, StartPgpoolRequest, StartRequest, StopRequest, WalChunk,
+    AttachNodeRequest, BasebackupRequest, ConfigureStandbyRequest, CreateSlotRequest,
+    DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse,
+    NodeStatus, OpProgress, OpResult, PromoteRequest, ReloadPgpoolRequest, ReloadRequest,
+    RemoveVipRequest, RewindRequest, StartPgpoolRequest, StartRequest, StopRequest, WalChunk,
 };
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -213,6 +213,10 @@ pub struct PeerServer {
     /// The slot lives here, so this node's journal — not the caller's —
     /// is the authority on whether an orchestration still needs it.
     inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
+    /// LOCAL pgpool control plane, for [`PeerServer::attach_node`] —
+    /// the receiving half of `cluster recover`'s attach fan-out
+    /// (hook-contract §3: only this node can attach on this instance).
+    pcp: Arc<dyn crate::pcp::Pcp>,
     /// The consensus plane, served on this same listener when Raft is
     /// running (promotion-authority §5, "Transport"): same port, same
     /// certs, same SAN allowlist. `None` until the node has a Raft
@@ -228,6 +232,7 @@ impl PeerServer {
         standby: Arc<dyn StandbyOps>,
         wal: Arc<dyn WalStore>,
         inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
+        pcp: Arc<dyn crate::pcp::Pcp>,
     ) -> Self {
         Self {
             node_info,
@@ -236,6 +241,7 @@ impl PeerServer {
             standby,
             wal,
             inflight,
+            pcp,
             raft: None,
         }
     }
@@ -475,6 +481,70 @@ impl PgAgentPeer for PeerServer {
         info!("peer: StartPgpool");
         self.sd.start_pgpool().await.map_err(internal)?;
         Ok(Response::new(ok()))
+    }
+
+    /// The receiving half of `cluster recover`'s attach fan-out
+    /// (hook-contract §3). Finding-16 semantics, server-side:
+    /// - attach ONLY a backend this instance holds DOWN — blindly
+    ///   attaching an up backend makes pgpool re-run its failover
+    ///   processing and transiently degenerate healthy backends;
+    /// - when the current primary's backend is down here too, attach
+    ///   it FIRST — a standby attach into a primary-less map blocks in
+    ///   `find_primary_node_repeatedly` (300 s), wedging every later
+    ///   pcp request behind it.
+    /// pgpool being down (or pcp failing) is an `ok=false` answer, not
+    /// a gRPC error: the caller's fan-out is best-effort per instance.
+    async fn attach_node(
+        &self,
+        req: Request<AttachNodeRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        let req = req.into_inner();
+        info!(
+            node_id = req.node_id,
+            primary_node_id = req.primary_node_id,
+            "peer: AttachNode"
+        );
+        let infos = match self.pcp.node_info_all().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!("attach_node: local pgpool map unavailable: {e}"),
+                }));
+            }
+        };
+        let is_down = |id: i32| infos.iter().any(|n| n.id == id && !n.is_up());
+        if req.primary_node_id != req.node_id && is_down(req.primary_node_id) {
+            if let Err(e) = self.pcp.attach_node(req.primary_node_id).await {
+                return Ok(Response::new(OpResult {
+                    ok: false,
+                    message: format!(
+                        "attach_node: refusing to attach node {} into a primary-less map — \
+                         attaching primary backend {} first failed: {e}",
+                        req.node_id, req.primary_node_id
+                    ),
+                }));
+            }
+        }
+        if !is_down(req.node_id) {
+            return Ok(Response::new(OpResult {
+                ok: true,
+                message: format!(
+                    "attach_node: backend {} already up (or absent) on this instance; no action",
+                    req.node_id
+                ),
+            }));
+        }
+        match self.pcp.attach_node(req.node_id).await {
+            Ok(()) => Ok(Response::new(OpResult {
+                ok: true,
+                message: format!("attach_node: backend {} attached", req.node_id),
+            })),
+            Err(e) => Ok(Response::new(OpResult {
+                ok: false,
+                message: format!("attach_node: pcp_attach_node({}): {e}", req.node_id),
+            })),
+        }
     }
 
     async fn promote(&self, _req: Request<PromoteRequest>) -> Result<Response<OpResult>, Status> {
@@ -900,6 +970,70 @@ mod tests {
 
     // ----- Stub deps ------------------------------------------------------
 
+    /// Scripted local-pgpool view for the attach fan-out receiver:
+    /// `infos` is what `node_info_all` reports; attaches are recorded
+    /// and flip that backend up.
+    #[derive(Default)]
+    struct StubPcp {
+        infos: StdMutex<Vec<crate::pcp::NodeInfo>>,
+        attach_calls: StdMutex<Vec<i32>>,
+        node_info_fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl StubPcp {
+        fn backend(id: i32, up: bool) -> crate::pcp::NodeInfo {
+            crate::pcp::NodeInfo {
+                id,
+                hostname: format!("db{id}"),
+                port: 5432,
+                status_code: if up { 2 } else { 3 },
+                lb_weight: 0.33,
+                status_name: if up { "up" } else { "down" }.into(),
+                actual_status: "up".into(),
+                role: "standby".into(),
+                actual_role: "standby".into(),
+                replication_delay: "0".into(),
+                replication_state: "none".into(),
+                sync_state: "none".into(),
+            }
+        }
+        fn with_backends(states: &[(i32, bool)]) -> Arc<Self> {
+            let s = Arc::new(Self::default());
+            *s.infos.lock().unwrap() = states
+                .iter()
+                .map(|(id, up)| Self::backend(*id, *up))
+                .collect();
+            s
+        }
+    }
+
+    #[async_trait]
+    impl crate::pcp::Pcp for StubPcp {
+        async fn attach_node(&self, node_id: i32) -> anyhow::Result<()> {
+            self.attach_calls.lock().unwrap().push(node_id);
+            let mut infos = self.infos.lock().unwrap();
+            if let Some(n) = infos.iter_mut().find(|n| n.id == node_id) {
+                *n = Self::backend(node_id, true);
+            }
+            Ok(())
+        }
+        async fn detach_node(&self, _: i32) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn node_count(&self) -> anyhow::Result<i32> {
+            unreachable!()
+        }
+        async fn node_info_all(&self) -> anyhow::Result<Vec<crate::pcp::NodeInfo>> {
+            if self
+                .node_info_fails
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("scripted: pgpool not running")
+            }
+            Ok(self.infos.lock().unwrap().clone())
+        }
+    }
+
     #[derive(Default)]
     struct StubSd {
         start_calls: AtomicUsize,
@@ -1123,6 +1257,7 @@ mod tests {
             standby.clone(),
             wal.clone(),
             Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
+            Arc::new(StubPcp::default()),
         );
         (server, sd, db, standby, wal)
     }
@@ -1222,6 +1357,99 @@ mod tests {
         assert_eq!(*db.created_slots.lock().unwrap(), vec!["node1".to_string()]);
     }
 
+    // ----- attach_node (hook-contract §3 fan-out receiver) -----------------
+
+    fn server_with_pcp(pcp: Arc<StubPcp>) -> PeerServer {
+        PeerServer::new(
+            Arc::new(FakeNodeInfo),
+            Arc::new(StubSd::default()),
+            Arc::new(StubDb::default()),
+            Arc::new(StubStandby::default()),
+            Arc::new(StubWal::default()),
+            Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
+            pcp,
+        )
+    }
+
+    #[tokio::test]
+    async fn attach_node_attaches_a_down_backend() {
+        let pcp = StubPcp::with_backends(&[(0, true), (1, false)]);
+        let s = server_with_pcp(pcp.clone());
+        let resp = s
+            .attach_node(Request::new(AttachNodeRequest {
+                node_id: 1,
+                primary_node_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn attach_node_leaves_an_up_backend_alone() {
+        // Blindly attaching an up backend makes pgpool re-run its
+        // failover processing and transiently degenerate healthy
+        // backends (finding 16's harness lesson, now server-side).
+        let pcp = StubPcp::with_backends(&[(0, true), (1, true)]);
+        let s = server_with_pcp(pcp.clone());
+        let resp = s
+            .attach_node(Request::new(AttachNodeRequest {
+                node_id: 1,
+                primary_node_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert!(resp.message.contains("no action"), "{}", resp.message);
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_node_fixes_a_primaryless_map_first() {
+        // A standby attach into a map with no up primary blocks in
+        // find_primary_node_repeatedly — the primary's backend goes
+        // first.
+        let pcp = StubPcp::with_backends(&[(0, false), (1, false)]);
+        let s = server_with_pcp(pcp.clone());
+        let resp = s
+            .attach_node(Request::new(AttachNodeRequest {
+                node_id: 1,
+                primary_node_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(
+            *pcp.attach_calls.lock().unwrap(),
+            vec![0, 1],
+            "primary backend must be attached before the standby"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_node_reports_unavailable_pgpool_as_not_ok() {
+        // Best-effort contract: pgpool down is an ok=false ANSWER, not
+        // a gRPC error — the caller's fan-out moves on.
+        let pcp = StubPcp::with_backends(&[(0, true), (1, false)]);
+        pcp.node_info_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let s = server_with_pcp(pcp.clone());
+        let resp = s
+            .attach_node(Request::new(AttachNodeRequest {
+                node_id: 1,
+                primary_node_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn create_slot_rejects_empty_name() {
         let (s, _sd, db, _standby, _wal) = make_server();
@@ -1285,6 +1513,7 @@ mod tests {
             Arc::new(StubStandby::default()),
             Arc::new(StubWal::default()),
             inflight,
+            Arc::new(StubPcp::default()),
         );
 
         let resp = s
@@ -1495,6 +1724,7 @@ mod tests {
             Arc::new(StubStandby::default()),
             Arc::new(StubWal::default()),
             Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
+            Arc::new(StubPcp::default()),
         );
         let result = server
             .basebackup(Request::new(valid_basebackup_req()))

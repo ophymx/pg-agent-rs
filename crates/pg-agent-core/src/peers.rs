@@ -21,10 +21,10 @@ use crate::config::NodeConfig;
 use crate::pgstandby::{BasebackupOpts, RewindOpts, WriteRecoveryConfOpts};
 use async_trait::async_trait;
 use pg_agent_proto::pgagentpb::{
-    pg_agent_peer_client::PgAgentPeerClient, BasebackupRequest, ConfigureStandbyRequest,
-    CreateSlotRequest, DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest,
-    NodeConfigResponse, NodeStatus, OpProgress, PromoteRequest, RewindRequest, StartPgpoolRequest,
-    StartRequest, StopRequest,
+    pg_agent_peer_client::PgAgentPeerClient, AttachNodeRequest, BasebackupRequest,
+    ConfigureStandbyRequest, CreateSlotRequest, DropSlotRequest, FetchWalRequest, GetStatusRequest,
+    NodeConfigRequest, NodeConfigResponse, NodeStatus, OpProgress, PromoteRequest, RewindRequest,
+    StartPgpoolRequest, StartRequest, StopRequest,
 };
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -94,6 +94,14 @@ pub trait PeerClient: Send + Sync {
     /// after recovery_first_stage to bring pgpool back up on the
     /// freshly re-cloned target. Idempotent.
     async fn start_pgpool(&self) -> anyhow::Result<()>;
+
+    /// Attach backend `node_id` on the PEER's local pgpool instance
+    /// (hook-contract §3: attach is per-instance; `cluster recover`
+    /// fans this out so every instance routes to the recovered node).
+    /// `primary_node_id` lets the receiver attach the primary's
+    /// backend first when its map holds that down too. Idempotent —
+    /// an already-up backend is left alone.
+    async fn attach_node(&self, node_id: i32, primary_node_id: i32) -> anyhow::Result<()>;
 
     /// Stream a WAL segment from the peer's archive. Returns
     ///   - `Ok(Some(reader))` — segment found; the reader streams the
@@ -561,6 +569,27 @@ impl PeerClient for PeerChannel {
         Ok(())
     }
 
+    async fn attach_node(&self, node_id: i32, primary_node_id: i32) -> anyhow::Result<()> {
+        let mut client = self.inner.clone();
+        // Not a short RPC: the receiver's pcp call can legitimately
+        // take a while (pgpool re-runs its failback machinery), and a
+        // wedged instance is bounded by the receiver's own PCP_TIMEOUT.
+        let mut req = tonic::Request::new(AttachNodeRequest {
+            node_id,
+            primary_node_id,
+        });
+        req.set_timeout(LONG_RPC_TIMEOUT);
+        let resp = client
+            .attach_node(req)
+            .await
+            .map_err(|s| self.peer_err("attach_node", s))?
+            .into_inner();
+        if !resp.ok {
+            anyhow::bail!("peer attach_node: {}", resp.message);
+        }
+        Ok(())
+    }
+
     async fn fetch_wal(
         &self,
         wal_file: &str,
@@ -869,6 +898,7 @@ mod tests {
                 standby,
                 wal,
                 Arc::new(crate::inflight_ops::InMemoryInflightOpStore::new()),
+                Arc::new(NoOpPcp),
             )
             .serve(listener, Some(tls), s)
             .await;
@@ -903,6 +933,24 @@ mod tests {
         }
         async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    struct NoOpPcp;
+
+    #[async_trait]
+    impl crate::pcp::Pcp for NoOpPcp {
+        async fn attach_node(&self, _: i32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn detach_node(&self, _: i32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn node_count(&self) -> anyhow::Result<i32> {
+            Ok(0)
+        }
+        async fn node_info_all(&self) -> anyhow::Result<Vec<crate::pcp::NodeInfo>> {
+            Ok(Vec::new())
         }
     }
 

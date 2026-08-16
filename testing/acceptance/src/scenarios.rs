@@ -434,6 +434,18 @@ async fn g4(
     repair_standbys(cx, w1, "g4", marks).await;
     let primaries = cx.pg.count_primaries().await;
     cx.check("exactly one primary after the rejoin", primaries == 1);
+    // Hook-contract §3: recover fans the attach out, so EVERY
+    // instance's map converges on the recovered node — previously only
+    // the recovering primary's did, and the others routed around it
+    // until an operator attached per instance.
+    for n in NODES {
+        cx.wait_until(
+            60,
+            &format!("{n}: pgpool routes to recovered {dead} (attach fan-out)"),
+            || async move { pcp_node_info(n, node_id(dead)).await.contains(" up ") },
+        )
+        .await;
+    }
 }
 
 async fn g4b(cx: &mut Ctx, w1: &'static str, marks: &mut HashMap<&'static str, Cursor>) {

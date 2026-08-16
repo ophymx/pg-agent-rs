@@ -1395,6 +1395,35 @@ impl PgAgentLocal for LocalServer {
             }
         }
 
+        // Hook-contract §3: with the watchdog gone, backend maps do
+        // not propagate — attach is per-instance. Fan the attach out
+        // so EVERY member's pgpool routes to the recovered node, not
+        // just this primary's (previously the maps stayed stale until
+        // an operator attached per instance; a later detach-fired hook
+        // even arrived with %m = -1 because an instance believed no
+        // standby was alive). Best-effort per peer: the recovered node
+        // streams regardless; this is routing convergence.
+        let local_id = self.node_pool.local_node_id;
+        for member in self.node_pool.members.iter().filter(|n| n.id != local_id) {
+            let outcome = match self.peers.client(member).await {
+                Ok(client) => client.attach_node(standby.id, local_id).await,
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(()) => post_status.push(format!("attach fanned out to {}", member.hostname)),
+                Err(e) => {
+                    warn!(
+                        member = %member.hostname,
+                        target_id = standby.id,
+                        ?e,
+                        "cluster_recover: attach fan-out failed on member; its map \
+                         converges via operator pcp_attach_node or the next recover"
+                    );
+                    post_status.push(format!("attach fan-out to {} failed: {e}", member.hostname));
+                }
+            }
+        }
+
         Ok(Response::new(OpResult {
             ok: true,
             message: format!(
@@ -3876,6 +3905,8 @@ mod tests {
         configure_standby_opts: StdMutex<Vec<WriteRecoveryConfOpts>>,
         // Failover surface.
         promote_calls: AtomicUsize,
+        /// `(node_id, primary_node_id)` per AttachNode fan-out call.
+        attach_fanout_calls: StdMutex<Vec<(i32, i32)>>,
         drop_slot_calls: StdMutex<Vec<String>>,
         drop_slot_fails: AtomicBool,
         create_slot_calls: StdMutex<Vec<String>>,
@@ -3945,6 +3976,13 @@ mod tests {
             if self.start_fails.load(Ordering::SeqCst) {
                 anyhow::bail!("stub peer start boom");
             }
+            Ok(())
+        }
+        async fn attach_node(&self, node_id: i32, primary_node_id: i32) -> anyhow::Result<()> {
+            self.attach_fanout_calls
+                .lock()
+                .unwrap()
+                .push((node_id, primary_node_id));
             Ok(())
         }
         async fn start_pgpool(&self) -> anyhow::Result<()> {
@@ -5343,6 +5381,38 @@ mod tests {
         assert!(resp.message.contains("postgres started"));
         assert!(resp.message.contains("pgpool started"));
         assert!(resp.message.contains("attached node 1"));
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_fans_the_attach_out_to_every_member() {
+        // Hook-contract §3: attach is per-instance — after the local
+        // attach, every other member's agent is asked to attach the
+        // recovered backend on ITS pgpool, carrying the primary's id
+        // so a primary-less map is fixed first server-side.
+        let (s, _db, _peers, _maint, _replay, peer, pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // Local instance attached directly…
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+        // …and the peer's agent was asked to attach (target, primary).
+        assert_eq!(
+            *peer.attach_fanout_calls.lock().unwrap(),
+            vec![(1, 0)],
+            "fan-out must carry (recovered node, current primary)"
+        );
+        assert!(
+            resp.message.contains("attach fanned out to"),
+            "{}",
+            resp.message
+        );
     }
 
     #[tokio::test]

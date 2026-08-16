@@ -829,6 +829,9 @@ mod tests {
         async fn start_pgpool(&self) -> anyhow::Result<()> {
             unreachable!("shadow loop only calls get_status")
         }
+        async fn attach_node(&self, _: i32, _: i32) -> anyhow::Result<()> {
+            unreachable!("shadow loop only calls get_status")
+        }
         async fn stop(&self) -> anyhow::Result<()> {
             unreachable!("shadow loop only calls get_status")
         }

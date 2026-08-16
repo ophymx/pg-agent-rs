@@ -326,9 +326,10 @@ impl Agent {
             let standby = self.deps.standby.clone();
             let wal = self.deps.wal.clone();
             let inflight = self.deps.inflight.clone();
+            let pcp = self.deps.pcp.clone();
             let raft = self.opts.raft.clone();
             js.spawn(async move {
-                let mut server = PeerServer::new(me, sd, db, standby, wal, inflight);
+                let mut server = PeerServer::new(me, sd, db, standby, wal, inflight, pcp);
                 if let Some(rt) = raft {
                     server = server.with_raft(rt.raft.clone(), rt.reader.clone());
                 }
@@ -1156,6 +1157,9 @@ mod tests {
             unreachable!()
         }
         async fn start_pgpool(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn attach_node(&self, _: i32, _: i32) -> anyhow::Result<()> {
             unreachable!()
         }
         async fn stop(&self) -> anyhow::Result<()> {

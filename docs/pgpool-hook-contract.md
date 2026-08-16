@@ -82,6 +82,13 @@ Two hook-adjacent settings that are not commands but shape the contract:
 
 ## 3. The unpriced cost: backend-status sync is a watchdog feature
 
+> **Priced and paid:** the attach half of this obligation is closed —
+> `cluster recover` fans the attach out via the `AttachNode` peer RPC
+> (each agent attaches on its OWN instance, only-if-down, primary's
+> backend first when its map lacks one), and the executor's finding-16
+> self-attach covers the promotion case. The analysis below is the
+> original pricing.
+
 From [pgpool 4.6 §"Watchdog"](https://www.pgpool.net/docs/46/en/html/tutorial-watchdog-intro.html):
 
 > "At the startup, if the watchdog is enabled, Pgpool-II node sync the

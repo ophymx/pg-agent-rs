@@ -96,7 +96,18 @@ scheduled. Items roughly in priority order within each section.
   then recover, then re-attach. The acceptance harness does exactly
   this in `repair_cluster`.
 
-### `cluster recover` should fan out the pgpool attach (hook-contract §3)
+### ~~`cluster recover` should fan out the pgpool attach (hook-contract §3)~~ — DONE
+
+> Closed via the `AttachNode` peer RPC: recover's attach tail fans out
+> to every member, each agent attaching on its OWN instance with the
+> finding-16 semantics server-side (only-if-down; primary's backend
+> first into a primary-less map). Best-effort per member — a failed
+> instance converges via operator pcp or the next recover. G4 asserts
+> every instance routes to the recovered node. The harness's
+> `pcp_attach_everywhere` remains as belt-and-braces map normalizer
+> for scenario setup. Original report below.
+
+### (historical) `cluster recover` should fan out the pgpool attach
 
 - **Where:** `crates/pg-agent-core/src/localserver.rs` recovery/attach
   tail; `crate::pcp` only talks to the local pgpool.

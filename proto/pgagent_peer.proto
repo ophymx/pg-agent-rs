@@ -19,6 +19,14 @@ message StopRequest {}
 message ReloadRequest {}
 message ReloadPgpoolRequest {}
 message StartPgpoolRequest {}
+
+message AttachNodeRequest {
+  // Backend id to attach on the receiver's local pgpool.
+  int32 node_id = 1;
+  // The current primary's node id (the sender — recover runs on the
+  // primary). Attached first if the receiver's map shows it down.
+  int32 primary_node_id = 2;
+}
 message PromoteRequest {}
 
 message CreateSlotRequest { string slot_name = 1; }
@@ -67,6 +75,15 @@ service PgAgentPeer {
   // re-cloned target. Idempotent — starting an already-active unit is
   // a no-op.
   rpc StartPgpool      (StartPgpoolRequest)      returns (OpResult);
+  // Attach a backend on the RECEIVER's local pgpool instance. With the
+  // watchdog gone, backend maps do not propagate — attach is
+  // per-instance (docs/pgpool-hook-contract.md §3), so `cluster
+  // recover` fans this out to every member after a rejoin. The
+  // receiver applies the finding-16 lessons server-side: attach only
+  // a backend its map holds DOWN, and attach the current primary's
+  // backend first when that one is down too (a standby attach into a
+  // primary-less map blocks in find_primary_node_repeatedly).
+  rpc AttachNode       (AttachNodeRequest)       returns (OpResult);
   rpc Promote          (PromoteRequest)          returns (OpResult);
   rpc CreateSlot       (CreateSlotRequest)       returns (OpResult);
   rpc DropSlot         (DropSlotRequest)         returns (OpResult);
