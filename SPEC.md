@@ -841,7 +841,11 @@ absence. With `shadow = false`:
 - A holder change → re-point the local standby: replication slot
   ensured on the holder (peer RPC), recovery config rewritten, reload
   (`primary_conninfo` is reloadable). This replaces pgpool's
-  `follow_primary_command`.
+  `follow_primary_command`. A confirmed follow is then VERIFIED, not
+  trusted: if it has not reached `streaming` after `leader_ttl`, the
+  executor logs at error, sets `/healthz follow_wedged=true`, and
+  re-attempts (finding 15 — structurally unreachable since candidacy
+  went strict flush-max, kept as defense in depth).
 - **Demote policy: stop and wait.** A fenced node stays stopped;
   rejoining (rewind/reclone) is `cluster recover` — operator-driven,
   never automatic.

@@ -129,9 +129,18 @@ pub struct RoleExecutor {
     self_attach_last_probe: Mutex<Option<Instant>>,
     /// Rate limit for the quorum-commit convergence check.
     sync_arm_last_probe: Mutex<Option<Instant>>,
+    /// When a CONFIRMED follow was first observed not streaming — the
+    /// finding-15 wedge clock. `None` while streaming (or not
+    /// following).
+    follow_stalled_since: Mutex<Option<Instant>>,
+    /// Surfaced in `/healthz` as `follow_wedged`: a follow this
+    /// executor confirmed has not streamed for over the grace window.
+    /// Cleared the moment streaming is observed (or the role changes).
+    follow_wedged: Arc<AtomicBool>,
 }
 
 impl RoleExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance: Arc<dyn PostgresInstance>,
         peers: Arc<dyn PeerRegistry>,
@@ -140,6 +149,7 @@ impl RoleExecutor {
         pcp: Arc<dyn Pcp>,
         promote_deadline: Duration,
         pg: &PostgresRuntime,
+        follow_wedged: Arc<AtomicBool>,
     ) -> Self {
         Self {
             instance,
@@ -154,6 +164,8 @@ impl RoleExecutor {
             self_attach_in_flight: Arc::new(AtomicBool::new(false)),
             self_attach_last_probe: Mutex::new(None),
             sync_arm_last_probe: Mutex::new(None),
+            follow_stalled_since: Mutex::new(None),
+            follow_wedged,
         }
     }
 
@@ -186,8 +198,11 @@ impl RoleExecutor {
                 ..
             } => {
                 // Primary steady state; any remembered upstream is
-                // stale the moment we hold the lease as primary.
+                // stale the moment we hold the lease as primary — and
+                // so is any follower-era wedge state.
                 *self.confirmed_upstream.lock().unwrap() = None;
+                *self.follow_stalled_since.lock().unwrap() = None;
+                self.follow_wedged.store(false, Ordering::SeqCst);
                 self.ensure_quorum_commit(false).await;
                 self.ensure_self_attached();
             }
@@ -271,6 +286,8 @@ impl RoleExecutor {
     async fn fence(&self, why: &str) {
         error!(why, "roleexec: FENCING — stopping local PostgreSQL");
         *self.confirmed_upstream.lock().unwrap() = None;
+        *self.follow_stalled_since.lock().unwrap() = None;
+        self.follow_wedged.store(false, Ordering::SeqCst);
         if let Err(e) = self.instance.ensure_stopped().await {
             // The next tick re-decides and re-tries. This is the one
             // failure worth shouting about at every occurrence.
@@ -290,15 +307,53 @@ impl RoleExecutor {
                 ))
                 .await;
             }
-            InstanceState::Standby { .. } => {
+            InstanceState::Standby { streaming } => {
                 let confirmed = *self.confirmed_upstream.lock().unwrap();
                 if confirmed == Some(holder) {
-                    return; // converged; Following ticks are free
+                    // Converged per the conf — but VERIFY the stream
+                    // (finding 15): a standby past the holder's fork
+                    // point takes the conf rewrite and reload without
+                    // complaint while PostgreSQL loops "new timeline
+                    // forked off before current recovery point"
+                    // underneath, never streaming. Strict flush-max
+                    // candidacy makes that unreachable in the designed
+                    // flows; this detection is the defense in depth
+                    // that says so LOUDLY if some other path gets here.
+                    if streaming {
+                        *self.follow_stalled_since.lock().unwrap() = None;
+                        self.follow_wedged.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    let stalled_for = {
+                        let mut since = self.follow_stalled_since.lock().unwrap();
+                        since.get_or_insert_with(Instant::now).elapsed()
+                    };
+                    if stalled_for >= self.promote_deadline {
+                        // Grace = leader_ttl, same clock the rest of
+                        // the design breathes in.
+                        error!(
+                            holder,
+                            stalled_for_s = stalled_for.as_secs(),
+                            "roleexec: follow WEDGED — confirmed onto the holder but not \
+                             streaming past the grace (likely diverged past the holder's \
+                             fork point; finding 15). Redundancy is degraded until \
+                             `cluster recover` rebuilds this node. Re-attempting the \
+                             follow; /healthz shows follow_wedged=true"
+                        );
+                        self.follow_wedged.store(true, Ordering::SeqCst);
+                        // Clear the confirmation so the follow re-runs:
+                        // idempotent and harmless, and it self-heals
+                        // the conf-drift flavors of "not streaming".
+                        *self.confirmed_upstream.lock().unwrap() = None;
+                        *self.follow_stalled_since.lock().unwrap() = None;
+                    }
+                    return;
                 }
                 match self.follow(holder).await {
                     Ok(()) => {
                         info!(holder, "roleexec: now following lease holder");
                         *self.confirmed_upstream.lock().unwrap() = Some(holder);
+                        *self.follow_stalled_since.lock().unwrap() = None;
                     }
                     Err(e) => {
                         // Unconfirmed → next tick retries.
@@ -723,6 +778,7 @@ mod tests {
         peers: Arc<StubPeers>,
         inflight: Arc<InMemoryInflightOpStore>,
         pcp: Arc<StubPcp>,
+        wedged: Arc<AtomicBool>,
     }
 
     fn fixture(local: i32, state: InstanceState) -> Fixture {
@@ -735,6 +791,7 @@ mod tests {
             data_dir: std::path::PathBuf::from("/nonexistent"),
             repl_user: "repl".into(),
         };
+        let wedged = Arc::new(AtomicBool::new(false));
         let exec = RoleExecutor::new(
             instance.clone(),
             Arc::new(StubRegistry(peers.clone())),
@@ -743,6 +800,7 @@ mod tests {
             pcp.clone(),
             Duration::from_secs(30),
             &pg,
+            wedged.clone(),
         );
         Fixture {
             exec,
@@ -750,6 +808,7 @@ mod tests {
             peers,
             inflight,
             pcp,
+            wedged,
         }
     }
 
@@ -998,6 +1057,69 @@ mod tests {
         drain_self_attach(&f).await;
         assert!(f.pcp.attach_calls.lock().unwrap().is_empty());
         assert!(f.instance.calls().is_empty());
+    }
+
+    // ----- wedged-follow detection (finding 15) ----------------------------
+
+    #[tokio::test]
+    async fn streaming_confirmed_follow_is_healthy() {
+        let f = fixture(2, InstanceState::Standby { streaming: true });
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await;
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await;
+        assert_eq!(
+            f.instance
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("follow"))
+                .count(),
+            1,
+            "streaming confirmed follow must stay converged"
+        );
+        assert!(!f.wedged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn confirmed_but_never_streaming_is_detected_as_wedged() {
+        // The finding-15 shape: the conf rewrite + reload succeeded
+        // (follow Ok → confirmed) while PostgreSQL loops "forked off"
+        // underneath and never streams. Grace zeroed so the very next
+        // tick trips detection.
+        let mut f = fixture(2, InstanceState::Standby { streaming: false });
+        f.exec.promote_deadline = Duration::ZERO;
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await; // follow → confirmed
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await; // stalled past grace → wedged
+        assert!(
+            f.wedged.load(Ordering::SeqCst),
+            "confirmed-but-not-streaming past the grace must set the wedge flag"
+        );
+        // Confirmation was cleared, so the follow re-runs next tick.
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await;
+        assert_eq!(
+            f.instance
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("follow"))
+                .count(),
+            2,
+            "a wedged follow is re-attempted, not silently trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn wedge_flag_clears_when_streaming_resumes() {
+        let mut f = fixture(2, InstanceState::Standby { streaming: false });
+        f.exec.promote_deadline = Duration::ZERO;
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await;
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await;
+        assert!(f.wedged.load(Ordering::SeqCst));
+        // The node starts streaming (e.g. after `cluster recover`).
+        *f.instance.state.lock().unwrap() = InstanceState::Standby { streaming: true };
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await; // re-follow → confirmed
+        f.exec.apply(&HaDecision::Following { holder: 0 }).await; // streaming observed
+        assert!(
+            !f.wedged.load(Ordering::SeqCst),
+            "streaming clears the wedge flag"
+        );
     }
 
     // ----- quorum commit arming (docs/quorum-commit.md §5-6) ---------------

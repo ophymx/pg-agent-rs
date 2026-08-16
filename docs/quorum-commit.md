@@ -116,8 +116,17 @@ point defeated by one field.
 Changes:
 - `NodeStatus` grows `last_flush_lsn` (standby: receive/flush
   position; primary: current LSN). Additive proto field.
-- The HA loop's candidacy (`WalPosition`) and `max_lag_on_failover`
-  compare `(timeline, flush_lsn)`.
+- The HA loop's candidacy (`WalPosition`) compares
+  `(timeline, flush_lsn)` **strictly**: any reachable peer with more
+  flushed WAL outranks, byte-for-byte, and node id breaks exact ties
+  only. The former ±`max_lag_on_failover` tiebreak band let a lower-id
+  node up to 16 MiB behind win — under ANY 1 an acknowledged write can
+  live exactly in that delta on the higher-flush standby, so the band
+  contradicted §3's invariant (and was finding 15's wedge cause: only
+  a behind-node winner leaves a loser past the fork point). Strict-max
+  is livelock-free because candidacy runs against a dead primary —
+  flush positions are static while it decides. The config knob remains
+  accepted but is vestigial in candidacy.
 - Promotion already replays everything received before exiting
   recovery, so a flush-ahead/replay-behind winner promotes correctly —
   the replay distance is promotion *latency*, not a safety input.

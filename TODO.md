@@ -122,7 +122,24 @@ scheduled. Items roughly in priority order within each section.
   ~20 s *after* the promotion. The cross-instance fan-out above is
   still open — self-attach fixes only the winner's own instance.
 
-### Executor: detect a wedged follow (finding 15) — URGENCY UPGRADED
+### ~~Executor: detect a wedged follow (finding 15)~~ — DONE, and the cause is gone
+
+> Two-part closure. **Cause eliminated:** candidacy's ±`max_lag_on_failover`
+> tiebreak band let a lower-id node up to 16 MiB of flush BEHIND win —
+> which was both the wedge's structural cause (the loser could be past
+> the winner's fork point) and, under quorum commit, an
+> acknowledged-write loss hole (an ANY-1 ack can live exactly in that
+> delta). Selection is now STRICT flush-max, node id breaking exact
+> ties only; livelock-free because flush positions are static against
+> a dead primary. Loser replay ≤ loser flush ≤ winner flush = fork
+> point ⇒ the light follow always lands. **Detection stays as defense
+> in depth:** a confirmed follow not streaming past `leader_ttl` logs
+> at error, sets `/healthz follow_wedged=true`, and clears the
+> confirmation so the follow re-runs. Auto-rewind is no longer worth
+> pulling forward — if the flag ever trips, that is a new finding, not
+> this one. Original report below.
+
+### (historical) Executor: detect a wedged follow (finding 15) — urgency note
 
 > Greenfield acceptance runs show the diverged survivor is the COMMON
 > post-takeover case, not the rare one: both surviving standbys stream
@@ -133,7 +150,7 @@ scheduled. Items roughly in priority order within each section.
 > Detection (below) is the minimum; the rewind-only auto-repair is
 > likely worth pulling forward.
 
-### (details) Executor: detect a wedged follow (finding 15)
+### (historical details) Executor: detect a wedged follow (finding 15)
 
 - **Where:** `crates/pg-agent-core/src/roleexec.rs` `converge_follow` /
   `crates/pgman/src/instance.rs` `state()`.

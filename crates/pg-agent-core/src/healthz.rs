@@ -179,6 +179,10 @@ pub struct HealthSnapshot {
     pub pgpool: PgpoolProbe,
     pub replication: ReplicationProbe,
     pub sync_commit: SyncCommitState,
+    /// The executor's finding-15 wedge flag: a follow it confirmed has
+    /// not streamed past the grace window. Redundancy is degraded
+    /// until the node is rebuilt (`cluster recover`).
+    pub follow_wedged: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +195,8 @@ pub struct HealthSnapshotter {
     interval: Duration,
     probe_timeout: Duration,
     snap: ArcSwapOption<HealthSnapshot>,
+    /// Shared with the role executor; read into each snapshot.
+    follow_wedged: Arc<AtomicBool>,
 }
 
 impl HealthSnapshotter {
@@ -210,7 +216,15 @@ impl HealthSnapshotter {
             interval,
             probe_timeout,
             snap: ArcSwapOption::from(None),
+            follow_wedged: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Wire the role executor's finding-15 wedge flag so it surfaces
+    /// in every snapshot as `follow_wedged`.
+    pub fn with_follow_wedged(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.follow_wedged = flag;
+        self
     }
 
     /// Snapshot, or `None` if [`HealthSnapshotter::probe_once`] hasn't
@@ -224,7 +238,13 @@ impl HealthSnapshotter {
     /// very first request after READY sees a real snapshot, not 503),
     /// then on every tick inside `run`.
     pub async fn probe_once(&self) {
-        let snap = build_snapshot(self.db.as_ref(), self.pcp.as_ref(), self.probe_timeout).await;
+        let snap = build_snapshot(
+            self.db.as_ref(),
+            self.pcp.as_ref(),
+            self.probe_timeout,
+            self.follow_wedged.load(Ordering::SeqCst),
+        )
+        .await;
         debug!(
             role = ?snap.role,
             postgres_reachable = snap.postgres.reachable,
@@ -257,6 +277,7 @@ async fn build_snapshot(
     db: &dyn LocalDb,
     pcp: &dyn Pcp,
     probe_timeout: Duration,
+    follow_wedged: bool,
 ) -> HealthSnapshot {
     // Probe postgres and pgpool concurrently. tokio::join! drives both
     // futures in the same task — independent deadlines, no cross-stall.
@@ -277,6 +298,7 @@ async fn build_snapshot(
         pgpool: pgpool_probe,
         replication,
         sync_commit,
+        follow_wedged,
     }
 }
 
@@ -429,6 +451,7 @@ struct HealthBody {
     pgpool: PgpoolProbe,
     replication: ReplicationProbe,
     sync_commit: SyncCommitState,
+    follow_wedged: bool,
 }
 
 /// Pure verdict + body builder — tests call this directly without
@@ -449,6 +472,7 @@ fn compute_health(
                 pgpool: PgpoolProbe::default(),
                 replication: ReplicationProbe::default(),
                 sync_commit: SyncCommitState::NotApplicable,
+                follow_wedged: false,
             },
         );
     };
@@ -473,6 +497,7 @@ fn compute_health(
         pgpool: s.pgpool.clone(),
         replication: s.replication.clone(),
         sync_commit: s.sync_commit,
+        follow_wedged: s.follow_wedged,
     };
     (status, body)
 }
@@ -494,6 +519,7 @@ async fn handle_healthz(State(state): State<HealthState>) -> Response {
             pgpool: PgpoolProbe::default(),
             replication: ReplicationProbe::default(),
             sync_commit: SyncCommitState::NotApplicable,
+            follow_wedged: false,
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
@@ -831,6 +857,7 @@ mod tests {
             },
             replication: ReplicationProbe::default(),
             sync_commit: SyncCommitState::Armed,
+            follow_wedged: false,
         })
     }
 

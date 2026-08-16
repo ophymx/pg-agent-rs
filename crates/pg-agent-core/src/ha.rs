@@ -537,42 +537,44 @@ impl HaLoop {
             // LSN), and they must still funnel into the node-id
             // tiebreak below — otherwise every equal candidate
             // proceeds and only the store CAS separates them.
-            if best_pos >= my_pos {
-                match my_pos.lag_behind(&best_pos) {
-                    None => {
-                        self.arm_backoff(now);
-                        return HaDecision::StoodDown {
-                            reason: format!(
-                                "node {best_id} is on a newer timeline ({best_pos} vs \
-                                 {my_pos}); not a candidate"
-                            ),
-                        };
-                    }
-                    Some(lag) if lag > self.timing.max_lag_on_failover => {
-                        self.arm_backoff(now);
-                        return HaDecision::StoodDown {
-                            reason: format!(
-                                "node {best_id} is ahead by {lag} bytes ({best_pos} vs \
-                                 {my_pos}) > max_lag_on_failover {}; not a candidate",
-                                self.timing.max_lag_on_failover
-                            ),
-                        };
-                    }
-                    Some(_) => {
-                        // Within threshold: positions effectively equal.
-                        // Node id breaks the tie so two near-equal
-                        // candidates can't both defer forever.
-                        if best_id < local_id {
-                            self.arm_backoff(now);
-                            return HaDecision::StoodDown {
-                                reason: format!(
-                                    "node {best_id} is within max_lag_on_failover and has \
-                                     the lower node id; deferring (tiebreak)"
-                                ),
-                            };
-                        }
-                    }
-                }
+            // STRICT selection: any reachable peer with strictly more
+            // flushed WAL outranks us, byte-for-byte — node id breaks
+            // EXACT ties only. The old rule tiebroke within a
+            // `max_lag_on_failover` band, which let a lower-id node up
+            // to 16 MiB of flush BEHIND win — and under quorum commit
+            // an ANY-1-acked write can live exactly in that delta on
+            // the higher-flush standby (docs/quorum-commit.md §3-4).
+            // The band was also finding 15's structural cause: a loser
+            // flushed past the winner's fork point wedges its light
+            // follow. Strict-max makes both impossible: loser replay ≤
+            // loser flush ≤ winner flush = the fork point. No livelock
+            // risk in exchange — candidacy runs against a dead
+            // primary, so flush positions are static while it decides.
+            // (`max_lag_on_failover` is vestigial here; kept in config
+            // for compatibility.)
+            if best_pos > my_pos {
+                self.arm_backoff(now);
+                let reason = match my_pos.lag_behind(&best_pos) {
+                    None => format!(
+                        "node {best_id} is on a newer timeline ({best_pos} vs {my_pos}); \
+                         not a candidate"
+                    ),
+                    Some(lag) => format!(
+                        "node {best_id} has more flushed WAL (ahead by {lag} bytes, \
+                         {best_pos} vs {my_pos}); deferring — an acknowledged write may \
+                         exist only in that delta"
+                    ),
+                };
+                return HaDecision::StoodDown { reason };
+            }
+            if best_pos == my_pos && best_id < local_id {
+                self.arm_backoff(now);
+                return HaDecision::StoodDown {
+                    reason: format!(
+                        "node {best_id} is flush-equal and has the lower node id; \
+                         deferring (tiebreak)"
+                    ),
+                };
             }
         }
 
@@ -1057,16 +1059,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vacant_tiebreak_defers_to_lower_node_id_within_threshold() {
-        // Node 2 (local) and node 1 within max_lag of each other, node 1
-        // slightly ahead. Lower id proceeds; we defer.
+    async fn any_strictly_ahead_peer_outranks_regardless_of_id() {
+        // Node 1 is a single COMMIT ahead of local node 2. Under
+        // quorum commit that byte may be an acknowledged write that
+        // exists nowhere else — strict selection defers to it, with no
+        // "close enough" band (the old ±max_lag tiebreak let a
+        // behind node win and was finding 15's wedge cause).
         let f = fixture(2, StubDb::standby(2, BASE));
-        f.peers.set(1, standby_status(2, BASE + 100)); // within 1024
+        f.peers.set(1, standby_status(2, BASE + 100));
         f.peers.mark_unreachable(0);
 
         match f.ha.tick_once().await {
-            HaDecision::StoodDown { reason } => assert!(reason.contains("tiebreak"), "{reason}"),
-            other => panic!("expected tiebreak StoodDown, got {other:?}"),
+            HaDecision::StoodDown { reason } => {
+                assert!(reason.contains("more flushed WAL"), "{reason}")
+            }
+            other => panic!("expected StoodDown, got {other:?}"),
         }
     }
 
@@ -1094,11 +1101,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vacant_tiebreak_proceeds_when_local_has_lower_id() {
-        // Same shape, but local is node 1 and node 2 is slightly ahead:
-        // within threshold + higher id → we proceed.
-        let f = fixture(1, StubDb::standby(2, BASE));
-        f.peers.set(2, standby_status(2, BASE + 100));
+    async fn strictly_ahead_local_proceeds_regardless_of_id() {
+        // Local node 2 has more flushed WAL than lower-id node 1:
+        // strict-max wins outright — id matters only at exact
+        // equality. (The inverse of this shape — behind-but-lower-id
+        // winning — is exactly what the old band allowed.)
+        let f = fixture(2, StubDb::standby(2, BASE + 100));
+        f.peers.set(1, standby_status(2, BASE));
         f.peers.mark_unreachable(0);
 
         assert!(matches!(

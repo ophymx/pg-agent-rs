@@ -261,12 +261,16 @@ impl Agent {
             return Err(AgentError::InsecureRemotePeer.into());
         }
 
+        // Shared between the role executor (writer) and the healthz
+        // snapshotter (reader): the finding-15 wedged-follow flag.
+        let follow_wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Healthz snapshotter — initial probe runs synchronously so the
         // very first request after READY sees a real snapshot, not 503.
-        let snapshotter = Arc::new(HealthSnapshotter::new(
-            self.deps.db.clone(),
-            self.deps.pcp.clone(),
-        ));
+        let snapshotter = Arc::new(
+            HealthSnapshotter::new(self.deps.db.clone(), self.deps.pcp.clone())
+                .with_follow_wedged(follow_wedged.clone()),
+        );
         snapshotter.probe_once().await;
 
         // Maintenance worker. NodePool is small + Clone; no Arc needed.
@@ -462,6 +466,7 @@ impl Agent {
                     // against a fresh holder (see roleexec docs).
                     timing.leader_ttl,
                     &self.opts.postgres,
+                    follow_wedged.clone(),
                 ))
             });
             // With Raft running the loop reads a replicated state

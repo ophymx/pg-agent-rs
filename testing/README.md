@@ -335,10 +335,17 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     same fundamental race; the answer there and here is `pg_rewind` —
     which v1 demote policy reserves for the operator, so E2b now
     detects the non-streaming survivor and repairs it via `cluster
-    recover` (the operator path, exercised). Product follow-ups in
-    TODO.md: the executor should *detect* a wedged follow (standby
-    confirmed-following but not streaming past a grace) and say so
-    loudly, and opt-in auto-rewind is the eventual closure.
+    recover` (the operator path, exercised). RESOLVED twice over:
+    candidacy is now strict flush-max (node id breaks exact ties
+    only), which makes the wedge unreachable by construction — the
+    loser's replay ≤ its flush ≤ the winner's flush = the fork point,
+    so the light follow always lands (the old ±16 MiB tiebreak band
+    that allowed a behind-node winner was also an acknowledged-write
+    hole under quorum commit); and the executor detects any wedge
+    that somehow still occurs — a confirmed follow not streaming past
+    `leader_ttl` logs at error, sets `/healthz follow_wedged=true`,
+    and re-attempts the follow. If that flag ever trips, it is a new
+    finding.
 
 16. **After a lease-driven promotion, the winner's own pgpool instance
     can blackhole the primary — and pcp operations wedge behind it.

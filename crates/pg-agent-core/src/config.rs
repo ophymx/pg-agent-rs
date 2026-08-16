@@ -399,8 +399,13 @@ pub struct RaftConfig {
     /// (open question 3 — needs a measured answer on the live cluster).
     #[serde(default)]
     pub election_timeout_ms: Option<u64>,
-    /// Candidate eligibility: refuse to promote a candidate lagging the
-    /// most-advanced reachable peer by more than this many bytes.
+    /// VESTIGIAL (accepted for config compatibility, no longer read by
+    /// candidacy): selection is strict flush-max — any reachable peer
+    /// with more flushed WAL outranks, node id breaking exact ties
+    /// only. The former "close enough" band this knob bounded let a
+    /// behind node win, which quorum commit cannot tolerate
+    /// (docs/quorum-commit.md §4) and which caused finding 15's
+    /// wedged follows.
     #[serde(default)]
     pub max_lag_on_failover_bytes: Option<u64>,
 }
