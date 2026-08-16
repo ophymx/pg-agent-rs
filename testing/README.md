@@ -74,6 +74,17 @@ bash`, `journalctl -u pg_agentd`).
   lagging one stands down naming the gap. This is the candidate-
   selection defect the design exists to close, tested in the decision
   layer that now owns it.
+- **G8** — **holder AGENT death, PostgreSQL healthy** (mask +
+  SIGKILL): the one deposal with no fence. The majority promotes while
+  the deposed primary keeps serving — the suite asserts that reality
+  instead of hiding it (a **declared dual-serving window** the auditor
+  verifies is covered AND eventually closed), then asserts the
+  quorum-commit contract that makes it safe: the acked sentinel
+  survives onto the winner, a write on the deposed primary **starves**
+  (5 s timeout, `timeout(1)` exit 124 is the assertion), and the
+  never-acked row does not survive the rejoin. The restarted agent's
+  phantom check (higher peer timeline → stop) is the fence that closes
+  the window.
 
 ---
 
@@ -99,10 +110,10 @@ Failure-coverage gaps, roughly ordered by expected bug yield (the
 suite today covers clean, single, scripted failures on an idle
 cluster; the discovery rate on new probes says these will pay):
 
-1. **Holder AGENT death with PostgreSQL healthy** (`kill -9
-   pg_agentd`, no restart): the one deposal path with no fence — the
-   design's answer is ack starvation once the standbys re-point, which
-   has never been observed. Highest value.
+1. ~~Holder AGENT death with PostgreSQL healthy~~ — **done: G8**. Ack
+   starvation is now observed, not assumed, and the auditor's
+   single-primary invariant gained the declared-window mechanism
+   instead of an exemption blindspot.
 2. **Crash-shape death** (SIGKILL the postmaster): no shutdown
    checkpoint, none of the log events the harness and auditor key on,
    crash recovery on rejoin.

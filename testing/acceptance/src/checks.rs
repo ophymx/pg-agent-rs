@@ -20,6 +20,13 @@ pub struct Ctx {
     pub pg: Arc<Pg>,
     pub pass: usize,
     pub failures: Vec<String>,
+    /// Declared dual-serving windows for the audit: `(from, node)` —
+    /// the scenario asserts that `node` will keep serving as primary
+    /// past a rival's promotion (the fence-less agent-death deposal is
+    /// the one legitimate case), and the auditor holds it to that
+    /// declaration: the overlap must be covered by a window AND the
+    /// window must CLOSE (the node's serving eventually ends).
+    pub expected_dual_serving: Vec<(Cursor, &'static str)>,
     suite_t0: Instant,
     last_say: Instant,
 }
@@ -32,9 +39,15 @@ impl Ctx {
             pg,
             pass: 0,
             failures: Vec::new(),
+            expected_dual_serving: Vec::new(),
             suite_t0: now,
             last_say: now,
         }
+    }
+
+    /// Declare an expected dual-serving window (see the field docs).
+    pub fn expect_dual_serving(&mut self, node: &'static str, from: Cursor) {
+        self.expected_dual_serving.push((from, node));
     }
 
     pub fn say(&mut self, title: &str) {

@@ -143,7 +143,8 @@ pub async fn run_all(cx: &mut Ctx) {
     let w2 = g5(cx, w1).await;
     g5b(cx, w1, w2, &mut marks).await;
     g6(cx, w2).await;
-    g7(cx, w2, &mut marks).await;
+    let w3 = g7(cx, w2, &mut marks).await;
+    g8(cx, w3, &mut marks).await;
     crate::audit::run(cx);
 }
 
@@ -630,7 +631,11 @@ async fn g6(cx: &mut Ctx, w2: &'static str) {
     cx.check("replication intact (2 streaming)", streaming == Some(2));
 }
 
-async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+async fn g7(
+    cx: &mut Ctx,
+    w2: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
     cx.say("G7: candidate selection refuses a FLUSH-lagging standby (§2.2 under the lease)");
     // The §2.2 defect was pgpool picking a candidate by lowest node id
     // with no WAL comparison. Under the lease, candidacy runs the
@@ -753,6 +758,164 @@ async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cu
         primaries == 1,
     );
     check_sentinel(cx, actual, "g7").await;
+    actual
+}
+
+async fn g8(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G8: holder agent death — the one deposal with no fence");
+    // Kill the AGENT on the lease holder while its PostgreSQL stays
+    // healthy. The lease expires, the majority promotes — but nothing
+    // can fence the old primary: its executor is the thing that died.
+    // Dual-serving at the PostgreSQL level is REAL here, and the
+    // scenario's claims are exactly the quorum-commit contract
+    // (docs/quorum-commit.md §3): acked writes survive onto the winner,
+    // and the deposed primary can no longer get anything ACKED —
+    // topological ack starvation is the write fence when process
+    // fencing is impossible.
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit armed before the kill"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    write_sentinel(cx, prim, "g8").await;
+    let since = cx.log.cursor();
+    // Mask FIRST: the unit carries Restart=on-failure/RestartSec=5s, so
+    // a bare SIGKILL is a 5-second blip, not a death. Masked + killed,
+    // the agent stays dead until the operator brings it back.
+    cx.check(
+        &format!("{prim}: agent masked and SIGKILLed (PostgreSQL left running)"),
+        exec_ok(
+            prim,
+            "systemctl mask --runtime pg_agentd && systemctl kill -s SIGKILL pg_agentd",
+        )
+        .await,
+    );
+    // Declare the expected dual-serving window to the auditor: the
+    // no-concurrent-primaries invariant must see this overlap covered
+    // AND verify it eventually closed (the phantom-check fence below).
+    cx.expect_dual_serving(prim, since);
+    let winner_ev = cx
+        .await_event(
+            90,
+            "majority deposed the dead-agent holder and promoted",
+            since,
+            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+        )
+        .await;
+    let w: &'static str = match winner_ev {
+        Some(ev) => {
+            cx.pass(&format!("winner: {}", ev.node));
+            ev.node
+        }
+        None => {
+            cx.fail("no winner despite the holder's agent being dead");
+            other_node(prim)
+        }
+    };
+    // The fence-less reality, asserted honestly: the deposed node's
+    // PostgreSQL is still up and still believes it is a primary.
+    cx.check(
+        &format!("{prim} PostgreSQL still running (nothing could fence it)"),
+        unit_active(prim, "postgresql@17-main").await,
+    );
+    cx.check(
+        &format!("{prim} still believes it is a primary (expected dual-serving)"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    // Both ack sources must LEAVE the deposed primary before starvation
+    // holds: the winner's walreceiver died at its promotion; the
+    // survivor leaves when its executor re-points it at the winner.
+    let survivor = NODES
+        .iter()
+        .copied()
+        .find(|n| *n != prim && *n != w)
+        .unwrap();
+    cx.await_event(
+        60,
+        &format!("{survivor} re-pointed at {w} (last ack source leaves the deposed primary)"),
+        since,
+        |ev| agent(ev, survivor, "now following lease holder"),
+    )
+    .await;
+    // Ack starvation: a write on the deposed primary must hang in the
+    // sync-rep wait — connection accepted, commit never acknowledged.
+    // Via a throwaway in-container psql (not the harness connection
+    // cache: the hung commit would wedge a pipelined cached
+    // connection); `timeout` exiting 124 IS the assertion.
+    let starved = exec_pg(
+        prim,
+        "timeout 5 psql -qAt -d postgres -c \
+         \"insert into sentinel(label, at) values ('g8-unacked', now())\"; echo rc=$?",
+    )
+    .await
+    .unwrap_or_default();
+    cx.check(
+        "write on the deposed primary starves (no ack within 5s)",
+        starved.contains("rc=124"),
+    );
+    check_sentinel(cx, w, "g8").await;
+    // Operator path: bring the agent back. The phantom-primary check is
+    // the mechanism that fences a returned stale primary — it sees the
+    // peer's higher timeline and stops PostgreSQL, which is the event
+    // that CLOSES the declared dual-serving window.
+    let _ = exec(
+        prim,
+        "systemctl unmask --runtime pg_agentd && systemctl start pg_agentd",
+    )
+    .await;
+    cx.await_event(
+        60,
+        &format!("{prim}: restarted agent's phantom check fenced the stale primary"),
+        since,
+        |ev| agent(ev, prim, "phantom-primary check") && ev.line.contains("stopping postgres"),
+    )
+    .await;
+    cx.await_event(
+        90,
+        &format!("{prim} PostgreSQL fully shut down (dual-serving window closed)"),
+        since,
+        |ev| {
+            ev.node == prim
+                && ev.source == Source::Postgres
+                && ev.line.contains("database system is shut down")
+        },
+    )
+    .await;
+    cluster_recover(cx, w, prim).await;
+    // Between the phantom stop and the recover just above, the deposed
+    // node's executor may have tried to follow the new timeline and
+    // logged the "forked off" wedge signature — those events predate
+    // the reclone that fixed them. Consume them so repair_standbys
+    // doesn't read them as a live wedge and reclone a second time.
+    marks.insert(prim, cx.log.cursor());
+    repair_standbys(cx, w, "g8", marks).await;
+    let primaries = cx.pg.count_primaries().await;
+    cx.check(
+        "exactly one primary after the operator rejoin",
+        primaries == 1,
+    );
+    // The starved write must NOT have survived anywhere: it was never
+    // acknowledged, and the reclone discarded the deposed primary's
+    // divergent tail. (If this row exists, the "starvation" above was
+    // an ack that merely arrived late — a real contract violation.)
+    let unacked = cx
+        .pg
+        .scalar(
+            w,
+            "select count(*)::text from sentinel where label = 'g8-unacked'",
+        )
+        .await;
+    cx.check(
+        "the never-acked write did not survive (starvation was real, tail discarded)",
+        unacked.ok().as_deref() == Some("0"),
+    );
+    cx.wait_until(
+        60,
+        &format!("{w}: quorum commit re-armed after the rejoin"),
+        || async move { sync_commit_state(w).await == "armed" },
+    )
+    .await;
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —

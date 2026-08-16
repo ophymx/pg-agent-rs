@@ -177,16 +177,46 @@ pub fn run(cx: &mut Ctx) {
     // at sample instants. (Only db0 serves during the pre-scenario
     // history replay, so arbitrary cross-node interleaving there
     // cannot fabricate an overlap.)
+    //
+    // Exemption: a scenario may DECLARE an expected dual-serving
+    // window (`Ctx::expect_dual_serving`) — the agent-death deposal is
+    // fence-less by construction, so the old primary keeps serving at
+    // the PostgreSQL level until the phantom check fences it on agent
+    // restart. The declaration is not a blank pass: the overlap must
+    // be covered by a window (right node, at/after the declared
+    // cursor), and the window must CLOSE — the declared node's serving
+    // must END after the rival's start. An overlap that never closes
+    // is the real split-brain the invariant exists for.
+    let windows = cx.expected_dual_serving.clone();
     let mut open: Option<&'static str> = None;
     let mut overlap = None;
+    let mut exempted = 0usize;
     for ev in &all {
         if serving_start(ev) {
             match open {
                 Some(existing) if existing != ev.node => {
-                    overlap = Some(format!(
-                        "{} began serving while {existing} was still serving (seq {})",
-                        ev.node, ev.seq
-                    ));
+                    let declared = windows
+                        .iter()
+                        .any(|(from, node)| *node == existing && ev.seq >= from.0);
+                    let closes = declared
+                        && all
+                            .iter()
+                            .any(|e| e.node == existing && e.seq > ev.seq && serving_end(e));
+                    if closes {
+                        exempted += 1;
+                        open = Some(ev.node);
+                    } else if declared {
+                        overlap = Some(format!(
+                            "declared dual-serving window for {existing} never closed \
+                             ({} began serving at seq {} and {existing} never stopped)",
+                            ev.node, ev.seq
+                        ));
+                    } else {
+                        overlap = Some(format!(
+                            "{} began serving while {existing} was still serving (seq {})",
+                            ev.node, ev.seq
+                        ));
+                    }
                 }
                 _ => open = Some(ev.node),
             }
@@ -196,13 +226,15 @@ pub fn run(cx: &mut Ctx) {
     }
     cx.check(
         &format!(
-            "audit: no two nodes ever served as primary concurrently{}",
+            "audit: no undeclared concurrent primaries ({exempted} declared \
+             window{} verified closed){}",
+            if exempted == 1 { "" } else { "s" },
             overlap
                 .clone()
                 .map(|s| format!(" — {s}"))
                 .unwrap_or_default()
         ),
-        overlap.is_none(),
+        overlap.is_none() && exempted == windows.len(),
     );
 
     // Every fence completed. The claim is about STATE, not about a
