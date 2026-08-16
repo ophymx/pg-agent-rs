@@ -186,6 +186,19 @@ impl EventLog {
             "tail -F -n +1 /var/log/postgresql/postgresql-17-main.log 2>/dev/null".to_string(),
             "tail -F -n 0 /var/log/postgresql/postgresql-17-main.log 2>/dev/null".to_string(),
         );
+        // The unit journal, also as Postgres events: a SIGKILLed
+        // postmaster writes nothing to its log file — systemd's
+        // "Main process exited, code=killed" report is the ONLY event
+        // a crash-shape death leaves (G9), and the auditor's serving
+        // intervals need it. The journal carries unit lifecycle
+        // messages, not the server log, so it cannot duplicate the
+        // file tail's serving_start/serving_end lines.
+        self.spawn_tail(
+            node,
+            Source::Postgres,
+            "journalctl -u postgresql@17-main -f -n all --no-pager -o cat".to_string(),
+            "journalctl -u postgresql@17-main -f -n 0 --no-pager -o cat".to_string(),
+        );
     }
 
     fn spawn_tail(

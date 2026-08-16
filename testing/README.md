@@ -85,6 +85,16 @@ bash`, `journalctl -u pg_agentd`).
   never-acked row does not survive the rejoin. The restarted agent's
   phantom check (higher peer timeline → stop) is the fence that closes
   the window.
+- **G9** — **crash-shape primary death** (SIGKILL the postgresql
+  cgroup): no shutdown checkpoint, no walsender drain, and no log-file
+  goodbye — the suite tails the unit journal so systemd's
+  `code=killed` report is the death event, and the auditor accepts it
+  as a serving-interval end (with G9's own await keeping that parser
+  from going silently blind). The corpse stays down (Debian ships
+  `Restart` commented out), the acked sentinel survives onto the
+  winner, and the rejoin reclones the marker-less pgdata back into a
+  standby — asserted by the absence of any later writable serving
+  start on the crashed node.
 
 ---
 
@@ -114,9 +124,11 @@ cluster; the discovery rate on new probes says these will pay):
    starvation is now observed, not assumed, and the auditor's
    single-primary invariant gained the declared-window mechanism
    instead of an exemption blindspot.
-2. **Crash-shape death** (SIGKILL the postmaster): no shutdown
-   checkpoint, none of the log events the harness and auditor key on,
-   crash recovery on rejoin.
+2. ~~Crash-shape death~~ — **done: G9**. The missing-death-event
+   problem was real: the fix is a per-node unit-journal tail, making
+   systemd's `code=killed` the serving-interval end. Rejoin is a
+   reclone, so crash recovery of the old pgdata itself is never run —
+   that only becomes reachable with a restart-in-place path.
 3. **Full-cluster cold restart of an ESTABLISHED cluster** (the site
    power blip): persisted lease in the raft store, three phantom
    checks racing, executors reconciling stale roles. G0/G1 only cover

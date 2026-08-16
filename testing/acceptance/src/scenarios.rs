@@ -144,7 +144,8 @@ pub async fn run_all(cx: &mut Ctx) {
     g5b(cx, w1, w2, &mut marks).await;
     g6(cx, w2).await;
     let w3 = g7(cx, w2, &mut marks).await;
-    g8(cx, w3, &mut marks).await;
+    let w4 = g8(cx, w3, &mut marks).await;
+    g9(cx, w4, &mut marks).await;
     crate::audit::run(cx);
 }
 
@@ -761,7 +762,11 @@ async fn g7(
     actual
 }
 
-async fn g8(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+async fn g8(
+    cx: &mut Ctx,
+    prim: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
     cx.say("G8: holder agent death — the one deposal with no fence");
     // Kill the AGENT on the lease holder while its PostgreSQL stays
     // healthy. The lease expires, the majority promotes — but nothing
@@ -913,6 +918,84 @@ async fn g8(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, 
     cx.wait_until(
         60,
         &format!("{w}: quorum commit re-armed after the rejoin"),
+        || async move { sync_commit_state(w).await == "armed" },
+    )
+    .await;
+    w
+}
+
+async fn g9(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G9: crash-shape primary death — no checkpoint, no goodbye");
+    // SIGKILL the whole postgresql cgroup: no shutdown checkpoint, no
+    // walsender drain, and none of the log-file events the suite keys
+    // on — a killed postmaster writes nothing. systemd's code=killed
+    // report in the unit journal is the ONE event the death leaves,
+    // and it is what the auditor now accepts as this serving
+    // interval's end; the await below keeps that parser honest.
+    // Debian's unit ships Restart commented out, so the corpse stays
+    // down, and rejoin is the operator path onto a pgdata with no
+    // clean-shutdown marker.
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit armed before the crash"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    write_sentinel(cx, prim, "g9").await;
+    let since = cx.log.cursor();
+    cx.check(
+        &format!("{prim}: postmaster SIGKILLed (crash shape, whole cgroup)"),
+        exec_ok(prim, "systemctl kill -s SIGKILL postgresql@17-main").await,
+    );
+    cx.await_event(
+        30,
+        &format!("{prim}: systemd recorded the crash (code=killed — the only death event)"),
+        since,
+        |ev| ev.node == prim && ev.source == Source::Postgres && ev.line.contains("code=killed"),
+    )
+    .await;
+    let winner_ev = cx
+        .await_event(
+            60,
+            "the lease promoted past the crashed primary",
+            since,
+            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+        )
+        .await;
+    let w: &'static str = match winner_ev {
+        Some(ev) => {
+            cx.pass(&format!("winner: {}", ev.node));
+            ev.node
+        }
+        None => {
+            cx.fail("no winner after the crash");
+            other_node(prim)
+        }
+    };
+    cx.check(
+        &format!("{prim} stayed dead (no auto-restart of a crashed postmaster)"),
+        !unit_active(prim, "postgresql@17-main").await,
+    );
+    check_sentinel(cx, w, "g9").await;
+    cluster_recover(cx, w, prim).await;
+    repair_standbys(cx, w, "g9", marks).await;
+    // The crashed node's pgdata carried no clean-shutdown marker; the
+    // reclone must have brought it back as a STANDBY — it never logs a
+    // writable serving start again in this window.
+    cx.check_absent(
+        &format!("{prim} never came back writable (rejoin is a reclone into standby)"),
+        since,
+        |ev| {
+            ev.node == prim
+                && ev.source == Source::Postgres
+                && ev.line.contains("is ready to accept connections")
+        },
+    );
+    let primaries = cx.pg.count_primaries().await;
+    cx.check("exactly one primary after the crash rejoin", primaries == 1);
+    cx.wait_until(
+        60,
+        &format!("{w}: quorum commit re-armed after the crash failover"),
         || async move { sync_commit_state(w).await == "armed" },
     )
     .await;

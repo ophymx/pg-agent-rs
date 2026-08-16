@@ -58,10 +58,14 @@ fn serving_start(ev: &Event) -> bool {
 /// wal_sender_timeout). Using only the final line would report
 /// dual-primary for windows where no client could write. "is shut
 /// down" stays as the fallback end for paths with no request line.
+/// "code=killed" is the crash shape (G9): a SIGKILLed postmaster
+/// writes neither of the above — systemd's report from the unit
+/// journal is the death event.
 fn serving_end(ev: &Event) -> bool {
     ev.source == Source::Postgres
         && (ev.line.contains("shutdown request")
-            || ev.line.contains("database system is shut down"))
+            || ev.line.contains("database system is shut down")
+            || ev.line.contains("code=killed"))
 }
 
 pub fn run(cx: &mut Ctx) {
