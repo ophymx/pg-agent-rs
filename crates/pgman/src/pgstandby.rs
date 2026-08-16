@@ -674,14 +674,28 @@ fn append_tail(tail: &mut String, line: &str) {
 /// Remove every entry directly under `pg_data_dir`. The directory
 /// itself is kept. Caller MUST have verified PostgreSQL is not running.
 async fn clear_pgdata_contents(pg_data_dir: &Path) -> std::io::Result<()> {
+    // NotFound during the walk is tolerated everywhere: deletion is the
+    // goal, so an entry vanishing between readdir and unlink means the
+    // work is already done. (Defense in depth for anything else
+    // deleting concurrently — the settling guard in the peer server
+    // keeps the known case, a mid-shutdown postmaster, out entirely.)
+    fn ignore_missing(r: std::io::Result<()>) -> std::io::Result<()> {
+        match r {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
     let mut entries = tokio::fs::read_dir(pg_data_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        let ft = entry.file_type().await?;
+        let ft = match entry.file_type().await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            other => other?,
+        };
         if ft.is_dir() {
-            tokio::fs::remove_dir_all(&path).await?;
+            ignore_missing(tokio::fs::remove_dir_all(&path).await)?;
         } else {
-            tokio::fs::remove_file(&path).await?;
+            ignore_missing(tokio::fs::remove_file(&path).await)?;
         }
     }
     Ok(())
@@ -771,9 +785,14 @@ fn render_recovery_conf(
     if !allowed_slot_name().is_match(slot_name) {
         anyhow::bail!("slot_name contains invalid characters");
     }
+    // application_name = the slot name = this node's one identity
+    // (`node{id}`, SPEC §5.1). It is what the primary's
+    // `synchronous_standby_names = ANY 1 (...)` will match walsenders
+    // by (docs/quorum-commit.md §6) — without it, quorum commit has
+    // nothing to name. Already validated by the slot-name regex above.
     let mut out = format!(
         "# managed by pgman\n\
-         primary_conninfo = '{conninfo}'\n\
+         primary_conninfo = '{conninfo} application_name={slot_name}'\n\
          primary_slot_name = '{slot_name}'\n"
     );
     if let Some(cmd) = restore_command {
@@ -972,7 +991,7 @@ mod tests {
         assert_eq!(
             got,
             "# managed by pgman\n\
-             primary_conninfo = 'host=server1 port=5432 user=repl'\n\
+             primary_conninfo = 'host=server1 port=5432 user=repl application_name=node0'\n\
              primary_slot_name = 'node0'\n\
              restore_command = 'restore-wrapper %f %p'\n"
         );

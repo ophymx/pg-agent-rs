@@ -381,6 +381,9 @@ mod tests {
             self.0.log("pg_promote");
             Ok(())
         }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             unreachable!()
         }
@@ -399,6 +402,9 @@ mod tests {
             unreachable!()
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
             unreachable!()
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {

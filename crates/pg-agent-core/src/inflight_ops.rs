@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[allow(unused)]
 // currently unused; reserved for future variants that consult cluster topology.
@@ -247,6 +247,15 @@ pub struct InflightOp {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// When the op's target node was OBSERVED alive after completion
+    /// (its replication slot active — a walreceiver connected). This
+    /// is the event that ends a completed op's cross-op ownership:
+    /// once the rebuilt standby has demonstrably come up, a later
+    /// destructive request aimed at it is the ordinary standby-down
+    /// case, not the finding-9 race — see [`owner_of_node`]. Recorded
+    /// by [`owner_of_slot_observing`] at consult time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discharged_at: Option<DateTime<Utc>>,
     /// Last error captured at any phase transition that surfaced one.
     /// Cleared when the op moves to `Done`; preserved on `Abandoned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,6 +341,12 @@ pub trait InflightOpStore: Send + Sync {
     /// reason. The recorded phase is preserved so an operator
     /// inspecting later can see where the op was when abandoned.
     async fn abandon(&self, id: &str, reason: &str) -> anyhow::Result<()>;
+
+    /// Record that the op's target was observed alive after completion
+    /// (sets `discharged_at`), ending the op's cross-op ownership at
+    /// the event instead of the grace expiry. Idempotent; meaningful
+    /// only on terminal-`Done` ops.
+    async fn discharge(&self, id: &str) -> anyhow::Result<()>;
 
     /// Look up the most-recent op (by `started_at`) matching the given
     /// `op_name` + `key`. Used by handlers for idempotency / resume
@@ -509,6 +524,7 @@ impl InflightOpStore for FileInflightOpStore {
             started_at: now,
             updated_at: now,
             completed_at: None,
+            discharged_at: None,
             last_error: None,
         };
         self.write_atomic(&op).await?;
@@ -560,6 +576,15 @@ impl InflightOpStore for FileInflightOpStore {
         op.updated_at = now;
         op.completed_at = Some(now);
         op.last_error = Some(reason.to_string());
+        self.write_atomic(&op).await
+    }
+
+    async fn discharge(&self, id: &str) -> anyhow::Result<()> {
+        let mut op = self.get(id).await?;
+        if op.discharged_at.is_some() {
+            return Ok(());
+        }
+        op.discharged_at = Some(Utc::now());
         self.write_atomic(&op).await
     }
 
@@ -969,6 +994,107 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].path, "garbled.json");
     }
+
+    // ----- cross-op ownership: event-terminated (discharge) -----------------
+
+    /// The Handoff payload targets `to_node_id`, whose slot per the
+    /// `node{id}` convention is `node{to}` — this helper begins +
+    /// completes an op owning node 2.
+    async fn completed_op_owning_node2(store: &FileInflightOpStore) -> InflightOp {
+        let op = store
+            .begin(handoff_payload(1, 2), "preflight_done", true)
+            .await
+            .unwrap();
+        store.complete(&op.id).await.unwrap();
+        op
+    }
+
+    #[tokio::test]
+    async fn completed_undischarged_op_owns_within_grace() {
+        let (_tmp, store) = fixture();
+        completed_op_owning_node2(&store).await;
+        let owner = owner_of_node(&store, 2, chrono::Duration::seconds(120)).await;
+        assert!(owner.is_some(), "grace backstop must hold pre-discharge");
+    }
+
+    #[tokio::test]
+    async fn discharge_ends_ownership_before_the_grace_expires() {
+        let (_tmp, store) = fixture();
+        let op = completed_op_owning_node2(&store).await;
+        store.discharge(&op.id).await.unwrap();
+        let owner = owner_of_node(&store, 2, chrono::Duration::seconds(120)).await;
+        assert!(
+            owner.is_none(),
+            "ownership ends at the observed-alive event, not the clock"
+        );
+        // Durably recorded — a fresh read sees it.
+        assert!(store.get(&op.id).await.unwrap().discharged_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn observing_consult_discharges_on_active_slot() {
+        let (_tmp, store) = fixture();
+        let op = completed_op_owning_node2(&store).await;
+        let owner =
+            owner_of_slot_observing(&store, "node2", chrono::Duration::seconds(120), || {
+                std::future::ready(Ok(true))
+            })
+            .await;
+        assert!(
+            owner.is_none(),
+            "active slot = purpose fulfilled = no owner"
+        );
+        assert!(
+            store.get(&op.id).await.unwrap().discharged_at.is_some(),
+            "the observation must be recorded so later consults skip the grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn observing_consult_retains_ownership_on_inactive_slot() {
+        let (_tmp, store) = fixture();
+        let op = completed_op_owning_node2(&store).await;
+        let owner =
+            owner_of_slot_observing(&store, "node2", chrono::Duration::seconds(120), || {
+                std::future::ready(Ok(false))
+            })
+            .await;
+        assert_eq!(owner.map(|o| o.id), Some(op.id.clone()));
+        assert!(store.get(&op.id).await.unwrap().discharged_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn observing_consult_retains_ownership_when_evidence_unavailable() {
+        // Evidence failure is NOT discharge — the conservative side.
+        let (_tmp, store) = fixture();
+        let op = completed_op_owning_node2(&store).await;
+        let owner =
+            owner_of_slot_observing(&store, "node2", chrono::Duration::seconds(120), || {
+                std::future::ready(Err(anyhow::anyhow!("pg down")))
+            })
+            .await;
+        assert_eq!(owner.map(|o| o.id), Some(op.id.clone()));
+        assert!(store.get(&op.id).await.unwrap().discharged_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn observing_consult_never_discharges_an_in_flight_op() {
+        // An InProgress op owns its node unconditionally: an active
+        // slot mid-orchestration (e.g. basebackup's WAL stream) is not
+        // completion evidence.
+        let (_tmp, store) = fixture();
+        let op = store
+            .begin(handoff_payload(1, 2), "preflight_done", true)
+            .await
+            .unwrap();
+        let owner =
+            owner_of_slot_observing(&store, "node2", chrono::Duration::seconds(120), || {
+                std::future::ready(Ok(true))
+            })
+            .await;
+        assert_eq!(owner.map(|o| o.id), Some(op.id.clone()));
+        assert!(store.get(&op.id).await.unwrap().discharged_at.is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1134,7 @@ impl InMemoryInflightOpStore {
             started_at: now,
             updated_at: now,
             completed_at: None,
+            discharged_at: None,
             last_error: None,
         };
         self.seed(op.clone());
@@ -1044,6 +1171,13 @@ impl InflightOpStore for InMemoryInflightOpStore {
         if let Some(op) = ops.iter_mut().find(|o| o.id == id) {
             op.status = InflightStatus::Done;
             op.completed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+    async fn discharge(&self, id: &str) -> anyhow::Result<()> {
+        let mut ops = self.ops.lock().unwrap();
+        if let Some(op) = ops.iter_mut().find(|o| o.id == id) {
+            op.discharged_at = Some(Utc::now());
         }
         Ok(())
     }
@@ -1097,14 +1231,21 @@ pub fn node_id_from_slot(slot_name: &str) -> Option<i32> {
 }
 
 /// The orchestration that owns `node_id` — `InProgress`, or terminal-
-/// `Done` within `grace`.
+/// `Done` that is **undischarged** and within `grace`.
 ///
-/// The grace exists because destructive requests aimed at a node reach
-/// us *late*: pgpool's `failover_command` lags its health check, and a
-/// queued `drop_slot_cleanup` intent retries with exponential backoff.
-/// Both routinely arrive after an orchestration finished but before the
-/// node it rebuilt is streaming — a window in which the node looks
-/// legitimately dead to every other check.
+/// A completed op keeps owning its node because destructive requests
+/// aimed at it reach us *late*: pgpool's `failover_command` lags its
+/// health check, and a queued `drop_slot_cleanup` intent retries with
+/// exponential backoff. Both routinely arrive after an orchestration
+/// finished but before the node it rebuilt is streaming — a window in
+/// which the node looks legitimately dead to every other check.
+///
+/// That ownership ends at an **event**, not a clock: once the rebuilt
+/// node has been observed alive (`discharged_at` set — see
+/// [`owner_of_slot_observing`]), a later destructive request is the
+/// ordinary standby-down case and proceeds immediately. The `grace` is
+/// only the backstop for a node that never comes up, so its slot does
+/// not stay protected forever.
 ///
 /// `Abandoned` ops deliberately do **not** own anything: abandonment
 /// runs the cleanup path, so the slot is meant to go.
@@ -1125,7 +1266,9 @@ pub async fn owner_of_node(
         .filter(|o| o.payload.target_node_id() == Some(node_id))
         .filter(|o| match o.status {
             InflightStatus::InProgress => true,
-            _ => o.completed_at.is_some_and(|t| Utc::now() - t < grace),
+            _ => {
+                o.discharged_at.is_none() && o.completed_at.is_some_and(|t| Utc::now() - t < grace)
+            }
         })
         .max_by_key(|o| o.started_at)
 }
@@ -1137,4 +1280,52 @@ pub async fn owner_of_slot(
     grace: chrono::Duration,
 ) -> Option<InflightOp> {
     owner_of_node(store, node_id_from_slot(slot_name)?, grace).await
+}
+
+/// [`owner_of_slot`] with live evidence: the consult that also
+/// OBSERVES. When the would-be owner is a completed op and the slot is
+/// active right now — a walreceiver is connected, i.e. the node the op
+/// rebuilt demonstrably came up — the op's purpose is fulfilled:
+/// record the discharge (durably ending its ownership at this event)
+/// and report no owner. The caller's ordinary live-state guards take
+/// over from there — and PostgreSQL itself refuses to drop an active
+/// slot, so "no owner" for an active slot is never a hazard.
+///
+/// `slot_active` is queried only when a completed op would otherwise
+/// own the node, and an evidence failure (`Err`) counts as "not
+/// observed": ownership then simply continues until the grace backstop
+/// — the conservative side.
+pub async fn owner_of_slot_observing<F, Fut>(
+    store: &dyn InflightOpStore,
+    slot_name: &str,
+    grace: chrono::Duration,
+    slot_active: F,
+) -> Option<InflightOp>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let owner = owner_of_slot(store, slot_name, grace).await?;
+    if owner.status == InflightStatus::InProgress {
+        return Some(owner);
+    }
+    match slot_active().await {
+        Ok(true) => {
+            info!(
+                op = %owner.id,
+                slot = %slot_name,
+                "cross-op ownership discharged: rebuilt node observed alive (slot active)"
+            );
+            if let Err(e) = store.discharge(&owner.id).await {
+                // Harmless: ownership falls back to the grace backstop.
+                warn!(?e, op = %owner.id, "discharge record failed; grace backstop applies");
+            }
+            None
+        }
+        Ok(false) => Some(owner),
+        Err(e) => {
+            warn!(?e, slot = %slot_name, "slot_active evidence unavailable; ownership retained");
+            Some(owner)
+        }
+    }
 }

@@ -46,6 +46,15 @@ message NodeStatus {
   // most-up-to-date in a split-brain (`(timeline_id, current_wal_lsn)`
   // lex order — higher TL wins, ties broken by higher LSN).
   uint64 current_wal_lsn         = 11;
+  // Durably-flushed WAL position (docs/quorum-commit.md §4): on a
+  // primary pg_current_wal_lsn(); on a standby the greatest of
+  // pg_last_wal_receive_lsn() / pg_last_wal_replay_lsn() — WAL a
+  // standby has FLUSHED but not yet replayed is still WAL it owns,
+  // and under quorum commit the acknowledged-write guarantee attaches
+  // to flushed WAL, so candidate selection compares this field, not
+  // current_wal_lsn (replay misclassifies a flush-complete standby as
+  // lagging — testing/README.md finding 19). 0 = unknown.
+  uint64 last_flush_lsn          = 12;
 }
 
 message GetStatusRequest {}

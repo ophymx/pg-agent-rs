@@ -783,20 +783,17 @@ impl Agent {
             .cloned()
             .collect();
 
-        let views = match crate::cluster_view::collect_statuses(
+        // Per-peer degradation: a peer that outlives the budget shows
+        // up as an Err view and simply contributes no observation —
+        // the required-peers floor below decides whether what remains
+        // is enough evidence. (Previously a single slow peer erased
+        // every answered peer's evidence and forced Unverifiable.)
+        let views = crate::cluster_view::collect_statuses(
             self.deps.peers.clone(),
             &peers,
             STARTUP_CHECK_TIMEOUT,
         )
-        .await
-        {
-            Ok(v) => v,
-            Err(_) => {
-                return PrimaryVerdict::Unverifiable {
-                    reason: format!("peer fan-out exceeded {:?}", STARTUP_CHECK_TIMEOUT),
-                };
-            }
-        };
+        .await;
         let mut observations: Vec<PeerObservation> = Vec::new();
         for view in views {
             match view.status {
@@ -879,13 +876,22 @@ impl NodeInfo for Agent {
     /// lag. A node where any probe failed is degraded, not ready, even if
     /// the visible facts (e.g. service running) look fine. See SPEC §5.9.
     async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
-        let (pg_status_res, pgpool_status_res, in_recovery_res, lag_res, timeline_res, wal_lsn_res) = tokio::join!(
+        let (
+            pg_status_res,
+            pgpool_status_res,
+            in_recovery_res,
+            lag_res,
+            timeline_res,
+            wal_lsn_res,
+            flush_lsn_res,
+        ) = tokio::join!(
             self.deps.sd.status_postgres(),
             self.deps.sd.status_pgpool(),
             self.deps.db.is_in_recovery(),
             self.deps.db.replication_lag(),
             self.deps.db.timeline_id(),
             self.deps.db.current_wal_lsn(),
+            self.deps.db.flush_lsn(),
         );
 
         let (pg_running, pg_status_ok) = pg_status_res
@@ -914,6 +920,9 @@ impl NodeInfo for Agent {
         let wal_lsn = wal_lsn_res
             .inspect_err(|e| warn!(?e, "get_status: current_wal_lsn query failed"))
             .unwrap_or(0);
+        let flush_lsn = flush_lsn_res
+            .inspect_err(|e| warn!(?e, "get_status: flush_lsn query failed"))
+            .unwrap_or(0);
 
         let ready = recovery_ok && lag_ok && pg_status_ok && pgpool_status_ok;
 
@@ -929,6 +938,7 @@ impl NodeInfo for Agent {
             is_pgpool_status_ok: pgpool_status_ok,
             timeline_id: timeline,
             current_wal_lsn: wal_lsn,
+            last_flush_lsn: flush_lsn,
         })
     }
 
@@ -979,6 +989,9 @@ mod tests {
         async fn promote(&self) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1005,6 +1018,9 @@ mod tests {
                 anyhow::bail!("stub: current_wal_lsn boom");
             }
             Ok(self.wal_lsn)
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
+            self.current_wal_lsn().await
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {
             if self.lag_fails.load(Ordering::SeqCst) {
@@ -1213,6 +1229,7 @@ mod tests {
             is_pgpool_status_ok: true,
             timeline_id,
             current_wal_lsn,
+            last_flush_lsn: current_wal_lsn,
         }
     }
 
@@ -1264,6 +1281,7 @@ mod tests {
                 started_at: now,
                 updated_at: now,
                 completed_at: None,
+                discharged_at: None,
                 last_error: None,
             })
         }
@@ -1274,6 +1292,9 @@ mod tests {
             Ok(())
         }
         async fn abandon(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn discharge(&self, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
         async fn find(

@@ -364,3 +364,62 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     cross-instance attach fan-out (other nodes' instances) remains
     open in TODO.md; `pcp_attach_everywhere` still attaches the
     primary's backend first so failbacks can find a primary.
+
+17. **A partitioned primary's fence takes up to `wal_sender_timeout`
+    to complete — 44 s observed.** The fence's fast shutdown
+    disconnects clients immediately (write service ends at "received
+    fast shutdown request"), but the postmaster then drains walsenders
+    whose peers are exactly the nodes the partition cut off, so the
+    final "database system is shut down" lags tens of seconds. Two
+    consequences, one benign, one real: no dual-primary window (writes
+    were already refused — the audit's serving intervals end at the
+    request line for this reason), but the node's $PGDATA stays owned
+    that whole time, which is what made a too-eager recover race
+    basebackup's pgdata clear against the dying postmaster (the
+    settling guard in `PeerServer::basebackup` and the harness's
+    shutdown-event await both exist because of this). Product
+    follow-up in TODO.md: an immediate-mode fence escalation would
+    close the latency; the fenced node is recloned/rewound on rejoin
+    anyway, so crash-recovery cost on a node being demoted is moot.
+
+18. **A healthy serving holder was deposed because one unreachable
+    peer blinded the rival's whole status view — caught by the event
+    auditor's dual-serving invariant on its first un-blinded run,
+    fixed.** `collect_statuses` returned `Err` with NOTHING when any
+    peer outlived the collective fan-out budget, and the HA loop
+    mapped that to an empty peer view. During G5's partition the
+    isolated node's probe blew the budget on some ticks, the healthy
+    just-promoted holder went missing from the view, "missing" read as
+    "unhealthy", and the rival's deposal clock ran to `leader_ttl` on
+    pure blindness — then legally CAS'd the lease away and promoted,
+    giving real concurrent serving until the deposed holder's executor
+    fenced it (containment held, terms stayed unique — the audit's
+    consensus invariants all passed while its serving-interval
+    invariant flagged the overlap). Fourth member of the findings
+    11/12/14 class, with a new lesson: it is not enough for evidence
+    RPCs to be bounded — a bounded fan-out must degrade PER PEER, so
+    one straggler costs exactly one peer's evidence rather than
+    converting partial evidence into total blindness that a
+    life-and-death clock then runs on. `collect_statuses` now always
+    returns one view per node (stragglers as explicit `Err` entries),
+    and the startup phantom check got the same upgrade for free.
+
+19. **The replay-paused standby won G7's takeover — and factually
+    held every byte.** Candidacy's lag gate acts only on positive
+    evidence (refusing on absent evidence is the §3 unavailability
+    branch), so one blipped status probe of the caught-up rival let
+    the "lagging" node proceed, and it won the CAS race. Two lessons.
+    Harness: repairs must target the ACTUAL primary
+    (`pg.current_primary()`), not the scenario's predicted winner —
+    assuming the winner cascaded four follow-on failures. Product:
+    the deeper wrongness is the selection KEY, not the race — the
+    "lagging" node had all 24 MB *flushed* (replay paused, receive
+    flowing), so promotion replayed it and nothing was lost; replay-
+    based candidacy misclassifies a data-complete node as lagging.
+    docs/quorum-commit.md §4 (flush-position candidacy) is the fix,
+    and this run validated its premise before a line of it was
+    implemented. RESOLVED: candidacy now compares flush positions
+    (quorum-commit phase 2), and G7 arranges genuine FLUSH lag by
+    severing the standby's walreceiver path (PG port only — the agent
+    stays reachable so the node still participates in candidacy and
+    the lag gate is what refuses it).

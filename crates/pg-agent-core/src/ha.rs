@@ -627,7 +627,11 @@ impl HaLoop {
         };
         let pos = if is_primary.is_some() {
             let tl = self.db.timeline_id().await.ok().filter(|t| *t > 0);
-            let lsn = self.db.current_wal_lsn().await.ok().filter(|l| *l > 0);
+            // FLUSH position, matching what peers report in
+            // last_flush_lsn: candidacy compares what each node has
+            // durably flushed and will replay before promoting
+            // (docs/quorum-commit.md §4, finding 19).
+            let lsn = self.db.flush_lsn().await.ok().filter(|l| *l > 0);
             match (tl, lsn) {
                 (Some(timeline), Some(lsn)) => Some(WalPosition { timeline, lsn }),
                 _ => None,
@@ -650,24 +654,30 @@ impl HaLoop {
         if others.is_empty() {
             return Vec::new();
         }
-        match collect_statuses(self.peers.clone(), &others, STATUS_FANOUT_BUDGET).await {
-            Ok(views) => views
-                .into_iter()
-                .map(|v| match v.status {
-                    Ok(s) => PeerView {
-                        running_as_primary: s.is_postgres_running && !s.is_in_recovery,
-                        pos: WalPosition::from_status(&s),
-                        node: v.node,
-                    },
-                    Err(_) => PeerView {
-                        node: v.node,
-                        running_as_primary: false,
-                        pos: None,
-                    },
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        // Per-peer degradation, never collective: an unreachable peer
+        // yields ONE PeerView with running_as_primary=false (dead and
+        // unreachable are indistinguishable by design — that per-peer
+        // equivalence is what lets a real takeover happen), while the
+        // peers that answered keep their evidence. The old collective
+        // Err → empty-view path made one partitioned peer blind the
+        // loop to a healthy holder, and the deposal clock ran on that
+        // blindness — see collect_statuses' docs.
+        collect_statuses(self.peers.clone(), &others, STATUS_FANOUT_BUDGET)
+            .await
+            .into_iter()
+            .map(|v| match v.status {
+                Ok(s) => PeerView {
+                    running_as_primary: s.is_postgres_running && !s.is_in_recovery,
+                    pos: WalPosition::from_status(&s),
+                    node: v.node,
+                },
+                Err(_) => PeerView {
+                    node: v.node,
+                    running_as_primary: false,
+                    pos: None,
+                },
+            })
+            .collect()
     }
 
     fn log_decision(&self, decision: &HaDecision) {
@@ -740,6 +750,9 @@ mod tests {
         async fn promote(&self) -> anyhow::Result<()> {
             unreachable!("shadow loop must never touch PG")
         }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             unreachable!()
         }
@@ -759,6 +772,9 @@ mod tests {
             Ok(self.timeline.load(Ordering::SeqCst))
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            Ok(self.lsn.load(Ordering::SeqCst))
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
             Ok(self.lsn.load(Ordering::SeqCst))
         }
         async fn replication_lag(&self) -> anyhow::Result<crate::localdb::ReplicationLag> {
@@ -875,6 +891,7 @@ mod tests {
             is_in_recovery: false,
             timeline_id: tl,
             current_wal_lsn: lsn,
+            last_flush_lsn: lsn,
             ..Default::default()
         }
     }
@@ -885,6 +902,7 @@ mod tests {
             is_in_recovery: true,
             timeline_id: tl,
             current_wal_lsn: lsn,
+            last_flush_lsn: lsn,
             ..Default::default()
         }
     }
@@ -1042,6 +1060,29 @@ mod tests {
 
         match f.ha.tick_once().await {
             HaDecision::StoodDown { reason } => assert!(reason.contains("tiebreak"), "{reason}"),
+            other => panic!("expected tiebreak StoodDown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn candidacy_compares_flush_not_replay() {
+        // Finding 19's shape (docs/quorum-commit.md §4): the peer has
+        // every byte FLUSHED (last_flush_lsn current) while its replay
+        // position trails far past max_lag. Under the flush key it is
+        // position-equal — the node-id tiebreak decides, not the lag
+        // gate. Replay-key selection called exactly this node
+        // "lagging", and it lost nothing when it won anyway.
+        let f = fixture(2, StubDb::standby(2, BASE));
+        let mut peer = standby_status(2, BASE); // flush-equal…
+        peer.current_wal_lsn = BASE - 900_000; // …replay far behind: irrelevant
+        f.peers.set(1, peer);
+        f.peers.mark_unreachable(0);
+
+        match f.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => assert!(
+                reason.contains("tiebreak"),
+                "flush-equal peer must funnel into the tiebreak, not the lag gate: {reason}"
+            ),
             other => panic!("expected tiebreak StoodDown, got {other:?}"),
         }
     }

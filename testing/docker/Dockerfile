@@ -17,7 +17,7 @@ RUN ln -s /dev/null /etc/systemd/system/pgpool2.service
 RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus polkitd \
         postgresql-17 postgresql-17-pgpool2 pgpool2 \
-        openssl procps less curl \
+        openssl procps less curl iptables \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY pg-agent.deb /tmp/pg-agent.deb

@@ -41,17 +41,27 @@ fn term_of(line: &str) -> Option<u64> {
     None
 }
 
-/// A node's PostgreSQL entering normal (writable) operation. Genuine
-/// primaries only: standbys log the "read only" variant, which the
-/// `!read` guard excludes (robust to hyphenation across PG versions).
+/// A node's PostgreSQL entering normal (writable) operation. Exact
+/// phrase: the standby variant is "ready to accept read-only
+/// connections", which does not contain this string. (The first
+/// attempt guarded with `!contains("read")` — but "ready" contains
+/// "read", so it matched NOTHING and two invariants were silently
+/// vacuous. The non-vacuity floor now covers serving events too.)
 fn serving_start(ev: &Event) -> bool {
-    ev.source == Source::Postgres
-        && ev.line.contains("database system is ready to accept")
-        && !ev.line.contains("read")
+    ev.source == Source::Postgres && ev.line.contains("is ready to accept connections")
 }
 
+/// Write service ENDS at the shutdown *request* — PostgreSQL
+/// disconnects clients and refuses new ones right there, while
+/// draining walsenders can hold the final "is shut down" for tens of
+/// seconds (observed 44 s on a partitioned primary heading toward
+/// wal_sender_timeout). Using only the final line would report
+/// dual-primary for windows where no client could write. "is shut
+/// down" stays as the fallback end for paths with no request line.
 fn serving_end(ev: &Event) -> bool {
-    ev.source == Source::Postgres && ev.line.contains("database system is shut down")
+    ev.source == Source::Postgres
+        && (ev.line.contains("shutdown request")
+            || ev.line.contains("database system is shut down"))
 }
 
 pub fn run(cx: &mut Ctx) {
@@ -80,12 +90,23 @@ pub fn run(cx: &mut Ctx) {
         fences.len()
     ));
 
-    // Non-vacuity: the suite runs three real failovers (G3, G5, G7).
-    // Seeing fewer promotions means the parsers went blind (log format
-    // drift), and every invariant below would pass on nothing.
+    // Non-vacuity: the suite runs at least three real failovers (G3,
+    // G5, G7). Seeing fewer promotions — or fewer PostgreSQL serving
+    // starts than promotions + the bootstrap primary — means a parser
+    // went blind (log format drift, or a bad guard: the first
+    // serving_start matched nothing for exactly this reason), and the
+    // invariants below would pass on nothing.
+    let serving_starts = all.iter().filter(|ev| serving_start(ev)).count();
     cx.check(
-        "audit: parsers saw the suite's promotions (non-vacuous)",
-        promotions.len() >= 3 && !takeovers.is_empty() && !fences.is_empty(),
+        &format!(
+            "audit: parsers saw the suite's promotions and serving starts \
+             (non-vacuous: {} promotions, {serving_starts} serving starts)",
+            promotions.len()
+        ),
+        promotions.len() >= 3
+            && !takeovers.is_empty()
+            && !fences.is_empty()
+            && serving_starts > promotions.len(),
     );
 
     // Every promotion is authorized by an earlier takeover of the SAME

@@ -527,13 +527,32 @@ impl MaintenanceWorker {
         // once per backoff step. The peer branch below is guarded
         // server-side too, but the local branch calls `db.drop_slot`
         // directly, so the check has to happen here as well.
-        if let Some(owner) = crate::inflight_ops::owner_of_slot(
-            self.inflight.as_ref(),
-            slot_name,
-            crate::localserver::CROSS_OP_GRACE,
-        )
-        .await
-        {
+        if let Some(owner) = {
+            // Live evidence keys the discharge: the slot being active
+            // means the rebuilt node came up, ending the op's
+            // ownership at that event (grace is only the never-came-up
+            // backstop). Only the LOCAL slot state is authoritative
+            // here — for a peer-held slot the server-side guard in
+            // `PeerServer::drop_slot` re-checks with its own DB.
+            let db = self.db.clone();
+            let s = slot_name.to_string();
+            let local = self.node_pool.is_local(&node);
+            crate::inflight_ops::owner_of_slot_observing(
+                self.inflight.as_ref(),
+                slot_name,
+                crate::localserver::CROSS_OP_GRACE,
+                move || async move {
+                    if local {
+                        db.slot_active(&s).await
+                    } else {
+                        // No local evidence about a remote slot: never
+                        // discharge from here.
+                        Ok(false)
+                    }
+                },
+            )
+            .await
+        } {
             info!(
                 intent_id = %intent.id,
                 slot = slot_name,
@@ -917,6 +936,9 @@ mod tests {
     }
     #[async_trait]
     impl LocalDb for StubDb {
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn drop_slot(&self, name: &str) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(name.to_string());
             let response = self
@@ -946,6 +968,9 @@ mod tests {
             unreachable!()
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
             unreachable!()
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {

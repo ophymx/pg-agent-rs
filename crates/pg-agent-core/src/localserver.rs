@@ -138,22 +138,28 @@ pub(crate) const REC_PHASE_STANDBY_CONFIGURED: &str = "standby_configured";
 /// overrides it, which is how `cluster recover` re-runs deliberately.
 pub(crate) const RECOVERY_DEDUP_WINDOW: chrono::Duration = chrono::Duration::hours(24);
 
-/// How long a *finished* orchestration still counts as owning its
-/// target for `failover`'s cross-op consult.
+/// BACKSTOP bound on how long a *finished* orchestration still counts
+/// as owning its target for `failover`'s cross-op consult. Ownership
+/// normally ends at an **event**, not this clock: the moment the
+/// rebuilt node is observed alive (its slot active), the op is
+/// discharged and a later destructive request proceeds immediately —
+/// see [`crate::inflight_ops::owner_of_slot_observing`]. This constant
+/// only bounds the case where that evidence never arrives.
 ///
-/// pgpool's `failover_command` is a delayed reaction: health-check
-/// detection (`health_check_period` × retries) plus the hook's own
-/// exec time means a hook caused by "the recovery stopped its target"
-/// routinely arrives *after* the recovery has completed. Dropping the
-/// slot then is exactly as destructive as dropping it mid-flight, and
-/// the precondition check does not catch it either — the rebuilt
-/// standby has been started but has not necessarily reached
-/// `streaming` yet, so it reads as a legitimately-down node.
+/// Why finished ops own anything at all: pgpool's `failover_command`
+/// is a delayed reaction — health-check detection
+/// (`health_check_period` × retries) plus the hook's own exec time
+/// means a hook caused by "the recovery stopped its target" routinely
+/// arrives *after* the recovery has completed. Dropping the slot then
+/// is exactly as destructive as dropping it mid-flight, and the
+/// precondition check does not catch it either — the rebuilt standby
+/// has been started but has not necessarily reached `streaming` yet,
+/// so it reads as a legitimately-down node.
 ///
 /// Two minutes comfortably clears a default pgpool detection window.
-/// The cost of being generous is bounded: it delays cleanup of a slot
-/// belonging to a node that really did fail moments after a recovery,
-/// and the maintenance queue reclaims that on the next genuine hook.
+/// The cost of the backstop is bounded: for a node that never comes
+/// up, its slot stays protected this long before the maintenance
+/// queue can reclaim it.
 pub const CROSS_OP_GRACE: chrono::Duration = chrono::Duration::seconds(120);
 
 pub(crate) const FP_PHASE_QUEUED: &str = "queued";
@@ -2094,8 +2100,10 @@ enum FetchOutcome {
 
 impl LocalServer {
     /// The orchestration that owns `node_id`'s data directory /
-    /// replication slot, if any — in flight, or finished so recently
-    /// that a hook it caused may still be arriving.
+    /// replication slot, if any — in flight, or finished with the
+    /// rebuilt node not yet observed alive (ownership ends at that
+    /// event; [`CROSS_OP_GRACE`] is only the backstop for a node that
+    /// never comes up).
     ///
     /// `failover` uses this to avoid acting destructively on a node
     /// another operation is mid-way through rebuilding. A journal read
@@ -2104,7 +2112,16 @@ impl LocalServer {
     /// failover because the journal is unreadable would be worse than
     /// the race it guards.
     async fn inflight_owner_of(&self, node_id: i32) -> Option<crate::inflight_ops::InflightOp> {
-        crate::inflight_ops::owner_of_node(self.inflight.as_ref(), node_id, CROSS_OP_GRACE).await
+        let slot = format!("node{node_id}");
+        let db = self.db.clone();
+        let s = slot.clone();
+        crate::inflight_ops::owner_of_slot_observing(
+            self.inflight.as_ref(),
+            &slot,
+            CROSS_OP_GRACE,
+            move || async move { db.slot_active(&s).await },
+        )
+        .await
     }
 
     /// Queue a `DropSlotCleanup` maintenance intent after a slot drop
@@ -3414,6 +3431,7 @@ mod tests {
                 is_pgpool_status_ok: true,
                 timeline_id: 0,
                 current_wal_lsn: 0,
+                last_flush_lsn: 0,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -3436,6 +3454,9 @@ mod tests {
         drop_slot_fails: AtomicBool,
         created_repl_roles: StdMutex<Vec<String>>,
         create_repl_role_fails: AtomicBool,
+        /// What `slot_active` reports (default false — no walreceiver).
+        /// Tests exercising the cross-op ownership discharge flip it.
+        slot_is_active: AtomicBool,
         /// Local PG's `pg_current_wal_lsn()` value. Tests set this to a
         /// non-zero value when exercising the handoff lag check so the
         /// "cannot measure lag" guard doesn't trip.
@@ -3450,6 +3471,12 @@ mod tests {
         async fn checkpoint(&self) -> anyhow::Result<()> {
             self.checkpoint_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(self.slot_is_active.load(Ordering::SeqCst))
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
+            Ok(self.current_wal_lsn.load(Ordering::SeqCst))
         }
         async fn create_slot(&self, name: &str) -> anyhow::Result<()> {
             self.created_slots.lock().unwrap().push(name.to_string());
@@ -3608,6 +3635,7 @@ mod tests {
                 started_at: now,
                 updated_at: now,
                 completed_at: None,
+                discharged_at: None,
                 last_error: None,
             };
             ops.push(op.clone());
@@ -3657,6 +3685,15 @@ mod tests {
             op.updated_at = now;
             op.completed_at = Some(now);
             op.last_error = Some(reason.to_string());
+            Ok(())
+        }
+        async fn discharge(&self, id: &str) -> anyhow::Result<()> {
+            let mut ops = self.ops.lock().unwrap();
+            let op = ops
+                .iter_mut()
+                .find(|o| o.id == id)
+                .ok_or_else(|| anyhow::anyhow!("stub: id not found: {id}"))?;
+            op.discharged_at = Some(Utc::now());
             Ok(())
         }
         async fn find(
@@ -3875,6 +3912,7 @@ mod tests {
                 is_pgpool_status_ok: true,
                 timeline_id: self.timeline_id.load(Ordering::SeqCst),
                 current_wal_lsn: lsn,
+                last_flush_lsn: lsn,
             })
         }
         async fn stop(&self) -> anyhow::Result<()> {
@@ -4816,6 +4854,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failover_discharges_ownership_when_the_rebuilt_standby_streams() {
+        // The event that ends a completed op's ownership: the consult
+        // observes the slot ACTIVE (the rebuilt standby came up),
+        // records the discharge, and stops shielding the node — the
+        // ordinary guards own the decision from here.
+        let (s, db, _peers, _maint, _wal, _replay, _pcp, _sd, _standby, inflight) = make_server();
+        db.slot_is_active.store(true, Ordering::SeqCst);
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: 0,
+                    standby_node_id: 1,
+                    standby_hostname: "peer1.local".into(),
+                    slot_name: "node1".into(),
+                },
+                REC_PHASE_SLOT_CREATED,
+                false,
+            )
+            .await
+            .unwrap();
+        inflight.complete(&op.id).await.unwrap();
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert!(
+            !resp.message.contains("retained"),
+            "consult must not shield a discharged op: {}",
+            resp.message
+        );
+        assert!(
+            inflight.get(&op.id).await.unwrap().discharged_at.is_some(),
+            "the observed-alive event must be recorded on the op"
+        );
+        // The drop proceeded (stub PG has no active-slot refusal; in
+        // production an active slot cannot be dropped anyway).
+        assert_eq!(*db.dropped_slots.lock().unwrap(), vec!["node1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failover_reclaims_immediately_once_discharged() {
+        // Came up (discharged), then genuinely died: the next hook
+        // reclaims the slot NOW — no waiting out the grace window.
+        let (s, db, _peers, _maint, _wal, _replay, _pcp, _sd, _standby, inflight) = make_server();
+        let op = inflight
+            .begin(
+                crate::inflight_ops::InflightPayload::Recovery {
+                    primary_node_id: 0,
+                    standby_node_id: 1,
+                    standby_hostname: "peer1.local".into(),
+                    slot_name: "node1".into(),
+                },
+                REC_PHASE_SLOT_CREATED,
+                false,
+            )
+            .await
+            .unwrap();
+        inflight.complete(&op.id).await.unwrap();
+        inflight.discharge(&op.id).await.unwrap();
+        // Slot inactive now (the standby died) — well within the grace.
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(
+            *db.dropped_slots.lock().unwrap(),
+            vec!["node1".to_string()],
+            "a discharged op must not delay reclaim until the grace expires"
+        );
+    }
+
+    #[tokio::test]
     async fn failover_refuses_slot_drop_when_detached_standby_streaming() {
         // Standby-down flavor of the same false report: the standby is
         // reachable, in recovery, and streaming — dropping its slot
@@ -5704,6 +5820,7 @@ mod tests {
             started_at: now,
             updated_at: now,
             completed_at: Some(now),
+            discharged_at: None,
             last_error: None,
         });
         let resp = s
@@ -5744,6 +5861,7 @@ mod tests {
             started_at: now,
             updated_at: now,
             completed_at: None,
+            discharged_at: None,
             last_error: None,
         });
         let resp = s
@@ -5813,6 +5931,7 @@ mod tests {
             } else {
                 Some(now)
             },
+            discharged_at: None,
             last_error: None,
         });
     }
@@ -7172,6 +7291,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             completed_at: None,
+            discharged_at: None,
             last_error: None,
         });
 
@@ -7206,6 +7326,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             completed_at: None,
+            discharged_at: None,
             last_error: None,
         });
         let resp = s

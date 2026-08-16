@@ -397,11 +397,18 @@ dispatches per-step calls to peer agents over `PgAgentPeer`.
      PostgreSQL deliberately, which is what fired this hook; dropping
      the slot would destroy the one it just created and leave a standby
      that can never stream. Ownership covers `InProgress` ops **and**
-     ops completed within `CROSS_OP_GRACE` (120s): pgpool's hook is a
-     delayed reaction, so it routinely arrives after the orchestration
-     finished but before the rebuilt standby reaches `streaming` — a
-     window in which the precondition check below also reads the node
-     as legitimately down.
+     completed ops whose rebuilt node has not yet been observed alive:
+     pgpool's hook is a delayed reaction, so it routinely arrives after
+     the orchestration finished but before the rebuilt standby reaches
+     `streaming` — a window in which the precondition check below also
+     reads the node as legitimately down. A completed op's ownership
+     ends at an **event**, not a clock: the consult itself observes the
+     slot, and the first time it finds the slot active (the rebuilt
+     node came up) it records a durable *discharge* on the op — from
+     then on a destructive request is the ordinary standby-down case
+     and proceeds immediately. `CROSS_OP_GRACE` (120s) survives only as
+     the backstop for a node that never comes up, so its slot does not
+     stay protected forever.
    - **Precondition** (defense in depth — see
      [docs/promotion-authority.md](docs/promotion-authority.md) §3): if
      `detached` is reachable, running, in recovery, and
@@ -569,7 +576,7 @@ no password.
 | `ReloadPgpool`      | `systemd.ReloadOrRestartUnit($pgpool_service, "replace")` |
 | `Promote`           | `SELECT pg_promote()` |
 | `CreateSlot`        | `pg_create_physical_replication_slot(name)`, SQLSTATE 42710 ok |
-| `DropSlot`          | **Ownership guard first:** if `inflight_ops::owner_of_slot` reports an op owns this slot (`InProgress`, or `Done` within `CROSS_OP_GRACE`), return `ok=true` with a "retained" message and do nothing. `ok=true` rather than an error is deliberate — the caller's cleanup is genuinely obsolete, and an error keeps a maintenance intent retrying against a slot now in legitimate use. Otherwise `pg_drop_replication_slot(name)`. The guard lives here because callers are plural and some are stale (a queued `drop_slot_cleanup` on another node retries with backoff), and only the slot's host knows whether it is spoken for. |
+| `DropSlot`          | **Ownership guard first:** if `inflight_ops::owner_of_slot_observing` reports an op owns this slot (`InProgress`, or `Done`, undischarged, within the `CROSS_OP_GRACE` backstop — an active slot discharges the op instead, §5.1 step 4), return `ok=true` with a "retained" message and do nothing. `ok=true` rather than an error is deliberate — the caller's cleanup is genuinely obsolete, and an error keeps a maintenance intent retrying against a slot now in legitimate use. Otherwise `pg_drop_replication_slot(name)`. The guard lives here because callers are plural and some are stale (a queued `drop_slot_cleanup` on another node retries with backoff), and only the slot's host knows whether it is spoken for. |
 | `ConfigureStandby`  | validate (`primary_host` regex, port>0, repl_user regex, slot regex). Write `$PGDATA/myrecovery.conf` (template — see §5.10) and create empty `$PGDATA/standby.signal`. Both files mode `0640`. |
 | `Basebackup`        | refuse if PostgreSQL is running (`FailedPrecondition`). Clear `$PGDATA` contents. Exec `<pg_install_prefix>/bin/pg_basebackup --pgdata <data> --dbname '<conninfo>' --wal-method=stream --checkpoint=fast --no-password [--slot <name>] [--progress]`. Scan stderr line-by-line (split on `\r` *or* `\n`), forward `done/total kB` lines as `OpProgress { phase="streaming", bytes_done=done*1024, bytes_total=total*1024 }`, log other lines, capture last ~4 KiB into the error tail if the subprocess exits non-zero. Final `OpProgress { phase="done" }`. |
 | `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pg_install_prefix>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |

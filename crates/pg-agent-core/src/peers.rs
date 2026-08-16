@@ -732,6 +732,7 @@ mod tests {
                 is_pgpool_status_ok: true,
                 timeline_id: 0,
                 current_wal_lsn: 0,
+                last_flush_lsn: 0,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -841,6 +842,9 @@ mod tests {
         async fn promote(&self) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             Ok(())
         }
@@ -857,6 +861,9 @@ mod tests {
             Ok(0)
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
             Ok(0)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {

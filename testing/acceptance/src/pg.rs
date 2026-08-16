@@ -141,19 +141,6 @@ impl Pg {
             .ok()
             .filter(|s| !s.is_empty())
     }
-
-    /// Receive-vs-replay gap in bytes on a standby.
-    pub async fn replay_gap(&self, node: &'static str) -> Option<i64> {
-        self.scalar(
-            node,
-            "select coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), \
-             pg_last_wal_replay_lsn()), 0)::bigint::text",
-        )
-        .await
-        .ok()?
-        .parse()
-        .ok()
-    }
 }
 
 fn row_text(row: &tokio_postgres::Row) -> anyhow::Result<String> {

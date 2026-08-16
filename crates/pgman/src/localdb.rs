@@ -63,6 +63,14 @@ pub trait LocalDb: Send + Sync {
     async fn create_slot(&self, name: &str) -> anyhow::Result<()>;
     async fn drop_slot(&self, name: &str) -> anyhow::Result<()>;
 
+    /// True iff the replication slot exists AND a consumer is connected
+    /// to it right now (`pg_replication_slots.active`). This is the
+    /// "the rebuilt standby actually came up" event the cross-op
+    /// ownership discharge keys on (see
+    /// `pg_agent_core::inflight_ops::owner_of_slot_observing`): an
+    /// absent slot and an inactive slot both return false.
+    async fn slot_active(&self, name: &str) -> anyhow::Result<bool>;
+
     async fn is_in_recovery(&self) -> anyhow::Result<bool>;
 
     /// Live PostgreSQL timeline ID parsed from the current WAL filename:
@@ -84,6 +92,17 @@ pub trait LocalDb: Send + Sync {
     /// split-brain (higher LSN on the same timeline = more committed
     /// WAL).
     async fn current_wal_lsn(&self) -> anyhow::Result<u64>;
+
+    /// Durably-flushed WAL position: on a primary `pg_current_wal_lsn()`
+    /// (same as [`Self::current_wal_lsn`]); on a standby
+    /// `GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())` —
+    /// received-and-flushed WAL that replay has not caught up to is
+    /// still WAL this node owns and will replay before promoting. This
+    /// is the candidate-selection key (docs/quorum-commit.md §4):
+    /// under quorum commit the acknowledged-write guarantee attaches
+    /// to FLUSHED WAL, and replay-based comparison misclassifies a
+    /// flush-complete standby as lagging (finding 19).
+    async fn flush_lsn(&self) -> anyhow::Result<u64>;
 
     /// On a primary returns `ReplicationLag::default()` (zeros).
     async fn replication_lag(&self) -> anyhow::Result<ReplicationLag>;
@@ -198,6 +217,18 @@ impl LocalDb for PgLocalDb {
         }
     }
 
+    async fn slot_active(&self, name: &str) -> anyhow::Result<bool> {
+        let conn = self.get_conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&name],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: slot_active({name:?}): {}", describe_pg(&e)))?;
+        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+    }
+
     async fn drop_slot(&self, name: &str) -> anyhow::Result<()> {
         let conn = self.get_conn().await?;
         conn.execute("SELECT pg_drop_replication_slot($1)", &[&name])
@@ -283,6 +314,35 @@ impl LocalDb for PgLocalDb {
                     anyhow::anyhow!("localdb: pg_last_wal_replay_lsn: {}", describe_pg(&e))
                 })?
                 .get(0)
+        } else {
+            conn.query_one("SELECT pg_current_wal_lsn()::text", &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("localdb: pg_current_wal_lsn: {}", describe_pg(&e)))?
+                .get(0)
+        };
+        parse_pg_lsn(&text)
+    }
+
+    async fn flush_lsn(&self) -> anyhow::Result<u64> {
+        let conn = self.get_conn().await?;
+        let in_recovery: bool = conn
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_is_in_recovery: {}", describe_pg(&e)))?
+            .get(0);
+        let text: String = if in_recovery {
+            // GREATEST covers both standby shapes: streaming (receive
+            // ahead of replay — flushed WAL the node owns) and
+            // restore_command-fed (receive NULL, replay is all there
+            // is). COALESCE '0/0' keeps GREATEST total.
+            conn.query_one(
+                "SELECT GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'::pg_lsn), \
+                                 COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn))::text",
+                &[],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: flush_lsn (standby): {}", describe_pg(&e)))?
+            .get(0)
         } else {
             conn.query_one("SELECT pg_current_wal_lsn()::text", &[])
                 .await

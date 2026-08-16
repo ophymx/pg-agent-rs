@@ -542,6 +542,9 @@ mod tests {
     }
     #[async_trait]
     impl LocalDb for StubDb {
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn is_in_recovery(&self) -> anyhow::Result<bool> {
             match self.in_recovery.lock().unwrap().clone() {
                 Ok(v) => Ok(v),
@@ -552,6 +555,9 @@ mod tests {
             Ok(0)
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
             Ok(0)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {

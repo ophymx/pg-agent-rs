@@ -255,17 +255,23 @@ impl PeerServer {
     }
 
     /// The orchestration that owns `slot_name`, if any — in flight, or
-    /// finished within [`crate::localserver::CROSS_OP_GRACE`].
+    /// finished with the rebuilt node not yet observed alive
+    /// (ownership ends at that event;
+    /// [`crate::localserver::CROSS_OP_GRACE`] is only the backstop for
+    /// a node that never comes up).
     ///
     /// Slots are named `node{id}` (SPEC §5.1), which is the link
     /// between a slot and the op that owns the node it belongs to. An
     /// unparseable name means no owner: the guard exists to protect
     /// known orchestrations, not to block anything unfamiliar.
     async fn slot_owner(&self, slot_name: &str) -> Option<crate::inflight_ops::InflightOp> {
-        crate::inflight_ops::owner_of_slot(
+        let db = self.db.clone();
+        let s = slot_name.to_string();
+        crate::inflight_ops::owner_of_slot_observing(
             self.inflight.as_ref(),
             slot_name,
             crate::localserver::CROSS_OP_GRACE,
+            move || async move { db.slot_active(&s).await },
         )
         .await
     }
@@ -617,6 +623,24 @@ impl PgAgentPeer for PeerServer {
         // non-empty target dir, and StandbyOps::basebackup clears `$PGDATA`
         // contents — catching the "PG running" case here is the only way
         // to keep us from blowing away a live cluster.
+        //
+        // "Live" includes MID-SHUTDOWN: `status_postgres` reports
+        // `deactivating` as not-running, but the dying postmaster still
+        // owns $PGDATA (its shutdown checkpoint can take seconds, and a
+        // fence-then-recover legitimately arrives inside that window —
+        // observed as the pgdata clear racing the postmaster's own file
+        // deletions). Wait, bounded, for the unit to settle before
+        // judging.
+        let settle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.sd.postgres_settling().await.map_err(internal)? {
+            if tokio::time::Instant::now() >= settle_deadline {
+                return Err(Status::failed_precondition(
+                    "refusing to basebackup: postgres unit stuck in a transitional \
+                     state for 30s (mid-start or mid-shutdown owns $PGDATA)",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
         let pg_running = self.sd.status_postgres().await.map_err(internal)?;
         if pg_running {
             return Err(Status::failed_precondition(
@@ -863,6 +887,7 @@ mod tests {
                 is_pgpool_status_ok: true,
                 timeline_id: 0,
                 current_wal_lsn: 0,
+                last_flush_lsn: 0,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -929,6 +954,9 @@ mod tests {
             self.promote_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             Ok(())
         }
@@ -947,6 +975,9 @@ mod tests {
             Ok(0)
         }
         async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
             Ok(0)
         }
         async fn replication_lag(&self) -> anyhow::Result<ReplicationLag> {

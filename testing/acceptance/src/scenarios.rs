@@ -43,8 +43,8 @@ async fn pcp_backends_up(node: &str) -> usize {
         .count()
 }
 
-async fn cluster_recover(via: &str, target: &str) {
-    let _ = exec_pg(
+async fn cluster_recover(cx: &Ctx, via: &str, target: &str) {
+    let res = exec_pg(
         via,
         &format!(
             "pg_agentctl cluster recover --target {} --stop-target-pg",
@@ -52,6 +52,17 @@ async fn cluster_recover(via: &str, target: &str) {
         ),
     )
     .await;
+    // A failed recover is not itself an assert (the convergence checks
+    // downstream fail the suite), but a silent one costs an hour of
+    // journal forensics — surface the tail.
+    if let Err(e) = res {
+        let text = e.to_string();
+        let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let tail = tail[tail.len().saturating_sub(3)..].join(" | ");
+        cx.note(&format!(
+            "cluster recover of {target} via {via} FAILED: {tail}"
+        ));
+    }
 }
 
 pub async fn run_all(cx: &mut Ctx) {
@@ -338,7 +349,7 @@ async fn g4(
         &format!("dead ex-primary {dead} stayed stopped (rejoin is never automatic)"),
         !unit_active(dead, "postgresql@17-main").await,
     );
-    cluster_recover(w1, dead).await;
+    cluster_recover(cx, w1, dead).await;
     repair_standbys(cx, w1, "g4", marks).await;
     let primaries = cx.pg.count_primaries().await;
     cx.check("exactly one primary after the rejoin", primaries == 1);
@@ -353,7 +364,7 @@ async fn g4b(cx: &mut Ctx, w1: &'static str, marks: &mut HashMap<&'static str, C
     pcp_attach_everywhere(cx).await;
     let target = other_node(w1);
     let since = cx.log.cursor();
-    cluster_recover(w1, target).await;
+    cluster_recover(cx, w1, target).await;
     cx.await_event(
         30,
         "failover hook deferred to the in-flight recovery (slot survived)",
@@ -378,10 +389,26 @@ async fn g5(cx: &mut Ctx, w1: &'static str) -> &'static str {
         |ev| agent(ev, w1, "FENCING"),
     )
     .await;
-    cx.check(
-        &format!("isolated {w1} PostgreSQL is actually stopped"),
-        !unit_active(w1, "postgresql@17-main").await,
-    );
+    // Await the shutdown EVENT, not a systemd sample: `is-active`
+    // reads `deactivating` as stopped while the postmaster still owns
+    // $PGDATA, and proceeding into G5b's recover on that sample raced
+    // basebackup's pgdata clear against the dying postmaster —
+    // observed live. Budget 90 s: a PARTITIONED primary's fast
+    // shutdown drains walsenders toward wal_sender_timeout (60 s
+    // default; 44 s observed — finding 17). Write service ends at the
+    // shutdown request, so this drain is fence *latency*, not a
+    // dual-primary window; the audit's serving intervals encode that.
+    cx.await_event(
+        90,
+        &format!("isolated {w1} PostgreSQL fully shut down"),
+        since,
+        |ev| {
+            ev.node == w1
+                && ev.source == Source::Postgres
+                && ev.line.contains("database system is shut down")
+        },
+    )
+    .await;
     let winner_ev = cx
         .await_event(60, "majority completed a real promotion", since, |ev| {
             ev.node != w1 && agent_any(ev, "roleexec: promotion complete")
@@ -447,7 +474,7 @@ async fn g5b(
         "fenced ex-holder stays down after reconnect (demote policy)",
         !unit_active(w1, "postgresql@17-main").await,
     );
-    cluster_recover(w2, w1).await;
+    cluster_recover(cx, w2, w1).await;
     repair_standbys(cx, w2, "g5", marks).await;
     let primaries = cx.pg.count_primaries().await;
     cx.check("exactly one primary after the rejoin", primaries == 1);
@@ -509,16 +536,38 @@ async fn g6(cx: &mut Ctx, w2: &'static str) {
 }
 
 async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
-    cx.say("G7: candidate selection refuses a lagging standby (§2.2 under the lease)");
+    cx.say("G7: candidate selection refuses a FLUSH-lagging standby (§2.2 under the lease)");
     // The §2.2 defect was pgpool picking a candidate by lowest node id
     // with no WAL comparison. Under the lease, candidacy runs the
-    // most-advanced check itself. Arrange real lag: pause replay on
-    // one standby, write ~24 MB on the primary, kill the primary — the
-    // caught-up standby MUST win and the lagging one must stand down.
+    // most-advanced check itself — comparing FLUSH positions
+    // (docs/quorum-commit.md §4, finding 19: replay lag is not data
+    // lag; a replay-paused standby holds every flushed byte and is a
+    // legitimate winner). Arrange real flush lag: sever one standby's
+    // walreceiver path only (PG port — its agent stays reachable, so
+    // it PARTICIPATES in candidacy and the lag gate is what refuses
+    // it; a full partition would just exclude it from quorum), write
+    // ~24 MB on the primary, kill the primary.
     let mut rest = NODES.iter().copied().filter(|n| *n != w2);
     let s_lag = rest.next().unwrap();
     let s_ok = rest.next().unwrap();
-    let _ = cx.pg.execute(s_lag, "select pg_wal_replay_pause()").await;
+    let prim_ip = cluster::container_ip(w2).await.unwrap_or_default();
+    let _ = exec(
+        s_lag,
+        &format!(
+            "iptables -A OUTPUT -d {prim_ip} -p tcp --dport 5432 -j DROP && \
+             iptables -A INPUT -s {prim_ip} -p tcp --sport 5432 -j DROP"
+        ),
+    )
+    .await;
+    // Kill the established walreceiver connection; reconnects hit the
+    // DROP rules and hang in connect, so receive (flush) goes static.
+    let _ = cx
+        .pg
+        .execute(
+            s_lag,
+            "select pg_terminate_backend(pid) from pg_stat_wal_receiver",
+        )
+        .await;
     let _ = cx
         .pg
         .execute(
@@ -531,10 +580,30 @@ async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cu
     let pg = cx.pg.clone();
     cx.wait_until(
         30,
-        &format!("{s_lag} trails by > 16 MiB (replay paused, still receiving)"),
+        &format!("{s_lag} trails by > 16 MiB of FLUSHED WAL (walreceiver severed)"),
         || {
             let pg = pg.clone();
-            async move { pg.replay_gap(s_lag).await.unwrap_or(0) > 16 * 1024 * 1024 }
+            async move {
+                let Ok(lag_flush) = pg
+                    .scalar(
+                        s_lag,
+                        "select greatest(coalesce(pg_last_wal_receive_lsn(),'0/0'::pg_lsn), \
+                         coalesce(pg_last_wal_replay_lsn(),'0/0'::pg_lsn))::text",
+                    )
+                    .await
+                else {
+                    return false;
+                };
+                pg.scalar(
+                    w2,
+                    &format!(
+                        "select (pg_wal_lsn_diff(pg_current_wal_lsn(), '{lag_flush}'::pg_lsn) \
+                         > 16*1024*1024)::text"
+                    ),
+                )
+                .await
+                .is_ok_and(|v| v == "t" || v == "true")
+            }
         },
     )
     .await;
@@ -567,9 +636,21 @@ async fn g7(cx: &mut Ctx, w2: &'static str, marks: &mut HashMap<&'static str, Cu
             "{s_lag} never reached candidacy (winner's CAS landed first)"
         ));
     }
-    let _ = cx.pg.execute(s_lag, "select pg_wal_replay_resume()").await;
-    cluster_recover(s_ok, w2).await;
-    repair_standbys(cx, s_ok, "g7", marks).await;
+    // Heal the severed walreceiver path (rules are the only ones in
+    // these chains — the containers run no other firewalling).
+    let _ = exec(s_lag, "iptables -F OUTPUT && iptables -F INPUT").await;
+    // Repair via the ACTUAL primary, not the predicted winner: if the
+    // enforced assert above failed (finding 19's candidacy race), the
+    // repairs must still converge the cluster instead of cascading
+    // "not the primary" refusals through the remaining checks.
+    let actual = cx.pg.current_primary().await.unwrap_or(s_ok);
+    if actual != s_ok {
+        cx.note(&format!(
+            "repairing via actual primary {actual} (predicted winner was {s_ok})"
+        ));
+    }
+    cluster_recover(cx, actual, w2).await;
+    repair_standbys(cx, actual, "g7", marks).await;
     let primaries = cx.pg.count_primaries().await;
     cx.check(
         "exactly one primary after the lag-gated failover + rejoin",
@@ -613,7 +694,7 @@ async fn repair_standbys(
                     "{n} shows the timeline-fork wedge ({}s) — recovering it now",
                     t0.elapsed().as_secs()
                 ));
-                cluster_recover(prim, n).await;
+                cluster_recover(cx, prim, n).await;
                 marks.insert(n, cx.log.cursor());
                 recovered.push(n);
             }
@@ -689,7 +770,7 @@ async fn repair_standbys(
                 cx.note(&format!(
                     "{n} not streaming, not advancing, not followed — operator recover ({ctxname})"
                 ));
-                cluster_recover(prim, n).await;
+                cluster_recover(cx, prim, n).await;
                 marks.insert(n, cx.log.cursor());
             }
         }

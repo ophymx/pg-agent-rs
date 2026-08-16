@@ -79,6 +79,20 @@ pub trait Systemd: Send + Sync {
     async fn status_postgres(&self) -> anyhow::Result<bool>;
     async fn status_pgpool(&self) -> anyhow::Result<bool>;
 
+    /// True while the postgres unit is in a TRANSITIONAL state
+    /// (`activating`/`deactivating`/`reloading`) — neither decisively
+    /// up nor decisively down. `status_postgres` reports
+    /// `deactivating` as "not running", which is right for routing
+    /// decisions but WRONG for wipe-safety: a postmaster mid-shutdown
+    /// still owns `$PGDATA` (observed: a fence-then-recover race where
+    /// basebackup's pgdata clear collided with the dying postmaster's
+    /// own file deletions). Guards that destroy data must wait for
+    /// this to go false. Default `false` so test stubs — which model
+    /// settled states only — need no changes; real impls override.
+    async fn postgres_settling(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// ReloadOrRestart — starts the unit if not running.
     async fn reload_or_restart_postgres(&self) -> anyhow::Result<()>;
     async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()>;
@@ -312,6 +326,18 @@ impl Systemd for DbusSystemd {
     async fn status_pgpool(&self) -> anyhow::Result<bool> {
         self.unit_running(&self.pgpool_service).await
     }
+
+    async fn postgres_settling(&self) -> anyhow::Result<bool> {
+        let statuses = self
+            .proxy
+            .list_units_by_names(vec![self.pg_service.clone()])
+            .await
+            .map_err(|e| anyhow::anyhow!("systemd: status {}: {e}", self.pg_service))?;
+        match statuses.into_iter().next() {
+            None => Ok(false), // not loaded = settled (down)
+            Some(s) => Ok(is_active_state_transitional(&s.active_state)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +351,13 @@ impl Systemd for DbusSystemd {
 /// rather than "unknown" to operators.
 fn is_active_state_running(state: &str) -> bool {
     matches!(state, "active" | "activating" | "reloading")
+}
+
+/// Transitional `ActiveState`s: the unit is between settled states, so
+/// neither "running" nor "down" conclusions are safe yet — see
+/// [`Systemd::postgres_settling`].
+fn is_active_state_transitional(state: &str) -> bool {
+    matches!(state, "activating" | "deactivating" | "reloading")
 }
 
 /// `JobRemoved.result` values we accept as success. Anything else

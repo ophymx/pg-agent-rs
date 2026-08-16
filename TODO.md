@@ -5,6 +5,26 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
+### Quorum commit — make the lease's terms bind writes (designed)
+
+- **Design:** [docs/quorum-commit.md](docs/quorum-commit.md). The gap:
+  terms fence *promotion* flawlessly (the acceptance auditor proves it
+  every run) but nothing at the write path checks one — a deposed
+  primary's acknowledged commits die with its timeline (findings 17,
+  18). The mechanism: `synchronous_standby_names = ANY 1` managed by
+  the executor, so acknowledging a commit requires a standby that
+  follows the lease — a primary that loses the lease loses the ability
+  to acknowledge within one follow-convergence, independent of fence
+  latency.
+- **Phases** (each shippable alone, §8): (1) `application_name` in
+  `primary_conninfo` + `last_flush_lsn` in `NodeStatus`;
+  (2) candidacy key → flush position + G7 rework — **finding 19
+  validated this premise live**: the replay-paused standby that "won
+  wrongly" held every byte flushed and lost nothing; (3) executor
+  arms `ANY 1` on first-standby-attach, healthz `sync_commit`
+  tri-state, `allow-async` escape hatch; (4) acceptance sentinel
+  write-survival asserts — the suite's first data-survival checks.
+
 ### ~~`cluster recover` races pgpool's failover hook and loses its slot~~ — FIXED
 
 > Closed by the `inflight_ops` migration: `recovery_first_stage` now
@@ -258,6 +278,17 @@ Two related issues around handoff's replication-slot management on the new prima
 ### Replay marker 24h TTL surprises long-gap re-runs (non-handoff ops)
 
 - `crates/pg-agent-core/src/replay_markers.rs`. Handoff moved to `inflight_ops` (7d retention) in 0.6.0. `failover`, `recovery_first_stage`, `cluster_recover` still use 24h replay markers — an operator who re-runs `cluster recover --target N` 25 hours after a successful run will trigger the destructive reclone again. Mitigated by each handler's own state checks (basebackup refuses non-empty pgdata, slot create is duplicate-OK, etc.) so the failure mode is soft. Fix: bump retention to 7 days to match inflight_ops, or migrate these handlers to `inflight_ops` too if the contract grows phased state.
+
+### Fence latency: fast shutdown drains walsenders toward `wal_sender_timeout` (finding 17) — urgency drops once quorum commit lands
+
+> With [docs/quorum-commit.md](docs/quorum-commit.md) implemented, the
+> fence window can no longer lose *acknowledged* writes (the deposed
+> primary's commits hang unacknowledged the moment its standbys
+> re-point) — this item then becomes latency polish, not safety.
+
+### Fence latency (detail)
+
+- `crates/pg-agent-core/src/roleexec.rs` `fence` → `PostgresInstance::ensure_stopped` → systemd stop (fast shutdown). On a PARTITIONED primary — the fence's primary use case — the walsenders being drained point at exactly the unreachable peers, so "database system is shut down" lags up to `wal_sender_timeout` (44 s observed in the acceptance suite). Writes are refused from the shutdown *request* onward, so this is not a split-brain window — but the node's $PGDATA stays owned by the dying postmaster the whole time, delaying operator recover (guarded by `PeerServer::basebackup`'s settling wait) and stretching the fence's completion evidence. Fix shape: escalate the fence to an immediate-mode stop (SIGQUIT semantics) after a short fast-shutdown grace, or preemptively terminate walsenders before the stop. Crash-recovery cost is moot — demote policy recloneds/rewinds the fenced node on rejoin anyway.
 
 ### Escalation hook constants + Escalation RPC are vestigial
 
