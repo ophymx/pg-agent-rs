@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Trait surface
@@ -203,6 +203,12 @@ pub struct PeerPool {
 struct ChannelEntry {
     client: Arc<dyn PeerClient>,
     created_at: Instant,
+    /// Set by the entry's own [`PeerChannel`] on a transport-class
+    /// error (finding 20): the connection is known-broken — a
+    /// partition, a peer restart — and serving it until the age cap
+    /// makes every caller in between pay the broken-connection tax.
+    /// `client()` treats a poisoned entry like an aged-out one.
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerPool {
@@ -300,26 +306,31 @@ impl PeerRegistry for PeerPool {
     async fn client(&self, node: &NodeConfig) -> anyhow::Result<Arc<dyn PeerClient>> {
         let mut map = self.channels.lock().await;
         if let Some(entry) = map.get(&node.id) {
-            if entry.created_at.elapsed() < self.max_age {
+            let poisoned = entry.poisoned.load(std::sync::atomic::Ordering::SeqCst);
+            if entry.created_at.elapsed() < self.max_age && !poisoned {
                 debug!(node = node.id, host = %node.hostname, "peer: cache hit");
                 return Ok(entry.client.clone());
             }
             debug!(
                 node = node.id,
                 age_s = entry.created_at.elapsed().as_secs(),
-                "peer: cache entry aged out — redialing"
+                poisoned,
+                "peer: cache entry aged out or poisoned — redialing"
             );
         }
         info!(node = node.id, host = %node.hostname, "peer: dialing");
         let channel = self.dial(node).await?;
+        let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let client: Arc<dyn PeerClient> = Arc::new(PeerChannel {
             inner: PgAgentPeerClient::new(channel),
+            poisoned: poisoned.clone(),
         });
         map.insert(
             node.id,
             ChannelEntry {
                 client: client.clone(),
                 created_at: Instant::now(),
+                poisoned,
             },
         );
         Ok(client)
@@ -397,6 +408,53 @@ pub(crate) async fn connect_mtls(
 
 struct PeerChannel {
     inner: PgAgentPeerClient<Channel>,
+    /// Shared with this channel's [`ChannelEntry`]; set on
+    /// transport-class errors so the pool redials (finding 20).
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Transport-class: the CONNECTION is broken, as opposed to the peer's
+/// handler answering with an application error. Only these poison the
+/// pooled channel — an application error proves the connection works.
+///
+/// tonic surfaces connection breakage as `Unavailable` ("transport
+/// error", "error trying to connect") or as `Unknown`/`Internal`
+/// carrying h2-level detail in the message; the markers below are the
+/// shapes observed in the acceptance suite's partition scenarios.
+fn is_transport_error(s: &tonic::Status) -> bool {
+    if s.code() == tonic::Code::Unavailable {
+        return true;
+    }
+    let m = s.message();
+    m.contains("h2 protocol error")
+        || m.contains("http2 error")
+        || m.contains("transport error")
+        || m.contains("connection reset")
+        || m.contains("broken pipe")
+        || m.contains("error trying to connect")
+        // hyper's shape for "the connection died with this request in
+        // flight" (e.g. the peer hung up / GOAWAY mid-RPC). A
+        // server-side application cancel is Code::Cancelled, not this.
+        || m.contains("operation was canceled")
+}
+
+impl PeerChannel {
+    /// Map a failed RPC's `Status` into the peer error, poisoning this
+    /// channel's pool entry first when the failure is transport-class.
+    fn peer_err(&self, what: &str, s: tonic::Status) -> anyhow::Error {
+        if is_transport_error(&s)
+            && !self
+                .poisoned
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            warn!(
+                what,
+                code = ?s.code(),
+                "peer channel poisoned on transport error — next use redials"
+            );
+        }
+        anyhow::anyhow!("peer {what}: {}", s.message())
+    }
 }
 
 /// Bound a fast unary RPC at [`DEFAULT_REQUEST_TIMEOUT`].
@@ -432,7 +490,7 @@ impl PeerClient for PeerChannel {
             let resp = client
                 .create_slot(req)
                 .await
-                .map_err(|s| anyhow::anyhow!("peer create_slot: {}", s.message()))?
+                .map_err(|s| self.peer_err("create_slot", s))?
                 .into_inner();
             if !resp.ok {
                 anyhow::bail!("peer create_slot: {}", resp.message);
@@ -451,7 +509,7 @@ impl PeerClient for PeerChannel {
             let resp = client
                 .drop_slot(req)
                 .await
-                .map_err(|s| anyhow::anyhow!("peer drop_slot: {}", s.message()))?
+                .map_err(|s| self.peer_err("drop_slot", s))?
                 .into_inner();
             if !resp.ok {
                 anyhow::bail!("peer drop_slot: {}", resp.message);
@@ -467,7 +525,7 @@ impl PeerClient for PeerChannel {
             Ok(client
                 .get_node_config(NodeConfigRequest {})
                 .await
-                .map_err(|s| anyhow::anyhow!("peer get_node_config: {}", s.message()))?
+                .map_err(|s| self.peer_err("get_node_config", s))?
                 .into_inner())
         })
         .await
@@ -480,7 +538,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .start(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer start: {}", s.message()))?
+            .map_err(|s| self.peer_err("start", s))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer start: {}", resp.message);
@@ -495,7 +553,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .start_pgpool(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer start_pgpool: {}", s.message()))?
+            .map_err(|s| self.peer_err("start_pgpool", s))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer start_pgpool: {}", resp.message);
@@ -542,7 +600,7 @@ impl PeerClient for PeerChannel {
                 ))))
             }
             Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
-            Err(s) => Err(anyhow::anyhow!("peer fetch_wal: {}", s.message())),
+            Err(s) => Err(self.peer_err("fetch_wal", s)),
         }
     }
 
@@ -552,7 +610,7 @@ impl PeerClient for PeerChannel {
             Ok(client
                 .get_status(GetStatusRequest {})
                 .await
-                .map_err(|s| anyhow::anyhow!("peer get_status: {}", s.message()))?
+                .map_err(|s| self.peer_err("get_status", s))?
                 .into_inner())
         })
         .await
@@ -565,7 +623,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .stop(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer stop: {}", s.message()))?
+            .map_err(|s| self.peer_err("stop", s))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer stop: {}", resp.message);
@@ -583,9 +641,9 @@ impl PeerClient for PeerChannel {
         let stream = client
             .rewind(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer rewind: {}", s.message()))?
+            .map_err(|s| self.peer_err("rewind", s))?
             .into_inner();
-        drain_progress_stream("peer rewind", stream).await
+        drain_progress_stream("peer rewind", stream, &self.poisoned).await
     }
 
     async fn basebackup(&self, opts: BasebackupOpts) -> anyhow::Result<()> {
@@ -599,9 +657,9 @@ impl PeerClient for PeerChannel {
         let stream = client
             .basebackup(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer basebackup: {}", s.message()))?
+            .map_err(|s| self.peer_err("basebackup", s))?
             .into_inner();
-        drain_progress_stream("peer basebackup", stream).await
+        drain_progress_stream("peer basebackup", stream, &self.poisoned).await
     }
 
     async fn configure_standby(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()> {
@@ -615,7 +673,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .configure_standby(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer configure_standby: {}", s.message()))?
+            .map_err(|s| self.peer_err("configure_standby", s))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer configure_standby: {}", resp.message);
@@ -630,7 +688,7 @@ impl PeerClient for PeerChannel {
         let resp = client
             .promote(req)
             .await
-            .map_err(|s| anyhow::anyhow!("peer promote: {}", s.message()))?
+            .map_err(|s| self.peer_err("promote", s))?
             .into_inner();
         if !resp.ok {
             anyhow::bail!("peer promote: {}", resp.message);
@@ -645,6 +703,7 @@ impl PeerClient for PeerChannel {
 async fn drain_progress_stream(
     operation: &'static str,
     mut stream: tonic::Streaming<OpProgress>,
+    poisoned: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
     loop {
         match stream.message().await {
@@ -664,6 +723,17 @@ async fn drain_progress_stream(
                 anyhow::bail!("{operation}: stream ended without 'done' phase");
             }
             Err(s) => {
+                // Mid-stream breakage is transport-class too: poison so
+                // the pool redials rather than serving the dead channel.
+                if is_transport_error(&s)
+                    && !poisoned.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    warn!(
+                        operation,
+                        code = ?s.code(),
+                        "peer channel poisoned on stream transport error — next use redials"
+                    );
+                }
                 anyhow::bail!("{operation}: stream error: {}", s.message());
             }
         }
@@ -1111,6 +1181,72 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("peer dial"), "got {e}"),
             Ok(_) => panic!("expected dial to fail (port 1 is not bound)"),
         }
+    }
+
+    // ----- transport-error poisoning (finding 20) --------------------------
+
+    #[test]
+    fn transport_error_classification() {
+        use tonic::{Code, Status};
+        for s in [
+            Status::new(Code::Unavailable, "transport error"),
+            Status::new(Code::Unknown, "h2 protocol error: connection reset"),
+            Status::new(Code::Internal, "http2 error"),
+            Status::new(
+                Code::Unknown,
+                "error trying to connect: tcp connect refused",
+            ),
+        ] {
+            assert!(is_transport_error(&s), "{s:?} should be transport-class");
+        }
+        for s in [
+            Status::new(Code::NotFound, "restore_wal: not found on any peer"),
+            Status::new(Code::FailedPrecondition, "refusing to basebackup"),
+            Status::new(Code::Internal, "pg_drop_replication_slot: boom"),
+        ] {
+            assert!(
+                !is_transport_error(&s),
+                "{s:?} is an application error — the connection works"
+            );
+        }
+    }
+
+    /// The finding-20 shape: a pooled channel goes bad (here: the
+    /// "peer" accepts TCP then drops, so the first RPC dies at the
+    /// transport layer), and the NEXT `client()` must redial instead
+    /// of serving the broken channel until the age cap.
+    #[tokio::test]
+    async fn transport_error_poisons_the_pooled_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((sock, _)) => drop(sock), // accept, then hang up
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let pool = PeerPool::new_dev(port);
+        let node = NodeConfig {
+            id: 1,
+            hostname: "127.0.0.1".into(),
+        };
+        let c1 = pool
+            .client(&node)
+            .await
+            .expect("dial succeeds (TCP accepts)");
+        let err = c1
+            .get_status()
+            .await
+            .expect_err("RPC must fail on the dropped connection");
+        eprintln!("observed transport failure: {err:#}");
+        let c2 = pool.client(&node).await.expect("redial succeeds");
+        assert!(
+            !Arc::ptr_eq(&c1, &c2),
+            "a poisoned entry must be redialed, not served from cache"
+        );
     }
 
     // Compile-time check: `cert_reloader` field is still in scope even if

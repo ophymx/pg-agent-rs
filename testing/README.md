@@ -434,6 +434,8 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     harness's `cluster_recover` now retries once (as the operator it
     models would), and the repair fallback recovers any node whose
     PostgreSQL is unreachable instead of letting a stale follow event
-    shield it. Product follow-up in TODO.md: evict (or probation-mark)
-    a pooled channel on transport error so post-heal first-RPCs stop
-    paying the broken-connection tax.
+    shield it. FIXED in the pool: `PeerChannel` poisons its cache
+    entry on transport-class errors (unary and mid-stream) and
+    `client()` redials past poisoned entries — post-heal first-RPCs no
+    longer pay the broken-connection tax; the harness retry stays as
+    operator-model belt-and-braces.
