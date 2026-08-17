@@ -209,6 +209,11 @@ pub struct Agent {
     /// must not route at a node whose role hasn't been validated
     /// against the cluster yet.
     pub(crate) startup_verified: Arc<AtomicBool>,
+    /// Freshness of this node's own contact with each peer, recorded by
+    /// the HA loop's fan-out and reported to peers in `NodeStatus` —
+    /// the second opinion candidacy consults before deposing a holder
+    /// it cannot see (finding 25).
+    pub(crate) peer_seen: Arc<crate::cluster_view::PeerSeen>,
 }
 
 impl Agent {
@@ -219,6 +224,7 @@ impl Agent {
             deps,
             opts,
             startup_verified: Arc::new(AtomicBool::new(false)),
+            peer_seen: Arc::new(crate::cluster_view::PeerSeen::new()),
         })
     }
 
@@ -498,7 +504,10 @@ impl Agent {
                 self.deps.peers.clone(),
                 self.opts.node_pool.clone(),
                 timing,
-            );
+            )
+            // The loop records who it reached each tick; get_status
+            // ships those ages to peers as the second opinion.
+            .with_peer_seen(self.peer_seen.clone());
             if let Some(executor) = executor {
                 info!("ha loop: EXECUTE mode — decisions act on local PostgreSQL");
                 ha = ha.with_executor(executor);
@@ -1079,6 +1088,7 @@ impl NodeInfo for Agent {
             timeline_id: timeline,
             current_wal_lsn: wal_lsn,
             last_flush_lsn: flush_lsn,
+            peer_primary_seen_age_ms: self.peer_seen.ages_ms(),
         })
     }
 
@@ -1386,6 +1396,7 @@ mod tests {
             timeline_id,
             current_wal_lsn,
             last_flush_lsn: current_wal_lsn,
+            peer_primary_seen_age_ms: Default::default(),
         }
     }
 

@@ -164,6 +164,14 @@ struct PeerView {
     /// Peer reports an active walreceiver (`replication_state` is
     /// "streaming"/"catchup") — its position is still moving.
     receiving: bool,
+    /// This peer answered us at all this tick. A peer we could not
+    /// reach has no opinion to offer about anyone else.
+    reachable: bool,
+    /// The peer's OWN per-node "last seen SERVING as primary" ages, in
+    /// milliseconds (`NodeStatus.peer_primary_seen_age_ms`) — the
+    /// second opinion candidacy consults before deposing a holder this
+    /// node cannot see.
+    seen_ages: std::collections::HashMap<i32, u64>,
 }
 
 struct TickState {
@@ -218,6 +226,9 @@ pub struct HaLoop {
     /// step 7 removes it from the real path. `ClusterInit` seeding is
     /// the deterministic bootstrap.
     vacant_adoption: bool,
+    /// Records which peers this loop reached, per tick. `None` in
+    /// tests that do not exercise the second-opinion path.
+    peer_seen: Option<Arc<crate::cluster_view::PeerSeen>>,
 }
 
 impl HaLoop {
@@ -246,7 +257,16 @@ impl HaLoop {
             }),
             executor: None,
             vacant_adoption: true,
+            peer_seen: None,
         }
+    }
+
+    /// Share the per-tick contact record with `Agent::get_status`, so
+    /// this node can serve as a witness for its peers' candidacy
+    /// decisions (finding 25's second-opinion gate).
+    pub fn with_peer_seen(mut self, seen: Arc<crate::cluster_view::PeerSeen>) -> Self {
+        self.peer_seen = Some(seen);
+        self
     }
 
     /// Attach the executor: every decision is now acted on, and
@@ -550,6 +570,55 @@ impl HaLoop {
                 reason: "local PostgreSQL state unknown; not a candidate".into(),
             };
         }
+
+        // The SECOND-OPINION gate (finding 25). Reaching here with
+        // `expected = Some(holder)` means: this node has not seen the
+        // holder healthy for a full leader_ttl and is about to take
+        // its lease. But "the holder looks dead to me" is evidence
+        // about the observer exactly as much as about the holder — and
+        // the CAS cannot tell them apart, because the store has no
+        // notion of whether the incumbent is still alive. So ask the
+        // other members: every node reports how long ago it last
+        // observed each peer SERVING as a primary
+        // (`NodeStatus.peer_primary_seen_age_ms`), and if any
+        // REACHABLE member has watched the holder serve within the
+        // ttl, this node's blindness is local and the holder keeps its
+        // lease.
+        //
+        // Serving, not answering. The first cut of this gate recorded
+        // mere reachability and deadlocked the most ordinary failover
+        // there is: when a holder's PostgreSQL dies its agent keeps
+        // answering GetStatus perfectly, so every witness truthfully
+        // reported "I reached it 1s ago" and no standby would ever
+        // take the lease (caught by G3 on the first run).
+        //
+        // Self-clearing by construction: a genuinely dead holder makes
+        // every witness's age grow past the ttl within one ttl, so the
+        // gate opens on its own. It costs a bounded delay, never a
+        // deadlock — and it never blocks the paths that matter most
+        // (a fully isolated holder is unreachable to everyone, and a
+        // vacant lease has no incumbent to defend).
+        if let Some((holder, _)) = expected {
+            let ttl_ms = self.timing.leader_ttl.as_millis() as u64;
+            let witness = peers
+                .iter()
+                .filter(|p| p.reachable && p.node.id != holder)
+                .find_map(|p| {
+                    p.seen_ages
+                        .get(&holder)
+                        .filter(|age| **age <= ttl_ms)
+                        .map(|age| (p.node.id, *age))
+                });
+            if let Some((witness_id, age_ms)) = witness {
+                return HaDecision::StoodDown {
+                    reason: format!(
+                        "node {witness_id} saw holder {holder} SERVING {age_ms}ms ago \
+                         (within leader_ttl {ttl_ms}ms) — my blindness is local, \
+                         not the holder's death; deferring"
+                    ),
+                };
+            }
+        }
         // The candidacy freeze (finding 23). A fence-less deposal —
         // the holder's AGENT dead, its PostgreSQL serving — leaves the
         // standbys streaming and their flush positions MOVING. A
@@ -819,17 +888,35 @@ impl HaLoop {
             .await
             .into_iter()
             .map(|v| match v.status {
-                Ok(s) => PeerView {
-                    running_as_primary: s.is_postgres_running && !s.is_in_recovery,
-                    pos: WalPosition::from_status(&s),
-                    receiving: s.is_in_recovery && !s.replication_state.is_empty(),
-                    node: v.node,
-                },
+                Ok(s) => {
+                    let running_as_primary = s.is_postgres_running && !s.is_in_recovery;
+                    // Record only a SERVING sighting — this is the
+                    // other half of the second opinion (every node is
+                    // a potential witness), and what a witness must
+                    // vouch for is the role, not the socket: a holder
+                    // whose PostgreSQL died keeps answering from its
+                    // healthy agent.
+                    if running_as_primary {
+                        if let Some(seen) = &self.peer_seen {
+                            seen.record_primary(v.node.id);
+                        }
+                    }
+                    PeerView {
+                        running_as_primary,
+                        pos: WalPosition::from_status(&s),
+                        receiving: s.is_in_recovery && !s.replication_state.is_empty(),
+                        reachable: true,
+                        seen_ages: s.peer_primary_seen_age_ms,
+                        node: v.node,
+                    }
+                }
                 Err(_) => PeerView {
                     node: v.node,
                     running_as_primary: false,
                     pos: None,
                     receiving: false,
+                    reachable: false,
+                    seen_ages: std::collections::HashMap::new(),
                 },
             })
             .collect()
@@ -1096,6 +1183,15 @@ mod tests {
             replication_state: "streaming".into(),
             ..standby_status(tl, lsn)
         }
+    }
+
+    /// A standby that reports having seen `seen_id` SERVING as primary
+    /// `age_ms` ago — a witness for the second-opinion gate
+    /// (finding 25).
+    fn standby_seeing(tl: i32, lsn: u64, seen_id: i32, age_ms: u64) -> pb::NodeStatus {
+        let mut s = standby_status(tl, lsn);
+        s.peer_primary_seen_age_ms.insert(seen_id, age_ms);
+        s
     }
 
     fn pool3(local: i32) -> NodePool {
@@ -1559,6 +1655,131 @@ mod tests {
             } => assert!(!already_primary),
             other => panic!("expected TookOver, got {other:?}"),
         }
+    }
+
+    /// The second-opinion gate (finding 25). Local node 1 cannot see
+    /// holder 0 and has watched it "die" for a full ttl — but node 2
+    /// answers and reports having reached node 0 well inside the ttl
+    /// (10ms against this fixture's 50ms). One node's blindness is not
+    /// the cluster's verdict: the holder keeps its lease, and the
+    /// healthy primary is never deposed.
+    #[tokio::test]
+    async fn a_blind_candidate_defers_to_a_witness_that_still_sees_the_holder() {
+        let f = fixture(1, StubDb::standby(2, BASE + 500));
+        f.peers.set(0, primary_status(2, BASE));
+        f.peers.set(2, standby_status(2, BASE));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+
+        // The holder becomes unreachable TO US only; node 2 still sees
+        // it (and says so, freshly).
+        f.peers.mark_unreachable(0);
+        f.peers.set(2, standby_seeing(2, BASE, 0, 10));
+        let _ = f.ha.tick_once().await; // unhealthy clock starts
+        tokio::time::sleep(Duration::from_millis(60)).await; // past ttl (50ms)
+        match f.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => {
+                assert!(reason.contains("blindness is local"), "{reason}");
+                assert!(reason.contains("node 2 saw holder 0 SERVING"), "{reason}");
+            }
+            other => panic!("expected the second-opinion stand-down, got {other:?}"),
+        }
+        assert_eq!(
+            f.store.snapshot().lease.unwrap().holder,
+            0,
+            "a healthy holder must keep its lease"
+        );
+    }
+
+    /// The gate is self-clearing: once the witness's own contact with
+    /// the holder ages past the ttl, nobody can still see it and the
+    /// takeover proceeds. A genuinely dead holder costs at most one
+    /// extra ttl, never a deadlock.
+    #[tokio::test]
+    async fn the_gate_opens_once_no_witness_has_seen_the_holder_either() {
+        let f = fixture(1, StubDb::standby(2, BASE + 500));
+        f.peers.set(0, primary_status(2, BASE));
+        f.peers.set(2, standby_status(2, BASE));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+        f.peers.mark_unreachable(0);
+        // The witness last reached the holder LONGER ago than the ttl:
+        // its evidence has expired too, so the cluster agrees.
+        f.peers.set(2, standby_seeing(2, BASE, 0, 10_000));
+        let _ = f.ha.tick_once().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        match tick_candidacy(&f.ha).await {
+            HaDecision::TookOver {
+                already_primary, ..
+            } => assert!(!already_primary),
+            other => panic!("expected TookOver once no witness sees the holder, got {other:?}"),
+        }
+        assert_eq!(f.store.snapshot().lease.unwrap().holder, 1);
+    }
+
+    /// The gate must not confuse ANSWERING with SERVING. When a
+    /// holder's PostgreSQL dies, its agent keeps answering GetStatus
+    /// perfectly and every peer keeps reaching it — so a witness whose
+    /// last *primary* sighting has aged out must not vouch for it,
+    /// however recently it was contacted. Regression for the first cut
+    /// of this gate, which recorded reachability and thereby blocked
+    /// the single most common failover in the suite (G3) forever.
+    #[tokio::test]
+    async fn a_reachable_but_dead_primary_gets_no_witness() {
+        let f = fixture(1, StubDb::standby(2, BASE + 500));
+        f.peers.set(0, primary_status(2, BASE));
+        f.peers.set(2, standby_status(2, BASE));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+        // The holder's PostgreSQL dies; its AGENT stays up and
+        // reachable to everyone, including us.
+        f.peers.set(
+            0,
+            pb::NodeStatus {
+                is_postgres_running: false,
+                ..primary_status(2, BASE)
+            },
+        );
+        // The witness reaches the holder constantly, but its last
+        // sighting of it SERVING is older than the ttl.
+        f.peers.set(2, standby_seeing(2, BASE, 0, 10_000));
+        let _ = f.ha.tick_once().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        match tick_candidacy(&f.ha).await {
+            HaDecision::TookOver {
+                already_primary, ..
+            } => assert!(!already_primary),
+            other => panic!("a dead-but-reachable holder must be deposable, got {other:?}"),
+        }
+        assert_eq!(f.store.snapshot().lease.unwrap().holder, 1);
+    }
+
+    /// A witness that cannot be reached offers no opinion — its stale
+    /// map must not veto a takeover, or one unreachable bystander
+    /// would freeze every failover.
+    #[tokio::test]
+    async fn an_unreachable_witness_cannot_veto_a_takeover() {
+        let f = fixture(1, StubDb::standby(2, BASE + 500));
+        f.peers.set(0, primary_status(2, BASE));
+        f.peers.set(2, standby_seeing(2, BASE, 0, 10)); // fresh, but…
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+        f.peers.mark_unreachable(0);
+        f.peers.mark_unreachable(2); // …we cannot ask it
+        let _ = f.ha.tick_once().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(matches!(
+            tick_candidacy(&f.ha).await,
+            HaDecision::TookOver { .. }
+        ));
     }
 
     /// Finding 24's dip: a just-detached rival's flush REPORT drops to

@@ -274,6 +274,38 @@ quorum. That is the property SPEC §5.1 lacks, and it holds without any
 assumption about synchronized clocks — only that each node's own monotonic
 clock advances at roughly a real second per second.
 
+**The premise in that case analysis, stated.** It reasons about *disjoint*
+partition sides: every node is either in the majority or in the minority.
+Real failures are not always cuts. Under **asymmetric** reachability — one
+node's dials to the holder fail while everyone else reaches it, a firewall
+rule, a one-way NIC fault — a candidate can be in the majority *and* the
+holder can be in the majority, because "sides" no longer partition the
+cluster. The safety invariant above survives (the CAS still admits exactly
+one holder, and the deposed one fences as soon as it reads the store), but
+what it buys is smaller than it looks: the takeover is *unnecessary*, and
+between the CAS and the ex-holder's next read there is a window where a
+healthy primary is still serving writes it can no longer have acknowledged
+by a quorum. Cost paid for nothing, on the say-so of the one node that
+could not see.
+
+The store cannot arbitrate this — it has no notion of whether the incumbent
+is alive, only of what the lease says. So candidacy asks the cluster
+instead, and this is the **second-opinion gate**: every node reports how
+long ago it last reached each peer (`NodeStatus.peer_seen_age_ms`, an age
+rather than a timestamp, so no clock assumption is added), and a candidate
+about to depose a holder it cannot see stands down if any *reachable*
+member has touched that holder within `leader_ttl`. One node's blindness is
+evidence about the observer as much as about the observed, and now the
+decision says so.
+
+The gate is self-clearing by construction: a genuinely dead holder makes
+every witness's age exceed the ttl within one ttl, so failover proceeds
+after a bounded delay and can never deadlock. It also does not touch the
+paths that matter most — a fully isolated holder is unreachable to
+*everyone* (no witness, gate opens), and a vacant lease has no incumbent to
+defend. See testing/README.md finding 25, and G17 for the manufactured
+case.
+
 That reframing pays off concretely:
 
 - **Retain is a read, not a write.** The holder confirms it still holds

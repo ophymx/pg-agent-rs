@@ -55,6 +55,26 @@ message NodeStatus {
   // current_wal_lsn (replay misclassifies a flush-complete standby as
   // lagging — testing/README.md finding 19). 0 = unknown.
   uint64 last_flush_lsn          = 12;
+  // How long ago (milliseconds) this node last observed each pool
+  // member RUNNING AS A PRIMARY, keyed by node id. Recorded by the HA
+  // loop's per-tick status fan-out, so an entry is at most one tick
+  // stale; a member absent from the map has never been seen serving
+  // since this node started.
+  //
+  // This is the SECOND OPINION that candidacy needs (testing/README.md
+  // finding 25): "the holder is unreachable" is evidence about the
+  // observer as much as about the holder, and a candidate that cannot
+  // see the holder must not depose it while some other member still
+  // watches it serve. Ages rather than timestamps: no clock
+  // synchronization is assumed or required between nodes.
+  //
+  // SERVING, not merely answering — the distinction is the whole
+  // field. A holder whose PostgreSQL has died keeps answering
+  // GetStatus from its perfectly healthy agent, so a reachability
+  // signal here would report every witness as "still sees it" and
+  // block the single most common failover in existence. What a
+  // witness must vouch for is the role, not the socket.
+  map<int32, uint64> peer_primary_seen_age_ms = 13;
 }
 
 message GetStatusRequest {}

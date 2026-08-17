@@ -3530,6 +3530,7 @@ mod tests {
                 timeline_id: 0,
                 current_wal_lsn: 0,
                 last_flush_lsn: 0,
+                peer_primary_seen_age_ms: Default::default(),
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -4029,6 +4030,7 @@ mod tests {
                 timeline_id: self.timeline_id.load(Ordering::SeqCst),
                 current_wal_lsn: lsn,
                 last_flush_lsn: lsn,
+                peer_primary_seen_age_ms: Default::default(),
             })
         }
         async fn stop(&self) -> anyhow::Result<()> {

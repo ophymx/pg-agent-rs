@@ -23,7 +23,7 @@ use crate::peers::PeerRegistry;
 use pg_agent_proto::pgagentpb as pb;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 /// Default wall-clock budget for one status fan-out. Matches the
@@ -54,6 +54,48 @@ pub struct PeerStatusView {
 /// deposed a healthy serving primary (acceptance G5, caught by the
 /// audit's dual-serving invariant; the fence contained it). One slow
 /// peer must degrade exactly one peer's evidence.
+/// When this node last observed each peer **running as a primary**.
+///
+/// Written by the HA loop's per-tick fan-out and read by
+/// `Agent::get_status`, which ships the ages to peers as
+/// `NodeStatus.peer_primary_seen_age_ms`. That is what lets a
+/// candidate ask "does anyone else still watch the holder serve?"
+/// before deposing it — the second-opinion gate (finding 25). Ages,
+/// never timestamps: the cluster assumes no clock synchronization.
+///
+/// SERVING, not reachable. A holder whose PostgreSQL died still
+/// answers `GetStatus` from its healthy agent, so recording mere
+/// contact here would make every witness vouch for a dead primary and
+/// block the most ordinary failover there is — which is exactly what
+/// it did the first time this was built.
+#[derive(Default)]
+pub struct PeerSeen {
+    inner: std::sync::Mutex<std::collections::HashMap<i32, Instant>>,
+}
+
+impl PeerSeen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `node_id` was observed running as a primary, now.
+    pub fn record_primary(&self, node_id: i32) {
+        self.inner.lock().unwrap().insert(node_id, Instant::now());
+    }
+
+    /// Age in milliseconds of the last primary sighting per peer.
+    /// Peers never seen serving are absent — "no evidence", which a
+    /// consumer must not read as "seen long ago" or "seen recently".
+    pub fn ages_ms(&self) -> std::collections::HashMap<i32, u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, at)| (*id, at.elapsed().as_millis() as u64))
+            .collect()
+    }
+}
+
 pub async fn collect_statuses(
     registry: Arc<dyn PeerRegistry>,
     nodes: &[NodeConfig],

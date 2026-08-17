@@ -136,6 +136,30 @@ bash`, `journalctl -u pg_agentd`).
   a REPORT: the wedged node neither promotes nor is destructively
   rebuilt, the primary keeps its lease, and healing the path clears
   the flag with no operator action.
+- **G14 / G15** — **the plane inversions**. G14 cuts the DATA plane
+  (replication severed from both standbys) while every agent still
+  sees a healthy holder: the answer must be no failover at all, and
+  instead `sync_commit=blocked`, writes unacknowledged rather than
+  quietly single-copy, and both wedge tripwires up. G15 cuts the
+  CONTROL plane on the holder (9701, peer RPC and raft) while
+  replication stays perfect: the holder must fence a database that is
+  healthy by every data-plane measure, because it can no longer prove
+  it holds the lease, and the majority promotes. Lost redundancy and
+  lost authority, answered oppositely.
+- **G16** — **one-way blindness**: a standby loses the ability to
+  INITIATE control-plane connections while remaining fully answerable,
+  so it sees a cluster in which everyone is dead while everyone else
+  sees a healthy cluster including it. It can reach no quorum member,
+  so it cannot act — one-sided evidence is not authority — and its
+  replication is never disturbed.
+- **G17** — **a blind standby must not depose a healthy holder**
+  (finding 25's second-opinion gate): sever one standby's
+  control-plane path to the holder alone, leaving its link to the
+  third node and the whole data plane intact. It watches the holder
+  "die" for a full `leader_ttl` while the holder serves happily — and
+  must not take the lease, because the third node has touched the
+  holder within the ttl and says so. No takeover, no promotion, no
+  fence.
 
 ---
 
@@ -218,14 +242,13 @@ cluster; the discovery rate on new probes says these will pay):
     acceptance provisioning sets it. The auditor gained a standing
     invariant that would have caught finding 22 by itself: no standby
     may ever log "WAL segment ... has already been removed".
-11. **The second-opinion gate before deposing a holder** (finding 25's
-    open half): a standby that can reach the raft leader but not the
-    holder wins its CAS and deposes a healthy primary on one node's
-    blindness. Peers already answer `GetStatus`; what they do not
-    report is *their* view of the holder, so candidacy has no cheap
-    way to ask "can anyone else see it?" before taking the lease.
-    Protocol change, not a test — and the highest-value remaining
-    safety item.
+11. ~~The second-opinion gate before deposing a holder~~ — **done**.
+    `NodeStatus` grew `peer_seen_age_ms` (per-peer contact freshness,
+    recorded by the HA loop's own fan-out), candidacy consults it
+    before deposing a holder it cannot see, and G17 manufactures the
+    shape. Three unit tests pin the behavior: defer to a fresh
+    witness, proceed once no witness has seen the holder either, and
+    never let an UNREACHABLE witness's stale map veto a takeover.
 
 ## Findings log
 
@@ -690,17 +713,32 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     strongest form of "one-sided evidence is not authority", provable
     without knowing the leader.
 
-    Left open deliberately (gap item 11): the shape where a standby
-    can still reach the raft leader but NOT the holder. It would
-    believe the holder dead, and its CAS would succeed — deposing a
-    healthy primary on one node's blindness, with a brief dual-serving
-    window until the ex-holder reads the store and fences itself. The
-    store has no notion of "the incumbent is still alive", and no
-    peer's opinion of the holder is consulted before deposing it. That
-    is a design gap, not a bug in the code as written, and closing it
-    needs a second-opinion gate (ask the other peers whether they can
-    see the holder before taking its lease) — a real protocol change,
-    not a test.
+    The other half — a standby that can still reach the raft leader
+    but NOT the holder, whose CAS would succeed and depose a healthy
+    primary on one node's blindness — was left open here and CLOSED
+    since (gap item 11): the second-opinion gate. Every node reports
+    how long ago it last observed each peer SERVING as a primary
+    (`NodeStatus.peer_primary_seen_age_ms`), and a candidate about to
+    depose a holder it cannot see stands down when any reachable
+    member has watched that holder serve within `leader_ttl`.
+    Self-clearing: a dead holder ages out of every witness's map
+    within one ttl, so the gate costs a bounded delay and can never
+    deadlock. G17 manufactures the shape;
+    docs/promotion-authority.md §"Lease semantics" carries the
+    reasoning, including the disjoint-partition premise the original
+    case analysis left unstated.
+
+    **The first cut of the gate recorded REACHABILITY, and that was a
+    serious mistake — G3 caught it in one run.** When a holder's
+    PostgreSQL dies, its agent keeps answering `GetStatus` perfectly,
+    so every witness truthfully reported "I reached the holder 1.1s
+    ago" and every candidate deferred: the single most common failover
+    in existence deadlocked, and the suite sat for 292 s where it
+    normally takes 25. A witness must vouch for the ROLE, not the
+    socket. The lesson is the same one findings 18 and 23 taught from
+    other directions — evidence has to name exactly what it observed,
+    because "I can talk to it" and "it is doing its job" are different
+    claims about a node, and only one of them is about the lease.
 
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death

@@ -1544,6 +1544,7 @@ quoted_with_spaces = '  spaces inside  '
             timeline_id,
             current_wal_lsn,
             last_flush_lsn: current_wal_lsn,
+            peer_primary_seen_age_ms: Default::default(),
         }
     }
 
@@ -1615,6 +1616,7 @@ quoted_with_spaces = '  spaces inside  '
             timeline_id: 0,
             current_wal_lsn: 0,
             last_flush_lsn: 0,
+            peer_primary_seen_age_ms: Default::default(),
         };
         let cells = format_status_cells(2, "pg2.local", &status);
         assert_eq!(cells[2], "unknown", "role must not default to primary");
@@ -1642,6 +1644,7 @@ quoted_with_spaces = '  spaces inside  '
             timeline_id: 0,
             current_wal_lsn: 0,
             last_flush_lsn: 0,
+            peer_primary_seen_age_ms: Default::default(),
         };
         let cells = format_status_cells(3, "pg3.local", &status);
         assert_eq!(cells[2], "unknown");

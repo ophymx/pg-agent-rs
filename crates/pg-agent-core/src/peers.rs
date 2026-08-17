@@ -832,6 +832,7 @@ mod tests {
                 timeline_id: 0,
                 current_wal_lsn: 0,
                 last_flush_lsn: 0,
+                peer_primary_seen_age_ms: Default::default(),
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {

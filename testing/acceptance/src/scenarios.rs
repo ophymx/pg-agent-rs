@@ -153,6 +153,7 @@ pub async fn run_all(cx: &mut Ctx) {
     g14(cx, w7, &mut marks).await;
     let w8 = g15(cx, w7, &mut marks).await;
     g16(cx, w8).await;
+    g17(cx, w8).await;
     crate::audit::run(cx);
 }
 
@@ -1802,6 +1803,86 @@ async fn g16(cx: &mut Ctx, prim: &'static str) {
         since,
         |ev| agent_any(ev, "TookOver"),
     );
+}
+
+async fn g17(cx: &mut Ctx, prim: &'static str) {
+    cx.say("G17: a blind standby must not depose a healthy holder (the second-opinion gate)");
+    // Finding 25's open half, closed: sever ONE standby's control-plane
+    // path to the holder alone, leaving that standby's link to the
+    // third node — and the whole data plane — intact. The blind standby
+    // now watches the holder "die" for a full leader_ttl while the
+    // holder serves happily and the third node sees everyone.
+    //
+    // Before the gate, whether this deposed a healthy primary came down
+    // to which node happened to lead raft: if the blind standby could
+    // still reach the raft leader, its CAS succeeded and a healthy
+    // primary lost its lease to one node's blindness. Now the candidate
+    // asks the other members first — the third node has touched the
+    // holder within the ttl, so the blindness is diagnosed as local.
+    // The assertion is deterministic either way, which is the point:
+    // no takeover, no promotion, no fence.
+    let blind = other_node(prim);
+    let prim_ip = cluster::container_ip(prim).await.unwrap_or_default();
+    let since = cx.log.cursor();
+    cluster::sever_peer_port(blind, &prim_ip, 9701).await;
+    // Either branch proves the cut landed, and which one runs depends
+    // on who leads raft (finding 25): if the holder also leads, the
+    // blind node cannot even read the store and reports StoreUnknown;
+    // otherwise it reads fine, sees the holder "dead", and starts its
+    // deposal clock. The SAFETY assertions below hold in both.
+    cx.await_event(
+        90,
+        &format!("{blind} noticed the cut (holder unhealthy, or the store unreadable)"),
+        since,
+        |ev| agent(ev, blind, "HolderUnhealthy") || agent(ev, blind, "StoreUnknown"),
+    )
+    .await;
+    // Well past leader_ttl: this is the window in which the unguarded
+    // code would have taken the lease.
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    cx.check_absent(
+        "the healthy holder was not deposed by a blind standby",
+        since,
+        |ev| agent_any(ev, "TookOver"),
+    );
+    cx.check_absent("no promotion from one node's blindness", since, |ev| {
+        agent_any(ev, "roleexec: promotion complete")
+    });
+    cx.check_absent("no fence from one node's blindness", since, |ev| {
+        agent_any(ev, "FENCING")
+    });
+    cx.check(
+        &format!("{prim} still serves as primary throughout"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    // The gate's own voice, when the candidate got far enough to ask.
+    // Whether it does depends on which node leads raft (a candidate
+    // that cannot reach the raft leader never reaches the gate at all
+    // — finding 25), so this corroborates rather than enforces.
+    if cx
+        .log
+        .find(since, |ev| agent(ev, blind, "blindness is local"))
+        .is_some()
+    {
+        cx.pass(&format!(
+            "{blind} named its own blindness and deferred (the gate fired)"
+        ));
+    } else {
+        cx.note(&format!(
+            "{blind} never reached the gate (it could not reach the raft leader either)"
+        ));
+    }
+    cluster::heal_firewall(blind).await;
+    let pg = cx.pg.clone();
+    cx.wait_until(
+        90,
+        &format!("{prim}: replication intact after the heal"),
+        || {
+            let pg = pg.clone();
+            async move { pg.streaming_count(prim).await == Some(2) }
+        },
+    )
+    .await;
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —
