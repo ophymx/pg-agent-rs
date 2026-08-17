@@ -19,24 +19,30 @@ use tokio_postgres::{Client, NoTls};
 use crate::cluster::NODES;
 
 pub struct Pg {
-    ips: HashMap<&'static str, String>,
     conns: Mutex<HashMap<&'static str, Client>>,
 }
 
 impl Pg {
     pub async fn discover() -> anyhow::Result<Self> {
-        let mut ips = HashMap::new();
+        // Probe that every container resolves — but do NOT keep the
+        // addresses: container restarts (G10's power blip) reassign
+        // IPs in whatever order docker starts them, and a suite-start
+        // map silently pointed "db2" at what had become db0 — every
+        // node-specific query then interrogated the wrong PostgreSQL
+        // while set-shaped checks (count_primaries) kept passing.
+        // Resolution happens per (re)dial instead.
         for n in NODES {
-            ips.insert(n, crate::cluster::container_ip(n).await?);
+            crate::cluster::container_ip(n).await?;
         }
         Ok(Self {
-            ips,
             conns: Mutex::new(HashMap::new()),
         })
     }
 
     async fn connect(&self, node: &'static str) -> anyhow::Result<Client> {
-        let ip = self.ips.get(node).context("unknown node")?;
+        let ip = crate::cluster::container_ip(node)
+            .await
+            .context("resolve container ip")?;
         let config = format!("host={ip} port=5432 user=postgres dbname=postgres connect_timeout=3");
         let (client, conn) = tokio_postgres::connect(&config, NoTls)
             .await

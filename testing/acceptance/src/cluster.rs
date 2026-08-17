@@ -119,6 +119,14 @@ pub async fn container_ip(node: &str) -> anyhow::Result<String> {
     Ok(ip)
 }
 
+/// The site power blip: SIGKILL PID 1 in every container at once —
+/// nothing inside shuts down cleanly (no shutdown checkpoints, no
+/// journald goodbye) — then power comes back.
+pub async fn power_blip() {
+    let _ = host(&["docker", "kill", "pga-db0", "pga-db1", "pga-db2"]).await;
+    let _ = host(&["docker", "start", "pga-db0", "pga-db1", "pga-db2"]).await;
+}
+
 pub async fn network_disconnect(node: &str) {
     let _ = host(&[
         "docker",

@@ -98,6 +98,17 @@ include_if_exists = '/var/lib/postgresql/17/main/myrecovery.conf'
 EOF
 chown -R postgres:postgres "$PGCONF_DIR/conf.d"
 
+# PostgreSQL is AGENT-managed: the OS must never autostart it. Debian's
+# generator starts every 'auto' cluster at boot through the postgresql
+# meta-service — and enabling pgpool2 pulls that in via its
+# Wants=postgresql.service — which is exactly the path that raced the
+# agent's cold-start reconciliation out of G10 (PostgreSQL was up 2 s
+# before the agent, so the reconcile correctly no-op'd and the product
+# path went untested). 'manual' closes autostart while leaving explicit
+# `systemctl start postgresql@17-main` (provision bootstrap, recover,
+# cold start) untouched.
+echo manual > "$PGCONF_DIR/start.conf"
+
 HBA="$PGCONF_DIR/pg_hba.conf"
 if ! grep -q "pg-agent-acceptance" "$HBA"; then
     cat >> "$HBA" <<'EOF'
@@ -137,9 +148,14 @@ SQL
     fi
     touch "$MARKER"
 else
-    # Subsequent boots: bring PostgreSQL up in whatever role its data
-    # dir holds (primary or standby.signal).
-    systemctl start postgresql@17-main.service || true
+    # Subsequent boots: PostgreSQL stays down here ON PURPOSE. The
+    # agent's cold-start reconciliation (finding 21) owns bringing it
+    # back — standby-shaped pgdata starts unconditionally, a
+    # primary-shaped one only when the persisted lease still names
+    # this node. Starting it from provisioning would preempt exactly
+    # the product path G10 exists to exercise (and did, masking the
+    # cold-start behavior entirely on the first G10 run).
+    echo "provision: subsequent boot — PostgreSQL left to the agent's cold-start reconcile"
 fi
 
 echo "provision: done"

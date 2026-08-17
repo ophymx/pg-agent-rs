@@ -145,7 +145,8 @@ pub async fn run_all(cx: &mut Ctx) {
     g6(cx, w2).await;
     let w3 = g7(cx, w2, &mut marks).await;
     let w4 = g8(cx, w3, &mut marks).await;
-    g9(cx, w4, &mut marks).await;
+    let w5 = g9(cx, w4, &mut marks).await;
+    g10(cx, w5).await;
     crate::audit::run(cx);
 }
 
@@ -452,19 +453,46 @@ async fn g4(
 
 async fn g4b(cx: &mut Ctx, w1: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
     cx.say("G4b: reclone a LIVE standby — the slot-race guard (finding 9)");
-    // The recover/failover-hook race needs pgpool to believe the
-    // target is UP when recovery stops it: the stop fires the
-    // standby-down hook, whose job is to drop the very slot the
-    // recovery just created — the cross-op consult must defer.
+    // The recover/failover-hook race: the standby-down hook's job is
+    // to drop the very slot the in-flight recovery just created — the
+    // cross-op consult must defer. The hook used to fire NATURALLY
+    // (pgpool's health check detached the recovery-stopped standby in
+    // ~4 s); with blip-tolerant health checking (~22 s, G10) natural
+    // detection no longer lands inside a small test reclone — but a
+    // production reclone takes minutes and the race is as real as
+    // ever. Manufacture it deterministically: an explicit detach on
+    // the primary's instance mid-reclone fires the same hook.
     pcp_attach_everywhere(cx).await;
     let target = other_node(w1);
     let since = cx.log.cursor();
-    cluster_recover(cx, w1, target).await;
+    let recover = cluster_recover(cx, w1, target);
+    let detach_mid_op = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = exec_pg(
+            w1,
+            &format!(
+                "pcp_detach_node -h localhost -p 9898 -U pgpool -w -n {}",
+                node_id(target)
+            ),
+        )
+        .await;
+    };
+    tokio::join!(recover, detach_mid_op);
     cx.await_event(
         30,
         "failover hook deferred to the in-flight recovery (slot survived)",
         since,
         |ev| agent(ev, w1, "in-flight op owns this node; skipping slot drop"),
+    )
+    .await;
+    // The recover's attach fan-out (only-if-down, runs at the tail of
+    // the reclone — after the +2 s detach) restores the backend this
+    // detach downed; G4 asserted exactly that convergence shape.
+    let tid = node_id(target);
+    cx.wait_until(
+        60,
+        &format!("{w1}: pgpool re-attached recovered {target} (fan-out after mid-op detach)"),
+        || async move { pcp_node_info(w1, tid).await.contains(" up ") },
     )
     .await;
     repair_standbys(cx, w1, "g4b", marks).await;
@@ -924,7 +952,11 @@ async fn g8(
     w
 }
 
-async fn g9(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+async fn g9(
+    cx: &mut Ctx,
+    prim: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
     cx.say("G9: crash-shape primary death — no checkpoint, no goodbye");
     // SIGKILL the whole postgresql cgroup: no shutdown checkpoint, no
     // walsender drain, and none of the log-file events the suite keys
@@ -999,6 +1031,141 @@ async fn g9(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, 
         || async move { sync_commit_state(w).await == "armed" },
     )
     .await;
+    w
+}
+
+async fn g10(cx: &mut Ctx, prim: &'static str) {
+    cx.say("G10: full-cluster cold restart — the site power blip");
+    // SIGKILL PID 1 in all three containers at once, then power back
+    // on. Nothing shut down cleanly, PostgreSQL is disabled in systemd
+    // (agent-managed), and before finding 21's cold-start
+    // reconciliation NOTHING would ever start it again: followers
+    // honor the demote policy on a Down instance and a holder with
+    // PostgreSQL down can only fence — an established cluster stayed
+    // down forever, lease intact, waiting for an operator. The
+    // contract now: the holder reads its persisted lease (no rival
+    // could take over while the site was dark — takeovers need the
+    // very quorum that was down) and starts its primary through crash
+    // recovery; standby-shaped nodes just start; nobody promotes,
+    // nobody fences, the term survives the blip.
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit armed before the blip"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    write_sentinel(cx, prim, "g10").await;
+    let since = cx.log.cursor();
+    cluster::power_blip().await;
+    for n in NODES {
+        cx.wait_until(
+            90,
+            &format!("{n}: pg_agentd active after the blip"),
+            || async move { unit_active(n, "pg_agentd").await },
+        )
+        .await;
+    }
+    // Boot-window lines race the tail respawn: the exec-based tails
+    // die with the container and reattach seconds into the new boot,
+    // while these lines are written 2-10 s in — G10 is the only
+    // scenario that restarts containers, so it asserts the MECHANISM
+    // against the journals/logs directly (the state checks below pin
+    // the outcome). Each needle is unique to the post-blip boot:
+    // "this node holds"/"standby-shaped" never occur on the greenfield
+    // or agent-restart paths, and this is prim's first hard kill.
+    cx.wait_until(
+        60,
+        &format!("{prim}: cold start read the persisted lease and started as primary"),
+        || async move {
+            exec(
+                prim,
+                "journalctl -u pg_agentd --no-pager | \
+                 grep -q 'cold start: this node holds the persisted lease'",
+            )
+            .await
+            .is_ok()
+        },
+    )
+    .await;
+    cx.wait_until(
+        60,
+        &format!("{prim}: crash recovery ran (hard kill left no clean shutdown)"),
+        || async move {
+            exec(
+                prim,
+                "grep -q 'database system was not properly shut down' \
+                 /var/log/postgresql/postgresql-17-main.log",
+            )
+            .await
+            .is_ok()
+        },
+    )
+    .await;
+    for n in NODES {
+        if n != prim {
+            cx.wait_until(
+                60,
+                &format!("{n}: cold start brought the standby back"),
+                || async move {
+                    exec(
+                        n,
+                        "journalctl -u pg_agentd --no-pager | \
+                         grep -q 'cold start: standby-shaped pgdata'",
+                    )
+                    .await
+                    .is_ok()
+                },
+            )
+            .await;
+        }
+    }
+    cx.await_event(
+        60,
+        &format!("{prim} retains the lease across the blip"),
+        since,
+        |ev| agent(ev, prim, "RetainedLease"),
+    )
+    .await;
+    let pg = cx.pg.clone();
+    cx.wait_until(
+        120,
+        &format!("{prim} has 2 streaming standbys after the blip"),
+        || {
+            let pg = pg.clone();
+            async move { pg.streaming_count(prim).await == Some(2) }
+        },
+    )
+    .await;
+    // The blip is not a failover: same holder, same term, no fence.
+    cx.check_absent("no takeover across the blip", since, |ev| {
+        agent_any(ev, "TookOver")
+    });
+    cx.check_absent("no promotion across the blip", since, |ev| {
+        agent_any(ev, "roleexec: promotion complete")
+    });
+    cx.check_absent("no fence across the blip", since, |ev| {
+        agent_any(ev, "FENCING")
+    });
+    let primaries = cx.pg.count_primaries().await;
+    cx.check("exactly one primary after the blip", primaries == 1);
+    check_sentinel(cx, prim, "g10").await;
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit re-armed after the blip"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    // Full routing recovery: the agents' pgpool supervisors bring the
+    // routers back and the self-attach/attach convergence restores all
+    // three backends on every instance.
+    for n in NODES {
+        cx.wait_until(
+            120,
+            &format!("{n}: pgpool back with 3 backends up after the blip"),
+            || async move { pcp_backends_up(n).await == 3 },
+        )
+        .await;
+    }
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —
@@ -1029,8 +1196,17 @@ async fn repair_standbys(
                 continue;
             }
             let mark = *marks.get(n).unwrap_or(&Cursor(0));
+            // Two wedge signatures, either one → operator recover now:
+            // - PostgreSQL's timeline fork ("forked off", finding 15);
+            // - the executor's own tripwire ("follow WEDGED"), which
+            //   covers every confirmed-but-never-streaming shape —
+            //   first seen for WAL-removed-under-slot-race (finding
+            //   22), where the re-follow loop emits a FRESH follow
+            //   event each cycle and the follow-event gate below would
+            //   otherwise shield the node from repair forever.
             let wedged = cx.log.find(mark, |ev| {
-                ev.source == Source::Postgres && ev.node == n && ev.line.contains("forked off")
+                (ev.source == Source::Postgres && ev.node == n && ev.line.contains("forked off"))
+                    || agent(ev, n, "follow WEDGED")
             });
             if wedged.is_some() {
                 cx.note(&format!(

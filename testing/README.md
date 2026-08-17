@@ -95,6 +95,15 @@ bash`, `journalctl -u pg_agentd`).
   winner, and the rejoin reclones the marker-less pgdata back into a
   standby — asserted by the absence of any later writable serving
   start on the crashed node.
+- **G10** — **full-cluster cold restart** (SIGKILL PID 1 in all three
+  containers, then power back): finding 21's scenario. The holder
+  reads its persisted lease (no rival could take over while the site
+  was dark — takeovers need the very quorum that was down), starts its
+  primary through real crash recovery, standby-shaped nodes just
+  start, and the suite asserts the blip is NOT a failover: no
+  takeover, no promotion, no fence, same holder retains, the
+  quorum-acked sentinel survives, replication and all three pgpool
+  maps converge back.
 
 ---
 
@@ -129,10 +138,13 @@ cluster; the discovery rate on new probes says these will pay):
    systemd's `code=killed` the serving-interval end. Rejoin is a
    reclone, so crash recovery of the old pgdata itself is never run —
    that only becomes reachable with a restart-in-place path.
-3. **Full-cluster cold restart of an ESTABLISHED cluster** (the site
-   power blip): persisted lease in the raft store, three phantom
-   checks racing, executors reconciling stale roles. G0/G1 only cover
-   greenfield boot.
+3. ~~Full-cluster cold restart of an ESTABLISHED cluster~~ — **done:
+   G10**, and it found finding 21 before ever running: nothing in the
+   steady-state design started a Down instance, so an established
+   cluster stayed down forever after a blip. Fixed with cold-start
+   reconciliation in `Agent::serve` (standby-shaped pgdata starts
+   unconditionally; primary-shaped only on a quorum-fresh lease read
+   naming self; uninitialized never).
 4. **Write load through the failover**: a continuous ledger upgrades
    data-survival from "one at-rest sentinel survived" to "every
    acknowledged row survived" (the actual quorum-commit invariant),
@@ -153,6 +165,13 @@ cluster; the discovery rate on new probes says these will pay):
 8. `detach_false_primary` storm behavior (hook-contract §5.5), which
    needs a false primary manufactured out of band.
 9. `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
+10. **Close finding 22's slot race in the product**: create member
+    slots AT promote (the winner knows the member set) instead of
+    waiting for each standby's follow, plus a `wal_keep_size` floor so
+    a replay-trailing survivor can't lose its window to the
+    post-promote checkpoint. Today the race ends in the finding-15
+    tripwire + operator reclone — correct but a full rebuild where
+    slot timing would have preserved the stream.
 
 ## Findings log
 
@@ -501,3 +520,91 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     `client()` redials past poisoned entries — post-heal first-RPCs no
     longer pay the broken-connection tax; the harness retry stays as
     operator-model belt-and-braces.
+
+21. **An established cluster never comes back from a full-site power
+    blip.** Found statically while designing G10, confirmed by the
+    code paths: PostgreSQL is agent-managed (disabled in systemd), the
+    executor's demote policy ignores `Down` instances, and a holder
+    whose PostgreSQL is down can only tick `WouldDemote` — so after
+    every node reboots, the cluster sits with the lease intact in the
+    persisted raft store and no PostgreSQL anywhere, forever. Peers
+    can't even depose usefully: candidacy needs a local flush
+    position, which needs a running standby. FIXED with cold-start
+    reconciliation in `Agent::serve` (between the phantom check and
+    the HA-loop spawn, so a primary starting through crash recovery
+    never races the loop's fence): standby-shaped pgdata
+    (`standby.signal`) starts unconditionally — divergence lands in
+    the finding-15 wedge tripwire, never in a serving primary;
+    primary-shaped pgdata starts only on a quorum-fresh lease read
+    naming this node (no rival could take over while the site was
+    dark — takeovers need the very quorum that was down); deposed
+    ex-holders read `holder != self` and stay down, preserving the
+    demote policy; uninitialized pgdata (greenfield pre-init, or a
+    blip-interrupted reclone) is never touched. G10 asserts the blip
+    is not a failover: same holder, same term, no fence, crash
+    recovery observed, acked sentinel intact.
+
+    The first cut earned its own sub-finding: the quorum poll ran 60 s
+    ahead of `sd_notify(READY)` while the unit ships
+    `TimeoutStartSec=30s` — and a VIRGIN Debian pgdata (the package's
+    default cluster: `PG_VERSION`, no `standby.signal`) is
+    indistinguishable from a primary's, with a pre-membership store
+    that never answers. Every greenfield standby boot therefore polled
+    to the budget and was killed by systemd mid-poll, failing G0/G1
+    across the board. The budget is now 10 s: on a synchronized blip
+    the standby-shaped peers start without consulting the store, so
+    quorum exists within seconds; a holder that boots long before its
+    peers exhausts it and stays down — and the site still heals,
+    because the auto-started standbys give candidacy a live flush
+    position and the majority promotes past the cold ex-holder.
+
+    The second G10 run found three more, all environment/harness:
+    provision.sh restarted PostgreSQL itself on every container boot —
+    a crutch predating the reconcile that preempted the exact product
+    path under test (the cluster "recovered" in 4 s with zero
+    cold-start involvement); pgpool was unmasked+started but never
+    ENABLED, so no router came back after the blip and every healthz
+    went 503 (`curl -sf` then reads armed sync as ""); and the
+    harness's `Pg` resolved container IPs ONCE at suite start, while
+    the blip's sequential `docker start` reshuffles them — "db2"
+    queries interrogated what had become db0, so node-specific checks
+    (streaming count) failed against a fully-recovered cluster while
+    set-shaped checks (count_primaries) kept passing. Wrong-node
+    evidence is the worst kind of green: IPs now resolve per redial.
+
+    And the pgpool-enable fix bred a fourth: `pgpool2.service` carries
+    `Wants=postgresql.service`, so enabling the router made systemd
+    pull Debian's postgresql meta-service at boot — whose generator
+    starts every cluster whose `start.conf` says `auto` (the package
+    default), regardless of `postgresql@17-main` being disabled.
+    PostgreSQL was up 2 s before the agent on every post-blip boot;
+    the reconcile correctly no-op'd on a running instance, silently,
+    and only the missing journal lines gave it away (diagnosed via
+    validate-env's DB-backed checks passing at a boot where PostgreSQL
+    should have been down). An agent-managed deployment must set
+    `start.conf = manual` — explicit `systemctl start` paths
+    (bootstrap, recover, cold start) are unaffected. A false alarm
+    from the same investigation, worth keeping: the raft store's
+    9-entry log recovered IDENTICALLY on all three nodes after the
+    hard kill, holder and term intact — redb's Immediate durability
+    held under power loss exactly as the storage comments claim.
+
+22. **The slot-creation race at failover: a surviving standby can lose
+    its WAL window before its slot exists on the winner.** In a G9
+    run, db1's FLUSH was quorum-current but its REPLAY trailed inside
+    segment 0x11 when the primary died; the winner's post-promote
+    checkpoint recycled 0x11 before db1's re-follow created its slot
+    on the new primary (~2 s later), leaving "requested WAL segment
+    has already been removed" + a timeline history file no peer had
+    archived. Unrecoverable without reclone — and the finding-15
+    tripwire fired exactly as designed ("follow WEDGED … until
+    `cluster recover` rebuilds this node"). The HARNESS bug it
+    exposed: repair_standbys' wedge scan only knew the "forked off"
+    signature, and the executor's re-follow loop emits a fresh
+    "now following" event each cycle, so the follow-event gate
+    shielded the wedged node from the stuck-fallback for the full
+    budget. The tripwire log line is now itself a wedge signature —
+    the repair consumes the product's own loud diagnosis. Product-side
+    narrowing (create member slots AT promote instead of at each
+    standby's follow; a `wal_keep_size` floor to close the race
+    entirely) is on the gap list.

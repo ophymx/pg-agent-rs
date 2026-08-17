@@ -47,8 +47,21 @@ health_check_timeout = 3
 health_check_user = 'pgpool'
 health_check_password = ''
 health_check_database = 'postgres'
-health_check_max_retries = 1
-health_check_retry_delay = 1
+# The router must outwait a cold-booting database (G10): pgpool starts
+# seconds after the blip while the agent's cold-start reconcile is
+# still bringing PostgreSQL through crash recovery (~12 s observed).
+# With 1-retry tolerance the health check detached the primary during
+# that window, and with auto_failback off + PCP not listening during
+# startup's find_primary_node loop, pgpool wedged until
+# search_primary_node_timeout. ~22 s of retry tolerance covers the
+# window; detach speed is ROUTING convergence, not failover authority
+# (the lease owns that), so nothing safety-relevant slows down.
+health_check_max_retries = 10
+health_check_retry_delay = 2
+# Backstop, not the fix: a genuinely dead primary bounds pgpool's
+# startup search at 30 s (default 300) and it comes up degraded with
+# PCP listening — reachable by the attach fan-out instead of wedged.
+search_primary_node_timeout = 30
 connect_timeout = 3000
 
 # Per-instance routing reactions: self-limiting, kept on.
@@ -93,5 +106,9 @@ chmod 0600 /var/lib/postgresql/.pcppass
 systemctl stop pgpool2.service 2>/dev/null || true
 rm -f /var/log/postgresql/pgpool_status
 systemctl unmask pgpool2.service
+# Enabled, not just started: the router must come back on its own
+# after a node reboot (G10's site power blip) — pgpool is
+# systemd-managed in this deployment shape, not agent-managed.
+systemctl enable pgpool2.service
 systemctl start pgpool2.service
 echo "pgpool-setup: started on $(hostname)"

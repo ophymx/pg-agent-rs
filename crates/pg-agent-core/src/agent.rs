@@ -441,6 +441,14 @@ impl Agent {
         // instead of the bootstrap-pending placeholder.
         self.startup_verified.store(true, Ordering::SeqCst);
 
+        // Cold-start reconciliation (finding 21) — see the method docs.
+        // Synchronous, BEFORE the HA loop spawns: a holder starting its
+        // PostgreSQL through crash recovery must not race the loop's
+        // "holder with unknown local state" fence. `start_postgres`
+        // waits for readiness (pg_ctl -w), so the loop's first tick
+        // sees the recovered primary and retains.
+        self.cold_start_reconcile().await;
+
         // PgpoolSupervisor — only spawn on a verdict that says "this
         // node should be serving." A Phantom/SplitBrain/Unverifiable
         // node must NOT have its local pgpool started, because pgpool's
@@ -634,6 +642,23 @@ const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_CHECK_RETRIES: u8 = 3;
 const STARTUP_CHECK_RETRY_DELAY: Duration = Duration::from_secs(3);
 
+/// How long [`Agent::cold_start_reconcile`] polls for a quorum lease
+/// read before leaving a primary-shaped pgdata down. The poll blocks
+/// `serve` ahead of `sd_notify(READY)`, so it MUST stay well inside
+/// the unit's `TimeoutStartSec` (30 s in packaging/) — a 60 s first
+/// cut got the daemon killed mid-poll by systemd on every greenfield
+/// boot, because a virgin Debian pgdata (default cluster: PG_VERSION,
+/// no standby.signal) is indistinguishable from a primary's and the
+/// pre-membership store never answers. Short is also sufficient: on a
+/// synchronized site restart the standby-shaped peers start without
+/// consulting the store, so a quorum of raft servers exists within a
+/// few seconds. A holder that boots long before its peers exhausts
+/// this budget and stays down — and the site still heals, because the
+/// auto-started standbys give candidacy a live flush position and the
+/// majority promotes past the cold ex-holder (operator rejoin, per
+/// the demote policy).
+const COLD_START_QUORUM_BUDGET: Duration = Duration::from_secs(10);
+
 /// One peer's contribution to a [`PrimaryVerdict`]. Only reachable
 /// peers with a known timeline (`timeline_id > 0`) make it into the
 /// observation list — unreachable peers and pre-feature peers are
@@ -701,6 +726,115 @@ impl Agent {
     pub(crate) async fn verify_primary_with_retries(&self) -> PrimaryVerdict {
         self.verify_primary_with_retries_params(STARTUP_CHECK_RETRIES, STARTUP_CHECK_RETRY_DELAY)
             .await
+    }
+
+    /// Cold-start reconciliation (finding 21). A full-site power blip
+    /// reboots every node with PostgreSQL down — and nothing in the
+    /// steady-state design starts a Down instance: followers honor the
+    /// demote policy (`converge_follow` ignores `Down`), and a holder
+    /// whose PostgreSQL is down can only tick `WouldDemote`. Without
+    /// this step an established cluster stays down FOREVER after a
+    /// blip: lease intact in the persisted raft store, every executor
+    /// waiting for an operator.
+    ///
+    /// The evidence that makes starting safe, by pgdata shape:
+    /// - **standby-shaped** (`standby.signal` present): safe to start
+    ///   unconditionally — it starts into recovery and follows whoever
+    ///   the executor points it at; divergence lands in the wedge
+    ///   tripwire (finding 15), never in a serving primary.
+    /// - **primary-shaped**: starts ONLY on a quorum-fresh lease read
+    ///   saying this node still holds the lease. While the site was
+    ///   dark no rival could take over — a takeover needs the very
+    ///   quorum that was down — so the persisted lease is proof. A
+    ///   deposed ex-holder reads `holder != self` and stays down (the
+    ///   demote policy, unchanged).
+    /// - **uninitialized** (no `PG_VERSION`): nothing startable —
+    ///   greenfield pre-init, or a reclone that a blip interrupted
+    ///   (which is also not the holder, so it stays down either way).
+    ///
+    /// Runs synchronously in [`Agent::serve`] BETWEEN the phantom
+    /// check and the HA-loop spawn: the loop's first tick then sees
+    /// the started primary and retains, instead of racing a fence
+    /// against a PostgreSQL still in crash recovery.
+    pub(crate) async fn cold_start_reconcile(&self) {
+        let Some(instance) = &self.opts.pg_instance else {
+            return;
+        };
+        if !matches!(instance.state().await, pgman::instance::InstanceState::Down) {
+            return;
+        }
+        let pgdata = &self.opts.postgres.data_dir;
+        if !pgdata.join("PG_VERSION").exists() {
+            return;
+        }
+        if pgdata.join("standby.signal").exists() {
+            info!("cold start: standby-shaped pgdata with PostgreSQL down; starting as standby");
+            if let Err(e) = self.deps.sd.start_postgres().await {
+                warn!(err = %e, "cold start: standby start failed; leaving it to the operator");
+            }
+            return;
+        }
+        // Primary-shaped. Only the lease can say whether this node is
+        // still the cluster's primary — poll for a quorum read, since
+        // on a full-site restart the peers' raft servers are booting
+        // too and the store answers only once a majority is back.
+        let Some(rt) = &self.opts.raft else {
+            info!("cold start: primary-shaped pgdata but no raft store; staying down");
+            return;
+        };
+        let store: Arc<dyn crate::consensus::ConsensusStore> = rt.store.clone();
+        let local_id = self.opts.node_pool.local_node_id;
+        let deadline = std::time::Instant::now() + COLD_START_QUORUM_BUDGET;
+        loop {
+            match store.read_state().await {
+                Ok(state) => {
+                    match state.lease {
+                        Some(lease) if lease.holder == local_id => {
+                            info!(
+                                term = lease.term,
+                                "cold start: this node holds the persisted lease; starting \
+                                 PostgreSQL as primary (crash recovery may run)"
+                            );
+                            if let Err(e) = self.deps.sd.start_postgres().await {
+                                warn!(
+                                    err = %e,
+                                    "cold start: primary start failed; the HA loop will \
+                                     report the holder unhealthy and the majority decides"
+                                );
+                            }
+                        }
+                        Some(lease) => {
+                            info!(
+                                holder = lease.holder,
+                                "cold start: primary-shaped pgdata but another node holds \
+                                 the lease; staying down (operator path: cluster recover)"
+                            );
+                        }
+                        None => {
+                            info!(
+                                "cold start: primary-shaped pgdata and a vacant lease; \
+                                 staying down (candidacy needs a running standby, not a \
+                                 cold ex-primary)"
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        warn!(
+                            err = %e,
+                            budget = ?COLD_START_QUORUM_BUDGET,
+                            "cold start: store unreadable past the budget with \
+                             primary-shaped pgdata; leaving PostgreSQL down (operator \
+                             decision)"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     /// Parameterised retry — production goes through
@@ -1070,11 +1204,15 @@ mod tests {
         /// supervisor-behaviour assertions live in `pgpool_supervisor` with
         /// its own dedicated stub.
         start_pgpool_calls: std::sync::atomic::AtomicUsize,
+        /// # of start_postgres calls observed (cold-start reconcile tests).
+        start_calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
     impl Systemd for StubSd {
         async fn start_postgres(&self) -> anyhow::Result<()> {
+            self.start_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn stop_postgres(&self) -> anyhow::Result<()> {
@@ -1446,6 +1584,126 @@ mod tests {
 
     fn make_deps(db: Arc<dyn LocalDb>, sd: Arc<dyn Systemd>) -> AgentDeps {
         make_deps_with_peers(db, sd, Arc::new(StubPeers::default()))
+    }
+
+    /// Agent wired for cold-start reconcile tests: a real (temp)
+    /// pgdata path and a scripted instance state; no raft, so the
+    /// primary-shaped arm resolves immediately to "no authority".
+    fn make_agent_cold(
+        deps: AgentDeps,
+        data_dir: PathBuf,
+        state: pgman::instance::InstanceState,
+    ) -> Arc<Agent> {
+        let base = make_agent(deps);
+        let mut opts_agent = Arc::into_inner(base).expect("sole owner");
+        opts_agent.opts.postgres.data_dir = data_dir;
+        opts_agent.opts.pg_instance = Some(Arc::new(FixedStateInstance(state)));
+        Arc::new(opts_agent)
+    }
+
+    /// Instance whose `state()` is fixed; the reconcile must never
+    /// touch any other method.
+    struct FixedStateInstance(pgman::instance::InstanceState);
+    #[async_trait]
+    impl pgman::instance::PostgresInstance for FixedStateInstance {
+        async fn state(&self) -> pgman::instance::InstanceState {
+            self.0.clone()
+        }
+        async fn promote_and_wait(&self, _: Duration) -> anyhow::Result<()> {
+            unreachable!("cold start never promotes")
+        }
+        async fn ensure_stopped(&self) -> anyhow::Result<()> {
+            unreachable!("cold start never stops")
+        }
+        async fn follow(&self, _: &pgman::instance::UpstreamSpec) -> anyhow::Result<()> {
+            unreachable!("cold start never follows")
+        }
+        async fn rebuild_as_standby(
+            &self,
+            _: &pgman::instance::UpstreamSpec,
+        ) -> anyhow::Result<()> {
+            unreachable!("cold start never rebuilds")
+        }
+        async fn sync_standby_names(&self) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        async fn set_sync_standby_names(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>> {
+            unreachable!()
+        }
+    }
+
+    // ----- cold-start reconcile (finding 21) -----------------------------
+
+    fn cold_deps() -> (AgentDeps, Arc<StubSd>) {
+        let sd = Arc::new(StubSd::default());
+        (make_deps(Arc::new(StubDb::default()), sd.clone()), sd)
+    }
+
+    fn starts(sd: &StubSd) -> usize {
+        sd.start_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn cold_start_starts_standby_shaped_pgdata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
+        std::fs::write(dir.path().join("standby.signal"), "").unwrap();
+        let (deps, sd) = cold_deps();
+        let agent = make_agent_cold(
+            deps,
+            dir.path().to_path_buf(),
+            pgman::instance::InstanceState::Down,
+        );
+        agent.cold_start_reconcile().await;
+        assert_eq!(starts(&sd), 1, "standby-shaped pgdata is safe to start");
+    }
+
+    #[tokio::test]
+    async fn cold_start_ignores_uninitialized_pgdata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, sd) = cold_deps();
+        let agent = make_agent_cold(
+            deps,
+            dir.path().to_path_buf(),
+            pgman::instance::InstanceState::Down,
+        );
+        agent.cold_start_reconcile().await;
+        assert_eq!(starts(&sd), 0, "nothing startable pre-init / mid-reclone");
+    }
+
+    #[tokio::test]
+    async fn cold_start_leaves_primary_shaped_down_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
+        // No standby.signal: primary-shaped. raft is None in the test
+        // harness — no lease authority, so the conservative answer is
+        // to stay down rather than resurrect a possible stale primary.
+        let (deps, sd) = cold_deps();
+        let agent = make_agent_cold(
+            deps,
+            dir.path().to_path_buf(),
+            pgman::instance::InstanceState::Down,
+        );
+        agent.cold_start_reconcile().await;
+        assert_eq!(starts(&sd), 0, "primary-shaped needs the lease's say-so");
+    }
+
+    #[tokio::test]
+    async fn cold_start_noops_when_postgres_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
+        std::fs::write(dir.path().join("standby.signal"), "").unwrap();
+        let (deps, sd) = cold_deps();
+        let agent = make_agent_cold(
+            deps,
+            dir.path().to_path_buf(),
+            pgman::instance::InstanceState::Standby { streaming: true },
+        );
+        agent.cold_start_reconcile().await;
+        assert_eq!(starts(&sd), 0, "a running instance needs no reconciling");
     }
 
     fn make_deps_with_peers(
