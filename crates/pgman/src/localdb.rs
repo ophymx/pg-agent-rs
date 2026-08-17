@@ -222,8 +222,21 @@ impl LocalDb for PgLocalDb {
 
     async fn create_slot(&self, name: &str) -> anyhow::Result<()> {
         let conn = self.get_conn().await?;
+        // `immediately_reserve := true` — the slot holds WAL from the
+        // moment it exists, not from the moment a standby first
+        // connects. Without it a slot created ahead of its consumer
+        // retains nothing, which is precisely finding 22: the winner's
+        // post-promote checkpoint recycled a segment a surviving
+        // standby still needed, seconds before that standby's
+        // re-follow created the slot. The cost is that a slot whose
+        // consumer never arrives pins WAL — bounded by the same slot
+        // hygiene that already governs a consumer that goes away (the
+        // standby-down hook drops it).
         let result = conn
-            .execute("SELECT pg_create_physical_replication_slot($1)", &[&name])
+            .execute(
+                "SELECT pg_create_physical_replication_slot($1, true)",
+                &[&name],
+            )
             .await;
         match result {
             Ok(_) => Ok(()),

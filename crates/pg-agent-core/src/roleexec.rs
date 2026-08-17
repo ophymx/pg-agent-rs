@@ -274,6 +274,35 @@ impl RoleExecutor {
             Ok(()) => {
                 info!(term, "roleexec: promotion complete");
                 *self.confirmed_upstream.lock().unwrap() = None;
+                // Finding 22: retain WAL for every member from the
+                // promotion instant, instead of from whenever each
+                // survivor's re-follow gets around to asking. The
+                // window between the two is real — a post-promote
+                // checkpoint recycled a segment a replay-trailing
+                // standby still needed ~2 s before its slot existed,
+                // and the only cure left was a full reclone. The new
+                // primary knows the member set; it does not need to
+                // be told. Best-effort: never undo a promotion over
+                // slot bookkeeping.
+                let member_slots: Vec<String> = self
+                    .pool
+                    .members
+                    .iter()
+                    .filter(|n| n.id != local_id)
+                    .map(|n| n.slot_name())
+                    .collect();
+                match self.instance.ensure_slots(&member_slots).await {
+                    Ok(()) => info!(
+                        slots = ?member_slots,
+                        "roleexec: member replication slots reserved at promotion \
+                         (WAL retained for every member from this instant)"
+                    ),
+                    Err(e) => warn!(
+                        err = %e,
+                        "roleexec: reserving member slots at promotion failed; a \
+                         survivor that trails may need `cluster recover` (finding 22)"
+                    ),
+                }
                 if let Some(id) = op {
                     if let Err(e) = self.inflight.complete(&id).await {
                         warn!(?e, id, "roleexec: promote journal complete failed");
@@ -624,6 +653,13 @@ mod tests {
             self.calls.lock().unwrap().push("stop_receiving".into());
             Ok(())
         }
+        async fn ensure_slots(&self, names: &[String]) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ensure_slots:{}", names.join(",")));
+            Ok(())
+        }
         async fn sync_standby_names(&self) -> anyhow::Result<String> {
             Ok(self.sync_names.lock().unwrap().clone())
         }
@@ -862,7 +898,13 @@ mod tests {
                 already_primary: false,
             })
             .await;
-        assert_eq!(f.instance.calls(), vec!["promote"]);
+        // Finding 22: the promotion reserves every OTHER member's slot
+        // immediately — not node1's own, and not later, when each
+        // survivor's re-follow gets around to asking.
+        assert_eq!(
+            f.instance.calls(),
+            vec!["promote", "ensure_slots:node0,node2"]
+        );
 
         // Journaled and completed.
         let (ops, _) = f
@@ -1074,7 +1116,10 @@ mod tests {
             })
             .await;
         drain_self_attach(&f).await;
-        assert_eq!(f.instance.calls(), vec!["promote"]);
+        assert_eq!(
+            f.instance.calls(),
+            vec!["promote", "ensure_slots:node0,node2"]
+        );
         assert_eq!(*f.pcp.attach_calls.lock().unwrap(), vec![1]);
     }
 

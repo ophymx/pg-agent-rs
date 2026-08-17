@@ -1633,6 +1633,9 @@ mod tests {
         async fn stop_receiving(&self) -> anyhow::Result<()> {
             unreachable!("cold start never detaches")
         }
+        async fn ensure_slots(&self, _: &[String]) -> anyhow::Result<()> {
+            unreachable!("cold start never promotes")
+        }
         async fn sync_standby_names(&self) -> anyhow::Result<String> {
             unreachable!()
         }

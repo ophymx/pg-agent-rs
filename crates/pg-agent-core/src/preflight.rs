@@ -23,6 +23,13 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Recommended `wal_keep_size` floor, in MB. Covers the failover gap
+/// that replication slots structurally cannot (see the check's docs):
+/// enough WAL for a standby carrying normal replay debt to re-follow a
+/// freshly promoted primary without a reclone. A deployment with heavy
+/// write bursts should raise it — the check is a floor, not a target.
+const WAL_KEEP_SIZE_FLOOR_MB: i64 = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStatus {
     Ok,
@@ -384,6 +391,46 @@ async fn db_settings(db: &Arc<dyn LocalDb>, cfg: &Config, r: &mut PreflightRepor
         }
     }
 
+    // wal_keep_size: the floor that survives a failover's slot gap.
+    // Slots reserve WAL from the moment they exist (finding 22's fix),
+    // but a slot created at promotion cannot retroactively protect
+    // segments written BEFORE it — and a standby whose replay trails
+    // inside one of those segments needs exactly those. wal_keep_size
+    // is the only thing that covers that gap, so this is a WARN and
+    // not an error: the agent does not manage this GUC (it is static
+    // deployment config, unlike synchronous_standby_names), but it
+    // must say plainly when the deployment has left the gap open.
+    match db.setting("wal_keep_size").await {
+        Ok(got) => {
+            // `current_setting` renders memory GUCs WITH their unit
+            // ("512MB", "1GB", "0") — unlike the unitless integer
+            // settings below, so a bare parse::<i64>() reads every
+            // configured value as 0 and warns at a correctly-tuned
+            // deployment. (It did exactly that on first run.)
+            let mb = parse_size_mb(&got).unwrap_or(0);
+            if mb >= WAL_KEEP_SIZE_FLOOR_MB {
+                r.checks.push(Check::ok(
+                    "setting: wal_keep_size",
+                    format!("{mb}MB (want ≥{WAL_KEEP_SIZE_FLOOR_MB}MB)"),
+                ));
+            } else {
+                r.checks.push(Check::warn(
+                    "setting: wal_keep_size",
+                    format!(
+                        "{mb}MB (want ≥{WAL_KEEP_SIZE_FLOOR_MB}MB) — a standby whose \
+                         replay trails through a failover can lose its WAL window to \
+                         the new primary's first checkpoint and need a full reclone \
+                         (finding 22)"
+                    ),
+                ));
+            }
+        }
+        Err(e) => r.checks.push(Check::warn(
+            "setting: wal_keep_size",
+            format!("query failed: {e}"),
+        )),
+    }
+
     // Numeric settings: ≥ pool size + slack.
     for name in ["max_replication_slots", "max_wal_senders"] {
         match db.setting(name).await {
@@ -408,6 +455,23 @@ async fn db_settings(db: &Arc<dyn LocalDb>, cfg: &Config, r: &mut PreflightRepor
                 format!("query failed: {e}"),
             )),
         }
+    }
+}
+
+/// Parse a PostgreSQL memory setting ("0", "8kB", "512MB", "1GB") into
+/// whole MB, rounding down. `None` if the shape is unrecognized — the
+/// caller treats that as "cannot confirm" rather than silently 0.
+fn parse_size_mb(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let n: i64 = s[..digits_end].parse().ok()?;
+    match s[digits_end..].trim() {
+        "" | "MB" => Some(n),
+        "B" => Some(n / (1024 * 1024)),
+        "kB" => Some(n / 1024),
+        "GB" => Some(n * 1024),
+        "TB" => Some(n * 1024 * 1024),
+        _ => None,
     }
 }
 
@@ -568,6 +632,23 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
+
+    /// `current_setting` renders memory GUCs with their unit, so the
+    /// wal_keep_size floor check must read units — a bare integer
+    /// parse reported a correctly-configured 512MB deployment as 0MB
+    /// and warned at it (caught on the live cluster, not by a test).
+    #[test]
+    fn memory_settings_parse_with_their_units() {
+        assert_eq!(parse_size_mb("512MB"), Some(512));
+        assert_eq!(parse_size_mb("1GB"), Some(1024));
+        assert_eq!(parse_size_mb("0"), Some(0));
+        assert_eq!(parse_size_mb(" 2048 "), Some(2048)); // unitless = MB
+        assert_eq!(parse_size_mb("16384kB"), Some(16));
+        assert_eq!(parse_size_mb("1TB"), Some(1024 * 1024));
+        // Unrecognized shapes are "cannot confirm", never a silent 0.
+        assert_eq!(parse_size_mb("lots"), None);
+        assert_eq!(parse_size_mb("64XB"), None);
+    }
 
     fn make_cfg(tmp: &TempDir) -> Config {
         let home = tmp.path().join("postgres-home");

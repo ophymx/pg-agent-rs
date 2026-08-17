@@ -118,6 +118,24 @@ bash`, `journalctl -u pg_agentd`).
   design) before it first passed. Steady-state numbers from the first
   green run: ~750 acked writes, one hung commit, 5.2 s write outage
   across the whole deposal.
+- **G12** — **the quorum-commit states nothing had ever entered**:
+  stop PostgreSQL on BOTH standbys with their agents left up (raft
+  keeps quorum, so this stays a quorum-commit test and not a fencing
+  one) → `sync_commit=blocked`, and a write BLOCKS rather than
+  silently becoming single-copy. Then the operator's escape hatch:
+  `cluster allow-async --confirm` disarms (journaled, shouted), writes
+  flow again, and when the standbys return the executor AUTO re-arms
+  at the first attach — no second command, no lingering hatch. The
+  hatch-era single-copy write is then asserted to reach the standby
+  once redundancy is back.
+- **G13** — **the follow-wedge tripwire** (finding 15's defense in
+  depth, unreachable in the designed flows since strict flush-max
+  candidacy): sever one standby's replication path only, kill its
+  walreceiver, and the executor must declare `follow WEDGED` past the
+  grace and expose `follow_wedged=true` in `/healthz`. The tripwire is
+  a REPORT: the wedged node neither promotes nor is destructively
+  rebuilt, the primary keeps its lease, and healing the path clears
+  the flag with no operator action.
 
 ---
 
@@ -165,10 +183,8 @@ cluster; the discovery rate on new probes says these will pay):
    a lagging winner → the waldir TLI + stability gate) both fell out
    of it. The ledger, the acked-row audit, and the starvation
    observation are now standing assertions.
-5. **Built-but-never-entered states**: `sync_commit=blocked` (both
-   standbys down → commits hang → recover → unblock), the
-   `allow-async` disarm/auto-re-arm lifecycle, and a deliberately
-   provoked `follow_wedged` to prove the tripwire fires.
+5. ~~Built-but-never-entered states~~ — **done: G12 (blocked →
+   allow-async → auto re-arm) and G13 (the follow-wedge tripwire)**.
 6. **Asymmetric / partial partitions** (A-sees-B-not-vice-versa;
    agent-mesh-up-PG-mesh-down and inverse) — finding 18's class,
    found by accident once.
@@ -180,13 +196,25 @@ cluster; the discovery rate on new probes says these will pay):
 8. `detach_false_primary` storm behavior (hook-contract §5.5), which
    needs a false primary manufactured out of band.
 9. `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
-10. **Close finding 22's slot race in the product**: create member
-    slots AT promote (the winner knows the member set) instead of
-    waiting for each standby's follow, plus a `wal_keep_size` floor so
-    a replay-trailing survivor can't lose its window to the
-    post-promote checkpoint. Today the race ends in the finding-15
-    tripwire + operator reclone — correct but a full rebuild where
-    slot timing would have preserved the stream.
+10. ~~Close finding 22's slot race in the product~~ — **done**, and
+    the investigation corrected the plan: slots-at-promote alone does
+    NOT close the race, because a slot cannot retroactively protect
+    segments written before it existed — a standby trailing INSIDE an
+    older segment needs exactly those. So the fix is three-part:
+    (a) `create_slot` now passes `immediately_reserve := true`, so a
+    slot retains WAL from the moment it exists rather than from the
+    moment a consumer first connects (without this, creating slots
+    early buys nothing at all); (b) the executor reserves EVERY
+    member's slot at promotion — the winner knows the member set and
+    should not wait to be asked, which closes the window for a
+    survivor that reconnects late; (c) `wal_keep_size` is the only
+    thing covering the pre-promotion segments, so validate-env now
+    WARNs below a 512MB floor (the agent does not manage this GUC —
+    it is static deployment config, unlike synchronous_standby_names —
+    but it must say plainly when the gap is left open), and the
+    acceptance provisioning sets it. The auditor gained a standing
+    invariant that would have caught finding 22 by itself: no standby
+    may ever log "WAL segment ... has already been removed".
 
 ## Findings log
 
@@ -619,10 +647,12 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     "now following" event each cycle, so the follow-event gate
     shielded the wedged node from the stuck-fallback for the full
     budget. The tripwire log line is now itself a wedge signature —
-    the repair consumes the product's own loud diagnosis. Product-side
-    narrowing (create member slots AT promote instead of at each
-    standby's follow; a `wal_keep_size` floor to close the race
-    entirely) is on the gap list.
+    the repair consumes the product's own loud diagnosis. FIXED in the
+    product since (gap item 10): slots reserve WAL at creation, the
+    executor reserves every member's slot at promotion, and
+    validate-env warns when `wal_keep_size` leaves the pre-promotion
+    gap open. The auditor now fails the run outright if any standby
+    logs "WAL segment ... has already been removed".
 
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death

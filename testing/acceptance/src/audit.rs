@@ -291,4 +291,20 @@ pub fn run(cx: &mut Ctx) {
     cx.check_absent("audit: no fence ever failed", Cursor(0), |ev| {
         ev.source == Source::Agent && ev.line.contains("FENCE FAILED")
     });
+
+    // Finding 22, as a standing invariant: no standby may ever lose
+    // its WAL window. The failure is unmistakable in the PostgreSQL
+    // log and previously surfaced only as a mysterious wedge that the
+    // repair path quietly recloned — a full rebuild where slot timing
+    // (now: slots reserved AT promotion) and a wal_keep_size floor
+    // should have preserved the stream.
+    cx.check_absent(
+        "audit: no standby ever lost its WAL window (segment already removed)",
+        Cursor(0),
+        |ev| {
+            ev.source == Source::Postgres
+                && ev.line.contains("has already been removed")
+                && ev.line.contains("WAL segment")
+        },
+    );
 }

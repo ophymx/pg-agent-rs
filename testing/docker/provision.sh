@@ -91,6 +91,11 @@ PGCONF_DIR=/etc/postgresql/17/main
 mkdir -p "$PGCONF_DIR/conf.d"
 cat > "$PGCONF_DIR/conf.d/10-pg-agent-acceptance.conf" <<'EOF'
 listen_addresses = '*'
+# The retention floor slots structurally cannot provide (finding 22): a
+# slot created at promotion cannot retroactively protect segments
+# written before it, and a standby whose replay trails inside one of
+# those needs exactly those. validate-env warns below 512MB.
+wal_keep_size = '512MB'
 # The agent writes standby recovery settings to $PGDATA/myrecovery.conf
 # (SPEC §5.10, pgpool convention); PostgreSQL only reads it if the main
 # config includes it. Ansible owns this line in production.

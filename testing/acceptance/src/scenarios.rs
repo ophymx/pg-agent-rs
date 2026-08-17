@@ -147,7 +147,9 @@ pub async fn run_all(cx: &mut Ctx) {
     let w4 = g8(cx, w3, &mut marks).await;
     let w5 = g9(cx, w4, &mut marks).await;
     g10(cx, w5).await;
-    g11(cx, w5, &mut marks).await;
+    let w6 = g11(cx, w5, &mut marks).await;
+    let w7 = g12(cx, w6, &mut marks).await;
+    g13(cx, w7, &mut marks).await;
     crate::audit::run(cx);
 }
 
@@ -1169,7 +1171,11 @@ async fn g10(cx: &mut Ctx, prim: &'static str) {
     }
 }
 
-async fn g11(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+async fn g11(
+    cx: &mut Ctx,
+    prim: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
     cx.say("G11: fence-less deposal under WRITE LOAD — every acked row must survive");
     // G8 proved one probe starves; a continuous ledger (crate::load)
     // upgrades the claim to the actual quorum-commit invariant: EVERY
@@ -1345,6 +1351,221 @@ async fn g11(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
         || async move { sync_commit_state(w).await == "armed" },
     )
     .await;
+    w
+}
+
+/// Healthz-reported follow-wedge tripwire on `node`. Deliberately
+/// `curl -s`, NOT `-sf`: a wedged standby is unhealthy by definition,
+/// so /healthz answers 503 — and `-f` throws the body away on exactly
+/// the nodes this flag exists to describe. (The first cut copied
+/// `-sf` from the sync-commit probe, which only ever reads a healthy
+/// primary, and failed for that reason alone.) The body is the same
+/// JSON either way.
+async fn follow_wedged(node: &str) -> bool {
+    exec(node, "curl -s localhost:9702/healthz")
+        .await
+        .map(|body| body.contains("\"follow_wedged\":true"))
+        .unwrap_or(false)
+}
+
+/// A write attempt with a hard timeout, run INSIDE the container so a
+/// commit hung in the sync-rep wait cannot wedge the harness's pooled
+/// connections (G8's lesson). Returns true iff it committed; a
+/// `timeout(1)` kill (rc 124) is the hang.
+async fn timed_write(node: &str, label: &str, budget_s: u32) -> bool {
+    exec_pg(
+        node,
+        &format!(
+            "timeout {budget_s} psql -qAt -d postgres -c \
+             \"insert into sentinel(label, at) values ('{label}', now()) \
+              on conflict (label) do update set at = now()\"; echo rc=$?"
+        ),
+    )
+    .await
+    .map(|out| out.contains("rc=0"))
+    .unwrap_or(false)
+}
+
+async fn g12(
+    cx: &mut Ctx,
+    prim: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
+    cx.say("G12: quorum-commit states — blocked, the allow-async hatch, auto re-arm");
+    // The three states the design builds and the suite never entered.
+    // Stop PostgreSQL on BOTH standbys while their agents stay up:
+    // raft keeps quorum (so the lease holds and this stays a
+    // quorum-commit test, not a fencing test), the primary keeps
+    // serving reads, and `ANY 1` has no ack source left — commits
+    // hang. That is `blocked`, and it is the state the design says is
+    // a page: the cluster is UP and refusing to acknowledge writes,
+    // on purpose, rather than acknowledging single-copy ones.
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit armed before the blackout"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    write_sentinel(cx, prim, "g12-pre").await;
+    let since = cx.log.cursor();
+    for n in NODES {
+        if n != prim {
+            let _ = exec(n, "systemctl stop postgresql@17-main").await;
+        }
+    }
+    cx.wait_until(
+        60,
+        &format!("{prim}: /healthz reports sync_commit=blocked (no ack source)"),
+        || async move { sync_commit_state(prim).await == "blocked" },
+    )
+    .await;
+    cx.check(
+        "a write BLOCKS while quorum commit has no ack source (not silently single-copy)",
+        !timed_write(prim, "g12-blocked", 5).await,
+    );
+    cx.check(
+        &format!("{prim} still serves reads while blocked (the cluster is up, not down)"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    // The escape hatch: an operator who accepts single-copy writes
+    // trades the guarantee for availability, on the record.
+    let out = exec_pg(prim, "pg_agentctl cluster allow-async --confirm")
+        .await
+        .unwrap_or_else(|e| e.to_string());
+    cx.check(
+        "allow-async disarmed quorum commit (operator escape hatch)",
+        out.contains("disarmed"),
+    );
+    cx.await_event(
+        30,
+        "the disarm is journaled and shouted (QUORUM COMMIT DISARMED)",
+        since,
+        |ev| agent(ev, prim, "QUORUM COMMIT DISARMED"),
+    )
+    .await;
+    cx.wait_until(
+        30,
+        &format!("{prim}: /healthz reports sync_commit=disarmed"),
+        || async move { sync_commit_state(prim).await == "disarmed" },
+    )
+    .await;
+    cx.check(
+        "writes flow again after the hatch (single-copy, as advertised)",
+        timed_write(prim, "g12-async", 10).await,
+    );
+    let ops = exec_pg(prim, "pg_agentctl ops list")
+        .await
+        .unwrap_or_default();
+    cx.check(
+        "the disarm shows in the op journal (incident review)",
+        ops.to_lowercase().contains("allowasync") || ops.to_lowercase().contains("allow_async"),
+    );
+    // Operator brings the standbys back; the executor re-arms at the
+    // first standby attach — no second command, no lingering hatch.
+    repair_standbys(cx, prim, "g12", marks).await;
+    cx.wait_until(
+        90,
+        &format!("{prim}: quorum commit AUTO re-armed at the first standby attach"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    check_sentinel(cx, prim, "g12-pre").await;
+    // The single-copy write taken during the hatch is now replicated:
+    // the hatch's window closed without losing what it let through.
+    let standby = other_node(prim);
+    let pg = cx.pg.clone();
+    cx.wait_until(
+        60,
+        &format!("the hatch-era write reached {standby} once redundancy returned"),
+        || {
+            let pg = pg.clone();
+            async move {
+                pg.scalar(
+                    standby,
+                    "select count(*)::text from sentinel where label = 'g12-async'",
+                )
+                .await
+                .is_ok_and(|v| v == "1")
+            }
+        },
+    )
+    .await;
+    prim
+}
+
+async fn g13(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G13: the follow-wedge tripwire fires (finding 15's defense in depth)");
+    // Strict flush-max candidacy made the finding-15 wedge structurally
+    // unreachable in the designed flows — which left its DETECTION
+    // untested. Provoke the state directly: sever one standby's
+    // replication path only (PG port, G7's technique — its agent stays
+    // reachable, so its executor keeps deciding Following and keeps
+    // confirming the follow), then kill the walreceiver. The executor
+    // sees confirmed-onto-the-holder-but-not-streaming past the grace
+    // (= leader_ttl) and must say so LOUDLY rather than sitting on a
+    // silently degraded standby.
+    let target = other_node(prim);
+    let prim_ip = cluster::container_ip(prim).await.unwrap_or_default();
+    let since = cx.log.cursor();
+    let _ = exec(
+        target,
+        &format!(
+            "iptables -A OUTPUT -d {prim_ip} -p tcp --dport 5432 -j DROP && \
+             iptables -A INPUT -s {prim_ip} -p tcp --sport 5432 -j DROP"
+        ),
+    )
+    .await;
+    let _ = cx
+        .pg
+        .execute(
+            target,
+            "select pg_terminate_backend(pid) from pg_stat_wal_receiver",
+        )
+        .await;
+    cx.await_event(
+        90,
+        &format!("{target}: executor declares the follow WEDGED past the grace"),
+        since,
+        |ev| agent(ev, target, "follow WEDGED"),
+    )
+    .await;
+    cx.wait_until(
+        30,
+        &format!("{target}: /healthz exposes follow_wedged=true (operator-visible)"),
+        || async move { follow_wedged(target).await },
+    )
+    .await;
+    // The tripwire is a REPORT, not an action: a degraded standby must
+    // never be destructively rebuilt by the executor, and must never
+    // depose the healthy primary it cannot reach on 5432.
+    cx.check_absent(
+        "the wedged standby neither promoted nor was auto-rebuilt",
+        since,
+        |ev| {
+            agent(ev, target, "roleexec: promotion complete")
+                || agent(ev, target, "rebuild_as_standby")
+        },
+    );
+    cx.check(
+        &format!("{prim} kept the lease throughout (a wedged follower is not a failover)"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    // Heal the path: the executor's re-follow finds the stream again
+    // and the tripwire clears itself — no operator action for a
+    // transient cause.
+    let _ = exec(target, "iptables -F OUTPUT && iptables -F INPUT").await;
+    cx.wait_until(
+        120,
+        &format!("{target}: tripwire self-cleared once streaming resumed"),
+        || async move { !follow_wedged(target).await },
+    )
+    .await;
+    repair_standbys(cx, prim, "g13", marks).await;
+    let primaries = cx.pg.count_primaries().await;
+    cx.check(
+        "exactly one primary after the wedge cleared",
+        primaries == 1,
+    );
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —

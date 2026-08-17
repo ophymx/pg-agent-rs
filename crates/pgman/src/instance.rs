@@ -143,6 +143,15 @@ pub trait PostgresInstance: Send + Sync {
     /// `Standby { streaming: true }`.
     async fn rebuild_as_standby(&self, upstream: &UpstreamSpec) -> anyhow::Result<()>;
 
+    /// Ensure a physical replication slot exists for each name —
+    /// the member set minus self, called AT promotion (finding 22).
+    /// Idempotent, and each slot reserves WAL the moment it exists, so
+    /// the new primary starts retaining for every member before any of
+    /// them re-follows. Best-effort by contract: the caller logs and
+    /// carries on, because a promotion must never be undone by slot
+    /// bookkeeping.
+    async fn ensure_slots(&self, names: &[String]) -> anyhow::Result<()>;
+
     /// The candidacy freeze (finding 23): stop the walreceiver and
     /// keep it stopped, WITHOUT stopping PostgreSQL — rewrite
     /// `myrecovery.conf` conninfo-less and reload. Flush positions
@@ -328,6 +337,13 @@ impl PostgresInstance for Instance {
             .start()
             .await
             .map_err(|e| anyhow::anyhow!("rebuild: start: {e}"))
+    }
+
+    async fn ensure_slots(&self, names: &[String]) -> anyhow::Result<()> {
+        for name in names {
+            self.db.create_slot(name).await?;
+        }
+        Ok(())
     }
 
     async fn stop_receiving(&self) -> anyhow::Result<()> {
