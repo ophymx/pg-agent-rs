@@ -192,6 +192,26 @@ impl RoleExecutor {
                 self.converge_follow(*holder).await;
             }
 
+            // The candidacy freeze (finding 23): stop the walreceiver
+            // (conf rewrite + reload — PostgreSQL keeps serving reads)
+            // so the flush position stops moving before candidacy
+            // compares it. Idempotent; the decision repeats until the
+            // receiver is observed down. Clearing confirmed_upstream
+            // makes the eventual follow (new winner, or the old holder
+            // coming back healthy) rewrite the conf and re-stream.
+            HaDecision::DetachingFromDeposed { holder } => {
+                warn!(
+                    holder,
+                    "roleexec: detaching from deposed holder — freezing flush position \
+                     for candidacy (writes through this standby stop acking)"
+                );
+                *self.confirmed_upstream.lock().unwrap() = None;
+                *self.follow_stalled_since.lock().unwrap() = None;
+                if let Err(e) = self.instance.stop_receiving().await {
+                    warn!(holder, err = %e, "roleexec: detach failed; will retry next tick");
+                }
+            }
+
             HaDecision::RetainedLease { .. }
             | HaDecision::TookOver {
                 already_primary: true,
@@ -600,6 +620,10 @@ mod tests {
         async fn rebuild_as_standby(&self, _: &UpstreamSpec) -> anyhow::Result<()> {
             panic!("v1 executor must never rebuild — demote policy is operator rejoin");
         }
+        async fn stop_receiving(&self) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push("stop_receiving".into());
+            Ok(())
+        }
         async fn sync_standby_names(&self) -> anyhow::Result<String> {
             Ok(self.sync_names.lock().unwrap().clone())
         }
@@ -892,6 +916,28 @@ mod tests {
         assert!(
             f.peers.slot_calls.lock().unwrap().is_empty(),
             "must not have tried to follow"
+        );
+    }
+
+    /// The candidacy freeze (finding 23): the decision layer says
+    /// DetachingFromDeposed and the executor stops the walreceiver —
+    /// nothing else. No stop, no follow, no promote: PostgreSQL keeps
+    /// serving reads, only the stream (and with it the moving flush
+    /// position, and the deposed primary's ack supply) ends.
+    #[tokio::test]
+    async fn detaching_from_deposed_stops_receiving_only() {
+        let f = fixture(1, InstanceState::Standby { streaming: true });
+        f.exec
+            .apply(&HaDecision::DetachingFromDeposed { holder: 0 })
+            .await;
+        assert_eq!(f.instance.calls(), vec!["stop_receiving"]);
+        // And the eventual re-follow is not suppressed by a stale
+        // confirmed upstream: a later Following must actually follow.
+        f.exec.apply(&HaDecision::Following { holder: 2 }).await;
+        assert_eq!(
+            f.instance.calls(),
+            vec!["stop_receiving", "follow:db2"],
+            "detach must clear the confirmed upstream so the follow re-runs"
         );
     }
 

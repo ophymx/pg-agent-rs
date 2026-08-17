@@ -1135,6 +1135,9 @@ mod tests {
         async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn reload_conf(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
@@ -1398,6 +1401,9 @@ mod tests {
         async fn write_recovery_conf(&self, _: WriteRecoveryConfOpts) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn detach_recovery_conf(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct StubReplay;
@@ -1623,6 +1629,9 @@ mod tests {
             _: &pgman::instance::UpstreamSpec,
         ) -> anyhow::Result<()> {
             unreachable!("cold start never rebuilds")
+        }
+        async fn stop_receiving(&self) -> anyhow::Result<()> {
+            unreachable!("cold start never detaches")
         }
         async fn sync_standby_names(&self) -> anyhow::Result<String> {
             unreachable!()

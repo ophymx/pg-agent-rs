@@ -246,6 +246,13 @@ pub trait StandbyOps: Send + Sync {
 
     /// Writes `$PGDATA/myrecovery.conf` + creates `$PGDATA/standby.signal`.
     async fn write_recovery_conf(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()>;
+
+    /// Overwrites `$PGDATA/myrecovery.conf` with a conninfo-less stub:
+    /// after a reload the walreceiver stops and STAYS stopped — the
+    /// candidacy freeze (finding 23). `standby.signal` is untouched
+    /// (still a standby, just detached); the next follow/recover
+    /// rewrites the file.
+    async fn detach_recovery_conf(&self) -> anyhow::Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +456,22 @@ impl StandbyOps for StandbyExec {
             .map_err(|e| anyhow::anyhow!("write_recovery_conf: write standby.signal: {e}"))?;
 
         info!(datadir = %self.pg_data_dir.display(), "write_recovery_conf: completed");
+        Ok(())
+    }
+
+    async fn detach_recovery_conf(&self) -> anyhow::Result<()> {
+        let content = "# pg-agent: DETACHED — no primary_conninfo. Written by the\n\
+                       # candidacy freeze (finding 23): a candidate must stop receiving\n\
+                       # so flush positions are frozen before they are compared. The\n\
+                       # next follow/recover rewrites this file.\n";
+        atomic_write(
+            &self.pg_data_dir.join("myrecovery.conf"),
+            content.as_bytes(),
+            0o640,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("detach_recovery_conf: write myrecovery.conf: {e}"))?;
+        info!(datadir = %self.pg_data_dir.display(), "detach_recovery_conf: completed");
         Ok(())
     }
 }

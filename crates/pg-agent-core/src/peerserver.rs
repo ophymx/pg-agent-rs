@@ -1094,6 +1094,9 @@ mod tests {
         async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn reload_conf(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
@@ -1177,6 +1180,9 @@ mod tests {
         }
         async fn write_recovery_conf(&self, opts: WriteRecoveryConfOpts) -> anyhow::Result<()> {
             self.recovery_calls.lock().unwrap().push(opts);
+            Ok(())
+        }
+        async fn detach_recovery_conf(&self) -> anyhow::Result<()> {
             Ok(())
         }
     }

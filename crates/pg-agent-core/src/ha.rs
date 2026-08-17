@@ -121,6 +121,14 @@ pub enum HaDecision {
         holder: i32,
         unhealthy_for: Duration,
     },
+    /// Entering candidacy while still streaming from the deposed
+    /// holder: the executor detaches the walreceiver so the local
+    /// flush position freezes (finding 23). Positions are compared
+    /// only once frozen — a moving stream has no stable order, and
+    /// comparing a point-in-time local read against peers' fresher
+    /// reports made every candidate defer to every other forever
+    /// while the fence-less deposed primary kept serving.
+    DetachingFromDeposed { holder: i32 },
     /// Candidacy considered and declined; the reason says why
     /// (ineligible, not most-advanced, tiebreak, backoff, …).
     StoodDown { reason: String },
@@ -141,6 +149,10 @@ struct LocalView {
     /// (standby), `None` = unknown (query failed / PG down).
     is_primary: Option<bool>,
     pos: Option<WalPosition>,
+    /// The walreceiver is active — this standby's flush position is
+    /// still MOVING. A moving position must never enter a candidacy
+    /// comparison (finding 23).
+    receiving: bool,
 }
 
 /// What the loop knows about one peer this tick.
@@ -149,6 +161,9 @@ struct PeerView {
     /// Reachable and reported running && !in_recovery.
     running_as_primary: bool,
     pos: Option<WalPosition>,
+    /// Peer reports an active walreceiver (`replication_state` is
+    /// "streaming"/"catchup") — its position is still moving.
+    receiving: bool,
 }
 
 struct TickState {
@@ -168,6 +183,18 @@ struct TickState {
     held_term: Option<u64>,
     held_since: Option<Instant>,
     last_logged: Option<std::mem::Discriminant<HaDecision>>,
+    /// Candidacy-era position samples from the PREVIOUS tick, keyed by
+    /// node id (local node included, under its own id). A position
+    /// enters a comparison only when it matches the previous sample,
+    /// and a rival sampled last tick that VANISHES this tick (status
+    /// fetch failure) defers the comparison one tick instead of
+    /// silently leaving it — one transient Err must not hand the CAS
+    /// to whoever raced past the only rival that outranked it.
+    /// "Frozen" therefore means STABLE-AND-PRESENT, not merely
+    /// receiver-less: belt-and-braces under finding 23's moving
+    /// streams, and the hysteresis that finding 24's investigation
+    /// showed comparisons need against single-tick observation noise.
+    settled_pos: std::collections::HashMap<i32, WalPosition>,
 }
 
 pub struct HaLoop {
@@ -215,6 +242,7 @@ impl HaLoop {
                 held_term: None,
                 held_since: None,
                 last_logged: None,
+                settled_pos: std::collections::HashMap::new(),
             }),
             executor: None,
             vacant_adoption: true,
@@ -330,6 +358,7 @@ impl HaLoop {
                 let held_for = {
                     let mut ts = self.state.lock().unwrap();
                     ts.holder_unhealthy_since = None;
+                    ts.settled_pos.clear();
                     if ts.held_term != Some(lease.term) {
                         ts.held_term = Some(lease.term);
                         ts.held_since = Some(now);
@@ -383,6 +412,7 @@ impl HaLoop {
                     let prev = {
                         let mut ts = self.state.lock().unwrap();
                         ts.holder_unhealthy_since = None;
+                        ts.settled_pos.clear();
                         ts.last_holder
                     };
                     match prev {
@@ -520,11 +550,116 @@ impl HaLoop {
                 reason: "local PostgreSQL state unknown; not a candidate".into(),
             };
         }
+        // The candidacy freeze (finding 23). A fence-less deposal —
+        // the holder's AGENT dead, its PostgreSQL serving — leaves the
+        // standbys streaming and their flush positions MOVING. A
+        // moving stream has no stable order: each candidate compares
+        // its own point-in-time flush against peers' fresher reports,
+        // reads itself behind, and everyone defers forever, while the
+        // continuing acks are exactly what keeps the WAL moving. So:
+        // detach first (the executor stops the walreceiver; position
+        // freezes), and compare only against peers that have also
+        // stopped receiving. Frozen positions are also what makes the
+        // strict-max choice loss-free: an ANY-1-acked row at LSN L was
+        // flushed by some standby before it froze, so the frozen
+        // maximum is ≥ L and the winner holds every acked byte.
+        if local.is_primary == Some(false) && local.receiving {
+            return match expected {
+                Some((holder, _)) => HaDecision::DetachingFromDeposed { holder },
+                None => HaDecision::StoodDown {
+                    reason: "still streaming with a vacant lease; not a candidate this tick".into(),
+                },
+            };
+        }
+        if let Some(mover) = peers
+            .iter()
+            .find(|p| !p.running_as_primary && p.pos.is_some() && p.receiving)
+        {
+            // A rival candidate is still absorbing (and possibly
+            // ACKING) writes from the deposed primary — promoting past
+            // it could discard acknowledged rows that exist only in
+            // its unfrozen tail. Defer, without backoff: it detaches
+            // on its own ttl clock within a tick or two.
+            return HaDecision::StoodDown {
+                reason: format!(
+                    "node {} is still receiving from the deposed holder; \
+                     positions not frozen — deferring",
+                    mover.node.id
+                ),
+            };
+        }
         let Some(my_pos) = local.pos else {
             return HaDecision::StoodDown {
                 reason: "local WAL position unknown; not a candidate".into(),
             };
         };
+
+        // Stability gate — the freeze's second half. A position —
+        // local or peer — enters the comparison only after it matched
+        // the PREVIOUS tick's sample, and a rival that vanishes
+        // between samples defers the comparison a tick rather than
+        // silently leaving it. Positions that move mid-candidacy
+        // (finding 23's load) and single-tick observation noise
+        // (finding 24's investigation) both defer instead of deciding.
+        // Costs one confirming tick; arms no backoff.
+        let (unsettled, vanished): (Vec<i32>, Vec<i32>) = {
+            let mut ts = self.state.lock().unwrap();
+            let mut current: std::collections::HashMap<i32, WalPosition> =
+                std::collections::HashMap::new();
+            current.insert(local_id, my_pos);
+            for p in peers {
+                if let Some(pos) = p.pos {
+                    current.insert(p.node.id, pos);
+                }
+            }
+            let unsettled = current
+                .iter()
+                .filter(|(id, pos)| ts.settled_pos.get(id) != Some(pos))
+                .map(|(id, _)| *id)
+                .collect();
+            // A rival whose position was sampled LAST tick but is
+            // absent THIS tick (status fetch failed) must not silently
+            // vanish from the comparison — one transient Err would
+            // otherwise hand the CAS to whoever raced past it. Defer
+            // exactly one tick: the stale entry is replaced below, so
+            // a genuinely dead rival costs one tick of hysteresis,
+            // never a livelock.
+            let vanished = ts
+                .settled_pos
+                .keys()
+                .filter(|id| **id != local_id && !current.contains_key(id))
+                .copied()
+                .collect();
+            ts.settled_pos = current;
+            (unsettled, vanished)
+        };
+        if !unsettled.is_empty() || !vanished.is_empty() {
+            return HaDecision::StoodDown {
+                reason: format!(
+                    "positions not frozen-and-stable yet (settling: {unsettled:?}, \
+                     vanished this tick: {vanished:?}); deferring"
+                ),
+            };
+        }
+        // The comparison table, logged in full: every wrong-winner
+        // candidacy defect so far (findings 19, 23, 24) hinged on WHAT
+        // each node believed at this exact moment, and none of it was
+        // recorded.
+        info!(
+            my = %my_pos,
+            peers = ?peers
+                .iter()
+                .map(|p| {
+                    (
+                        p.node.id,
+                        p.pos.map(|x| x.to_string()),
+                        p.receiving,
+                        p.running_as_primary,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "candidacy: comparing frozen positions"
+        );
 
         // Most-advanced check against every reachable position.
         let best_other = peers
@@ -547,9 +682,11 @@ impl HaLoop {
             // The band was also finding 15's structural cause: a loser
             // flushed past the winner's fork point wedges its light
             // follow. Strict-max makes both impossible: loser replay ≤
-            // loser flush ≤ winner flush = the fork point. No livelock
-            // risk in exchange — candidacy runs against a dead
-            // primary, so flush positions are static while it decides.
+            // loser flush ≤ winner flush = the fork point. The
+            // livelock this trades for — comparing positions that are
+            // still MOVING (a fence-less deposed primary keeps feeding
+            // the standbys; finding 23) — is closed by the freeze
+            // above: by this point every compared position is static.
             // (`max_lag_on_failover` is vestigial here; kept in config
             // for compatibility.)
             if best_pos > my_pos {
@@ -641,7 +778,21 @@ impl HaLoop {
         } else {
             None
         };
-        LocalView { is_primary, pos }
+        // Standby with an active walreceiver → its flush is moving.
+        let receiving = if is_primary == Some(false) {
+            self.db
+                .replication_lag()
+                .await
+                .map(|l| !l.state.is_empty())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        LocalView {
+            is_primary,
+            pos,
+            receiving,
+        }
     }
 
     async fn observe_peers(&self) -> Vec<PeerView> {
@@ -671,12 +822,14 @@ impl HaLoop {
                 Ok(s) => PeerView {
                     running_as_primary: s.is_postgres_running && !s.is_in_recovery,
                     pos: WalPosition::from_status(&s),
+                    receiving: s.is_in_recovery && !s.replication_state.is_empty(),
                     node: v.node,
                 },
                 Err(_) => PeerView {
                     node: v.node,
                     running_as_primary: false,
                     pos: None,
+                    receiving: false,
                 },
             })
             .collect()
@@ -725,6 +878,9 @@ mod tests {
         in_recovery: StdMutex<Option<bool>>,
         timeline: AtomicI32,
         lsn: AtomicU64,
+        /// Local walreceiver active — the flush position is moving
+        /// (finding 23's candidacy freeze gates on this).
+        receiving: AtomicBool,
     }
 
     impl StubDb {
@@ -742,6 +898,11 @@ mod tests {
             s.lsn.store(lsn, Ordering::SeqCst);
             s
         }
+        fn streaming_standby(tl: i32, lsn: u64) -> Self {
+            let s = Self::standby(tl, lsn);
+            s.receiving.store(true, Ordering::SeqCst);
+            s
+        }
         fn down() -> Self {
             Self::default()
         }
@@ -756,6 +917,9 @@ mod tests {
             Ok(false)
         }
         async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn reload_conf(&self) -> anyhow::Result<()> {
             Ok(())
         }
         async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
@@ -786,7 +950,14 @@ mod tests {
             Ok(self.lsn.load(Ordering::SeqCst))
         }
         async fn replication_lag(&self) -> anyhow::Result<crate::localdb::ReplicationLag> {
-            unreachable!()
+            Ok(crate::localdb::ReplicationLag {
+                bytes: 0,
+                state: if self.receiving.load(Ordering::SeqCst) {
+                    "streaming".into()
+                } else {
+                    String::new()
+                },
+            })
         }
         async fn setting(&self, _: &str) -> anyhow::Result<String> {
             unreachable!()
@@ -918,6 +1089,15 @@ mod tests {
         }
     }
 
+    /// A standby whose walreceiver is ACTIVE — its position is moving,
+    /// so candidacy must not compare against it (finding 23).
+    fn streaming_standby_status(tl: i32, lsn: u64) -> pb::NodeStatus {
+        pb::NodeStatus {
+            replication_state: "streaming".into(),
+            ..standby_status(tl, lsn)
+        }
+    }
+
     fn pool3(local: i32) -> NodePool {
         NodePool {
             members: vec![
@@ -951,22 +1131,42 @@ mod tests {
         ha: HaLoop,
         store: Arc<InMemoryConsensusStore>,
         peers: Arc<StubPeers>,
+        db: Arc<StubDb>,
     }
 
     fn fixture(local: i32, db: StubDb) -> Fixture {
         let store = Arc::new(InMemoryConsensusStore::new());
         let peers = Arc::new(StubPeers::default());
+        let db = Arc::new(db);
         let ha = HaLoop::new(
             store.clone(),
-            Arc::new(db),
+            db.clone(),
             peers.clone(),
             pool3(local),
             timing(),
         );
-        Fixture { ha, store, peers }
+        Fixture {
+            ha,
+            store,
+            peers,
+            db,
+        }
     }
 
     const BASE: u64 = 1 << 32;
+
+    /// Drive a tick through the stability gate: candidacy compares
+    /// only positions confirmed by two consecutive samples (finding
+    /// 24), so the first candidacy tick after any position change is a
+    /// "settling" stand-down. Tests that assert the candidacy OUTCOME
+    /// go through this; tests asserting the settling behavior itself
+    /// use `tick_once` directly.
+    async fn tick_candidacy(ha: &HaLoop) -> HaDecision {
+        match ha.tick_once().await {
+            HaDecision::StoodDown { reason } if reason.contains("settling") => ha.tick_once().await,
+            other => other,
+        }
+    }
 
     // ----- scenarios --------------------------------------------------------
 
@@ -1029,7 +1229,7 @@ mod tests {
         f.peers.set(2, standby_status(2, BASE));
         f.peers.mark_unreachable(0); // the dead ex-primary
 
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::TookOver {
                 term,
                 already_primary,
@@ -1048,7 +1248,7 @@ mod tests {
         f.peers.set(2, standby_status(2, BASE + 1_000_000)); // way past max_lag 1024
         f.peers.mark_unreachable(0);
 
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::StoodDown { reason } => {
                 assert!(reason.contains("ahead by"), "{reason}");
             }
@@ -1072,7 +1272,7 @@ mod tests {
         f.peers.set(1, standby_status(2, BASE + 100));
         f.peers.mark_unreachable(0);
 
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::StoodDown { reason } => {
                 assert!(reason.contains("more flushed WAL"), "{reason}")
             }
@@ -1094,7 +1294,7 @@ mod tests {
         f.peers.set(1, peer);
         f.peers.mark_unreachable(0);
 
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::StoodDown { reason } => assert!(
                 reason.contains("tiebreak"),
                 "flush-equal peer must funnel into the tiebreak, not the lag gate: {reason}"
@@ -1114,7 +1314,7 @@ mod tests {
         f.peers.mark_unreachable(0);
 
         assert!(matches!(
-            f.ha.tick_once().await,
+            tick_candidacy(&f.ha).await,
             HaDecision::TookOver { .. }
         ));
     }
@@ -1127,14 +1327,14 @@ mod tests {
         ahead.peers.set(2, standby_status(2, BASE));
         ahead.peers.mark_unreachable(0);
         assert!(matches!(
-            ahead.ha.tick_once().await,
+            tick_candidacy(&ahead.ha).await,
             HaDecision::TookOver { .. }
         ));
 
         let behind = fixture(2, StubDb::standby(2, BASE));
         behind.peers.set(1, standby_status(2, BASE));
         behind.peers.mark_unreachable(0);
-        match behind.ha.tick_once().await {
+        match tick_candidacy(&behind.ha).await {
             HaDecision::StoodDown { reason } => {
                 assert!(reason.contains("tiebreak"), "{reason}")
             }
@@ -1148,7 +1348,7 @@ mod tests {
         f.peers.set(1, standby_status(2, BASE));
         f.peers.set(2, standby_status(2, BASE));
 
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::TookOver {
                 already_primary, ..
             } => assert!(already_primary, "claiming for the primary we already are"),
@@ -1204,7 +1404,7 @@ mod tests {
         f.peers.mark_unreachable(0);
 
         assert!(matches!(
-            f.ha.tick_once().await,
+            tick_candidacy(&f.ha).await,
             HaDecision::TookOver { .. }
         ));
         let term = f.store.snapshot().lease.unwrap().term;
@@ -1241,7 +1441,7 @@ mod tests {
         f.peers.set(1, standby_status(2, BASE));
         f.peers.set(2, standby_status(2, BASE));
         assert!(matches!(
-            f.ha.tick_once().await,
+            tick_candidacy(&f.ha).await,
             HaDecision::TookOver { .. }
         ));
         f.store.set_unavailable(true);
@@ -1278,13 +1478,126 @@ mod tests {
         }
         // Past leader_ttl (50ms): candidacy fires and wins.
         tokio::time::sleep(Duration::from_millis(60)).await;
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::TookOver {
                 already_primary, ..
             } => assert!(!already_primary),
             other => panic!("expected TookOver, got {other:?}"),
         }
         assert_eq!(f.store.snapshot().lease.unwrap().holder, 1);
+    }
+
+    /// Finding 23, the fence-less deposal's livelock: the holder's
+    /// AGENT is dead but its PostgreSQL keeps serving, so the standbys
+    /// keep STREAMING and their flush positions keep moving — and a
+    /// moving position must never enter a candidacy comparison. The
+    /// candidate first detaches (DetachingFromDeposed → the executor
+    /// stops the walreceiver), and only a frozen local position
+    /// proceeds.
+    #[tokio::test]
+    async fn candidacy_detaches_to_freeze_before_comparing() {
+        let f = fixture(1, StubDb::streaming_standby(2, BASE + 100));
+        f.peers.set(0, primary_status(2, BASE + 200));
+        f.peers.set(2, standby_status(2, BASE));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+
+        // The holder's agent dies (its PostgreSQL may well still be
+        // serving — that is exactly why the receiver still streams).
+        f.peers.mark_unreachable(0);
+        match f.ha.tick_once().await {
+            HaDecision::HolderUnhealthy { holder: 0, .. } => {}
+            other => panic!("expected HolderUnhealthy, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Still receiving → detach, do NOT compare.
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::DetachingFromDeposed { holder: 0 }
+        );
+        // The executor's detach lands; the position is frozen now.
+        f.db.receiving.store(false, Ordering::SeqCst);
+        match tick_candidacy(&f.ha).await {
+            HaDecision::TookOver {
+                already_primary, ..
+            } => assert!(!already_primary),
+            other => panic!("expected TookOver after freeze, got {other:?}"),
+        }
+        assert_eq!(f.store.snapshot().lease.unwrap().holder, 1);
+    }
+
+    /// The other half of the freeze: a frozen candidate must not
+    /// compare against a RIVAL that is still receiving — the rival's
+    /// unfrozen tail may hold ANY-1-acked rows that would be lost by
+    /// promoting past it. Defer (no backoff — the rival detaches on
+    /// its own ttl clock), then proceed once every position is frozen.
+    #[tokio::test]
+    async fn candidacy_defers_while_a_rival_is_still_receiving() {
+        let f = fixture(1, StubDb::standby(2, BASE + 100));
+        f.peers.set(0, primary_status(2, BASE + 200));
+        f.peers.set(2, streaming_standby_status(2, BASE));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+        f.peers.mark_unreachable(0);
+        let _ = f.ha.tick_once().await; // start the unhealthy clock
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        match f.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => {
+                assert!(reason.contains("still receiving"), "{reason}");
+            }
+            other => panic!("expected StoodDown, got {other:?}"),
+        }
+        // The rival detached (its report freezes) — now compare and win.
+        f.peers.set(2, standby_status(2, BASE));
+        match tick_candidacy(&f.ha).await {
+            HaDecision::TookOver {
+                already_primary, ..
+            } => assert!(!already_primary),
+            other => panic!("expected TookOver, got {other:?}"),
+        }
+    }
+
+    /// Finding 24's dip: a just-detached rival's flush REPORT drops to
+    /// its replay position (pg_last_wal_receive_lsn() nulls with the
+    /// walreceiver) and climbs back while replay drains the local WAL
+    /// tail. Sampling the dip crowned a flush-lagging candidate over
+    /// the true maximum — G7 lost an acknowledged write to it. The
+    /// stability gate defers while ANY compared position moved since
+    /// the previous tick, then the true maximum wins.
+    #[tokio::test]
+    async fn candidacy_defers_while_a_position_is_still_moving() {
+        let f = fixture(1, StubDb::standby(3, BASE));
+        f.peers.set(0, primary_status(3, BASE + 200));
+        f.peers.set(2, standby_status(3, BASE + 50));
+        assert_eq!(
+            f.ha.tick_once().await,
+            HaDecision::AdoptedObservedPrimary { node: 0 }
+        );
+        f.peers.mark_unreachable(0);
+        let _ = f.ha.tick_once().await; // unhealthy clock starts
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        match f.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => assert!(reason.contains("settling"), "{reason}"),
+            other => panic!("expected settling StoodDown, got {other:?}"),
+        }
+        // The rival's report climbs (replay draining its tail): the
+        // gate must keep deferring — the sampled value is not truth.
+        f.peers.set(2, standby_status(3, BASE + 150));
+        match f.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => assert!(reason.contains("settling"), "{reason}"),
+            other => panic!("expected settling StoodDown, got {other:?}"),
+        }
+        // Stable across two ticks — and the true maximum outranks us.
+        match f.ha.tick_once().await {
+            HaDecision::StoodDown { reason } => {
+                assert!(reason.contains("more flushed WAL"), "{reason}")
+            }
+            other => panic!("expected flush-defer StoodDown, got {other:?}"),
+        }
     }
 
     /// The unhealthy clock is each holder's, not the lease's. Watching
@@ -1349,7 +1662,7 @@ mod tests {
         // Once node 2 has been unhealthy for ITS OWN ttl, candidacy is
         // legitimate again.
         tokio::time::sleep(Duration::from_millis(60)).await;
-        match f.ha.tick_once().await {
+        match tick_candidacy(&f.ha).await {
             HaDecision::TookOver { .. } => {}
             other => panic!("expected TookOver after a full ttl on the new holder, got {other:?}"),
         }

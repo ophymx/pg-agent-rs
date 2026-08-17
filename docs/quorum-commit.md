@@ -123,10 +123,27 @@ Changes:
   node up to 16 MiB behind win — under ANY 1 an acknowledged write can
   live exactly in that delta on the higher-flush standby, so the band
   contradicted §3's invariant (and was finding 15's wedge cause: only
-  a behind-node winner leaves a loser past the fork point). Strict-max
-  is livelock-free because candidacy runs against a dead primary —
-  flush positions are static while it decides. The config knob remains
-  accepted but is vestigial in candidacy.
+  a behind-node winner leaves a loser past the fork point). The config
+  knob remains accepted but is vestigial in candidacy.
+- **The candidacy freeze** (finding 23). "Positions are static while
+  candidacy decides" only holds when the primary is dead. In the
+  fence-less deposal — the holder's AGENT dead, its PostgreSQL still
+  serving — the standbys keep streaming and their flush positions keep
+  MOVING, and a moving stream has no stable order: each candidate
+  compares its own point-in-time flush against peers' fresher reports,
+  reads itself behind, and everyone defers forever (observed live
+  under G11's write load: both standbys stood down deferring to each
+  other while the deposed primary kept acking through them — the
+  livelock is self-sustaining). So candidacy freezes first: a
+  candidate that is still receiving detaches (`DetachingFromDeposed` →
+  conninfo-less `myrecovery.conf` + reload; PostgreSQL keeps serving
+  reads), and positions are compared only once every counted candidate
+  has stopped receiving. The freeze also *completes* §3's fence: the
+  moment the candidates detach, the deposed primary has zero ack
+  sources — and it makes strict-max provably loss-free here, because
+  an ANY-1-acked row at LSN L was flushed by some standby before it
+  froze, so the frozen maximum is ≥ L and the winner holds every
+  acked byte.
 - Promotion already replays everything received before exiting
   recovery, so a flush-ahead/replay-behind winner promotes correctly —
   the replay distance is promotion *latency*, not a safety input.

@@ -119,6 +119,12 @@ pub trait LocalDb: Send + Sync {
     /// method refuses quote/control characters as defense in depth.
     async fn set_synchronous_standby_names(&self, value: &str) -> anyhow::Result<()>;
 
+    /// `SELECT pg_reload_conf()` — SIGHUP-context GUC reload. Used by
+    /// the candidacy freeze after rewriting `myrecovery.conf`:
+    /// `primary_conninfo` is reloadable, and an emptied value stops the
+    /// walreceiver without a restart.
+    async fn reload_conf(&self) -> anyhow::Result<()>;
+
     /// `application_name`s of member standbys currently connected via
     /// walsender (`pg_stat_replication`, names matching the `node{id}`
     /// convention — `pg_basebackup`'s stream never matches). The
@@ -278,16 +284,35 @@ impl LocalDb for PgLocalDb {
             // pg_walfile_name*() refuses to run during recovery
             // ("recovery is in progress" — found by the docker
             // acceptance suite; every standby reported timeline 0
-            // before this). Streaming standby: the WAL receiver's
-            // received_tli is the live timeline. Not streaming:
-            // fall back to the control file, which a standby updates
-            // at restartpoints — mildly stale at worst, and the
-            // phantom-check consumer only compares for *higher* peer
-            // timelines, so stale-low is the conservative direction.
+            // before this). GREATEST over every source the standby
+            // has — and the ordering of trust here was finding 24,
+            // learned in three painful layers:
+            // - received_tli: live, but ONLY while a walreceiver row
+            //   exists — the finding-23 candidacy detach removes it;
+            // - the pg_wal directory: the receiver WROTE the segments,
+            //   they persist, and the max WAL filename's first 8 hex
+            //   chars carry the received timeline — the one source
+            //   that is both live and durable for a DETACHED standby;
+            // - min_recovery_end_timeline and the checkpoint TLI: BOTH
+            //   control-file-backed and restartpoint-stale (a streaming
+            //   standby suppresses min-recovery-point updates until a
+            //   restartpoint — a standby-since-clone can carry TL1 in
+            //   both for many minutes).
+            // Stale-low was documented as "conservative" when only the
+            // phantom check (which fears higher peers) consumed this —
+            // for CANDIDACY it is inverted: a detached standby
+            // reporting TL1 read as an OLDER timeline than its
+            // flush-lagging rival's TL3, and strict-max crowned the
+            // lagging node, losing an acknowledged write (G7, three
+            // runs, one layer each).
             let tli: i32 = conn
                 .query_one(
-                    "SELECT COALESCE( \
-                       (SELECT received_tli FROM pg_stat_wal_receiver), \
+                    "SELECT GREATEST( \
+                       COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0), \
+                       COALESCE((SELECT ('x' || substr(max(name), 1, 8))::bit(32)::int \
+                                 FROM pg_ls_waldir() \
+                                 WHERE name ~ '^[0-9A-F]{24}$'), 0), \
+                       (SELECT min_recovery_end_timeline FROM pg_control_recovery()), \
                        (SELECT timeline_id FROM pg_control_checkpoint()))",
                     &[],
                 )
@@ -444,6 +469,14 @@ impl LocalDb for PgLocalDb {
                 describe_pg(&e)
             )
         })?;
+        conn.execute("SELECT pg_reload_conf()", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("localdb: pg_reload_conf: {}", describe_pg(&e)))?;
+        Ok(())
+    }
+
+    async fn reload_conf(&self) -> anyhow::Result<()> {
+        let conn = self.get_conn().await?;
         conn.execute("SELECT pg_reload_conf()", &[])
             .await
             .map_err(|e| anyhow::anyhow!("localdb: pg_reload_conf: {}", describe_pg(&e)))?;

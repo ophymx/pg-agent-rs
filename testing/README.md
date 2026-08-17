@@ -104,6 +104,20 @@ bash`, `journalctl -u pg_agentd`).
   takeover, no promotion, no fence, same holder retains, the
   quorum-acked sentinel survives, replication and all three pgpool
   maps converge back.
+- **G11** — **the fence-less deposal under WRITE LOAD** (gap item 4):
+  a continuous ledger writer (`crate::load`) runs through the G8
+  agent-death deposal, upgrading data-survival from "one at-rest
+  sentinel" to the actual quorum-commit invariant: EVERY acknowledged
+  row exists on the winner, checked seq by seq. The writer's naive
+  discovery genuinely writes to the deposed primary during
+  dual-serving (its hanging commits are counted — ack starvation
+  observed, not assumed), acks legitimately keep flowing until the
+  candidates detach (the freeze), and the resumption target is
+  anchored at the PROMOTION so starve → discover → resume is proven.
+  One scenario, three product findings (23, 24, and the freeze's
+  design) before it first passed. Steady-state numbers from the first
+  green run: ~750 acked writes, one hung commit, 5.2 s write outage
+  across the whole deposal.
 
 ---
 
@@ -145,11 +159,12 @@ cluster; the discovery rate on new probes says these will pay):
    reconciliation in `Agent::serve` (standby-shaped pgdata starts
    unconditionally; primary-shaped only on a quorum-fresh lease read
    naming self; uninitialized never).
-4. **Write load through the failover**: a continuous ledger upgrades
-   data-survival from "one at-rest sentinel survived" to "every
-   acknowledged row survived" (the actual quorum-commit invariant),
-   and lets the deposed primary's hanging-commit behavior be OBSERVED
-   rather than assumed.
+4. ~~Write load through the failover~~ — **done: G11**, and it earned
+   its keep before ever passing: finding 23 (candidacy livelock under
+   load → the freeze) and finding 24 (stale timeline sources crowned
+   a lagging winner → the waldir TLI + stability gate) both fell out
+   of it. The ledger, the acked-row audit, and the starvation
+   observation are now standing assertions.
 5. **Built-but-never-entered states**: `sync_commit=blocked` (both
    standbys down → commits hang → recover → unblock), the
    `allow-async` disarm/auto-re-arm lifecycle, and a deliberately
@@ -608,3 +623,74 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     narrowing (create member slots AT promote instead of at each
     standby's follow; a `wal_keep_size` floor to close the race
     entirely) is on the gap list.
+
+23. **Strict flush-max candidacy livelocks under write load — the
+    fence-less deposal never completes.** G11 (the G8 agent-death
+    deposal under a continuous ledger writer) ran its kill and then
+    NOTHING happened for 90 s: both standbys entered candidacy at ttl
+    and each stood down deferring to the other — db0 logged "node 1
+    has more flushed WAL", db1 logged "node 0 has more flushed WAL",
+    in the same second. Under load every candidate compares its own
+    point-in-time flush against the peer's FRESHER status report while
+    WAL advances ~70 rows/s, so everyone reads itself behind; and
+    since nobody promotes, the deposed primary keeps serving and
+    acking through the still-attached standbys, which keeps the WAL
+    moving — a self-sustaining livelock. (The strict-selection comment
+    even said it: "no livelock risk — candidacy runs against a dead
+    primary, so flush positions are static." True for a dead primary;
+    false for a dead agent.) FIXED with the candidacy freeze:
+    detach-before-compare. A candidate still receiving gets
+    `DetachingFromDeposed` (the executor rewrites `myrecovery.conf`
+    conninfo-less and reloads — PostgreSQL keeps serving reads), and
+    comparison waits until every counted candidate has stopped
+    receiving. Frozen positions restore a total order, the deposed
+    primary loses its last ack source the moment the candidates
+    detach (completing §3's ack-starvation fence and closing the
+    winner-promotes-while-survivor-still-acks loss window), and
+    strict-max on frozen positions provably holds every ANY-1-acked
+    byte. See docs/quorum-commit.md §4.
+
+24. **A detached standby reports a stale-low timeline — and candidacy
+    compares timelines FIRST, so the lagging standby won.** The
+    standby timeline read COALESCEd `pg_stat_wal_receiver.received_tli`
+    (gone the moment the receiver is — exactly what the finding-23
+    detach produces) into the control-file checkpoint TLI, whose
+    staleness was documented as "conservative" because the phantom
+    check only fears HIGHER peers. Candidacy inverted that: in the
+    first post-freeze run, G7's caught-up standby — standby-since-init
+    with no restartpoint yet — reported TL1 after detaching, read its
+    flush-lagging rival's TL3 as "a newer timeline", stood down, and
+    the LAGGING node promoted past 24 MiB of missing flushed WAL: the
+    g7 sentinel (an acknowledged write) was lost. The exact §2.2
+    defect, resurrected by an observability bug two layers down.
+    It took three layers to fix, and the middle one was a WRONG THEORY
+    worth recording. Layer 1: replace the COALESCE fallback with
+    GREATEST over receiver/control sources. Layer 2 (wrong): when the
+    fixed run failed identically, the leading theory was a flush-report
+    dip across detach (`pg_last_wal_receive_lsn()` nulling with the
+    receiver) — a live experiment FALSIFIED it (the value persists in
+    shared memory; the flush report never dips), but the stability
+    gate built for it stays: positions enter a comparison only after
+    two consecutive identical samples, and a rival that VANISHES
+    between samples (one transient status Err) defers the comparison
+    instead of silently leaving it — single-tick observation noise
+    must never decide a takeover. Layer 3 (the truth, nailed by the
+    new comparison-table log line): `min_recovery_end_timeline` is
+    ALSO restartpoint-stale — a streaming standby suppresses
+    min-recovery-point control-file updates until a restartpoint, so
+    every control-backed timeline source on a standby-since-clone can
+    read TL1 for many minutes, and GREATEST over stale sources is
+    still stale. The one source that is both live and durable for a
+    DETACHED standby is the pg_wal directory itself: the receiver
+    wrote the segments, and the max WAL filename's first 8 hex chars
+    carry the received timeline. The standby TLI is now GREATEST over
+    received_tli, the waldir scan, min_recovery_end_timeline, and the
+    checkpoint TLI. Also from the same runs: G11's "+200 acked past
+    the kill" target was met entirely inside the pre-detach ack window
+    (kill → leader_ttl, when acks legitimately still flow through the
+    fence-less primary), so the writer stopped before ever writing to
+    the winner — the resumption target is now anchored at the
+    PROMOTION, proving starve → discover → resume; and candidacy now
+    logs its full comparison table (every position, receiving flag,
+    and primary claim) — findings 19/23/24 all hinged on what each
+    node believed at that instant, and none of it was recorded.

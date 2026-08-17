@@ -147,6 +147,7 @@ pub async fn run_all(cx: &mut Ctx) {
     let w4 = g8(cx, w3, &mut marks).await;
     let w5 = g9(cx, w4, &mut marks).await;
     g10(cx, w5).await;
+    g11(cx, w5, &mut marks).await;
     crate::audit::run(cx);
 }
 
@@ -1166,6 +1167,184 @@ async fn g10(cx: &mut Ctx, prim: &'static str) {
         )
         .await;
     }
+}
+
+async fn g11(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G11: fence-less deposal under WRITE LOAD — every acked row must survive");
+    // G8 proved one probe starves; a continuous ledger (crate::load)
+    // upgrades the claim to the actual quorum-commit invariant: EVERY
+    // acknowledged row survives the deposal, and the boundary between
+    // "acked before the ack sources left" and "hung after" is walked
+    // by real concurrent traffic instead of a single at-rest sentinel.
+    // The writer's naive discovery also means it genuinely writes to
+    // the deposed primary during dual-serving — those commits hanging
+    // (timeouts) is the observation the gap list asked for.
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit armed before the load"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    let _ = cx
+        .pg
+        .execute(
+            prim,
+            "create table if not exists ledger(seq bigint primary key, at timestamptz default now())",
+        )
+        .await;
+    let load = crate::load::Load::start();
+    {
+        let l = &load;
+        cx.wait_until(60, "load: ≥200 writes acked before the kill", || async {
+            l.acked_count() >= 200
+        })
+        .await;
+    }
+    let acked_at_kill = load.acked_count();
+    let since = cx.log.cursor();
+    cx.check(
+        &format!("{prim}: agent masked and SIGKILLed under load"),
+        exec_ok(
+            prim,
+            "systemctl mask --runtime pg_agentd && systemctl kill -s SIGKILL pg_agentd",
+        )
+        .await,
+    );
+    cx.expect_dual_serving(prim, since);
+    let winner_ev = cx
+        .await_event(
+            90,
+            "majority deposed the loaded holder and promoted",
+            since,
+            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+        )
+        .await;
+    let w: &'static str = match winner_ev {
+        Some(ev) => {
+            cx.pass(&format!("winner: {}", ev.node));
+            ev.node
+        }
+        None => {
+            cx.fail("no winner under load");
+            other_node(prim)
+        }
+    };
+    let survivor = NODES
+        .iter()
+        .copied()
+        .find(|n| *n != prim && *n != w)
+        .unwrap();
+    cx.await_event(
+        60,
+        &format!("{survivor} re-pointed at {w} (ack sources leave the deposed primary)"),
+        since,
+        |ev| agent(ev, survivor, "now following lease holder"),
+    )
+    .await;
+    // Threshold from NOW — after the promotion — not from the kill:
+    // between the kill and the candidates' detach (leader_ttl) acks
+    // legitimately keep flowing through the fence-less primary, and a
+    // kill-anchored target was met entirely by that window on the
+    // first run, stopping the writer before it ever wrote to the
+    // winner. Requiring acks past this point proves the post-failover
+    // write path: the writer must starve on the deposed primary,
+    // discover the winner, and resume.
+    let acked_at_promotion = load.acked_count();
+    cx.note(&format!(
+        "load: {acked_at_kill} acked at the kill, {acked_at_promotion} by the promotion \
+         (the delta rode the pre-detach ack window)"
+    ));
+    {
+        let l = &load;
+        cx.wait_until(
+            120,
+            &format!("load: writes RESUMED on {w} (+100 acked past its promotion)"),
+            || async { l.acked_count() >= acked_at_promotion + 100 },
+        )
+        .await;
+    }
+    let stats = load.stop().await;
+    cx.note(&format!(
+        "load: {} acked, {} landed-unacked (indeterminate), {} hung writes (timeouts), \
+         {} connection errors, longest ack gap {} ms",
+        stats.acked.len(),
+        stats.landed,
+        stats.timeouts,
+        stats.conn_errors,
+        stats.max_ack_gap_ms
+    ));
+    cx.check(
+        "load observed hanging commits during the deposal (ack starvation under load)",
+        stats.timeouts >= 1,
+    );
+    // Operator path back to redundancy (G8's shape).
+    let _ = exec(
+        prim,
+        "systemctl unmask --runtime pg_agentd && systemctl start pg_agentd",
+    )
+    .await;
+    cx.await_event(
+        60,
+        &format!("{prim}: phantom check fenced the stale loaded primary"),
+        since,
+        |ev| agent(ev, prim, "phantom-primary check") && ev.line.contains("stopping postgres"),
+    )
+    .await;
+    cx.await_event(
+        90,
+        &format!("{prim} PostgreSQL fully shut down (dual-serving window closed)"),
+        since,
+        |ev| {
+            ev.node == prim
+                && ev.source == Source::Postgres
+                && ev.line.contains("database system is shut down")
+        },
+    )
+    .await;
+    cluster_recover(cx, w, prim).await;
+    marks.insert(prim, cx.log.cursor());
+    repair_standbys(cx, w, "g11", marks).await;
+    // THE audit: every acknowledged seq exists on the winner. This is
+    // the line finding 17/18 priced and quorum commit exists to hold.
+    let rows = cx
+        .pg
+        .rows_i64(w, "select seq from ledger")
+        .await
+        .unwrap_or_default();
+    let present: std::collections::HashSet<i64> = rows.into_iter().collect();
+    let missing: Vec<i64> = stats
+        .acked
+        .iter()
+        .copied()
+        .filter(|s| !present.contains(s))
+        .collect();
+    cx.check(
+        &format!(
+            "every acknowledged write survived onto {w} ({} acked{})",
+            stats.acked.len(),
+            if missing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " — {} MISSING, first: {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(8)]
+                )
+            }
+        ),
+        missing.is_empty(),
+    );
+    let primaries = cx.pg.count_primaries().await;
+    cx.check(
+        "exactly one primary after the loaded rejoin",
+        primaries == 1,
+    );
+    cx.wait_until(
+        60,
+        &format!("{w}: quorum commit re-armed after the loaded deposal"),
+        || async move { sync_commit_state(w).await == "armed" },
+    )
+    .await;
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —

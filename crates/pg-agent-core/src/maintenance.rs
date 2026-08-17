@@ -942,6 +942,9 @@ mod tests {
         async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn reload_conf(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }

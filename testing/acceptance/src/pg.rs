@@ -141,6 +141,17 @@ impl Pg {
         .ok()
     }
 
+    /// First column of every row as i64 (the ledger audit).
+    pub async fn rows_i64(&self, node: &'static str, sql: &str) -> anyhow::Result<Vec<i64>> {
+        let client = self.connect(node).await?;
+        let rows = tokio::time::timeout(Duration::from_secs(15), client.query(sql, &[]))
+            .await
+            .context("query timeout")??;
+        rows.iter()
+            .map(|r| r.try_get::<_, i64>(0).map_err(Into::into))
+            .collect()
+    }
+
     pub async fn replay_lsn(&self, node: &'static str) -> Option<String> {
         self.scalar(node, "select coalesce(pg_last_wal_replay_lsn()::text, '')")
             .await

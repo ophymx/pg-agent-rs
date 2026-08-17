@@ -143,6 +143,15 @@ pub trait PostgresInstance: Send + Sync {
     /// `Standby { streaming: true }`.
     async fn rebuild_as_standby(&self, upstream: &UpstreamSpec) -> anyhow::Result<()>;
 
+    /// The candidacy freeze (finding 23): stop the walreceiver and
+    /// keep it stopped, WITHOUT stopping PostgreSQL — rewrite
+    /// `myrecovery.conf` conninfo-less and reload. Flush positions
+    /// cannot be compared while they move: a candidate that keeps
+    /// streaming from a fence-less deposed primary always reads a
+    /// peer's fresher report as "ahead of me" and everyone defers
+    /// forever. The next follow/recover restores the stream.
+    async fn stop_receiving(&self) -> anyhow::Result<()>;
+
     /// Current `synchronous_standby_names` value ("" = quorum commit
     /// disarmed). See docs/quorum-commit.md §5-6.
     async fn sync_standby_names(&self) -> anyhow::Result<String>;
@@ -321,6 +330,11 @@ impl PostgresInstance for Instance {
             .map_err(|e| anyhow::anyhow!("rebuild: start: {e}"))
     }
 
+    async fn stop_receiving(&self) -> anyhow::Result<()> {
+        self.standby.detach_recovery_conf().await?;
+        self.db.reload_conf().await
+    }
+
     async fn sync_standby_names(&self) -> anyhow::Result<String> {
         self.db.setting("synchronous_standby_names").await
     }
@@ -412,6 +426,10 @@ mod tests {
         async fn set_synchronous_standby_names(&self, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn reload_conf(&self) -> anyhow::Result<()> {
+            self.0.log("reload_conf");
+            Ok(())
+        }
         async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
@@ -478,6 +496,10 @@ mod tests {
         }
         async fn write_recovery_conf(&self, _: WriteRecoveryConfOpts) -> anyhow::Result<()> {
             self.0.log("write_recovery_conf");
+            Ok(())
+        }
+        async fn detach_recovery_conf(&self) -> anyhow::Result<()> {
+            self.0.log("detach_recovery_conf");
             Ok(())
         }
     }

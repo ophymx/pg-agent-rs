@@ -16,6 +16,7 @@ mod audit;
 mod checks;
 mod cluster;
 mod events;
+mod load;
 mod pg;
 mod scenarios;
 
