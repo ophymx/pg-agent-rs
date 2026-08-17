@@ -310,10 +310,12 @@ impl Agent {
             let pool = self.opts.node_pool.clone();
             let pg = self.opts.postgres.clone();
             let raft = self.opts.raft.clone();
+            let peer_seen = self.peer_seen.clone();
             js.spawn(async move {
                 let mut server = LocalServer::new(
                     me, db, peers, maint, wal, replay, inflight, pcp, sd, standby, pool, pg,
-                );
+                )
+                .with_peer_seen(peer_seen);
                 if let Some(rt) = raft {
                     server = server.with_raft(rt);
                 }
@@ -473,6 +475,7 @@ impl Agent {
             let executor = self.opts.pg_instance.clone().map(|instance| {
                 Arc::new(crate::roleexec::RoleExecutor::new(
                     instance,
+                    self.deps.db.clone(),
                     self.deps.peers.clone(),
                     self.opts.node_pool.clone(),
                     self.deps.inflight.clone(),
@@ -937,10 +940,14 @@ impl Agent {
         // the required-peers floor below decides whether what remains
         // is enough evidence. (Previously a single slow peer erased
         // every answered peer's evidence and forced Unverifiable.)
+        // A real observation like any other: recording it here means a
+        // node that has just booted can already witness for its peers
+        // before its HA loop has ticked once.
         let views = crate::cluster_view::collect_statuses(
             self.deps.peers.clone(),
             &peers,
             STARTUP_CHECK_TIMEOUT,
+            Some(&self.peer_seen),
         )
         .await;
         let mut observations: Vec<PeerObservation> = Vec::new();
@@ -1643,18 +1650,6 @@ mod tests {
         }
         async fn stop_receiving(&self) -> anyhow::Result<()> {
             unreachable!("cold start never detaches")
-        }
-        async fn ensure_slots(&self, _: &[String]) -> anyhow::Result<()> {
-            unreachable!("cold start never promotes")
-        }
-        async fn sync_standby_names(&self) -> anyhow::Result<String> {
-            unreachable!()
-        }
-        async fn set_sync_standby_names(&self, _: &str) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>> {
-            unreachable!()
         }
     }
 

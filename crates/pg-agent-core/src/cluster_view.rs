@@ -40,20 +40,6 @@ pub struct PeerStatusView {
     pub status: anyhow::Result<pb::NodeStatus>,
 }
 
-/// Fan out `GetStatus` to every node in `nodes`, all in parallel, under
-/// one `budget`. ALWAYS returns one [`PeerStatusView`] per node (order
-/// not guaranteed): peers that answered carry their status, peers that
-/// did not answer before the budget expired carry an `Err`.
-///
-/// Partial evidence is the whole point. The previous contract returned
-/// `Err(Elapsed)` with NOTHING when any peer outlived the budget — and
-/// the HA loop mapped that to an empty view, so one unreachable peer
-/// (a partition — exactly when the view matters) blinded the caller to
-/// every peer that DID answer. A rival then read the missing holder as
-/// "unhealthy", ran its deposal clock on absence of evidence, and
-/// deposed a healthy serving primary (acceptance G5, caught by the
-/// audit's dual-serving invariant; the fence contained it). One slow
-/// peer must degrade exactly one peer's evidence.
 /// When this node last observed each peer **running as a primary**.
 ///
 /// Written by the HA loop's per-tick fan-out and read by
@@ -96,10 +82,32 @@ impl PeerSeen {
     }
 }
 
+/// Fan out `GetStatus` to every node in `nodes`, all in parallel, under
+/// one `budget`. ALWAYS returns one [`PeerStatusView`] per node (order
+/// not guaranteed): peers that answered carry their status, peers that
+/// did not answer before the budget expired carry an `Err`.
+///
+/// Partial evidence is the whole point. The previous contract returned
+/// `Err(Elapsed)` with NOTHING when any peer outlived the budget — and
+/// the HA loop mapped that to an empty view, so one unreachable peer
+/// (a partition — exactly when the view matters) blinded the caller to
+/// every peer that DID answer. A rival then read the missing holder as
+/// "unhealthy", ran its deposal clock on absence of evidence, and
+/// deposed a healthy serving primary (acceptance G5, caught by the
+/// audit's dual-serving invariant; the fence contained it). One slow
+/// peer must degrade exactly one peer's evidence.
+///
+/// `seen`, when supplied, is updated for every peer observed SERVING as
+/// a primary — the recording lives here, in the one place peer statuses
+/// arrive, rather than in whichever caller happened to need it. It was
+/// caller-side once, attached to the HA loop, and the second fan-out
+/// path (`cluster_status`) silently never recorded: a fact about the
+/// mechanism belongs to the mechanism.
 pub async fn collect_statuses(
     registry: Arc<dyn PeerRegistry>,
     nodes: &[NodeConfig],
     budget: Duration,
+    seen: Option<&PeerSeen>,
 ) -> Vec<PeerStatusView> {
     let deadline = tokio::time::Instant::now() + budget;
     let mut js: JoinSet<PeerStatusView> = JoinSet::new();
@@ -127,6 +135,19 @@ pub async fn collect_statuses(
         }
     }
     js.abort_all();
+    // One definition of "I saw that node serving", applied wherever
+    // statuses arrive. SERVING, not merely answering: a node whose
+    // PostgreSQL has died keeps answering GetStatus from a healthy
+    // agent, and a witness must vouch for the role (finding 25).
+    if let Some(seen) = seen {
+        for v in &out {
+            if let Ok(s) = &v.status {
+                if s.is_postgres_running && !s.is_in_recovery {
+                    seen.record_primary(v.node.id);
+                }
+            }
+        }
+    }
     for node in nodes {
         if !out.iter().any(|v| v.node.id == node.id) {
             out.push(PeerStatusView {
@@ -293,7 +314,13 @@ mod tests {
                 hostname: format!("db{id}"),
             })
             .collect();
-        let views = collect_statuses(Arc::new(SplitRegistry), &nodes, Duration::from_secs(5)).await;
+        let views = collect_statuses(
+            Arc::new(SplitRegistry),
+            &nodes,
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
         assert_eq!(views.len(), 2, "one view per node, always");
         let healthy = views.iter().find(|v| v.node.id == 0).unwrap();
         assert!(

@@ -143,15 +143,6 @@ pub trait PostgresInstance: Send + Sync {
     /// `Standby { streaming: true }`.
     async fn rebuild_as_standby(&self, upstream: &UpstreamSpec) -> anyhow::Result<()>;
 
-    /// Ensure a physical replication slot exists for each name —
-    /// the member set minus self, called AT promotion (finding 22).
-    /// Idempotent, and each slot reserves WAL the moment it exists, so
-    /// the new primary starts retaining for every member before any of
-    /// them re-follows. Best-effort by contract: the caller logs and
-    /// carries on, because a promotion must never be undone by slot
-    /// bookkeeping.
-    async fn ensure_slots(&self, names: &[String]) -> anyhow::Result<()>;
-
     /// The candidacy freeze (finding 23): stop the walreceiver and
     /// keep it stopped, WITHOUT stopping PostgreSQL — rewrite
     /// `myrecovery.conf` conninfo-less and reload. Flush positions
@@ -161,18 +152,16 @@ pub trait PostgresInstance: Send + Sync {
     /// forever. The next follow/recover restores the stream.
     async fn stop_receiving(&self) -> anyhow::Result<()>;
 
-    /// Current `synchronous_standby_names` value ("" = quorum commit
-    /// disarmed). See docs/quorum-commit.md §5-6.
-    async fn sync_standby_names(&self) -> anyhow::Result<String>;
-
-    /// Write `synchronous_standby_names` (+ reload). The executor's
-    /// quorum-commit arm/converge primitive; `""` is written only by
-    /// the operator's allow-async path, never by the executor.
-    async fn set_sync_standby_names(&self, value: &str) -> anyhow::Result<()>;
-
-    /// `application_name`s of member standbys currently connected via
-    /// walsender — the "first standby attached" arming event.
-    async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>>;
+    // Deliberately absent: `sync_standby_names`,
+    // `set_sync_standby_names`, `connected_member_standbys`,
+    // `ensure_slots`. Each was a one-line pass-through to `LocalDb`
+    // with a single caller — the role executor — added because that
+    // caller held no database handle. They composed nothing, which is
+    // the only thing this trait exists to do (process + db + standby
+    // into role operations), and they pulled policy vocabulary
+    // ("member slots", "quorum commit") into a mechanism crate. The
+    // executor now holds `Arc<dyn LocalDb>` and asks the database
+    // directly.
 }
 
 // ---------------------------------------------------------------------------
@@ -339,28 +328,9 @@ impl PostgresInstance for Instance {
             .map_err(|e| anyhow::anyhow!("rebuild: start: {e}"))
     }
 
-    async fn ensure_slots(&self, names: &[String]) -> anyhow::Result<()> {
-        for name in names {
-            self.db.create_slot(name).await?;
-        }
-        Ok(())
-    }
-
     async fn stop_receiving(&self) -> anyhow::Result<()> {
         self.standby.detach_recovery_conf().await?;
         self.db.reload_conf().await
-    }
-
-    async fn sync_standby_names(&self) -> anyhow::Result<String> {
-        self.db.setting("synchronous_standby_names").await
-    }
-
-    async fn set_sync_standby_names(&self, value: &str) -> anyhow::Result<()> {
-        self.db.set_synchronous_standby_names(value).await
-    }
-
-    async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>> {
-        self.db.connected_standby_names().await
     }
 }
 

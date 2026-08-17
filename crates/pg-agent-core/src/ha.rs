@@ -884,42 +884,36 @@ impl HaLoop {
         // Err → empty-view path made one partitioned peer blind the
         // loop to a healthy holder, and the deposal clock ran on that
         // blindness — see collect_statuses' docs.
-        collect_statuses(self.peers.clone(), &others, STATUS_FANOUT_BUDGET)
-            .await
-            .into_iter()
-            .map(|v| match v.status {
-                Ok(s) => {
-                    let running_as_primary = s.is_postgres_running && !s.is_in_recovery;
-                    // Record only a SERVING sighting — this is the
-                    // other half of the second opinion (every node is
-                    // a potential witness), and what a witness must
-                    // vouch for is the role, not the socket: a holder
-                    // whose PostgreSQL died keeps answering from its
-                    // healthy agent.
-                    if running_as_primary {
-                        if let Some(seen) = &self.peer_seen {
-                            seen.record_primary(v.node.id);
-                        }
-                    }
-                    PeerView {
-                        running_as_primary,
-                        pos: WalPosition::from_status(&s),
-                        receiving: s.is_in_recovery && !s.replication_state.is_empty(),
-                        reachable: true,
-                        seen_ages: s.peer_primary_seen_age_ms,
-                        node: v.node,
-                    }
-                }
-                Err(_) => PeerView {
-                    node: v.node,
-                    running_as_primary: false,
-                    pos: None,
-                    receiving: false,
-                    reachable: false,
-                    seen_ages: std::collections::HashMap::new(),
-                },
-            })
-            .collect()
+        // The fan-out records our own sightings (every node is a
+        // potential witness for its peers' candidacy decisions); the
+        // rule for what counts lives in `collect_statuses`.
+        collect_statuses(
+            self.peers.clone(),
+            &others,
+            STATUS_FANOUT_BUDGET,
+            self.peer_seen.as_deref(),
+        )
+        .await
+        .into_iter()
+        .map(|v| match v.status {
+            Ok(s) => PeerView {
+                running_as_primary: s.is_postgres_running && !s.is_in_recovery,
+                pos: WalPosition::from_status(&s),
+                receiving: s.is_in_recovery && !s.replication_state.is_empty(),
+                reachable: true,
+                seen_ages: s.peer_primary_seen_age_ms,
+                node: v.node,
+            },
+            Err(_) => PeerView {
+                node: v.node,
+                running_as_primary: false,
+                pos: None,
+                receiving: false,
+                reachable: false,
+                seen_ages: std::collections::HashMap::new(),
+            },
+        })
+        .collect()
     }
 
     fn log_decision(&self, decision: &HaDecision) {

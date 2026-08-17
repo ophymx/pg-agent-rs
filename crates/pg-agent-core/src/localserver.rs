@@ -220,6 +220,10 @@ pub struct LocalServer {
     /// where an operator, not the protocol, decides who the members
     /// are.
     raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
+    /// This node's record of when it last saw each peer serving, so a
+    /// `cluster status` fan-out counts as an observation rather than
+    /// being a second status path that silently records nothing.
+    peer_seen: Option<Arc<crate::cluster_view::PeerSeen>>,
 }
 
 impl LocalServer {
@@ -253,12 +257,22 @@ impl LocalServer {
             pg,
             wal_peer_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
             raft: None,
+            peer_seen: None,
         }
     }
 
     /// Let `ClusterInit` bootstrap Raft membership.
     pub fn with_raft(mut self, raft: Arc<crate::raftconsensus::RaftRuntime>) -> Self {
         self.raft = Some(raft);
+        self
+    }
+
+    /// Share the node's peer-sighting record, so a `cluster status`
+    /// fan-out counts as an observation like any other (finding 25's
+    /// witness evidence). Optional: without it the RPC still answers,
+    /// it just contributes nothing to what this node can vouch for.
+    pub fn with_peer_seen(mut self, seen: Arc<crate::cluster_view::PeerSeen>) -> Self {
+        self.peer_seen = Some(seen);
         self
     }
 
@@ -1915,61 +1929,76 @@ impl PgAgentLocal for LocalServer {
         let mut entries: Vec<ClusterStatusEntry> = Vec::with_capacity(self.node_pool.members.len());
         let mut all_reachable = true;
 
-        for node in &self.node_pool.members {
-            let entry = if self.node_pool.is_local(node) {
-                match self.node_info.get_status().await {
-                    Ok(status) => ClusterStatusEntry {
+        // Local node first, in-process.
+        if let Some(node) = self
+            .node_pool
+            .members
+            .iter()
+            .find(|n| self.node_pool.is_local(n))
+        {
+            entries.push(match self.node_info.get_status().await {
+                Ok(status) => ClusterStatusEntry {
+                    node_id: node.id,
+                    hostname: node.hostname.clone(),
+                    reachable: true,
+                    error: String::new(),
+                    status: Some(status),
+                },
+                Err(e) => {
+                    all_reachable = false;
+                    ClusterStatusEntry {
                         node_id: node.id,
                         hostname: node.hostname.clone(),
-                        reachable: true,
-                        error: String::new(),
-                        status: Some(status),
-                    },
-                    Err(e) => {
-                        all_reachable = false;
-                        ClusterStatusEntry {
-                            node_id: node.id,
-                            hostname: node.hostname.clone(),
-                            reachable: false,
-                            error: format!("local get_status: {e}"),
-                            status: None,
-                        }
+                        reachable: false,
+                        error: format!("local get_status: {e}"),
+                        status: None,
                     }
                 }
-            } else {
-                match self.peers.client(node).await {
-                    Ok(peer) => match peer.get_status().await {
-                        Ok(status) => ClusterStatusEntry {
-                            node_id: node.id,
-                            hostname: node.hostname.clone(),
-                            reachable: true,
-                            error: String::new(),
-                            status: Some(status),
-                        },
-                        Err(e) => {
-                            all_reachable = false;
-                            ClusterStatusEntry {
-                                node_id: node.id,
-                                hostname: node.hostname.clone(),
-                                reachable: false,
-                                error: format!("get_status: {e}"),
-                                status: None,
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        all_reachable = false;
-                        ClusterStatusEntry {
-                            node_id: node.id,
-                            hostname: node.hostname.clone(),
-                            reachable: false,
-                            error: format!("dial peer: {e}"),
-                            status: None,
-                        }
+            });
+        }
+
+        // Peers through the shared fan-out: parallel, budgeted, and
+        // recording what it sees. This used to be a hand-rolled serial
+        // loop with no budget — a second implementation of "ask every
+        // peer for status" that recorded nothing and let ONE hung peer
+        // stall the whole RPC for as long as its dial took (observed:
+        // a `cluster status` poll blocking ~60 s against a firewalled
+        // peer, in a suite where the same question via the HA loop
+        // cost 5 s).
+        let remotes: Vec<NodeConfig> = self
+            .node_pool
+            .members
+            .iter()
+            .filter(|n| !self.node_pool.is_local(n))
+            .cloned()
+            .collect();
+        for view in crate::cluster_view::collect_statuses(
+            self.peers.clone(),
+            &remotes,
+            crate::cluster_view::STATUS_FANOUT_BUDGET,
+            self.peer_seen.as_deref(),
+        )
+        .await
+        {
+            entries.push(match view.status {
+                Ok(status) => ClusterStatusEntry {
+                    node_id: view.node.id,
+                    hostname: view.node.hostname.clone(),
+                    reachable: true,
+                    error: String::new(),
+                    status: Some(status),
+                },
+                Err(e) => {
+                    all_reachable = false;
+                    ClusterStatusEntry {
+                        node_id: view.node.id,
+                        hostname: view.node.hostname.clone(),
+                        reachable: false,
+                        error: format!("get_status: {e}"),
+                        status: None,
                     }
                 }
-            };
-            entries.push(entry);
+            });
         }
         entries.sort_by_key(|e| e.node_id);
 

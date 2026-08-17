@@ -2,11 +2,20 @@
 //!
 //! [`RoleExecutor`] consumes [`HaDecision`]s and drives the local
 //! PostgreSQL instance toward what the lease says. The split matters:
-//! the loop stays a pure decision function (its tests stay
-//! deterministic, its tick stays cheap), and **shadow mode is the
-//! executor's absence** — the same structural guarantee shadow always
-//! had, now expressed at the composition root instead of inside the
-//! loop.
+//! the loop decides and never touches PostgreSQL, so **shadow mode is
+//! the executor's absence** — the same structural guarantee shadow
+//! always had, now expressed at the composition root instead of inside
+//! the loop.
+//!
+//! The loop is a decision function, not a *pure* one, and the
+//! distinction has grown teeth. It carries per-tick state — the
+//! holder-unhealthy and store-unknown clocks, candidacy backoff, the
+//! held-term grace, and the position samples the stability gate
+//! compares against (`ha::TickState`, eight fields) — so a decision
+//! can legitimately take more than one tick to reach, and its tests
+//! must drive ticks in order rather than assert on a single call.
+//! What stays true, and is what shadow mode rests on, is that the
+//! loop's only writes go to the consensus store.
 //!
 //! # The contract is convergence
 //!
@@ -99,6 +108,12 @@ const SYNC_ARM_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// Executes [`HaDecision`]s against the local instance.
 pub struct RoleExecutor {
     instance: Arc<dyn PostgresInstance>,
+    /// The local database. Held directly rather than reached through
+    /// `PostgresInstance`: the executor's quorum-commit and slot duties
+    /// are database facts, and routing them through the instance trait
+    /// only added pass-through methods there (four of them, each with
+    /// exactly one caller — this one).
+    db: Arc<dyn pgman::localdb::LocalDb>,
     peers: Arc<dyn PeerRegistry>,
     pool: NodePool,
     inflight: Arc<dyn InflightOpStore>,
@@ -143,6 +158,7 @@ impl RoleExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance: Arc<dyn PostgresInstance>,
+        db: Arc<dyn pgman::localdb::LocalDb>,
         peers: Arc<dyn PeerRegistry>,
         pool: NodePool,
         inflight: Arc<dyn InflightOpStore>,
@@ -153,6 +169,7 @@ impl RoleExecutor {
     ) -> Self {
         Self {
             instance,
+            db,
             peers,
             pool,
             inflight,
@@ -291,7 +308,14 @@ impl RoleExecutor {
                     .filter(|n| n.id != local_id)
                     .map(|n| n.slot_name())
                     .collect();
-                match self.instance.ensure_slots(&member_slots).await {
+                let mut slots_ok = Ok(());
+                for slot in &member_slots {
+                    if let Err(e) = self.db.create_slot(slot).await {
+                        slots_ok = Err(e);
+                        break;
+                    }
+                }
+                match slots_ok {
                     Ok(()) => info!(
                         slots = ?member_slots,
                         "roleexec: member replication slots reserved at promotion \
@@ -454,7 +478,7 @@ impl RoleExecutor {
         }
         others.sort();
         let desired = format!("ANY 1 ({})", others.join(", "));
-        let current = match self.instance.sync_standby_names().await {
+        let current = match self.db.setting("synchronous_standby_names").await {
             Ok(v) => v,
             Err(e) => {
                 debug!(err = %e, "roleexec: sync_standby_names read failed; retrying next probe");
@@ -470,7 +494,7 @@ impl RoleExecutor {
             // connected would hang every commit before a follower can
             // possibly exist (e.g. mid cluster-init, before the first
             // basebackup child comes up).
-            match self.instance.connected_member_standbys().await {
+            match self.db.connected_standby_names().await {
                 Ok(names) if !names.is_empty() => {}
                 Ok(_) => return, // nobody attached yet — stay disarmed
                 Err(e) => {
@@ -480,7 +504,7 @@ impl RoleExecutor {
             }
         }
         // Arm, or repair membership drift in an armed value.
-        match self.instance.set_sync_standby_names(&desired).await {
+        match self.db.set_synchronous_standby_names(&desired).await {
             Ok(()) => info!(
                 value = %desired,
                 was = %current,
@@ -596,26 +620,100 @@ mod tests {
 
     // ----- scripted PostgresInstance ---------------------------------------
 
+    /// The executor drives two collaborators — the instance and the
+    /// database — and what the tests assert is the ORDER of what it
+    /// did across both. So both stubs append to one shared log, and
+    /// `instance.calls()` remains the single ordered transcript it has
+    /// always been.
+    type CallLog = Arc<StdMutex<Vec<String>>>;
+
     struct ScriptedInstance {
         state: StdMutex<InstanceState>,
-        calls: StdMutex<Vec<String>>,
+        calls: CallLog,
         promote_fails: bool,
+    }
+
+    /// Scripted `LocalDb`: the executor's quorum-commit and slot duties
+    /// talk to this directly now, instead of through pass-throughs on
+    /// `PostgresInstance`.
+    struct ScriptedDb {
+        calls: CallLog,
         /// Scripted `synchronous_standby_names` GUC; set_sync writes it.
         sync_names: StdMutex<String>,
         /// Scripted `pg_stat_replication` member application_names.
         connected: StdMutex<Vec<String>>,
     }
 
+    #[async_trait]
+    impl pgman::localdb::LocalDb for ScriptedDb {
+        async fn create_slot(&self, name: &str) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("slot:{name}"));
+            Ok(())
+        }
+        async fn setting(&self, name: &str) -> anyhow::Result<String> {
+            assert_eq!(name, "synchronous_standby_names", "unexpected GUC read");
+            Ok(self.sync_names.lock().unwrap().clone())
+        }
+        async fn set_synchronous_standby_names(&self, value: &str) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("set_sync:{value}"));
+            *self.sync_names.lock().unwrap() = value.to_string();
+            Ok(())
+        }
+        async fn connected_standby_names(&self) -> anyhow::Result<Vec<String>> {
+            Ok(self.connected.lock().unwrap().clone())
+        }
+        // The executor touches nothing else on the database.
+        async fn promote(&self) -> anyhow::Result<()> {
+            unreachable!("promotion goes through the instance")
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn is_in_recovery(&self) -> anyhow::Result<bool> {
+            unreachable!("role comes from InstanceState")
+        }
+        async fn timeline_id(&self) -> anyhow::Result<i32> {
+            unreachable!()
+        }
+        async fn current_wal_lsn(&self) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn flush_lsn(&self) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn replication_lag(&self) -> anyhow::Result<pgman::localdb::ReplicationLag> {
+            unreachable!()
+        }
+        async fn reload_conf(&self) -> anyhow::Result<()> {
+            unreachable!("the detach path reloads through the instance")
+        }
+        async fn extension_exists(&self, _: &str) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn role_exists(&self, _: &str) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn create_replication_role(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
     impl ScriptedInstance {
-        fn new(state: InstanceState) -> Arc<Self> {
+        fn new(state: InstanceState, calls: CallLog) -> Arc<Self> {
             Arc::new(Self {
                 state: StdMutex::new(state),
-                calls: StdMutex::new(Vec::new()),
+                calls,
                 promote_fails: false,
-                sync_names: StdMutex::new(String::new()),
-                connected: StdMutex::new(Vec::new()),
             })
         }
+        /// The ordered transcript of what the executor did — across
+        /// the instance AND the database, in the order it did it.
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
@@ -652,24 +750,6 @@ mod tests {
         async fn stop_receiving(&self) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push("stop_receiving".into());
             Ok(())
-        }
-        async fn ensure_slots(&self, names: &[String]) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("ensure_slots:{}", names.join(",")));
-            Ok(())
-        }
-        async fn sync_standby_names(&self) -> anyhow::Result<String> {
-            Ok(self.sync_names.lock().unwrap().clone())
-        }
-        async fn set_sync_standby_names(&self, value: &str) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push(format!("set_sync:{value}"));
-            *self.sync_names.lock().unwrap() = value.to_string();
-            Ok(())
-        }
-        async fn connected_member_standbys(&self) -> anyhow::Result<Vec<String>> {
-            Ok(self.connected.lock().unwrap().clone())
         }
     }
 
@@ -838,6 +918,7 @@ mod tests {
     struct Fixture {
         exec: RoleExecutor,
         instance: Arc<ScriptedInstance>,
+        db: Arc<ScriptedDb>,
         peers: Arc<StubPeers>,
         inflight: Arc<InMemoryInflightOpStore>,
         pcp: Arc<StubPcp>,
@@ -845,7 +926,13 @@ mod tests {
     }
 
     fn fixture(local: i32, state: InstanceState) -> Fixture {
-        let instance = ScriptedInstance::new(state);
+        let calls: CallLog = Arc::new(StdMutex::new(Vec::new()));
+        let instance = ScriptedInstance::new(state, calls.clone());
+        let db = Arc::new(ScriptedDb {
+            calls,
+            sync_names: StdMutex::new(String::new()),
+            connected: StdMutex::new(Vec::new()),
+        });
         let peers = Arc::new(StubPeers::default());
         let inflight = Arc::new(InMemoryInflightOpStore::new());
         let pcp = StubPcp::all_up();
@@ -857,6 +944,7 @@ mod tests {
         let wedged = Arc::new(AtomicBool::new(false));
         let exec = RoleExecutor::new(
             instance.clone(),
+            db.clone(),
             Arc::new(StubRegistry(peers.clone())),
             pool3(local),
             inflight.clone(),
@@ -868,6 +956,7 @@ mod tests {
         Fixture {
             exec,
             instance,
+            db,
             peers,
             inflight,
             pcp,
@@ -903,7 +992,7 @@ mod tests {
         // survivor's re-follow gets around to asking.
         assert_eq!(
             f.instance.calls(),
-            vec!["promote", "ensure_slots:node0,node2"]
+            vec!["promote", "slot:node0", "slot:node2"]
         );
 
         // Journaled and completed.
@@ -1118,7 +1207,7 @@ mod tests {
         drain_self_attach(&f).await;
         assert_eq!(
             f.instance.calls(),
-            vec!["promote", "ensure_slots:node0,node2"]
+            vec!["promote", "slot:node0", "slot:node2"]
         );
         assert_eq!(*f.pcp.attach_calls.lock().unwrap(), vec![1]);
     }
@@ -1221,7 +1310,7 @@ mod tests {
     #[tokio::test]
     async fn holder_arms_quorum_commit_when_first_standby_attaches() {
         let f = fixture(0, InstanceState::Primary);
-        f.instance.connected.lock().unwrap().push("node1".into());
+        f.db.connected.lock().unwrap().push("node1".into());
         f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
         assert!(
             f.instance
@@ -1251,7 +1340,7 @@ mod tests {
         // primary — names include self, exclude the old primary):
         // rewrite to the correct set WITHOUT requiring a fresh attach.
         let f = fixture(0, InstanceState::Primary);
-        *f.instance.sync_names.lock().unwrap() = "ANY 1 (node0, node2)".into();
+        *f.db.sync_names.lock().unwrap() = "ANY 1 (node0, node2)".into();
         f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
         assert!(
             f.instance
@@ -1265,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn armed_and_converged_is_a_no_op() {
         let f = fixture(0, InstanceState::Primary);
-        *f.instance.sync_names.lock().unwrap() = "ANY 1 (node1, node2)".into();
+        *f.db.sync_names.lock().unwrap() = "ANY 1 (node1, node2)".into();
         f.exec.apply(&HaDecision::RetainedLease { term: 3 }).await;
         assert!(
             !f.instance.calls().iter().any(|c| c.starts_with("set_sync")),
@@ -1277,7 +1366,7 @@ mod tests {
     #[tokio::test]
     async fn promotion_forces_an_immediate_arming_check() {
         let f = fixture(1, InstanceState::Standby { streaming: true });
-        f.instance.connected.lock().unwrap().push("node2".into());
+        f.db.connected.lock().unwrap().push("node2".into());
         f.exec
             .apply(&HaDecision::TookOver {
                 term: 2,
