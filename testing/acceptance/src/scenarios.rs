@@ -1769,7 +1769,10 @@ async fn g16(cx: &mut Ctx, prim: &'static str) {
         |ev| agent(ev, blind, "StoreUnknown"),
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(25)).await;
+    // 1.5x leader_ttl of held belief. The absence claims below cover
+    // the whole window by event order; this sleep is only the liveness
+    // bound that gives the bug time to manifest.
+    tokio::time::sleep(Duration::from_secs(15)).await;
     cx.check_absent("no takeover from one-sided blindness", since, |ev| {
         agent_any(ev, "TookOver")
     });
@@ -1825,21 +1828,25 @@ async fn g17(cx: &mut Ctx, prim: &'static str) {
     let prim_ip = cluster::container_ip(prim).await.unwrap_or_default();
     let since = cx.log.cursor();
     cluster::sever_peer_port(blind, &prim_ip, 9701).await;
-    // Either branch proves the cut landed, and which one runs depends
-    // on who leads raft (finding 25): if the holder also leads, the
-    // blind node cannot even read the store and reports StoreUnknown;
-    // otherwise it reads fine, sees the holder "dead", and starts its
-    // deposal clock. The SAFETY assertions below hold in both.
-    cx.await_event(
-        90,
-        &format!("{blind} noticed the cut (holder unhealthy, or the store unreadable)"),
-        since,
-        |ev| agent(ev, blind, "HolderUnhealthy") || agent(ev, blind, "StoreUnknown"),
+    // Verify the CUT, not the cluster's reaction to it. Waiting for a
+    // decision event here is a trap: the decision log dedups by
+    // variant, and G16 leaves this same node in StoreUnknown — so when
+    // the cut lands before its next tick, the node is already in the
+    // state the await is watching for and no new line is ever emitted.
+    // The manufactured condition is directly observable, so observe it.
+    let ip = prim_ip.clone();
+    cx.wait_until(
+        30,
+        &format!("{blind} cannot reach the holder's agent port (cut verified)"),
+        || {
+            let ip = ip.clone();
+            async move { !cluster::can_reach(blind, &ip, 9701).await }
+        },
     )
     .await;
-    // Well past leader_ttl: this is the window in which the unguarded
-    // code would have taken the lease.
-    tokio::time::sleep(Duration::from_secs(25)).await;
+    // Past leader_ttl (1.5x): the window in which the unguarded code
+    // would have taken the lease.
+    tokio::time::sleep(Duration::from_secs(15)).await;
     cx.check_absent(
         "the healthy holder was not deposed by a blind standby",
         since,

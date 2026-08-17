@@ -96,6 +96,24 @@ listen_addresses = '*'
 # written before it, and a standby whose replay trails inside one of
 # those needs exactly those. validate-env warns below 512MB.
 wal_keep_size = '512MB'
+# Replication liveness detection. PostgreSQL's 60s defaults dominated
+# the suite's runtime: a severed walreceiver held 'streaming' for a
+# full minute before the wedge clock could even start (68s observed),
+# the primary kept counting severed standbys as ack sources for the
+# same minute (58s to reach sync_commit=blocked), and a partitioned
+# primary's shutdown drained walsenders toward it (47s). Three waits,
+# one knob, ~30% of the run. These are DETECTION-latency knobs, not
+# safety ones — every assertion they gate is about event order, not
+# duration — so the test cluster detects in 15s instead of 60s.
+#
+# The status interval must stay well under the timeout or a HEALTHY
+# walsender starts timing out: the standby only replies every
+# wal_receiver_status_interval, and the 10s default would leave 5s of
+# margin against a 15s timeout. 2s keeps the margin comfortable under
+# G11's write load and mid-basebackup.
+wal_sender_timeout = '15s'
+wal_receiver_timeout = '15s'
+wal_receiver_status_interval = '2s'
 # The agent writes standby recovery settings to $PGDATA/myrecovery.conf
 # (SPEC §5.10, pgpool convention); PostgreSQL only reads it if the main
 # config includes it. Ansible owns this line in production.

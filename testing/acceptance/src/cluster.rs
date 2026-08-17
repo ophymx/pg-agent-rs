@@ -178,6 +178,16 @@ pub async fn sever_outbound_port(node: &str, port: u16) {
     .await;
 }
 
+/// True iff `node` can open a TCP connection to `ip:port` within 2s.
+/// Verifies a manufactured cut directly, rather than inferring it from
+/// how the cluster reacts — the agent's decision log dedups by variant,
+/// so "the state I am waiting for" and "a line announcing it" are not
+/// the same thing when the previous scenario left the node in that
+/// state already.
+pub async fn can_reach(node: &str, ip: &str, port: u16) -> bool {
+    exec_ok(node, &format!("timeout 2 bash -c '</dev/tcp/{ip}/{port}'")).await
+}
+
 /// Drop every rule this suite installed (the containers run no other
 /// firewalling).
 pub async fn heal_firewall(node: &str) {
