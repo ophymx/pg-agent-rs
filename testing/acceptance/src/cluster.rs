@@ -127,6 +127,63 @@ pub async fn power_blip() {
     let _ = host(&["docker", "start", "pga-db0", "pga-db1", "pga-db2"]).await;
 }
 
+// --- partial / asymmetric partitions (gap item 6) -----------------------
+//
+// `network_disconnect` severs a node completely — both planes, both
+// directions, the shape every earlier scenario used. Real failures are
+// rarely that tidy: a firewall change closes one port, a NIC drops one
+// direction, a security group blocks a subnet. These primitives cut one
+// plane at a time so the suite can ask which plane's failure the design
+// is actually responding to. Rules are installed INSIDE the target
+// container (docker exec rides the API socket, not the compose
+// network), so the harness keeps full control of a node it has just
+// made unreachable to its peers.
+
+/// Sever `port` to and from `peer_ip`, both directions, on `node`.
+pub async fn sever_peer_port(node: &str, peer_ip: &str, port: u16) {
+    let _ = exec(
+        node,
+        &format!(
+            "iptables -A OUTPUT -d {peer_ip} -p tcp --dport {port} -j DROP && \
+             iptables -A INPUT -s {peer_ip} -p tcp --sport {port} -j DROP"
+        ),
+    )
+    .await;
+}
+
+/// Sever `port` to and from EVERY peer on `node` — one plane cut off
+/// entirely, the other left untouched.
+pub async fn sever_port_everywhere(node: &str, port: u16) {
+    let _ = exec(
+        node,
+        &format!(
+            "iptables -A INPUT -p tcp --dport {port} -j DROP && \
+             iptables -A OUTPUT -p tcp --dport {port} -j DROP"
+        ),
+    )
+    .await;
+}
+
+/// Drop only the connections `node` INITIATES to `port` on anyone.
+/// Replies to connections others initiate toward `node` are not matched
+/// (their source port is `port`, their destination is ephemeral), so
+/// the node becomes unable to ask anything while remaining fully
+/// answerable — one-sided blindness that does not depend on which peer
+/// happens to hold any particular role.
+pub async fn sever_outbound_port(node: &str, port: u16) {
+    let _ = exec(
+        node,
+        &format!("iptables -A OUTPUT -p tcp --dport {port} -j DROP"),
+    )
+    .await;
+}
+
+/// Drop every rule this suite installed (the containers run no other
+/// firewalling).
+pub async fn heal_firewall(node: &str) {
+    let _ = exec(node, "iptables -F INPUT && iptables -F OUTPUT").await;
+}
+
 pub async fn network_disconnect(node: &str) {
     let _ = host(&[
         "docker",

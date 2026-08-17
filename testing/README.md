@@ -185,9 +185,12 @@ cluster; the discovery rate on new probes says these will pay):
    observation are now standing assertions.
 5. ~~Built-but-never-entered states~~ — **done: G12 (blocked →
    allow-async → auto re-arm) and G13 (the follow-wedge tripwire)**.
-6. **Asymmetric / partial partitions** (A-sees-B-not-vice-versa;
-   agent-mesh-up-PG-mesh-down and inverse) — finding 18's class,
-   found by accident once.
+6. ~~Asymmetric / partial partitions~~ — **done: G14 (data plane cut,
+   control plane intact), G15 (the inverse), G16 (one-way
+   blindness)**. G14 and G15 passed first time — the two plane
+   inversions are exactly the pair that separates "lost redundancy"
+   from "lost authority", and the design answers them oppositely and
+   correctly. G16 cost a run and produced finding 25.
 7. **Double faults + soak**: primary death mid-rebuild of the only
    other standby; agent restart during basebackup; an N-cycle
    failover loop (slot debris, timeline growth, term growth, leaks);
@@ -215,6 +218,14 @@ cluster; the discovery rate on new probes says these will pay):
     acceptance provisioning sets it. The auditor gained a standing
     invariant that would have caught finding 22 by itself: no standby
     may ever log "WAL segment ... has already been removed".
+11. **The second-opinion gate before deposing a holder** (finding 25's
+    open half): a standby that can reach the raft leader but not the
+    holder wins its CAS and deposes a healthy primary on one node's
+    blindness. Peers already answer `GetStatus`; what they do not
+    report is *their* view of the holder, so candidacy has no cheap
+    way to ask "can anyone else see it?" before taking the lease.
+    Protocol change, not a test — and the highest-value remaining
+    safety item.
 
 ## Findings log
 
@@ -653,6 +664,43 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     validate-env warns when `wal_keep_size` leaves the pre-promotion
     gap open. The auditor now fails the run outright if any standby
     logs "WAL segment ... has already been removed".
+
+25. **One-way blindness toward the RAFT LEADER is real quorum loss —
+    and the correct response is to fence, not to shrug.** Not a
+    product defect: a wrong assertion, recorded because the reasoning
+    took a run to get right. G16's first cut blinded the lease
+    HOLDER's outbound dials to one standby and asserted that nothing
+    should move, on the theory that one node's lost view of a peer
+    cannot be evidence about the cluster. The run failed the
+    assertion: the holder logged "store unknown for 8.0s >
+    retry_timeout 2.0s while holding the lease (quorum contact lost)",
+    fenced itself, and a standby cleanly took over. The explanation is
+    that the raft LEADER and the lease HOLDER are independent roles —
+    the holder forwards its linearizable reads to whichever node leads
+    raft, so blinding it to that node makes it unable to verify it
+    still holds the lease, which is exactly the fail-closed case the
+    design prices. Every safety invariant held throughout (one fence,
+    one takeover, one term, no dual-primary), so the system was right
+    and the test was wrong. The lesson generalizes: **any assertion
+    about a partial control-plane cut must be stated relative to the
+    raft leader, which the suite does not control.** G16 is now
+    deterministic instead: it severs a STANDBY's outbound control
+    plane, so the blind node can reach no quorum member at all and
+    therefore cannot win a CAS no matter who leads raft — the
+    strongest form of "one-sided evidence is not authority", provable
+    without knowing the leader.
+
+    Left open deliberately (gap item 11): the shape where a standby
+    can still reach the raft leader but NOT the holder. It would
+    believe the holder dead, and its CAS would succeed — deposing a
+    healthy primary on one node's blindness, with a brief dual-serving
+    window until the ex-holder reads the store and fences itself. The
+    store has no notion of "the incumbent is still alive", and no
+    peer's opinion of the holder is consulted before deposing it. That
+    is a design gap, not a bug in the code as written, and closing it
+    needs a second-opinion gate (ask the other peers whether they can
+    see the holder before taking its lease) — a real protocol change,
+    not a test.
 
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death

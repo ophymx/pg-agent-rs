@@ -150,6 +150,9 @@ pub async fn run_all(cx: &mut Ctx) {
     let w6 = g11(cx, w5, &mut marks).await;
     let w7 = g12(cx, w6, &mut marks).await;
     g13(cx, w7, &mut marks).await;
+    g14(cx, w7, &mut marks).await;
+    let w8 = g15(cx, w7, &mut marks).await;
+    g16(cx, w8).await;
     crate::audit::run(cx);
 }
 
@@ -683,14 +686,7 @@ async fn g7(
     let s_lag = rest.next().unwrap();
     let s_ok = rest.next().unwrap();
     let prim_ip = cluster::container_ip(w2).await.unwrap_or_default();
-    let _ = exec(
-        s_lag,
-        &format!(
-            "iptables -A OUTPUT -d {prim_ip} -p tcp --dport 5432 -j DROP && \
-             iptables -A INPUT -s {prim_ip} -p tcp --sport 5432 -j DROP"
-        ),
-    )
-    .await;
+    cluster::sever_peer_port(s_lag, &prim_ip, 5432).await;
     // Kill the established walreceiver connection; reconnects hit the
     // DROP rules and hang in connect, so receive (flush) goes static.
     let _ = cx
@@ -769,9 +765,7 @@ async fn g7(
             "{s_lag} never reached candidacy (winner's CAS landed first)"
         ));
     }
-    // Heal the severed walreceiver path (rules are the only ones in
-    // these chains — the containers run no other firewalling).
-    let _ = exec(s_lag, "iptables -F OUTPUT && iptables -F INPUT").await;
+    cluster::heal_firewall(s_lag).await;
     // Repair via the ACTUAL primary, not the predicted winner: if the
     // enforced assert above failed (finding 19's candidacy race), the
     // repairs must still converge the cluster instead of cascading
@@ -1507,14 +1501,7 @@ async fn g13(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
     let target = other_node(prim);
     let prim_ip = cluster::container_ip(prim).await.unwrap_or_default();
     let since = cx.log.cursor();
-    let _ = exec(
-        target,
-        &format!(
-            "iptables -A OUTPUT -d {prim_ip} -p tcp --dport 5432 -j DROP && \
-             iptables -A INPUT -s {prim_ip} -p tcp --sport 5432 -j DROP"
-        ),
-    )
-    .await;
+    cluster::sever_peer_port(target, &prim_ip, 5432).await;
     let _ = cx
         .pg
         .execute(
@@ -1553,7 +1540,7 @@ async fn g13(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
     // Heal the path: the executor's re-follow finds the stream again
     // and the tripwire clears itself — no operator action for a
     // transient cause.
-    let _ = exec(target, "iptables -F OUTPUT && iptables -F INPUT").await;
+    cluster::heal_firewall(target).await;
     cx.wait_until(
         120,
         &format!("{target}: tripwire self-cleared once streaming resumed"),
@@ -1565,6 +1552,255 @@ async fn g13(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
     cx.check(
         "exactly one primary after the wedge cleared",
         primaries == 1,
+    );
+}
+
+/// One daemon's own view of whether it can reach every peer. `|| true`
+/// because the CLI exits non-zero precisely when the answer is "no",
+/// which is the interesting case.
+async fn all_reachable(node: &str) -> Option<bool> {
+    let out = exec_pg(node, "pg_agentctl cluster status --json || true")
+        .await
+        .ok()?;
+    out.split("\"all_reachable\":")
+        .nth(1)
+        .map(|s| s.trim_start().starts_with("true"))
+}
+
+async fn g14(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G14: DATA-plane partition — replication severed, control plane intact");
+    // Cut 5432 between the primary and BOTH standbys while leaving the
+    // agent mesh untouched. Every agent still sees a healthy holder, so
+    // the correct answer is emphatically NOT to fail over — the lease
+    // is doing its job. What must happen instead is that the silent
+    // failure becomes loud: quorum commit has no ack source left, so
+    // writes stop being acknowledged rather than quietly becoming
+    // single-copy, and both followers raise the wedge tripwire. This is
+    // the shape where a health-check-driven design (pgpool's §2.1)
+    // fails over into a split brain and the lease design refuses to.
+    let pg = cx.pg.clone();
+    cx.wait_until(
+        60,
+        &format!("{prim}: armed with both standbys streaming before the cut"),
+        || {
+            let pg = pg.clone();
+            async move { pg.streaming_count(prim).await == Some(2) }
+        },
+    )
+    .await;
+    let prim_ip = cluster::container_ip(prim).await.unwrap_or_default();
+    let since = cx.log.cursor();
+    for n in NODES {
+        if n != prim {
+            cluster::sever_peer_port(n, &prim_ip, 5432).await;
+            let _ = cx
+                .pg
+                .execute(
+                    n,
+                    "select pg_terminate_backend(pid) from pg_stat_wal_receiver",
+                )
+                .await;
+        }
+    }
+    cx.wait_until(
+        90,
+        &format!("{prim}: sync_commit=blocked (both ack sources gone)"),
+        || async move { sync_commit_state(prim).await == "blocked" },
+    )
+    .await;
+    cx.check(
+        "writes stop being acknowledged (redundancy loss is loud, not silent)",
+        !timed_write(prim, "g14-blocked", 5).await,
+    );
+    for n in NODES {
+        if n != prim {
+            cx.wait_until(
+                120,
+                &format!("{n}: follow_wedged=true (its stream is gone)"),
+                || async move { follow_wedged(n).await },
+            )
+            .await;
+        }
+    }
+    // The whole point: a broken DATA plane must not move the lease.
+    cx.check_absent(
+        "no takeover while only replication was broken",
+        since,
+        |ev| agent_any(ev, "TookOver"),
+    );
+    cx.check_absent(
+        "no promotion while only replication was broken",
+        since,
+        |ev| agent_any(ev, "roleexec: promotion complete"),
+    );
+    cx.check_absent("no fence while only replication was broken", since, |ev| {
+        agent_any(ev, "FENCING")
+    });
+    cx.check(
+        &format!("{prim} kept the lease and its role throughout"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    for n in NODES {
+        if n != prim {
+            cluster::heal_firewall(n).await;
+        }
+    }
+    cx.wait_until(
+        180,
+        &format!("{prim}: quorum commit back to armed once streams returned"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    for n in NODES {
+        if n != prim {
+            cx.wait_until(
+                120,
+                &format!("{n}: wedge tripwire cleared after the heal"),
+                || async move { !follow_wedged(n).await },
+            )
+            .await;
+        }
+    }
+    repair_standbys(cx, prim, "g14", marks).await;
+}
+
+async fn g15(
+    cx: &mut Ctx,
+    prim: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
+    cx.say("G15: CONTROL-plane partition — agent mesh cut, replication healthy");
+    // The exact inverse of G14: sever 9701 (peer RPC *and* raft) on the
+    // holder while 5432 keeps streaming perfectly. The holder loses
+    // quorum and must fence a PostgreSQL that is, by every data-plane
+    // measure, in perfect health — the fail-closed bill the design
+    // prices explicitly (a holder that cannot prove it still holds the
+    // lease must not keep serving writes). The majority, which can
+    // still see each other, promotes.
+    let since = cx.log.cursor();
+    cluster::sever_port_everywhere(prim, 9701).await;
+    cx.await_event(
+        60,
+        &format!("{prim}: fenced itself on quorum loss (control plane, not data)"),
+        since,
+        |ev| agent(ev, prim, "FENCING"),
+    )
+    .await;
+    let winner_ev = cx
+        .await_event(90, "the majority promoted a standby", since, |ev| {
+            ev.node != prim && agent_any(ev, "roleexec: promotion complete")
+        })
+        .await;
+    let w: &'static str = match winner_ev {
+        Some(ev) => {
+            cx.pass(&format!("winner: {}", ev.node));
+            ev.node
+        }
+        None => {
+            cx.fail("no winner after the control-plane partition");
+            other_node(prim)
+        }
+    };
+    cx.check_absent(
+        "the isolated holder never committed anything (no quorum, no writes)",
+        since,
+        |ev| agent(ev, prim, "TookOver"),
+    );
+    cluster::heal_firewall(prim).await;
+    cx.check(
+        &format!("fenced ex-holder {prim} stays down after the heal (demote policy)"),
+        !unit_active(prim, "postgresql@17-main").await,
+    );
+    cluster_recover(cx, w, prim).await;
+    marks.insert(prim, cx.log.cursor());
+    repair_standbys(cx, w, "g15", marks).await;
+    let primaries = cx.pg.count_primaries().await;
+    cx.check(
+        "exactly one primary after the control-plane partition healed",
+        primaries == 1,
+    );
+    cx.wait_until(90, &format!("{w}: quorum commit re-armed"), || async move {
+        sync_commit_state(w).await == "armed"
+    })
+    .await;
+    w
+}
+
+async fn g16(cx: &mut Ctx, prim: &'static str) {
+    cx.say("G16: ASYMMETRIC visibility — a node that can ask nothing must do nothing");
+    // Finding 18's lesson in its strongest form: one node loses the
+    // ability to INITIATE control-plane connections while remaining
+    // fully answerable. It therefore sees a cluster in which everyone
+    // is dead — including the lease holder — while everyone else sees
+    // a completely healthy cluster including it. One-sided evidence is
+    // not authority: the blind node must not depose anyone, and since
+    // it cannot reach any quorum member it cannot, which is the point.
+    //
+    // The blind node is a STANDBY on purpose. The first cut of this
+    // scenario blinded the HOLDER to one peer and asserted nothing
+    // would move — wrong, and the run said so: if the unreachable peer
+    // happens to be the raft leader, the holder cannot verify it still
+    // holds the lease, and fencing is then the only correct answer
+    // (finding 25). Whose-leader-is-it makes that shape
+    // nondeterministic; severing a standby's outbound control plane is
+    // deterministic, because no reachable quorum member means no CAS
+    // regardless of which node leads raft.
+    let blind = other_node(prim);
+    let since = cx.log.cursor();
+    cluster::sever_outbound_port(blind, 9701).await;
+    // Evidence the asymmetry is live, from each side's own fan-out.
+    cx.wait_until(
+        90,
+        &format!("{blind} can reach nobody (its own status fan-out says so)"),
+        || async move { all_reachable(blind).await == Some(false) },
+    )
+    .await;
+    cx.check(
+        &format!("{prim} still reaches everyone including {blind} (the cut is one-way)"),
+        all_reachable(prim).await == Some(true),
+    );
+    // The blind node believes the holder is dead. Hold that belief
+    // well past leader_ttl — the window is the whole point.
+    cx.await_event(
+        60,
+        &format!("{blind} concluded the store is unreadable (it sees a dead cluster)"),
+        since,
+        |ev| agent(ev, blind, "StoreUnknown"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    cx.check_absent("no takeover from one-sided blindness", since, |ev| {
+        agent_any(ev, "TookOver")
+    });
+    cx.check_absent("no fence from one-sided blindness", since, |ev| {
+        agent_any(ev, "FENCING")
+    });
+    cx.check_absent("no promotion from one-sided blindness", since, |ev| {
+        agent_any(ev, "roleexec: promotion complete")
+    });
+    cx.check(
+        &format!("{prim} still holds the lease and serves as primary"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    // A blinded CONTROL plane must not disturb the data plane: the
+    // node keeps streaming throughout, so its redundancy value is
+    // untouched by its inability to participate in decisions.
+    let streaming = cx.pg.streaming_count(prim).await;
+    cx.check(
+        "replication was never disturbed (only the control plane was cut)",
+        streaming == Some(2),
+    );
+    cluster::heal_firewall(blind).await;
+    cx.wait_until(
+        90,
+        &format!("{blind}: full peer visibility restored"),
+        || async move { all_reachable(blind).await == Some(true) },
+    )
+    .await;
+    cx.check_absent(
+        "the heal itself caused no churn (no takeover on reconnect)",
+        since,
+        |ev| agent_any(ev, "TookOver"),
     );
 }
 
