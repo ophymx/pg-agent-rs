@@ -215,11 +215,24 @@ cluster; the discovery rate on new probes says these will pay):
    inversions are exactly the pair that separates "lost redundancy"
    from "lost authority", and the design answers them oppositely and
    correctly. G16 cost a run and produced finding 25.
-7. **Double faults + soak**: primary death mid-rebuild of the only
-   other standby; agent restart during basebackup; an N-cycle
-   failover loop (slot debris, timeline growth, term growth, leaks);
-   disk-full on the WAL partition; raft-store deletion recovery
-   (documented as rm-and-re-replicate, never exercised).
+7. **Double faults + soak** — G19 (raft-store deletion), G20 (primary
+   death mid-rebuild of the only other standby), G21 (N-cycle failover
+   soak: slot debris, open journal entries). Still open from this item:
+   agent restart during basebackup, which overlaps G20's half-wiped
+   node closely enough to be a variant rather than a scenario.
+
+   **Disk-full on the WAL partition: deliberately deferred, not
+   pending.** It is a break-glass condition, and by the time it fires
+   the operators are already in a fire drill with human judgment in
+   the loop — which is the opposite of the automatic-reaction paths
+   this suite exists to police. There is also little of OUR behavior
+   left to assert: PostgreSQL PANICs on its own terms, and the agent's
+   state store may be on the same partition that just filled, so the
+   test would mostly be re-deriving PostgreSQL's documented failure
+   mode through a very expensive fixture. Revisit only if the agent
+   ever grows a policy for it (pre-emptive fencing on a disk-space
+   threshold, say) — a policy is something worth testing; a PANIC is
+   not.
 8. `detach_false_primary` storm behavior (hook-contract §5.5), which
    needs a false primary manufactured out of band.
 9. `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).

@@ -161,6 +161,10 @@ pub async fn run_all(cx: &mut Ctx) {
     g16(cx, w8).await;
     g17(cx, w8).await;
     g18(cx, w8, &mut marks).await;
+    let w9 = cx.pg.current_primary().await.unwrap_or(w8);
+    g19(cx, w9).await;
+    let w10 = g20(cx, w9, &mut marks).await;
+    g21(cx, w10, &mut marks).await;
     crate::audit::run(cx);
 }
 
@@ -1998,6 +2002,274 @@ async fn g18(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
         "exactly one primary after the maintenance window",
         cx.pg.count_primaries().await == 1,
     );
+}
+
+async fn g19(cx: &mut Ctx, prim: &'static str) {
+    cx.say("G19: raft-store deletion — the documented recovery, finally run");
+    // docs/promotion-authority.md argues the storage engine is a
+    // low-stakes choice BECAUSE "a Raft node's log is recoverable from
+    // its peers: stop the agent, delete <state_dir>/raft/, restart, let
+    // Raft re-replicate". That claim carries real design weight and had
+    // never been executed — the same shape as finding 21, where a
+    // documented recovery path turned out not to exist.
+    //
+    // The wiped node is a NON-holder on purpose: it makes the test
+    // deterministic, and it is the operationally common case (a node
+    // with a corrupt store gets rebuilt while the cluster serves).
+    let victim = other_node(prim);
+    let since = cx.log.cursor();
+    cx.check(
+        &format!("{victim}: agent stopped and raft store deleted"),
+        exec_ok(
+            victim,
+            "systemctl stop pg_agentd && rm -rf /var/lib/postgresql/pg_agent/raft && \
+             test ! -d /var/lib/postgresql/pg_agent/raft",
+        )
+        .await,
+    );
+    let _ = exec(victim, "systemctl start pg_agentd").await;
+    cx.wait_until(
+        60,
+        &format!("{victim}: agent back up on an empty store"),
+        || async move { unit_active(victim, "pg_agentd").await },
+    )
+    .await;
+    // Re-replication proof, in the node's own words: it starts from
+    // nothing (no vote, no log) and is fed by the leader.
+    cx.await_event(
+        90,
+        &format!("{victim}: raft restarted from an empty log"),
+        since,
+        |ev| agent(ev, victim, "get_initial_state vote=T0-N0:uncommitted"),
+    )
+    .await;
+    // The real proof is not a log line: it is that the node can serve a
+    // LINEARIZABLE read again. `cluster status` reports the pause state
+    // from the store, and reports "unknown (consensus read failed…)"
+    // when it cannot — so an empty pause line here means this node is
+    // reading committed cluster state through Raft once more.
+    cx.wait_until(
+        120,
+        &format!("{victim}: linearizable reads work again (store re-replicated)"),
+        || async move { pause_status(victim).await.is_empty() },
+    )
+    .await;
+    cx.await_event(
+        60,
+        &format!("{victim}: participating in decisions again"),
+        since,
+        |ev| agent(ev, victim, "ha shadow decision"),
+    )
+    .await;
+    // The cluster must not have noticed. A node rebuilding its own
+    // consensus state is not a failover trigger.
+    cx.check_absent("no takeover while a peer rebuilt its store", since, |ev| {
+        agent_any(ev, "TookOver")
+    });
+    cx.check_absent("no fence while a peer rebuilt its store", since, |ev| {
+        agent_any(ev, "FENCING")
+    });
+    cx.check(
+        &format!("{prim} still holds the lease and serves"),
+        cx.pg.is_in_recovery(prim).await == Some(false),
+    );
+    let pg = cx.pg.clone();
+    cx.wait_until(
+        60,
+        "replication untouched by the store rebuild (2 streaming)",
+        || {
+            let pg = pg.clone();
+            async move { pg.streaming_count(prim).await == Some(2) }
+        },
+    )
+    .await;
+}
+
+async fn g20(
+    cx: &mut Ctx,
+    prim: &'static str,
+    marks: &mut HashMap<&'static str, Cursor>,
+) -> &'static str {
+    cx.say("G20: DOUBLE FAULT — the primary dies mid-rebuild of the other standby");
+    // Every scenario so far has induced one fault at a time. This is
+    // the shape an on-call engineer actually meets: you are already
+    // rebuilding a standby when the primary dies under you. At the
+    // moment of death one standby is HALF-WIPED (its pgdata is being
+    // overwritten by a basebackup whose source just vanished), so the
+    // cluster's only viable candidate is the untouched one — and the
+    // wiped node must not win, must not be crowned by a candidacy that
+    // reads its absent state as "no objection", and must not be left
+    // believing it is anything.
+    let rebuilding = other_node(prim);
+    let survivor = NODES
+        .iter()
+        .copied()
+        .find(|n| *n != prim && *n != rebuilding)
+        .unwrap();
+    write_sentinel(cx, prim, "g20").await;
+    let since = cx.log.cursor();
+    // Start the rebuild and kill the source while it runs. The recover
+    // RPC is synchronous, so it goes to the background; the kill lands
+    // while pg_basebackup is streaming from `prim`.
+    let recover_target = node_id(rebuilding).to_string();
+    let bg = tokio::spawn(async move {
+        let _ = exec_pg(
+            prim,
+            &format!("pg_agentctl cluster recover --target {recover_target} --stop-target-pg"),
+        )
+        .await;
+    });
+    cx.await_event(
+        60,
+        &format!("{rebuilding}: rebuild started (pgdata is being overwritten)"),
+        since,
+        |ev| agent(ev, rebuilding, "basebackup") || agent(ev, prim, "recovery_1st_stage"),
+    )
+    .await;
+    let _ = exec(prim, "systemctl stop postgresql@17-main").await;
+    cx.note("primary killed mid-rebuild — the basebackup's source is now gone");
+    let winner_ev = cx
+        .await_event(
+            120,
+            "the UNTOUCHED standby won (a half-wiped node cannot be the candidate)",
+            since,
+            |ev| agent(ev, survivor, "roleexec: promotion complete"),
+        )
+        .await;
+    let w = winner_ev.map(|e| e.node).unwrap_or(survivor);
+    cx.check_absent(
+        &format!("the half-wiped {rebuilding} was never promoted"),
+        since,
+        |ev| agent(ev, rebuilding, "roleexec: promotion complete"),
+    );
+    let _ = bg.await;
+    cx.check(
+        "exactly one primary after the double fault",
+        cx.pg.count_primaries().await == 1,
+    );
+    check_sentinel(cx, w, "g20").await;
+    // Both broken nodes come back by the operator path: the interrupted
+    // rebuild has to be redone against the NEW primary, and the dead
+    // ex-primary rejoins as a standby.
+    for target in [rebuilding, prim] {
+        cluster_recover(cx, w, target).await;
+        marks.insert(target, cx.log.cursor());
+    }
+    repair_standbys(cx, w, "g20", marks).await;
+    cx.check(
+        "exactly one primary after both faults were repaired",
+        cx.pg.count_primaries().await == 1,
+    );
+    cx.wait_until(
+        90,
+        &format!("{w}: quorum commit re-armed after the double fault"),
+        || async move { sync_commit_state(w).await == "armed" },
+    )
+    .await;
+    w
+}
+
+/// Replication slots present on `node`, as `name=active` pairs.
+async fn slots(cx: &Ctx, node: &'static str) -> Vec<String> {
+    cx.pg
+        .scalar(
+            node,
+            "select coalesce(string_agg(slot_name || '=' || active::text, ' ' order by slot_name), '')
+             from pg_replication_slots",
+        )
+        .await
+        .map(|s| {
+            s.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+async fn g21(cx: &mut Ctx, start: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G21: SOAK — repeated failover must not accumulate anything");
+    // Individual failovers have been proven many times over. What no
+    // single scenario can show is whether the cluster is quietly
+    // getting worse each time: replication slots left behind by nodes
+    // that moved on, in-flight journal entries nobody closed, terms
+    // and timelines climbing without their bookkeeping keeping up.
+    // Debris is invisible per-cycle and fatal by cycle fifty, so the
+    // assertion is a COMPARISON across cycles, not a snapshot.
+    const CYCLES: usize = 3;
+    let mut prim = start;
+    let mut slot_counts: Vec<usize> = Vec::new();
+    for cycle in 1..=CYCLES {
+        let since = cx.log.cursor();
+        let _ = exec(prim, "systemctl stop postgresql@17-main").await;
+        let winner_ev = cx
+            .await_event(
+                90,
+                &format!("soak cycle {cycle}: a standby took over"),
+                since,
+                |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+            )
+            .await;
+        let dead = prim;
+        prim = winner_ev.map(|e| e.node).unwrap_or(other_node(prim));
+        cluster_recover(cx, prim, dead).await;
+        marks.insert(dead, cx.log.cursor());
+        repair_standbys(cx, prim, &format!("g21c{cycle}"), marks).await;
+        // The primary should hold exactly one slot per OTHER member —
+        // no more, cycle after cycle.
+        let s = slots(cx, prim).await;
+        cx.check(
+            &format!(
+                "soak cycle {cycle}: {prim} holds exactly the member slots ({})",
+                if s.is_empty() {
+                    "none".to_string()
+                } else {
+                    s.join(" ")
+                }
+            ),
+            s.len() == NODES.len() - 1,
+        );
+        slot_counts.push(s.len());
+    }
+    // The comparison that a snapshot cannot make.
+    cx.check(
+        &format!("slot count never grew across {CYCLES} failovers ({slot_counts:?})"),
+        slot_counts.windows(2).all(|w| w[1] <= w[0]),
+    );
+    // Standbys must not hoard slots of their own: a node that was
+    // primary two cycles ago should not still be holding slots for
+    // peers that now stream from someone else.
+    for n in NODES {
+        if n != prim {
+            let s = slots(cx, n).await;
+            cx.check(
+                &format!("soak: ex-primary {n} left no slots behind ({})", s.len()),
+                s.is_empty(),
+            );
+        }
+    }
+    // Nothing may be left mid-flight: every op the soak opened either
+    // completed or was abandoned with a reason.
+    let ops = exec_pg(prim, "pg_agentctl ops list")
+        .await
+        .unwrap_or_default();
+    let in_progress = ops
+        .lines()
+        .filter(|l| l.to_lowercase().contains("inprogress"))
+        .count();
+    cx.check(
+        &format!("soak: no in-flight ops left open after {CYCLES} cycles ({in_progress})"),
+        in_progress == 0,
+    );
+    cx.check(
+        "exactly one primary at the end of the soak",
+        cx.pg.count_primaries().await == 1,
+    );
+    cx.wait_until(
+        90,
+        &format!("{prim}: quorum commit armed at the end of the soak"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —
