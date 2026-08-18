@@ -26,6 +26,34 @@ SKIP_BUILD=1 testing/acceptance.sh # reuse dist/ .deb
 On failure the cluster is kept for debugging (`docker exec -it pga-db0
 bash`, `journalctl -u pg_agentd`).
 
+### The OS / PostgreSQL matrix — on demand, not on every run
+
+`acceptance.sh` above always runs the baseline cell (Debian 13,
+PostgreSQL 17) and needs no environment. The matrix is a separate,
+opt-in entry point that runs the whole suite once per cell:
+
+```
+testing/matrix.sh                  # every cell, sequentially
+testing/matrix.sh noble-pg16       # one named cell
+KEEP_GOING=1 testing/matrix.sh     # do not stop at the first failing cell
+```
+
+Cells pair each base with the PostgreSQL version it ships **natively**
+(no PGDG repo), so a build failure means "this pairing does not exist"
+rather than "an external repo moved". Cells run sequentially — they
+share the docker daemon and the compose project name — and each one
+tears down the previous cluster first, because a leftover container
+from cell N runs cell N's PostgreSQL.
+
+It costs a full suite run per cell, which is why it is not wired into
+the everyday path: its job is answering "does this still hold on the
+other distro" now and then, not taxing every iteration.
+
+Debian 12 (bookworm, PostgreSQL 15) is **absent on purpose** — see
+finding 26: the `.deb` this repo builds carries no glibc floor, so it
+installs there and dies at exec. That is a packaging defect to fix, not
+a cell to paper over.
+
 ## Layout
 
 | File | Role |
@@ -752,6 +780,72 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     other directions — evidence has to name exactly what it observed,
     because "I can talk to it" and "it is doing its job" are different
     claims about a node, and only one of them is about the lease.
+
+26. **The packaged binary has no glibc floor: it installs on an older
+    distro and dies at exec.** Found within minutes of standing up the
+    OS matrix, before a single scenario ran. The `.deb` declares no
+    `Depends` at all (`dpkg-deb -f` shows none — nfpm is given no
+    dependency list), while the binary is dynamically linked against
+    whatever glibc built it. On Debian 12 (glibc 2.36) the package
+    installs cleanly and then:
+
+        /usr/bin/pg_agentd: /lib/x86_64-linux-gnu/libc.so.6:
+        version `GLIBC_2.39' not found
+
+    A trixie-built package therefore supports glibc >= 2.39 and says so
+    nowhere; the same arithmetic rules out RHEL 9 (glibc 2.34) for the
+    `.rpm`, which is testing gap item 9's whole target. Ubuntu 24.04
+    (2.39) passes only by coincidence of being new enough. Fix
+    directions are in TODO.md: pick a baseline and build against it (an
+    old container, or `cargo-zigbuild --target
+    x86_64-unknown-linux-gnu.2.28`), or remove the floor with a static
+    musl build — for which this project is unusually well suited, since
+    its dependency set is already pure Rust where it counts. Moving to
+    `cargo-deb` helps either way: it derives `Depends` from the built
+    binary, turning this from a cryptic runtime crash into a clean apt
+    refusal. Debian 12 stays out of the matrix until then, because a
+    permanently-red cell teaches nobody anything the finding has not
+    already recorded.
+
+    A second, smaller lesson from the same hour: the matrix's first run
+    failed everywhere with "pgpool_node_id specifies id=0 which is not
+    in pool". The cause was three layers from the symptom — the image's
+    `ENV PG_VERSION` does not reach a systemd UNIT (systemd hands its
+    services a clean environment), so under provision.sh's `set -u` the
+    script died inside the config heredoc and wrote a config with an
+    EMPTY pool. It reproduced under `docker exec` not at all, because
+    exec DOES inherit the image env. Build-time facts a systemd unit
+    needs belong in a file, not the environment.
+
+27. **The polkit rule was pinned to PostgreSQL 17, so the agent could
+    not manage PostgreSQL on any other version.** The matrix's first
+    real cell (Ubuntu 24.04 / PostgreSQL 16) failed `cluster init` with
+    every peer stop returning
+    `org.freedesktop.DBus.Error.InteractiveAuthorizationRequired`. The
+    rule matched the unit name literally — `postgresql@17-main.service`
+    — so on a 16 cluster it never matched, polkit fell through, and the
+    fallback is to ask a human, which no daemon can answer. Two things
+    make this worth recording beyond the one-line fix (match
+    `/^postgresql@\d+-main\.service$/`):
+
+    - `systemd.rs`'s module docs *already* described the rule as
+      covering `postgresql@*.service`. The fixture had drifted from its
+      own stated contract, and nobody could notice while every test ran
+      on 17. Documentation that describes the general case while the
+      artifact implements a special case is invisible until something
+      exercises the difference — which is precisely what a matrix is
+      for.
+    - The file is the test fixture, but its header says it mirrors what
+      Ansible installs in production. Anything copied from it inherits
+      the pin, so a real PostgreSQL 15/16 deployment would hit the same
+      wall — with the same unhelpful error, since "interactive
+      authentication required" describes polkit's fallback rather than
+      the actual cause.
+
+    I first read this as a Debian-vs-Ubuntu polkit difference (126 vs
+    124) and was wrong; the versions were a coincidence. The tell was
+    that db0 could manage its OWN PostgreSQL — provisioning starts it
+    as root — while only agent-issued peer operations failed.
 
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death

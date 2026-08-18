@@ -295,6 +295,109 @@ Two related issues around handoff's replication-slot management on the new prima
 - **Why now:** every command added past 0.6.0 will re-invent its own preflight. A shared validator means the consistency story is consistent across handlers and one place to look when something refuses. The 2026-06-11 split-brain wouldn't have happened with the `detached`-is-actually-down check alone.
 - **Caveat — this is defense in depth, not the fix.** The `detached`-is-actually-down check closes the known trigger but not the class: under a real partition, `get_status(detached)` is itself unreachable, and both branches are wrong (refuse → unavailable during the partition we exist to survive; promote → the original bug). Split-brain is structurally reachable as long as promotion authority lives in pgpool's `failover_command`. See [docs/promotion-authority.md](docs/promotion-authority.md). Land this anyway — it's cheap and it helps — but don't record it as closing the issue.
 
+### Packaging: the binary has no glibc floor, and nfpm cannot give it one
+
+- **The defect (testing/README.md finding 26):** the `.deb` declares no
+  `Depends` at all, so it installs happily on a distro whose glibc is
+  older than the build host's and then dies at exec:
+  `/usr/bin/pg_agentd: /lib/x86_64-linux-gnu/libc.so.6: version
+  'GLIBC_2.39' not found`. Found by the OS matrix on Debian 12
+  (bookworm, glibc 2.36); the same applies to RHEL 9 (glibc 2.34), which
+  matters for the `.rpm` (testing gap item 9). A trixie-built package
+  currently supports glibc >= 2.39 and says so nowhere.
+
+- **Two real fixes, and they are not exclusive:**
+  1. *Pick a baseline and hold it.* Build releases against the oldest
+     glibc to be supported — an old build container (what `cross` and
+     manylinux do) or `cargo-zigbuild --target
+     x86_64-unknown-linux-gnu.2.28`, which gets a chosen floor from a
+     modern host.
+  2. *Remove the floor entirely* with `x86_64-unknown-linux-musl` —
+     **the preferred direction.** This project is unusually well suited
+     to it: the dependency set is already pure Rust where it counts
+     (zbus for D-Bus, tokio-postgres + rustls rather than libpq or
+     OpenSSL), so the usual musl blocker is absent, and the allocator
+     penalty is irrelevant for a daemon that sleeps between one-second
+     ticks. One artifact would then serve the `.deb`, the `.rpm`, and
+     every matrix cell.
+
+     **NSS plugins are declared unsupported** — a deliberate call, not
+     an oversight. Discovery in the deployments this targets is DNS or
+     `/etc/hosts` (Kubernetes CoreDNS, cloud DNS, the compose network
+     the suite runs on), all of which musl reads natively; SSSD/LDAP/
+     mDNS resolution is an on-prem-directory concern, and the agent
+     runs as a fixed local user under systemd rather than looking up
+     directory identities. Document it in the packaging README so it is
+     a stated boundary rather than a surprise.
+
+     What still needs checking is musl's DNS *implementation*, which is
+     a separate question from NSS: older musl had no EDNS0/TCP
+     fallback, so DNS answers over 512 bytes were truncated (a real
+     Kubernetes headless-service failure), and its `search`/`ndots`
+     handling differs from glibc's. musl 1.2.4+ addresses the
+     truncation case. Pin a recent musl and smoke-test peer resolution
+     inside a cluster before committing.
+
+- **Prep for musl, do this first: drop the accidental `aws-lc-rs`.**
+  `pg-agent-core` pins `rustls = { default-features = false, features =
+  ["ring"] }`, but `tokio-rustls` is declared with defaults ON, and its
+  default enables rustls's `aws-lc-rs`. Cargo features are additive, so
+  the whole graph gets it — `target/release/build` really does contain
+  aws-lc-sys build dirs today. It is the single most likely musl
+  blocker (cmake + C toolchain) and it is being compiled for nothing.
+  Fix: `default-features = false` + explicit `ring`/`tls12` on
+  `tokio-rustls` (and check `tonic`, which reaches rustls the same
+  way). Cuts build time now, removes a cross-compile hazard later.
+  Validate with the full suite — the peer mesh is mTLS end to end.
+
+- **Alpine — ASPIRATIONAL, long term. It is not a matrix cell, it is a
+  port.** Worth knowing before the next matrix round: musl removes the
+  *glibc floor*, it does not make Alpine work. Checked against
+  `alpine:3.20` rather than assumed:
+  - PostgreSQL **is** packaged: `postgresql14/15/16` (17 on newer
+    releases), each with an `-openrc` service subpackage.
+  - pgpool-II **is** packaged: `pgpool` 4.5.2, plus `pgpool-openrc`
+    and `pgpool-static`. I expected packaging to be the blocker; it is
+    not, which materially lowers the estimate.
+  - Everything is musl (`musl-1.2.5` — already past the 1.2.4 DNS
+    truncation fix noted above).
+
+  The blocker is the INIT SYSTEM, and those `-openrc` subpackages are
+  the tell. This agent drives PostgreSQL through systemd over D-Bus
+  with a polkit rule (`Systemd` trait, zbus), waiting on `JobRemoved`
+  signals for job completion, and assumes Debian's
+  `postgresql@VER-main` template units. Alpine has neither systemd nor
+  a D-Bus policy model, so support means a second implementation behind
+  the existing trait boundary — and OpenRC's `rc-service` offers no
+  async job-completion signal, so the "wait until the unit actually
+  finished" contract (systemd.rs gotcha #2) has to be rebuilt on
+  polling. A design change, not a build flag.
+
+- **Rocky/RHEL — NEAR TERM, and the next real target after packaging.**
+  Tractable, but needs a distro profile. systemd is there, so the
+  mechanism holds; the layout does not. RHEL-family
+  PostgreSQL is `postgresql-17.service` (PGDG) or `postgresql.service`
+  (AppStream) with data at `/var/lib/pgsql/17/data` — no
+  `postgresql@VER-main`, no `pg_ctlcluster`, no `conf.d` convention, no
+  `start.conf`. Both the harness (`cluster::pg_unit`/`pg_log`,
+  provision.sh's `PGCONF_DIR`) and the AGENT's own defaults
+  (`DEFAULT_PG_SERVICE`, `DEFAULT_PG_DATA_DIR`) hardcode the Debian
+  shape. Gap item 9 (`.rpm`) needs the same abstraction, so do them
+  together.
+
+- **Move off nfpm to Rust-native packaging** (`cargo-deb` +
+  `cargo-generate-rpm`), which is wanted anyway and pays for itself
+  here: **cargo-deb derives `Depends` from the built binary's actual
+  shared-library needs**, so the failure above becomes a clean apt
+  refusal at install time instead of a cryptic runtime crash. The
+  trade-off is that one `nfpm.yaml` covering both formats becomes two
+  tool configs (both live in `Cargo.toml` metadata, which is the point).
+  `cargo-dist` is the other candidate but is oriented at archives and
+  installers rather than native system packages — worth re-checking its
+  current `.deb`/`.rpm` support before choosing. If the musl route is
+  taken, the packaging tool matters less (no shared-library deps left to
+  compute), so decide the linking question first.
+
 ## Deferred (acknowledged, low priority, listed so they don't get lost)
 
 ### Ctrl-C during basebackup wipes $PGDATA

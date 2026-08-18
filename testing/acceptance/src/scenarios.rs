@@ -184,13 +184,13 @@ async fn g0(cx: &mut Ctx) {
         .await;
     }
     cx.wait_until(30, "db0: postgres active (bootstrap primary)", || async {
-        unit_active("db0", "postgresql@17-main").await
+        unit_active("db0", &cluster::pg_unit()).await
     })
     .await;
     for n in ["db1", "db2"] {
         cx.check(
             &format!("{n}: postgres intentionally down pre-init"),
-            !unit_active(n, "postgresql@17-main").await,
+            !unit_active(n, &cluster::pg_unit()).await,
         );
     }
     for n in NODES {
@@ -361,7 +361,7 @@ async fn g3(cx: &mut Ctx) -> &'static str {
     cx.say("G3: primary death — hook advises, the lease decides, pgpool discovers");
     write_sentinel(cx, "db0", "g3").await;
     let since = cx.log.cursor();
-    let _ = exec("db0", "systemctl stop postgresql@17-main").await;
+    let _ = exec("db0", &format!("systemctl stop {}", cluster::pg_unit())).await;
     cx.await_event(
         30,
         "failover hook answered advisory (notify-only, as contracted)",
@@ -449,7 +449,7 @@ async fn g4(
     cx.say("G4: operator rejoin — demote policy, the slot-race guard, repair");
     cx.check(
         &format!("dead ex-primary {dead} stayed stopped (rejoin is never automatic)"),
-        !unit_active(dead, "postgresql@17-main").await,
+        !unit_active(dead, &cluster::pg_unit()).await,
     );
     cluster_recover(cx, w1, dead).await;
     repair_standbys(cx, w1, "g4", marks).await;
@@ -614,7 +614,7 @@ async fn g5b(
     );
     cx.check(
         "fenced ex-holder stays down after reconnect (demote policy)",
-        !unit_active(w1, "postgresql@17-main").await,
+        !unit_active(w1, &cluster::pg_unit()).await,
     );
     cluster_recover(cx, w2, w1).await;
     repair_standbys(cx, w2, "g5", marks).await;
@@ -749,7 +749,7 @@ async fn g7(
     .await;
     write_sentinel(cx, w2, "g7").await;
     let since = cx.log.cursor();
-    let _ = exec(w2, "systemctl stop postgresql@17-main").await;
+    let _ = exec(w2, &format!("systemctl stop {}", cluster::pg_unit())).await;
     cx.await_event(
         60,
         &format!("the caught-up standby {s_ok} won the takeover"),
@@ -829,7 +829,14 @@ async fn g8(
         &format!("{prim}: agent masked and SIGKILLed (PostgreSQL left running)"),
         exec_ok(
             prim,
-            "systemctl mask --runtime pg_agentd && systemctl kill -s SIGKILL pg_agentd",
+            // `--kill-whom=main`: systemd 255 (Ubuntu 24.04) REFUSES a
+            // plain `systemctl kill` on a masked unit — "Failed to send
+            // signal SIGKILL to auxiliary processes: Invalid argument"
+            // — while 257 (Debian 13) allows it. The agent is a single
+            // process, so naming the main one is both portable and
+            // exactly what this scenario means.
+            "systemctl mask --runtime pg_agentd && \
+             systemctl kill -s SIGKILL --kill-whom=main pg_agentd",
         )
         .await,
     );
@@ -859,7 +866,7 @@ async fn g8(
     // PostgreSQL is still up and still believes it is a primary.
     cx.check(
         &format!("{prim} PostgreSQL still running (nothing could fence it)"),
-        unit_active(prim, "postgresql@17-main").await,
+        unit_active(prim, &cluster::pg_unit()).await,
     );
     cx.check(
         &format!("{prim} still believes it is a primary (expected dual-serving)"),
@@ -986,13 +993,30 @@ async fn g9(
     let since = cx.log.cursor();
     cx.check(
         &format!("{prim}: postmaster SIGKILLed (crash shape, whole cgroup)"),
-        exec_ok(prim, "systemctl kill -s SIGKILL postgresql@17-main").await,
+        exec_ok(
+            prim,
+            &format!("systemctl kill -s SIGKILL {}", cluster::pg_unit()),
+        )
+        .await,
     );
+    // How systemd RECORDS a killed postmaster is not portable. On
+    // Debian 13 the main process death is logged directly ("Main
+    // process exited, code=killed, status=9/KILL"). On Ubuntu 24.04 the
+    // SIGKILL leaves pg_ctlcluster to run, which reports "Cluster is
+    // not running" and exits 2, so the unit records "Control process
+    // exited, code=exited" and "Failed with result 'exit-code'" —
+    // `code=killed` never appears. Both distros always emit a
+    // `Failed with result` line, so the portable claim is "systemd
+    // recorded the unit dying badly", not the exact cause string.
     cx.await_event(
         30,
-        &format!("{prim}: systemd recorded the crash (code=killed — the only death event)"),
+        &format!("{prim}: systemd recorded the crash (the only death event)"),
         since,
-        |ev| ev.node == prim && ev.source == Source::Postgres && ev.line.contains("code=killed"),
+        |ev| {
+            ev.node == prim
+                && ev.source == Source::Postgres
+                && (ev.line.contains("code=killed") || ev.line.contains("Failed with result"))
+        },
     )
     .await;
     let winner_ev = cx
@@ -1015,7 +1039,7 @@ async fn g9(
     };
     cx.check(
         &format!("{prim} stayed dead (no auto-restart of a crashed postmaster)"),
-        !unit_active(prim, "postgresql@17-main").await,
+        !unit_active(prim, &cluster::pg_unit()).await,
     );
     check_sentinel(cx, w, "g9").await;
     cluster_recover(cx, w, prim).await;
@@ -1102,8 +1126,10 @@ async fn g10(cx: &mut Ctx, prim: &'static str) {
         || async move {
             exec(
                 prim,
-                "grep -q 'database system was not properly shut down' \
-                 /var/log/postgresql/postgresql-17-main.log",
+                &format!(
+                    "grep -q 'database system was not properly shut down' {}",
+                    cluster::pg_log()
+                ),
             )
             .await
             .is_ok()
@@ -1218,7 +1244,14 @@ async fn g11(
         &format!("{prim}: agent masked and SIGKILLed under load"),
         exec_ok(
             prim,
-            "systemctl mask --runtime pg_agentd && systemctl kill -s SIGKILL pg_agentd",
+            // `--kill-whom=main`: systemd 255 (Ubuntu 24.04) REFUSES a
+            // plain `systemctl kill` on a masked unit — "Failed to send
+            // signal SIGKILL to auxiliary processes: Invalid argument"
+            // — while 257 (Debian 13) allows it. The agent is a single
+            // process, so naming the main one is both portable and
+            // exactly what this scenario means.
+            "systemctl mask --runtime pg_agentd && \
+             systemctl kill -s SIGKILL --kill-whom=main pg_agentd",
         )
         .await,
     );
@@ -1409,7 +1442,7 @@ async fn g12(
     let since = cx.log.cursor();
     for n in NODES {
         if n != prim {
-            let _ = exec(n, "systemctl stop postgresql@17-main").await;
+            let _ = exec(n, &format!("systemctl stop {}", cluster::pg_unit())).await;
         }
     }
     cx.wait_until(
@@ -1712,7 +1745,7 @@ async fn g15(
     cluster::heal_firewall(prim).await;
     cx.check(
         &format!("fenced ex-holder {prim} stays down after the heal (demote policy)"),
-        !unit_active(prim, "postgresql@17-main").await,
+        !unit_active(prim, &cluster::pg_unit()).await,
     );
     cluster_recover(cx, w, prim).await;
     marks.insert(prim, cx.log.cursor());
@@ -1949,7 +1982,7 @@ async fn g18(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
     .await;
     // The hazard, made real: kill the primary while paused.
     let killed = cx.log.cursor();
-    let _ = exec(prim, "systemctl stop postgresql@17-main").await;
+    let _ = exec(prim, &format!("systemctl stop {}", cluster::pg_unit())).await;
     tokio::time::sleep(Duration::from_secs(15)).await; // 1.5x leader_ttl
     cx.check_absent(
         "paused: no takeover while the primary is down",
@@ -2126,7 +2159,7 @@ async fn g20(
         |ev| agent(ev, rebuilding, "basebackup") || agent(ev, prim, "recovery_1st_stage"),
     )
     .await;
-    let _ = exec(prim, "systemctl stop postgresql@17-main").await;
+    let _ = exec(prim, &format!("systemctl stop {}", cluster::pg_unit())).await;
     cx.note("primary killed mid-rebuild — the basebackup's source is now gone");
     let winner_ev = cx
         .await_event(
@@ -2200,7 +2233,7 @@ async fn g21(cx: &mut Ctx, start: &'static str, marks: &mut HashMap<&'static str
     let mut slot_counts: Vec<usize> = Vec::new();
     for cycle in 1..=CYCLES {
         let since = cx.log.cursor();
-        let _ = exec(prim, "systemctl stop postgresql@17-main").await;
+        let _ = exec(prim, &format!("systemctl stop {}", cluster::pg_unit())).await;
         let winner_ev = cx
             .await_event(
                 90,

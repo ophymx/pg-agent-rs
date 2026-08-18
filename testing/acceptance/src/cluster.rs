@@ -12,6 +12,27 @@ use tokio::process::Command;
 pub const NODES: [&str; 3] = ["db0", "db1", "db2"];
 pub const COMPOSE: &str = "testing/compose.yaml";
 
+/// The PostgreSQL major version under test, from `PG_VERSION` (the
+/// same variable that selects the matrix cell's base image and
+/// packages). Defaults to the baseline so a plain `acceptance.sh` run
+/// needs no environment at all.
+pub fn pg_version() -> String {
+    std::env::var("PG_VERSION").unwrap_or_else(|_| "17".to_string())
+}
+
+/// Debian-family unit name for the cluster, e.g. `postgresql@17-main`.
+/// One definition: the suite stops, kills, and inspects this unit from
+/// a dozen places, and a matrix cell where half of them said "17"
+/// would fail in ways that look like product bugs.
+pub fn pg_unit() -> String {
+    format!("postgresql@{}-main", pg_version())
+}
+
+/// Server log path for the cluster.
+pub fn pg_log() -> String {
+    format!("/var/log/postgresql/postgresql-{}-main.log", pg_version())
+}
+
 pub fn node_id(node: &str) -> &str {
     node.strip_prefix("db").unwrap_or(node)
 }

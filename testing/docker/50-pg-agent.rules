@@ -2,11 +2,21 @@
 // PostgreSQL + pgpool units over the system bus. Mirrors the rule
 // Ansible installs in production (see crates/pg-agent-core/src/systemd.rs
 // module docs).
+// The PostgreSQL unit is matched by PATTERN, not by a pinned version.
+// It used to read "postgresql@17-main.service", which meant the agent
+// could manage PostgreSQL only on a 17 cluster: on the OS matrix's
+// PostgreSQL 16 cell every peer stop came back
+// `org.freedesktop.DBus.Error.InteractiveAuthorizationRequired`,
+// because the rule simply did not match and polkit fell through to
+// asking a human that no daemon can answer. systemd.rs's module docs
+// already described this rule as covering `postgresql@*.service` — the
+// fixture had drifted from its own documented contract, and anything
+// copying it into production Ansible would inherit the same pin.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         subject.user == "postgres") {
         var unit = action.lookup("unit");
-        if (unit == "postgresql@17-main.service" ||
+        if (/^postgresql@\d+-main\.service$/.test(unit) ||
             unit == "postgresql.service" ||
             unit == "pgpool2.service") {
             return polkit.Result.YES;

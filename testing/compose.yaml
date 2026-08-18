@@ -1,11 +1,15 @@
 name: pg-agent-acceptance
 
-# Three systemd-booted nodes, each: PostgreSQL 17 + pg_agentd (from the
+# Three systemd-booted nodes, each: PostgreSQL + pg_agentd (from the
 # real .deb). Requires a cgroup-v2 host; `privileged` + `cgroup: host`
 # is the standard systemd-in-docker recipe.
+#
+# BASE_IMAGE / PG_VERSION select the matrix cell (testing/matrix.sh);
+# the image is TAGGED per cell so cells cannot clobber each other's
+# build cache or leave the next run testing the previous OS.
 
 x-node: &node
-  image: pg-agent-acceptance
+  image: pg-agent-acceptance:${MATRIX_TAG:-trixie-pg17}
   privileged: true
   cgroup: host
   stop_signal: SIGRTMIN+3
@@ -22,7 +26,11 @@ x-node: &node
 services:
   db0:
     <<: *node
-    build: ./docker
+    build:
+      context: ./docker
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-debian:trixie}
+        PG_VERSION: ${PG_VERSION:-17}
     hostname: db0
     container_name: pga-db0
   db1:

@@ -4,6 +4,13 @@
 # Plays the role Ansible plays in production (BOOTSTRAP.md Phase 1).
 set -euo pipefail
 
+# Which PostgreSQL this image was built against (matrix cell). Read from
+# disk, not the environment: systemd hands its units a clean env, so the
+# image's ENV is invisible here even though `docker exec` sees it.
+# shellcheck disable=SC1091
+[ -r /etc/pg-agent-matrix/env ] && . /etc/pg-agent-matrix/env
+PG_VERSION="${PG_VERSION:-17}"
+
 NODE_ID="${HOSTNAME#db}"
 case "$NODE_ID" in
     0|1|2) ;;
@@ -25,7 +32,7 @@ install -m 0600 "/certs/${HOSTNAME}.key" /etc/pg_agent/tls/node.key
 chown -R postgres:postgres /etc/pg_agent/tls
 
 # --- agent config ------------------------------------------------------
-cat > /etc/pg_agent/config.toml <<'EOF'
+cat > /etc/pg_agent/config.toml <<EOF
 listen = "0.0.0.0"
 
 [tls]
@@ -46,6 +53,13 @@ id       = 2
 hostname = "db2"
 
 [postgres]
+# Written explicitly rather than left to the agent's defaults: those
+# name PostgreSQL 17, and the OS/version matrix runs 15 and 16 too. A
+# matrix cell that silently fell back to 17 paths would fail in a way
+# that looks like a product bug.
+pg_install_prefix = "/usr/lib/postgresql/${PG_VERSION}"
+data_dir          = "/var/lib/postgresql/${PG_VERSION}/main"
+service           = "postgresql@${PG_VERSION}-main.service"
 
 # Container-to-container replication without client certs.
 [postgres.replication]
@@ -87,9 +101,9 @@ election_timeout_ms = 1000
 EOF
 
 # --- PostgreSQL config -------------------------------------------------
-PGCONF_DIR=/etc/postgresql/17/main
+PGCONF_DIR=/etc/postgresql/${PG_VERSION}/main
 mkdir -p "$PGCONF_DIR/conf.d"
-cat > "$PGCONF_DIR/conf.d/10-pg-agent-acceptance.conf" <<'EOF'
+cat > "$PGCONF_DIR/conf.d/10-pg-agent-acceptance.conf" <<EOF
 listen_addresses = '*'
 # The retention floor slots structurally cannot provide (finding 22): a
 # slot created at promotion cannot retroactively protect segments
@@ -114,10 +128,10 @@ wal_keep_size = '512MB'
 wal_sender_timeout = '15s'
 wal_receiver_timeout = '15s'
 wal_receiver_status_interval = '2s'
-# The agent writes standby recovery settings to $PGDATA/myrecovery.conf
+# The agent writes standby recovery settings to \$PGDATA/myrecovery.conf
 # (SPEC §5.10, pgpool convention); PostgreSQL only reads it if the main
 # config includes it. Ansible owns this line in production.
-include_if_exists = '/var/lib/postgresql/17/main/myrecovery.conf'
+include_if_exists = '/var/lib/postgresql/${PG_VERSION}/main/myrecovery.conf'
 EOF
 chown -R postgres:postgres "$PGCONF_DIR/conf.d"
 
@@ -128,7 +142,7 @@ chown -R postgres:postgres "$PGCONF_DIR/conf.d"
 # agent's cold-start reconciliation out of G10 (PostgreSQL was up 2 s
 # before the agent, so the reconcile correctly no-op'd and the product
 # path went untested). 'manual' closes autostart while leaving explicit
-# `systemctl start postgresql@17-main` (provision bootstrap, recover,
+# `systemctl start postgresql@<ver>-main` (provision bootstrap, recover,
 # cold start) untouched.
 echo manual > "$PGCONF_DIR/start.conf"
 
@@ -151,7 +165,7 @@ install -d -o postgres -g postgres /var/lib/postgresql/archive
 if [ ! -e "$MARKER" ]; then
     if [ "$NODE_ID" = "0" ]; then
         echo "provision: bootstrap primary — starting PostgreSQL"
-        systemctl start postgresql@17-main.service
+        systemctl start "postgresql@${PG_VERSION}-main.service"
         until runuser -u postgres -- pg_isready -q; do sleep 0.5; done
         runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
 DO $$ BEGIN

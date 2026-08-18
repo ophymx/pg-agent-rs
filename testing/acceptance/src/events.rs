@@ -180,11 +180,12 @@ impl EventLog {
             "journalctl -u pg_agentd -f -n all --no-pager -o cat".to_string(),
             "journalctl -u pg_agentd -f -n 0 --no-pager -o cat".to_string(),
         );
+        let log = crate::cluster::pg_log();
         self.spawn_tail(
             node,
             Source::Postgres,
-            "tail -F -n +1 /var/log/postgresql/postgresql-17-main.log 2>/dev/null".to_string(),
-            "tail -F -n 0 /var/log/postgresql/postgresql-17-main.log 2>/dev/null".to_string(),
+            format!("tail -F -n +1 {log} 2>/dev/null"),
+            format!("tail -F -n 0 {log} 2>/dev/null"),
         );
         // The unit journal, also as Postgres events: a SIGKILLed
         // postmaster writes nothing to its log file — systemd's
@@ -193,11 +194,12 @@ impl EventLog {
         // intervals need it. The journal carries unit lifecycle
         // messages, not the server log, so it cannot duplicate the
         // file tail's serving_start/serving_end lines.
+        let unit = crate::cluster::pg_unit();
         self.spawn_tail(
             node,
             Source::Postgres,
-            "journalctl -u postgresql@17-main -f -n all --no-pager -o cat".to_string(),
-            "journalctl -u postgresql@17-main -f -n 0 --no-pager -o cat".to_string(),
+            format!("journalctl -u {unit} -f -n all --no-pager -o cat"),
+            format!("journalctl -u {unit} -f -n 0 --no-pager -o cat"),
         );
     }
 

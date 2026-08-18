@@ -58,14 +58,22 @@ fn serving_start(ev: &Event) -> bool {
 /// wal_sender_timeout). Using only the final line would report
 /// dual-primary for windows where no client could write. "is shut
 /// down" stays as the fallback end for paths with no request line.
-/// "code=killed" is the crash shape (G9): a SIGKILLed postmaster
-/// writes neither of the above — systemd's report from the unit
-/// journal is the death event.
+/// The crash shape (G9) has no PostgreSQL-side goodbye at all — a
+/// SIGKILLed postmaster writes neither of the above — so systemd's
+/// unit journal carries the death event instead. Which line that is
+/// varies by distro: Debian 13 logs the main process dying
+/// ("code=killed"), while Ubuntu 24.04 lets pg_ctlcluster run, find no
+/// cluster, and exit 2, recording "Control process exited,
+/// code=exited". Both always emit `Failed with result`, so that is the
+/// portable marker; `code=killed` stays because matching more ways for
+/// a unit to have died can only close intervals earlier, never later,
+/// and an unclosed interval is what would raise a false dual-primary.
 fn serving_end(ev: &Event) -> bool {
     ev.source == Source::Postgres
         && (ev.line.contains("shutdown request")
             || ev.line.contains("database system is shut down")
-            || ev.line.contains("code=killed"))
+            || ev.line.contains("code=killed")
+            || ev.line.contains("Failed with result"))
 }
 
 pub fn run(cx: &mut Ctx) {
