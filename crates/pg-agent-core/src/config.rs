@@ -368,15 +368,6 @@ pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 ///    §"Prior art").
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaftConfig {
-    /// Run the HA loop in **shadow mode**: compute and log role
-    /// decisions every `loop_wait`, taking no action. Off by default.
-    /// The decision stream logs on the `ha_shadow` tracing target.
-    ///
-    /// Orthogonal to [`enabled`](Self::enabled), which selects *which
-    /// store answers*. Step 6 runs both: real Raft underneath, no
-    /// executors on top. Step 7 turns `shadow` off.
-    #[serde(default)]
-    pub shadow: Option<bool>,
     /// Join the embedded Raft cluster: open `<state_dir>/raft/`, serve
     /// `PgAgentRaft`, and back the HA loop with the replicated state
     /// machine instead of a process-local one. Off by default.
@@ -399,15 +390,25 @@ pub struct RaftConfig {
     /// (open question 3 — needs a measured answer on the live cluster).
     #[serde(default)]
     pub election_timeout_ms: Option<u64>,
-    /// VESTIGIAL (accepted for config compatibility, no longer read by
-    /// candidacy): selection is strict flush-max — any reachable peer
-    /// with more flushed WAL outranks, node id breaking exact ties
-    /// only. The former "close enough" band this knob bounded let a
-    /// behind node win, which quorum commit cannot tolerate
-    /// (docs/quorum-commit.md §4) and which caused finding 15's
-    /// wedged follows.
-    #[serde(default)]
-    pub max_lag_on_failover_bytes: Option<u64>,
+    // Deliberately absent: `max_lag_on_failover_bytes` and `shadow`.
+    //
+    // The lag knob bounded a "close enough" band around the most
+    // advanced candidate; selection is strict flush-max now (any
+    // reachable peer with more flushed WAL outranks, node id breaking
+    // exact ties only), because the band let a behind node win — which
+    // quorum commit cannot tolerate (docs/quorum-commit.md §4) and
+    // which caused finding 15's wedged follows. It was kept as an
+    // accepted-but-ignored knob, which is worse than absent: a setting
+    // an operator can tune that changes nothing is a lie the config
+    // file tells.
+    //
+    // `shadow` ran the loop with no executors — the staged-migration
+    // scaffolding (promotion-authority steps 5-6) whose S/R/E
+    // acceptance suites were deleted at the greenfield cutover. Under
+    // the shipped design it selected a cluster where the loop narrates
+    // and nothing manages PostgreSQL. Shadow mode still exists exactly
+    // where it always structurally did — as the executor's absence
+    // (`HaLoop::with_executor`), which the loop's own tests use.
 }
 
 pub const DEFAULT_RAFT_LOOP_WAIT_SECS: u64 = 10;
@@ -416,9 +417,6 @@ pub const DEFAULT_RAFT_LEADER_TTL_SECS: u64 = 30;
 pub const DEFAULT_RAFT_ELECTION_TIMEOUT_MS: u64 = 5_000;
 
 impl RaftConfig {
-    pub fn effective_shadow(&self) -> bool {
-        self.shadow.unwrap_or(false)
-    }
     pub fn effective_enabled(&self) -> bool {
         self.enabled.unwrap_or(false)
     }
@@ -440,11 +438,6 @@ impl RaftConfig {
                 .unwrap_or(DEFAULT_RAFT_ELECTION_TIMEOUT_MS),
         )
     }
-    pub fn effective_max_lag_on_failover(&self) -> u64 {
-        self.max_lag_on_failover_bytes
-            .unwrap_or(MAX_HANDOFF_LAG_BYTES as u64)
-    }
-
     pub fn validate(&self) -> Result<(), AgentError> {
         let loop_wait = self.effective_loop_wait();
         let retry = self.effective_retry_timeout();
@@ -1324,7 +1317,6 @@ mod tests {
         // Defaults: ttl 30 >= 10 + 2*10; retry 10s > election 5s.
         let d = RaftConfig::default();
         assert_eq!(d.effective_leader_ttl().as_secs(), 30);
-        assert_eq!(d.effective_max_lag_on_failover(), 16 * 1024 * 1024);
     }
 
     #[test]
@@ -1358,25 +1350,21 @@ mod tests {
     fn sample_config_raft_keys_all_exist() {
         let toml = r#"
             [raft]
-            shadow                    = false
             enabled                   = false
             loop_wait_secs            = 10
             retry_timeout_secs        = 10
             leader_ttl_secs           = 30
             election_timeout_ms       = 5000
-            max_lag_on_failover_bytes = 16777216
         "#;
         let cfg: Config = toml::from_str(toml).expect("sample [raft] block must parse");
         cfg.raft
             .validate()
             .expect("the documented defaults must satisfy both invariants");
-        assert!(!cfg.raft.effective_shadow());
         assert!(!cfg.raft.effective_enabled());
         assert_eq!(cfg.raft.effective_loop_wait().as_secs(), 10);
         assert_eq!(cfg.raft.effective_retry_timeout().as_secs(), 10);
         assert_eq!(cfg.raft.effective_leader_ttl().as_secs(), 30);
         assert_eq!(cfg.raft.effective_election_timeout().as_millis(), 5000);
-        assert_eq!(cfg.raft.effective_max_lag_on_failover(), 16 * 1024 * 1024);
     }
 
     #[test]
@@ -1389,13 +1377,11 @@ mod tests {
             retry_timeout_secs = 12
             leader_ttl_secs = 40
             election_timeout_ms = 8000
-            max_lag_on_failover_bytes = 1048576
             "#,
         )
         .unwrap();
         assert_eq!(cfg.raft.effective_loop_wait().as_secs(), 5);
         assert_eq!(cfg.raft.effective_election_timeout().as_millis(), 8000);
-        assert_eq!(cfg.raft.effective_max_lag_on_failover(), 1048576);
         cfg.raft.validate().unwrap(); // 40 >= 5 + 24; 12s > 8s
     }
 

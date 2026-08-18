@@ -338,19 +338,17 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         None
     };
 
-    // HA-loop mode matrix (promotion-authority §10):
-    //   shadow=true,  enabled=false → loop over the in-memory store (step 5)
-    //   shadow=true,  enabled=true  → loop over real Raft, log-only (step 6)
-    //   shadow=false, enabled=true  → EXECUTE (step 7): decisions act
-    //   shadow=false, enabled=false → no loop at all (pre-consensus default)
-    let ha_execute = config.raft.effective_enabled() && !config.raft.effective_shadow();
-    let ha_timing =
-        (config.raft.effective_shadow() || ha_execute).then(|| pg_agent_core::ha::HaTiming {
-            loop_wait: config.raft.effective_loop_wait(),
-            retry_timeout: config.raft.effective_retry_timeout(),
-            leader_ttl: config.raft.effective_leader_ttl(),
-            max_lag_on_failover: config.raft.effective_max_lag_on_failover(),
-        });
+    // Raft on → the loop runs and its decisions ACT. Raft off → no loop
+    // at all. The staged-migration middle grounds (a loop that only
+    // narrates, over a process-local store or a real one) are gone with
+    // the `shadow` flag: under the shipped design they describe a
+    // cluster where nothing manages PostgreSQL.
+    let ha_execute = config.raft.effective_enabled();
+    let ha_timing = ha_execute.then(|| pg_agent_core::ha::HaTiming {
+        loop_wait: config.raft.effective_loop_wait(),
+        retry_timeout: config.raft.effective_retry_timeout(),
+        leader_ttl: config.raft.effective_leader_ttl(),
+    });
     // The executor's instance is only ever built here, alongside a real
     // Raft — executing against a process-local store is not a
     // configuration that exists.

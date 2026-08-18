@@ -84,18 +84,24 @@ async fn check_sentinel(cx: &mut Ctx, node: &'static str, label: &str) {
     );
 }
 
-/// Healthz-reported quorum-commit posture on `node`.
-async fn sync_commit_state(node: &str) -> String {
-    exec(node, "curl -sf localhost:9702/healthz")
+/// The node's `/healthz` body, parsed. `curl -s`, never `-sf`: an
+/// UNHEALTHY node answers 503 with the same JSON, and those are exactly
+/// the nodes whose health the suite most wants to read (a `-f` here
+/// once discarded the very body a wedge flag lives in).
+async fn healthz(node: &str) -> serde_json::Value {
+    exec(node, "curl -s localhost:9702/healthz")
         .await
         .ok()
-        .and_then(|body| {
-            body.split("\"sync_commit\":\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Healthz-reported quorum-commit posture on `node`.
+async fn sync_commit_state(node: &str) -> String {
+    healthz(node).await["sync_commit"]
+        .as_str()
+        .unwrap_or("")
+        .into()
 }
 
 async fn cluster_recover(cx: &Ctx, via: &str, target: &str) {
@@ -154,6 +160,7 @@ pub async fn run_all(cx: &mut Ctx) {
     let w8 = g15(cx, w7, &mut marks).await;
     g16(cx, w8).await;
     g17(cx, w8).await;
+    g18(cx, w8, &mut marks).await;
     crate::audit::run(cx);
 }
 
@@ -1349,17 +1356,10 @@ async fn g11(
     w
 }
 
-/// Healthz-reported follow-wedge tripwire on `node`. Deliberately
-/// `curl -s`, NOT `-sf`: a wedged standby is unhealthy by definition,
-/// so /healthz answers 503 — and `-f` throws the body away on exactly
-/// the nodes this flag exists to describe. (The first cut copied
-/// `-sf` from the sync-commit probe, which only ever reads a healthy
-/// primary, and failed for that reason alone.) The body is the same
-/// JSON either way.
+/// Healthz-reported follow-wedge tripwire on `node`.
 async fn follow_wedged(node: &str) -> bool {
-    exec(node, "curl -s localhost:9702/healthz")
-        .await
-        .map(|body| body.contains("\"follow_wedged\":true"))
+    healthz(node).await["follow_wedged"]
+        .as_bool()
         .unwrap_or(false)
 }
 
@@ -1563,9 +1563,7 @@ async fn all_reachable(node: &str) -> Option<bool> {
     let out = exec_pg(node, "pg_agentctl cluster status --json || true")
         .await
         .ok()?;
-    out.split("\"all_reachable\":")
-        .nth(1)
-        .map(|s| s.trim_start().starts_with("true"))
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["all_reachable"].as_bool()
 }
 
 async fn g14(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
@@ -1890,6 +1888,116 @@ async fn g17(cx: &mut Ctx, prim: &'static str) {
         },
     )
     .await;
+}
+
+/// The `pause_status` line from a node's own `cluster status`.
+async fn pause_status(node: &str) -> String {
+    let out = exec_pg(node, "pg_agentctl cluster status --json || true")
+        .await
+        .unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| v["pause_status"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+async fn g18(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str, Cursor>) {
+    cx.say("G18: maintenance mode — pause suspends failover, resume restores it");
+    // The pause flag has existed in the consensus state machine since
+    // the lease landed, and the loop has always honored it — but until
+    // `cluster pause` shipped, nothing could set it, so HaDecision
+    // ::Paused had never once executed. This scenario is the proof that
+    // the feature is real: pause on one node, observe it on ANOTHER
+    // (it is replicated, not local), kill the primary, and watch the
+    // cluster deliberately NOT fail over — which is the hazard the
+    // command's own help text warns about, asserted rather than
+    // described. Then resume, and the failover it was holding back
+    // happens.
+    let observer = other_node(prim);
+    let since = cx.log.cursor();
+    let out = exec_pg(
+        prim,
+        "pg_agentctl cluster pause --reason 'acceptance G18 maintenance window'",
+    )
+    .await
+    .unwrap_or_else(|e| e.to_string());
+    cx.check(
+        "cluster pause accepted",
+        out.contains("Automatic failover is OFF"),
+    );
+    // Replicated, not local: the node that did NOT issue it must see it.
+    cx.wait_until(
+        30,
+        &format!("{observer} sees the pause (it is cluster state, not a local flag)"),
+        || async move { pause_status(observer).await.contains("PAUSED") },
+    )
+    .await;
+    cx.check(
+        "the pause records its reason for whoever finds it later",
+        pause_status(observer).await.contains("acceptance G18"),
+    );
+    cx.await_event(
+        30,
+        "the HA loop reports Paused (a decision that had never run before)",
+        since,
+        |ev| agent_any(ev, "decision=Paused"),
+    )
+    .await;
+    // The hazard, made real: kill the primary while paused.
+    let killed = cx.log.cursor();
+    let _ = exec(prim, "systemctl stop postgresql@17-main").await;
+    tokio::time::sleep(Duration::from_secs(15)).await; // 1.5x leader_ttl
+    cx.check_absent(
+        "paused: no takeover while the primary is down",
+        killed,
+        |ev| agent_any(ev, "TookOver"),
+    );
+    cx.check_absent(
+        "paused: no promotion while the primary is down",
+        killed,
+        |ev| agent_any(ev, "roleexec: promotion complete"),
+    );
+    cx.check(
+        "paused: the cluster really is without a primary (the documented cost)",
+        cx.pg.count_primaries().await == 0,
+    );
+    // Resume: the held-back failover proceeds on its own.
+    let resumed = cx.log.cursor();
+    let out = exec_pg(observer, "pg_agentctl cluster resume")
+        .await
+        .unwrap_or_else(|e| e.to_string());
+    cx.check("cluster resume accepted", out.contains("resumed"));
+    let winner_ev = cx
+        .await_event(
+            90,
+            "the failover pause was holding back completes on resume",
+            resumed,
+            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+        )
+        .await;
+    let w: &'static str = match winner_ev {
+        Some(ev) => {
+            cx.pass(&format!("winner: {}", ev.node));
+            ev.node
+        }
+        None => {
+            cx.fail("no winner after resume");
+            other_node(prim)
+        }
+    };
+    cx.wait_until(
+        30,
+        &format!("{w}: pause cleared everywhere"),
+        || async move { pause_status(w).await.is_empty() },
+    )
+    .await;
+    cluster_recover(cx, w, prim).await;
+    marks.insert(prim, cx.log.cursor());
+    repair_standbys(cx, w, "g18", marks).await;
+    cx.check(
+        "exactly one primary after the maintenance window",
+        cx.pg.count_primaries().await == 1,
+    );
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —

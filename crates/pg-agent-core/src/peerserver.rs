@@ -40,8 +40,8 @@ use pg_agent_proto::pgagentpb::{
     pg_agent_raft_server::PgAgentRaftServer,
     AttachNodeRequest, BasebackupRequest, ConfigureStandbyRequest, CreateSlotRequest,
     DropSlotRequest, FetchWalRequest, GetStatusRequest, NodeConfigRequest, NodeConfigResponse,
-    NodeStatus, OpProgress, OpResult, PromoteRequest, ReloadPgpoolRequest, ReloadRequest,
-    RemoveVipRequest, RewindRequest, StartPgpoolRequest, StartRequest, StopRequest, WalChunk,
+    NodeStatus, OpProgress, OpResult, PromoteRequest, RewindRequest, StartPgpoolRequest,
+    StartRequest, StopRequest, WalChunk,
 };
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -456,24 +456,6 @@ impl PgAgentPeer for PeerServer {
         Ok(Response::new(ok()))
     }
 
-    async fn reload(&self, _req: Request<ReloadRequest>) -> Result<Response<OpResult>, Status> {
-        info!("peer: Reload");
-        self.sd
-            .reload_or_restart_postgres()
-            .await
-            .map_err(internal)?;
-        Ok(Response::new(ok()))
-    }
-
-    async fn reload_pgpool(
-        &self,
-        _req: Request<ReloadPgpoolRequest>,
-    ) -> Result<Response<OpResult>, Status> {
-        info!("peer: ReloadPgpool");
-        self.sd.reload_or_restart_pgpool().await.map_err(internal)?;
-        Ok(Response::new(ok()))
-    }
-
     async fn start_pgpool(
         &self,
         _req: Request<StartPgpoolRequest>,
@@ -641,29 +623,6 @@ impl PgAgentPeer for PeerServer {
             .await
             .map_err(internal)?;
         Ok(Response::new(ok()))
-    }
-
-    // ----- network ------------------------------------------------------
-
-    /// Intentionally Unimplemented. This deployment uses HAProxy in front
-    /// of pgpool; there is no VIP to remove. Returning a deliberate
-    /// `Unimplemented` (instead of silent ok=true) prevents callers from
-    /// drifting into relying on non-existent VIP behaviour. The RPC stays
-    /// in the proto for forward compatibility if a VIP-managing
-    /// deployment is ever added.
-    async fn remove_vip(
-        &self,
-        req: Request<RemoveVipRequest>,
-    ) -> Result<Response<OpResult>, Status> {
-        let req = req.into_inner();
-        warn!(
-            address = %req.address,
-            device = %req.device,
-            "peer: RemoveVip rejected (HAProxy deployment has no VIP)"
-        );
-        Err(Status::unimplemented(
-            "RemoveVip not implemented: this deployment uses HAProxy, not VIP management",
-        ))
     }
 
     // ----- streaming: subprocess-backed ----------------------------------
@@ -1070,10 +1029,6 @@ mod tests {
             self.reload_pg_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
-            self.reload_pgpool_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
     }
 
     #[derive(Default)]
@@ -1322,24 +1277,6 @@ mod tests {
         let (s, sd, ..) = make_server();
         s.stop(Request::new(StopRequest::default())).await.unwrap();
         assert_eq!(sd.stop_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn reload_calls_systemd_pg() {
-        let (s, sd, ..) = make_server();
-        s.reload(Request::new(ReloadRequest::default()))
-            .await
-            .unwrap();
-        assert_eq!(sd.reload_pg_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn reload_pgpool_calls_systemd_pgpool() {
-        let (s, sd, ..) = make_server();
-        s.reload_pgpool(Request::new(ReloadPgpoolRequest::default()))
-            .await
-            .unwrap();
-        assert_eq!(sd.reload_pgpool_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1626,22 +1563,6 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    // ----- remove_vip is deliberately unimplemented ----------------------
-
-    #[tokio::test]
-    async fn remove_vip_returns_unimplemented() {
-        let (s, ..) = make_server();
-        let err = s
-            .remove_vip(Request::new(RemoveVipRequest {
-                address: "10.0.0.1".into(),
-                device: "eth0".into(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert!(err.message().contains("HAProxy"));
-    }
-
     // ----- streaming: basebackup -----------------------------------------
 
     fn valid_basebackup_req() -> BasebackupRequest {
@@ -1718,9 +1639,6 @@ mod tests {
                 Ok(true)
             }
             async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
-                Ok(())
-            }
-            async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
                 Ok(())
             }
         }

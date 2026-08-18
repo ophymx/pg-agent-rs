@@ -185,9 +185,30 @@ enum ClusterCmd {
         #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
-    // v1.x roadmap items (placeholders so the surface is reserved):
-    // Pause      — set cluster paused=true via shared-state RPC
-    // Resume     — clear pause flag
+    /// Suspend AUTOMATIC role decisions cluster-wide for planned work.
+    /// The loop keeps observing and logging; it stops acting — no
+    /// takeover, no fence, no re-point — on every member, until
+    /// `cluster resume`. Replicated through consensus, so it survives
+    /// agent restarts.
+    ///
+    /// This does NOT stop PostgreSQL or touch replication, and it does
+    /// not protect a primary that dies while paused: nothing will
+    /// promote in its place until you resume. `cluster status` shows
+    /// the pause.
+    Pause {
+        /// Why — recorded in consensus and shown by `cluster status`.
+        /// Required: the next person to find a cluster that is not
+        /// failing over needs to know whether that was deliberate.
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
+    /// Resume automatic role decisions after `cluster pause`.
+    Resume {
+        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -244,6 +265,19 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             } => cluster_handoff(config, target, allow_lag, cli.socket.as_deref(), cli.json).await,
             ClusterCmd::AllowAsync { confirm, config } => {
                 cluster_allow_async(config, confirm, cli.socket.as_deref(), cli.json).await
+            }
+            ClusterCmd::Pause { reason, config } => {
+                cluster_set_pause(config, true, reason, cli.socket.as_deref(), cli.json).await
+            }
+            ClusterCmd::Resume { config } => {
+                cluster_set_pause(
+                    config,
+                    false,
+                    String::new(),
+                    cli.socket.as_deref(),
+                    cli.json,
+                )
+                .await
             }
         },
     }
@@ -371,10 +405,16 @@ async fn cluster_status(
     if json {
         let payload = serde_json::json!({
             "all_reachable": resp.all_reachable,
+            "pause_status": resp.pause_status,
             "nodes": rows.iter().map(status_row_to_json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
+        // Above the table, not below it: a paused cluster explains
+        // everything else on the screen.
+        if !resp.pause_status.is_empty() {
+            println!("maintenance mode: {}", resp.pause_status);
+        }
         print_status_table(&rows, &mut std::io::stdout())?;
     }
 
@@ -438,6 +478,44 @@ async fn cluster_recover(
 /// daemon resolves the local node as the current primary and refuses
 /// if it's a standby. Same wire shape as `cluster recover` — JSON or
 /// human-readable output, exit code reflects `resp.ok`.
+/// `cluster pause` / `cluster resume` — one RPC, two verbs, because
+/// they are the same replicated flag and splitting them into separate
+/// handlers would let the two drift.
+async fn cluster_set_pause(
+    config_path: PathBuf,
+    paused: bool,
+    reason: String,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::SetPauseRequest;
+
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .set_pause(SetPauseRequest { paused, reason })
+        .await
+        .map_err(|s| rpc_failed("SetPause", s))?
+        .into_inner();
+    if json {
+        let payload = serde_json::json!({ "ok": resp.ok, "message": resp.message });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if resp.ok {
+        println!("OK: {}", resp.message);
+    } else {
+        eprintln!(
+            "cluster {}: {}",
+            if paused { "pause" } else { "resume" },
+            resp.message
+        );
+    }
+    if resp.ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
 async fn cluster_allow_async(
     config_path: PathBuf,
     confirm: bool,

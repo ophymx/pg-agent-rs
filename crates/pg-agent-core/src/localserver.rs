@@ -45,7 +45,7 @@ use pg_agent_proto::pgagentpb::{
     ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
     NodeConfigResponse, NodeRef, NodeStatus, OpResult, PgpoolBackendEntry, RecoveryRequest,
     RemoteStartRequest, RestoreWalRequest, ResumeInflightOpRequest, RetryMaintenanceRequest,
-    SkippedInflightOp as ProtoSkippedInflightOp, SkippedMaintenanceIntent,
+    SetPauseRequest, SkippedInflightOp as ProtoSkippedInflightOp, SkippedMaintenanceIntent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -60,6 +60,11 @@ use tracing::{debug, info, warn};
 /// partitioned peer wedging the entire fan-out. A WAL segment is 16 MiB,
 /// so 30 s is wide slack for handshake + transfer on a healthy LAN while
 /// still letting an unresponsive peer fail fast.
+/// Budget for the pause-state read inside `cluster status`. Short on
+/// purpose: the status command must stay answerable on a node that has
+/// lost quorum, which is when an operator most needs it.
+const PAUSE_READ_BUDGET: Duration = Duration::from_secs(2);
+
 const RESTORE_WAL_PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// After a peer times out (or errors) on FetchWal, skip it for this
@@ -197,9 +202,7 @@ pub struct LocalServer {
     /// See [`crate::inflight_ops`] for the contract. Consumed by
     /// `cluster_handoff` (single-flight gate + phase journal) and by
     /// the failover handler (cross-op consult before mutating cluster
-    /// state). Currently unused in this commit; wired through for
-    /// upcoming `cluster_handoff` refactor.
-    #[allow(dead_code)]
+    /// state).
     inflight: Arc<dyn crate::inflight_ops::InflightOpStore>,
     pcp: Arc<dyn Pcp>,
     /// Local systemd. `cluster_handoff` is the first handler that needs
@@ -1835,6 +1838,71 @@ impl PgAgentLocal for LocalServer {
         }))
     }
 
+    /// Maintenance mode, cluster-wide and replicated (see
+    /// `SetPauseRequest`). Any member may issue it: the flag lives in
+    /// consensus, not in the local loop, because pausing one node's
+    /// decisions would leave its peers free to depose it — which is the
+    /// opposite of what an operator asking for quiet wants.
+    ///
+    /// Requires consensus. Without it there is no cluster-wide anything
+    /// to pause, and quietly succeeding would hand back a promise this
+    /// node cannot keep.
+    async fn set_pause(&self, req: Request<SetPauseRequest>) -> Result<Response<OpResult>, Status> {
+        let req = req.into_inner();
+        // Validate the request before asking whether we could act on
+        // it: a pause with no reason is malformed wherever it lands.
+        if req.paused && req.reason.trim().is_empty() {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: "pause requires --reason: the next person to look at a cluster \
+                          that is not failing over needs to know why"
+                    .into(),
+            }));
+        }
+        let Some(rt) = &self.raft else {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: "pause requires consensus ([raft] enabled = true); without it \
+                          there is no cluster-wide decision loop to suspend"
+                    .into(),
+            }));
+        };
+        let local_id = self.node_pool.local_node_id;
+        let paused = req.paused.then(|| crate::consensus::Paused {
+            reason: req.reason.trim().to_string(),
+            // The honest identity available over a unix socket: which
+            // node the command was issued on. There is no operator cert
+            // to read here.
+            set_by: format!("node{local_id}"),
+            at: chrono::Utc::now(),
+        });
+        rt.store
+            .set_paused(paused.clone())
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("set_pause: {e}")))?;
+        let message = match &paused {
+            Some(p) => {
+                warn!(
+                    reason = %p.reason,
+                    set_by = %p.set_by,
+                    "cluster PAUSED — automatic role decisions suspended cluster-wide. \
+                     No takeover, no fence, no re-point until `cluster resume`; a primary \
+                     that dies now stays dead until an operator acts"
+                );
+                format!(
+                    "cluster paused ({}). Automatic failover is OFF until \
+                     `pg_agentctl cluster resume`.",
+                    p.reason
+                )
+            }
+            None => {
+                info!("cluster RESUMED — automatic role decisions live again");
+                "cluster resumed; automatic role decisions are live again".to_string()
+            }
+        };
+        Ok(Response::new(OpResult { ok: true, message }))
+    }
+
     async fn resume_inflight_op(
         &self,
         req: Request<ResumeInflightOpRequest>,
@@ -2002,9 +2070,38 @@ impl PgAgentLocal for LocalServer {
         }
         entries.sort_by_key(|e| e.node_id);
 
+        // Maintenance mode, if consensus can tell us. Bounded: this is
+        // a linearizable read, and a node that has lost quorum is
+        // exactly the node an operator is most likely to be running
+        // `cluster status` on. Unknown is reported as unknown — a
+        // cluster that is not failing over because it is PAUSED and one
+        // that is not failing over because it cannot reach quorum are
+        // different emergencies.
+        let pause_status = match &self.raft {
+            None => String::new(),
+            Some(rt) => {
+                match tokio::time::timeout(PAUSE_READ_BUDGET, rt.store.read_state()).await {
+                    Ok(Ok(state)) => match state.paused {
+                        Some(p) => format!(
+                            "PAUSED: {} (set by {} at {})",
+                            p.reason,
+                            p.set_by,
+                            p.at.to_rfc3339()
+                        ),
+                        None => String::new(),
+                    },
+                    Ok(Err(e)) => format!("unknown (consensus read failed: {e})"),
+                    Err(_) => format!(
+                        "unknown (consensus read did not answer within {PAUSE_READ_BUDGET:?})"
+                    ),
+                }
+            }
+        };
+
         Ok(Response::new(ClusterStatusResponse {
             all_reachable,
             nodes: entries,
+            pause_status,
         }))
     }
 
@@ -4131,9 +4228,6 @@ mod tests {
             Ok(true)
         }
         async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -7524,5 +7618,81 @@ mod tests {
             "got: {}",
             resp.message
         );
+    }
+
+    // ----- pause / resume -------------------------------------------------
+
+    /// A pause with no reason is malformed wherever it lands — the
+    /// check runs before the consensus check for exactly that reason.
+    #[tokio::test]
+    async fn pause_requires_a_reason() {
+        let (s, ..) = make_server();
+        let resp = s
+            .set_pause(Request::new(SetPauseRequest {
+                paused: true,
+                reason: "   ".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("--reason"), "got: {}", resp.message);
+    }
+
+    /// Without consensus there is no cluster-wide loop to suspend, and
+    /// answering ok=true would hand back a promise this node cannot
+    /// keep — an operator would go do maintenance believing failover
+    /// was off.
+    #[tokio::test]
+    async fn pause_refuses_without_consensus() {
+        let (s, ..) = make_server();
+        let resp = s
+            .set_pause(Request::new(SetPauseRequest {
+                paused: true,
+                reason: "planned switch upgrade".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("requires consensus"),
+            "got: {}",
+            resp.message
+        );
+    }
+
+    /// Resume carries no reason and must not be rejected for lacking
+    /// one; it still needs consensus to reach the flag.
+    #[tokio::test]
+    async fn resume_needs_no_reason_but_still_needs_consensus() {
+        let (s, ..) = make_server();
+        let resp = s
+            .set_pause(Request::new(SetPauseRequest {
+                paused: false,
+                reason: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("requires consensus"),
+            "got: {}",
+            resp.message
+        );
+    }
+
+    /// Without consensus the status line is empty rather than a
+    /// confident "not paused" — the daemon reports what it knows.
+    #[tokio::test]
+    async fn cluster_status_pause_line_is_empty_without_consensus() {
+        let (s, ..) = make_server();
+        let resp = s
+            .cluster_status(Request::new(ClusterStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.pause_status.is_empty());
     }
 }

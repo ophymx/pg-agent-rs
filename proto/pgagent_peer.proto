@@ -16,8 +16,6 @@ import "common.proto";
 
 message StartRequest {}
 message StopRequest {}
-message ReloadRequest {}
-message ReloadPgpoolRequest {}
 message StartPgpoolRequest {}
 
 message AttachNodeRequest {
@@ -60,16 +58,9 @@ message WalChunk {
   bytes data = 1;
 }
 
-message RemoveVipRequest {
-  string address = 1;
-  string device  = 2;
-}
-
 service PgAgentPeer {
   rpc Start            (StartRequest)            returns (OpResult);
   rpc Stop             (StopRequest)             returns (OpResult);
-  rpc Reload           (ReloadRequest)           returns (OpResult);
-  rpc ReloadPgpool     (ReloadPgpoolRequest)     returns (OpResult);
   // StartUnit on the peer's pgpool2.service. Used by `cluster_recover`
   // after recovery_first_stage to bring pgpool back up on the freshly
   // re-cloned target. Idempotent — starting an already-active unit is
@@ -91,7 +82,6 @@ service PgAgentPeer {
   rpc Basebackup       (BasebackupRequest)       returns (stream OpProgress);
   rpc Rewind           (RewindRequest)           returns (stream OpProgress);
   rpc FetchWal         (FetchWalRequest)         returns (stream WalChunk);
-  rpc RemoveVip        (RemoveVipRequest)        returns (OpResult);
   rpc GetStatus        (GetStatusRequest)        returns (NodeStatus);
   rpc GetNodeConfig    (NodeConfigRequest)       returns (NodeConfigResponse);
 }

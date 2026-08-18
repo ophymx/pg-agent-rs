@@ -63,8 +63,9 @@ phantom_check_required_peers = 0
 pgpool = false
 
 # EXECUTE MODE FROM FIRST BOOT - the greenfield deployment shape the
-# suite validates. This is the only supported shape: the pgpool-led
-# path (shadow on / enabled off) is deleted.
+# suite validates, and now the only shape there is: `enabled` alone
+# selects it, since the pgpool-led path and the log-only shadow mode
+# are both deleted.
 #
 # Test-friendly timing. Invariants:
 # leader_ttl >= loop_wait + 2*retry_timeout (10 >= 1+4);
@@ -79,7 +80,6 @@ pgpool = false
 # window.
 [raft]
 enabled             = true
-shadow              = false
 loop_wait_secs      = 1
 retry_timeout_secs  = 2
 leader_ttl_secs     = 10

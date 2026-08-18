@@ -144,14 +144,13 @@ pub trait PeerClient: Send + Sync {
     /// to promote the chosen new main after the primary goes down.
     async fn promote(&self) -> anyhow::Result<()>;
 
-    // Deliberately absent: the `Reload`, `ReloadPgpool`, and
-    // `RemoveVip` RPCs are reserved in pgagent_peer.proto for forward
-    // compatibility but not called by any v1 workflow:
-    //   - Reload / ReloadPgpool: every config reload in v1 is local
-    //     (systemd reload + SIGHUP on the node whose config changed).
-    //   - RemoveVip: SPEC §18 — HAProxy fronts the cluster; no VIP to
-    //     manage. (Future watchdog `delegate_IP` support tracked in
-    //     ROADMAP exploratory.)
+    // The `Reload`, `ReloadPgpool` and `RemoveVip` peer RPCs used to be
+    // listed here as deliberately-unimplemented client methods. They
+    // are gone from the proto entirely now: every config reload in this
+    // design is local to the node whose config changed, and HAProxy
+    // fronts the cluster so there is no VIP to manage. A reserved RPC
+    // with a server handler and no caller is a surface that has to be
+    // maintained, tested, and reasoned about while doing nothing.
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +197,11 @@ pub const FETCH_WAL_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// the daemon's preflight rejects mixed remote-peer + no-TLS configs).
 pub struct PeerPool {
     agent_port: u16,
-    cert_reloader: Option<Arc<CertReloader>>,
+    // No `cert_reloader` field: `build_client_config` consumes the
+    // reloader at construction and the resolver it builds holds its own
+    // handle, so hot-reload lives inside `tls_config`. The field was
+    // stored, never read, and kept alive by a test whose only purpose
+    // was to keep it from being flagged.
     /// Snapshot of the rustls `ClientConfig` for mTLS dials. `None` in
     /// dev (plain TCP). Captured at construction time; SIGHUP refreshes
     /// the *client cert* via the embedded `ReloadingClientCertResolver`,
@@ -226,7 +229,6 @@ impl PeerPool {
         let cfg = build_client_config(&reloader);
         Ok(Arc::new(Self {
             agent_port,
-            cert_reloader: Some(reloader),
             tls_config: Some(cfg),
             channels: Mutex::new(HashMap::new()),
             max_age: MAX_CONNECTION_AGE,
@@ -240,7 +242,6 @@ impl PeerPool {
     pub fn new_dev(agent_port: u16) -> Arc<Self> {
         Arc::new(Self {
             agent_port,
-            cert_reloader: None,
             tls_config: None,
             channels: Mutex::new(HashMap::new()),
             max_age: MAX_CONNECTION_AGE,
@@ -253,7 +254,6 @@ impl PeerPool {
     fn with_max_age(self: &Arc<Self>, max_age: Duration) -> Arc<Self> {
         Arc::new(Self {
             agent_port: self.agent_port,
-            cert_reloader: self.cert_reloader.clone(),
             tls_config: self.tls_config.clone(),
             channels: Mutex::new(HashMap::new()),
             max_age,
@@ -932,9 +932,6 @@ mod tests {
         async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
     }
 
     struct NoOpPcp;
@@ -1299,12 +1296,5 @@ mod tests {
             !Arc::ptr_eq(&c1, &c2),
             "a poisoned entry must be redialed, not served from cache"
         );
-    }
-
-    // Compile-time check: `cert_reloader` field is still in scope even if
-    // future paths stop reading it. Sink the warning explicitly.
-    #[allow(dead_code)]
-    fn _assert_field_kept(p: &PeerPool) -> Option<&Arc<CertReloader>> {
-        p.cert_reloader.as_ref()
     }
 }

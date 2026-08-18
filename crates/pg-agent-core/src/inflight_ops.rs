@@ -52,8 +52,6 @@
 //! orchestration must surface to `pg_agentctl ops list` so an operator
 //! can resume or abandon it.
 
-use crate::config::NodePool;
-use crate::peers::PeerRegistry;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -61,12 +59,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-
-#[allow(unused)]
-// currently unused; reserved for future variants that consult cluster topology.
-use NodePool as _;
-#[allow(unused)] // ditto for cross-peer probes (e.g. switchover verifying remote state).
-use PeerRegistry as _;
 
 /// 7 days. Longer than [`crate::replay_markers::DEFAULT_RETENTION`]
 /// because in-flight ops are rare, and operators often want incident

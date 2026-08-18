@@ -95,7 +95,11 @@ pub trait Systemd: Send + Sync {
 
     /// ReloadOrRestart — starts the unit if not running.
     async fn reload_or_restart_postgres(&self) -> anyhow::Result<()>;
-    async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()>;
+    // No `reload_or_restart_pgpool`: its only caller was the peer
+    // `ReloadPgpool` RPC, which nothing ever dialed (every config
+    // reload in this design is local to the node whose config
+    // changed). The supervisor starts pgpool; nothing reloads it
+    // remotely.
 }
 
 // ---------------------------------------------------------------------------
@@ -307,14 +311,6 @@ impl Systemd for DbusSystemd {
         self.run_unit_op("reload-or-restart", &self.pg_service, || {
             self.proxy
                 .reload_or_restart_unit(&self.pg_service, "replace")
-        })
-        .await
-    }
-
-    async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
-        self.run_unit_op("reload-or-restart", &self.pgpool_service, || {
-            self.proxy
-                .reload_or_restart_unit(&self.pgpool_service, "replace")
         })
         .await
     }

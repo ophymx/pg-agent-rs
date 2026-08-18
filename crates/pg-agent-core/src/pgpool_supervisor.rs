@@ -309,9 +309,6 @@ mod tests {
         async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn reload_or_restart_pgpool(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
     }
 
     fn supervisor(sd: Arc<FlipSd>) -> PgpoolSupervisor {

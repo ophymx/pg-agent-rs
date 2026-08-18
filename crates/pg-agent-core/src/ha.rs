@@ -85,7 +85,6 @@ pub struct HaTiming {
     pub loop_wait: Duration,
     pub retry_timeout: Duration,
     pub leader_ttl: Duration,
-    pub max_lag_on_failover: u64,
 }
 
 /// One tick's outcome. Exactly one per tick; the `run` loop logs them
@@ -1213,7 +1212,6 @@ mod tests {
             loop_wait: Duration::from_millis(10),
             retry_timeout: Duration::from_millis(20),
             leader_ttl: Duration::from_millis(50),
-            max_lag_on_failover: 1024,
         }
     }
 

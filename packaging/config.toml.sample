@@ -113,29 +113,16 @@ hostname = "pg3.example.com"
 
 
 # --- consensus / HA loop ----------------------------------------------
-# docs/promotion-authority.md §5. Off by default in every form: until
-# cutover, pgpool's failover_command remains the promotion authority and
-# this block changes nothing about who runs PostgreSQL.
+# docs/promotion-authority.md §5. Off by default: without it there is no
+# HA loop at all, and nothing here changes who runs PostgreSQL.
 #
-# Two independent switches:
+# One switch:
 #
-# shadow  = run the HA loop and log what it *would* decide, acting on
-#           nothing. Decisions log on the `ha_shadow` tracing target.
-# enabled = join the embedded Raft cluster: open <state_dir>/raft/,
-#           serve PgAgentRaft on the peer listener, and back the loop
-#           with the replicated state machine instead of a
-#           process-local one.
-#
-# They compose into the mode matrix:
-#   shadow=true,  enabled=false → decisions logged against a process-local
-#                                 store (validation only)
-#   shadow=true,  enabled=true  → decisions logged against the real Raft;
-#                                 nothing acts (the pre-cutover soak)
-#   shadow=false, enabled=true  → EXECUTE: decisions drive local
-#                                 PostgreSQL — promote on lease takeover,
-#                                 stop on lost lease/quorum, re-point
-#                                 standbys onto the holder
-#   shadow=false, enabled=false → no HA loop at all (default)
+# enabled = join the embedded Raft cluster (open <state_dir>/raft/, serve
+#           PgAgentRaft on the peer listener) AND let the HA loop's
+#           decisions act on local PostgreSQL — promote on lease
+#           takeover, stop on lost lease/quorum, re-point standbys onto
+#           the holder.
 #
 # A demoted node stays stopped: rejoining a fenced ex-primary is the
 # operator's call (`pg_agentctl cluster recover`), never automatic.
@@ -164,10 +151,8 @@ hostname = "pg3.example.com"
 # together and split the vote. The default is deliberately long, so an
 # Ansible rolling restart of the agents does not cascade into elections.
 # [raft]
-# shadow                 = false
 # enabled                = false
 # loop_wait_secs         = 10
 # retry_timeout_secs     = 10
 # leader_ttl_secs        = 30
 # election_timeout_ms    = 5000
-# max_lag_on_failover_bytes = 16777216

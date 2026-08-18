@@ -134,6 +134,23 @@ message GetInflightOpRequest {
 // a standby attaches. There is deliberately no permanent-async knob.
 message AllowAsyncRequest {}
 
+// Maintenance mode: suspend AUTOMATIC role decisions cluster-wide. The
+// HA loop keeps observing and logging, but takes no action — no
+// takeover, no fence, no re-point — until resumed. Replicated through
+// consensus, so it survives agent restarts and applies to every member,
+// which is the whole point: pausing one node's loop would leave the
+// others free to depose it.
+//
+// What pause does NOT do: it does not stop PostgreSQL, does not touch
+// replication, and does not protect a primary that dies while paused —
+// nothing will promote in its place until an operator resumes. It is
+// for planned work where automatic reaction is the hazard (rolling
+// maintenance, network surgery, a debugging session on a live cluster).
+message SetPauseRequest {
+  bool   paused = 1; // true = pause, false = resume
+  string reason = 2; // required when pausing; recorded for incident review
+}
+
 message AbandonInflightOpRequest {
   string id     = 1; // min_len 1
   string reason = 2; // free-form operator note; preserved in last_error
@@ -178,6 +195,12 @@ message ClusterStatusEntry {
 message ClusterStatusResponse {
   bool                        all_reachable = 1;
   repeated ClusterStatusEntry nodes         = 2;
+  // Human-readable maintenance-mode line. Empty means automatic role
+  // decisions are live. Otherwise it describes the pause, or says the
+  // pause state could not be read — an operator looking at a cluster
+  // that is not failing over needs to be told which of those it is,
+  // and "" for both would hide exactly the case worth seeing.
+  string                      pause_status  = 3;
 }
 
 message ClusterRecoverRequest {
@@ -274,4 +297,7 @@ service PgAgentLocal {
   // (emergency writes with no standby available). Journaled; auto
   // re-armed on the next standby attach. See AllowAsyncRequest.
   rpc AllowAsync (AllowAsyncRequest) returns (OpResult);
+
+  // Suspend / resume automatic role decisions cluster-wide.
+  rpc SetPause (SetPauseRequest) returns (OpResult);
 }
