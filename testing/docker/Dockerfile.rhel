@@ -1,0 +1,100 @@
+# Acceptance-test node image, RHEL family (Rocky Linux).
+#
+# Same contract as the Debian image: systemd as PID 1, the real .rpm,
+# the packaged unit + polkit rule + sd_notify path exercised exactly as
+# in production. What differs is everything about WHERE PostgreSQL
+# lives, which is the point of having this cell at all:
+#
+#            Debian family                  RHEL family
+#   unit     postgresql@17-main.service     postgresql-16.service
+#   data     /var/lib/postgresql/17/main    /var/lib/pgsql/16/data
+#   bins     /usr/lib/postgresql/17/bin     /usr/pgsql-16/bin
+#   config   /etc/postgresql/17/main/       inside PGDATA
+#   initdb   done by the package            explicit postgresql-NN-setup
+#   pgpool   pgpool2.service                pgpool.service
+#
+# PostgreSQL and pgpool both come from PGDG. Not a preference: RHEL's
+# AppStream ships PostgreSQL but NO pgpool-II (nor does EPEL), and this
+# agent coordinates pgpool — so PGDG is the only complete source, and
+# it is what RHEL deployments actually use.
+ARG BASE_IMAGE=rockylinux:9
+FROM ${BASE_IMAGE}
+
+ARG PG_VERSION=16
+ENV PG_VERSION=${PG_VERSION}
+
+# Distro facts, on disk. systemd hands its units a clean environment, so
+# the image's ENV never reaches the provisioning service — the same trap
+# that produced an empty `[[pool]]` on the Debian side. The harness also
+# reads this file (over docker exec) to learn which unit and paths this
+# cell uses, so there is exactly one place that knows the layout.
+RUN mkdir -p /etc/pg-agent-matrix && printf '%s\n' \
+    "PG_VERSION=${PG_VERSION}" \
+    "PG_FAMILY=rhel" \
+    "PG_UNIT=postgresql-${PG_VERSION}" \
+    "PGDATA=/var/lib/pgsql/${PG_VERSION}/data" \
+    "PG_BIN=/usr/pgsql-${PG_VERSION}/bin" \
+    "PGPOOL_UNIT=pgpool-II" \
+    "PGPOOL_CONF_DIR=/etc/pgpool-II" \
+    > /etc/pg-agent-matrix/env
+
+# PGDG repo. `repo_gpgcheck` is relaxed because PGDG's repomd signature
+# currently fails verification on EL9 ("Bad GPG signature") — package
+# signing (`gpgcheck=1`) is deliberately LEFT ON, so individual RPMs are
+# still verified; only the metadata signature is skipped. Note the
+# spaces around the `=` in the shipped file: a `^repo_gpgcheck=1` match
+# silently does nothing.
+RUN dnf -qy install \
+        https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm \
+    && sed -i "s/^repo_gpgcheck *= *1/repo_gpgcheck = 0/" /etc/yum.repos.d/pgdg-redhat-all.repo
+
+# Getting pgpool-II onto EL9 takes THREE repos beyond base, which is
+# worth stating plainly because none of it is discoverable from the
+# error messages:
+#   - PGDG           the only source of pgpool-II at all (above)
+#   - CRB            provides libmemcached-awesome, which is what now
+#                    Provides: libmemcached.so.11 — RHEL 9 moved it out
+#                    of base, and CRB is disabled by default
+#   - EPEL           general extras the above pull from
+# `curl` is deliberately absent from the install list: the base image
+# ships curl-minimal, which provides the binary and CONFLICTS with the
+# full curl package.
+RUN dnf -qy install "dnf-command(config-manager)" epel-release \
+    && dnf config-manager --set-enabled crb \
+    && dnf -qy install \
+        systemd polkit \
+        postgresql${PG_VERSION}-server postgresql${PG_VERSION}-contrib \
+        pgpool-II pgpool-II-pg${PG_VERSION}-extensions \
+        openssl procps-ng less iptables-nft \
+    && dnf clean all
+
+# pgpool must not start on its own — the suite's phase-2 scenarios bring
+# it up deliberately (BOOTSTRAP.md Phase 1.1). Masking pre-empts the
+# package's own preset.
+#
+# The unit is `pgpool-II.service` here, NOT `pgpool2.service` (Debian)
+# and not `pgpool.service`: masking a name the package does not ship
+# silently succeeds and leaves a phantom masked unit in the listing
+# while the real one stays enabled.
+RUN systemctl mask pgpool-II.service
+
+COPY pg-agent.rpm /tmp/pg-agent.rpm
+RUN dnf -qy install /tmp/pg-agent.rpm && rm /tmp/pg-agent.rpm && dnf clean all
+
+# Polkit rule granting the postgres user unit management. Same file as
+# the Debian image — it matches both families' unit names.
+COPY 50-pg-agent.rules /etc/polkit-1/rules.d/50-pg-agent.rules
+
+COPY provision.sh /usr/local/sbin/pg-agent-provision
+COPY pgpool-setup.sh /usr/local/sbin/pg-agent-pgpool-setup
+COPY provision.service /etc/systemd/system/pg-agent-provision.service
+RUN chmod 0755 /usr/local/sbin/pg-agent-provision /usr/local/sbin/pg-agent-pgpool-setup \
+    && systemctl enable pg-agent-provision.service \
+    # PostgreSQL never auto-starts: provisioning initdbs and starts the
+    # bootstrap primary only, and the agent's cold-start reconciliation
+    # owns it from then on (finding 21).
+    && systemctl disable postgresql-${PG_VERSION}.service \
+    && systemctl enable pg_agentd.service
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
