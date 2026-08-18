@@ -6,4 +6,9 @@
 /dist
 /docs/incidents/
 testing/.certs/
+# Build artifacts staged into the image build context by the harness.
+# Both, not just the .deb: the .rpm is the same 5-6 MB binary for the
+# RHEL cells, and a `git add -A` put one into history before this line
+# existed.
 testing/docker/pg-agent.deb
+testing/docker/pg-agent.rpm

@@ -15,8 +15,27 @@
 #     orthogonal to the failover behavior under test.
 set -euo pipefail
 
+# This cell's layout — see provision.sh and cluster::Facts. pgpool's
+# config directory and unit name are both family-specific
+# (/etc/pgpool2 + pgpool2.service on Debian, /etc/pgpool-II +
+# pgpool-II.service on RHEL); nothing else here is.
+# shellcheck disable=SC1091
+[ -r /etc/pg-agent-matrix/env ] && . /etc/pg-agent-matrix/env
+PG_VERSION="${PG_VERSION:-17}"
+PG_HOME="${PG_HOME:-/var/lib/postgresql}"
+PG_LOG="${PG_LOG:-/var/log/postgresql/postgresql-${PG_VERSION}-main.log}"
+PGPOOL_UNIT="${PGPOOL_UNIT:-pgpool2}"
+PGPOOL_CONF_DIR="${PGPOOL_CONF_DIR:-/etc/pgpool2}"
+
 PCP_PASSWORD="${PCP_PASSWORD:-pcpsecret}"
-CONF=/etc/pgpool2/pgpool.conf
+CONF="$PGPOOL_CONF_DIR/pgpool.conf"
+# Where pgpool keeps pgpool_status, and therefore the file the restart
+# below has to delete. Set EXPLICITLY rather than left to the package
+# default, which is one more thing the two families disagree about.
+LOGDIR="$(dirname "$PG_LOG")"
+
+mkdir -p "$PGPOOL_CONF_DIR"
+install -d -o postgres -g postgres "$LOGDIR"
 
 # --- base config -------------------------------------------------------
 cat > "$CONF" <<EOF
@@ -27,9 +46,26 @@ socket_dir = '/var/run/postgresql'
 pcp_listen_addresses = '*'
 pcp_port = 9898
 pcp_socket_dir = '/var/run/postgresql'
+# Explicit for the same reason as logdir: the compiled-in default is
+# /var/run/pgpool/pgpool.pid on RHEL and /var/run/postgresql on Debian,
+# and RHEL's directory comes from a tmpfiles.d entry that has not run
+# against this container's tmpfs /run — pgpool then exits 3 at startup
+# with "could not open pid file", on a loop, until systemd gives up.
+pid_file_name = '/var/run/postgresql/pgpool.pid'
+# pgpool 4.6 renamed this to work_dir and warns when it sees the old
+# name, but still honours it; Debian's 4.5 knows only `logdir`. The old
+# name is the one both understand.
+logdir = '${LOGDIR}'
 
 backend_clustering_mode = 'streaming_replication'
 enable_pool_hba = off
+# Empty = do not use a pool_passwd file at all, which is the honest
+# statement of this harness's auth deviation (trust everywhere, no
+# pg_enc/AES machinery). Left at its default, pgpool resolves the
+# relative name against its config directory and tries to CREATE
+# /etc/pgpool-II/pool_passwd as the postgres user — root-owned on RHEL,
+# so it exits 3 before serving anything.
+pool_passwd = ''
 log_destination = 'stderr'
 logging_collector = off
 log_min_messages = 'info'
@@ -88,11 +124,11 @@ EOF
 runuser -u postgres -- pg_agentctl gen-pgpool >> "$CONF"
 
 # --- PCP auth ----------------------------------------------------------
-printf 'pgpool:%s\n' "$(pg_md5 "$PCP_PASSWORD")" > /etc/pgpool2/pcp.conf
-chmod 0644 /etc/pgpool2/pcp.conf
-printf '*:9898:pgpool:%s\n' "$PCP_PASSWORD" > /var/lib/postgresql/.pcppass
-chown postgres:postgres /var/lib/postgresql/.pcppass
-chmod 0600 /var/lib/postgresql/.pcppass
+printf 'pgpool:%s\n' "$(pg_md5 "$PCP_PASSWORD")" > "$PGPOOL_CONF_DIR/pcp.conf"
+chmod 0644 "$PGPOOL_CONF_DIR/pcp.conf"
+printf '*:9898:pgpool:%s\n' "$PCP_PASSWORD" > "$PG_HOME/.pcppass"
+chown postgres:postgres "$PG_HOME/.pcppass"
+chmod 0600 "$PG_HOME/.pcppass"
 
 # --- start (BOOTSTRAP Phase 3.1) --------------------------------------
 # Discard any cached backend status: this is a config-changing restart,
@@ -103,12 +139,12 @@ chmod 0600 /var/lib/postgresql/.pcppass
 # stop phase — a freshly "cleared" instance then boots with the stale
 # backend states anyway (bit E3 on its first run: a mid-repair "down"
 # survived the rm and wedged the 3-backends-up wait).
-systemctl stop pgpool2.service 2>/dev/null || true
-rm -f /var/log/postgresql/pgpool_status
-systemctl unmask pgpool2.service
+systemctl stop "${PGPOOL_UNIT}.service" 2>/dev/null || true
+rm -f "$LOGDIR/pgpool_status"
+systemctl unmask "${PGPOOL_UNIT}.service"
 # Enabled, not just started: the router must come back on its own
 # after a node reboot (G10's site power blip) — pgpool is
 # systemd-managed in this deployment shape, not agent-managed.
-systemctl enable pgpool2.service
-systemctl start pgpool2.service
-echo "pgpool-setup: started on $(hostname)"
+systemctl enable "${PGPOOL_UNIT}.service"
+systemctl start "${PGPOOL_UNIT}.service"
+echo "pgpool-setup: started ${PGPOOL_UNIT} on $(hostname)"

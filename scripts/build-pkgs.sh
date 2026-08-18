@@ -1,5 +1,7 @@
 #!/bin/sh
-# Build the pg-agent-rs `.deb` and `.rpm` via nfpm.
+# Build the pg-agent-rs `.deb` and `.rpm` via cargo-deb and
+# cargo-generate-rpm. Package metadata lives in
+# crates/pg-agentd/Cargo.toml; see packaging/README.md.
 #
 # Usage:
 #   scripts/build-pkgs.sh              # both formats
@@ -8,18 +10,23 @@
 #   VERSION=1.2.3 scripts/build-pkgs.sh   # override version (default:
 #                                       # Cargo workspace version)
 #
-# Run from the repository root (it relies on relative paths). nfpm
-# resolves `src:` entries relative to its current working directory.
+# Run from the repository root (it relies on relative paths).
 
 set -eu
 
 cd "$(dirname "$0")/.."
 
-if ! command -v nfpm >/dev/null 2>&1; then
-    echo "error: nfpm not found in PATH" >&2
-    echo "       install with: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest" >&2
+# Check the tool for the format actually requested, so building just
+# the .deb does not demand the RPM packager. Checked at all because the
+# failure mode otherwise is a bare "command not found" for a cargo
+# subcommand, which reads like a broken toolchain rather than a missing
+# one-line install.
+need() {
+    command -v "$1" >/dev/null 2>&1 && return 0
+    echo "error: $1 not found in PATH" >&2
+    echo "       install with: cargo install $1" >&2
     exit 1
-fi
+}
 
 # Pick a version. CLI arg of "1.2.3-rc1" isn't supported here — set
 # VERSION as an env var instead.
@@ -59,10 +66,11 @@ cargo build --release --target "$TARGET"
 
 mkdir -p dist
 
-# Stage the built binaries where nfpm.yaml expects them. nfpm expands
-# env vars in `version` but not in `contents.src`, so the target triple
-# cannot be templated into the config — staging keeps the packaged
-# artifact honest about which build it came from.
+# Stage the built binaries at a FIXED path, because neither packager
+# expands environment variables in asset paths and cargo-deb resolves
+# them relative to the manifest — so the target triple cannot be
+# templated into the metadata. Staging keeps one build feeding both
+# packagers, and keeps the packaged artifact traceable to it.
 mkdir -p dist/staging
 for b in pg_agentd pg_agentc pg_agentctl; do
     cp -f "target/${TARGET}/release/${b}" "dist/staging/${b}"
@@ -70,6 +78,7 @@ done
 echo "==> staged $(file -b dist/staging/pg_agentd | cut -d, -f1-2)"
 
 build_deb() {
+    need cargo-deb
     out="dist/pg-agent-rs_${VERSION}_amd64.deb"
     # --no-build: the static musl build above IS the artifact. Letting
     # cargo-deb rebuild would produce a host-native dynamic binary —
@@ -79,6 +88,7 @@ build_deb() {
 }
 
 build_rpm() {
+    need cargo-generate-rpm
     out="dist/pg-agent-rs-${VERSION}-1.x86_64.rpm"
     echo "==> cargo generate-rpm → ${out}"
     cargo generate-rpm -p crates/pg-agentd --output "$out"

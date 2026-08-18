@@ -60,11 +60,25 @@ pub const DEFAULT_PG_SOCKET_DIR: &str = "/var/run/postgresql";
 pub const DEFAULT_PG_SERVICE: &str = "postgresql@17-main.service";
 pub const DEFAULT_PGPOOL_SERVICE: &str = "pgpool2.service";
 
-/// Default path pgpool writes its node id to on Debian. Used as the
+/// Paths pgpool writes its node id to, in probe order. Used as the
 /// implicit fallback by [`Config::resolve_local_node_id`] so the agent
 /// and pgpool share a single source of truth without the operator
 /// having to set `node_id_file` explicitly on every node.
-pub const DEFAULT_PGPOOL_NODE_ID_FILE: &str = "/etc/pgpool2/pgpool_node_id";
+///
+/// TWO paths because the config directory is the one pgpool location
+/// that differs by packaging family, and this file's whole purpose is
+/// to be the file *pgpool itself* reads: a single Debian-spelled
+/// constant meant that on RHEL the agent silently skipped the shared
+/// source and fell through to the hostname match — which happens to
+/// work in this test harness (hostnames are `db0`..`db2`) and would
+/// not on a host named anything else. The other family-specific paths
+/// (`data_dir`, `pg_install_prefix`, `service`) are config keys the
+/// operator sets; this one never was, so it had to learn both
+/// spellings.
+pub const DEFAULT_PGPOOL_NODE_ID_FILES: [&str; 2] = [
+    "/etc/pgpool2/pgpool_node_id",   // Debian, Ubuntu
+    "/etc/pgpool-II/pgpool_node_id", // RHEL family
+];
 
 // ---------------------------------------------------------------------------
 // Env var names
@@ -775,8 +789,9 @@ impl Config {
     ///
     /// 1. `node_id` field in `config.toml`
     /// 2. `node_id_file` field — file containing the integer
-    /// 3. `/etc/pgpool2/pgpool_node_id` if present — pgpool's own file,
-    ///    so a single Ansible step writes one file both tools read
+    /// 3. pgpool's own node-id file if present — so a single Ansible
+    ///    step writes one file both tools read. Both family spellings
+    ///    are probed ([`DEFAULT_PGPOOL_NODE_ID_FILES`])
     /// 4. Hostname fallback — `gethostname()` matched against `[[pool]].hostname`
     ///
     /// Sources 1 and 2 error if they point at an id not in the pool —
@@ -788,16 +803,17 @@ impl Config {
     ///
     /// Must be called **after** [`apply_defaults`](Self::apply_defaults).
     pub fn resolve_local_node_id(&mut self) -> Result<(), AgentError> {
-        self.resolve_local_node_id_with_pgpool_file(Path::new(DEFAULT_PGPOOL_NODE_ID_FILE))
+        let candidates: Vec<&Path> = DEFAULT_PGPOOL_NODE_ID_FILES.iter().map(Path::new).collect();
+        self.resolve_local_node_id_with_pgpool_files(&candidates)
     }
 
-    /// `resolve_local_node_id` with an overridable pgpool-file path.
-    /// Production always passes [`DEFAULT_PGPOOL_NODE_ID_FILE`]; tests
+    /// `resolve_local_node_id` with overridable pgpool-file paths.
+    /// Production always passes [`DEFAULT_PGPOOL_NODE_ID_FILES`]; tests
     /// drive synthetic tmpdir paths through this entry point so the
     /// step-3 probe is deterministic in any environment.
-    pub fn resolve_local_node_id_with_pgpool_file(
+    pub fn resolve_local_node_id_with_pgpool_files(
         &mut self,
-        pgpool_file: &Path,
+        pgpool_files: &[&Path],
     ) -> Result<(), AgentError> {
         self.local_node_id = -1;
 
@@ -815,13 +831,17 @@ impl Config {
         // 3. pgpool's own pgpool_node_id file — share a single source
         //    of truth between pg_agent and pgpool. Ansible writes this
         //    file once per node; both tools read from it. Missing →
-        //    fall through to hostname match; present-but-broken →
-        //    surface to the operator.
-        if let Some(id) = try_read_node_id_file(pgpool_file)? {
-            return self.set_local_node_by_id(
-                id,
-                &format!("pgpool_node_id file {}", pgpool_file.display()),
-            );
+        //    try the next family's spelling, then fall through to the
+        //    hostname match; present-but-broken → surface to the
+        //    operator rather than silently trying the other path, since
+        //    an unparseable file is a mistake worth seeing.
+        for pgpool_file in pgpool_files {
+            if let Some(id) = try_read_node_id_file(pgpool_file)? {
+                return self.set_local_node_by_id(
+                    id,
+                    &format!("pgpool_node_id file {}", pgpool_file.display()),
+                );
+            }
         }
 
         // 4. Hostname fallback. Errors here are non-fatal — validate()
@@ -1166,9 +1186,50 @@ mod tests {
         std::fs::write(&pgpool_file, "1\n").unwrap();
 
         let mut cfg = pool_cfg(&[(0, "primary"), (1, "standby")]);
-        cfg.resolve_local_node_id_with_pgpool_file(&pgpool_file)
+        cfg.resolve_local_node_id_with_pgpool_files(&[pgpool_file.as_path()])
             .unwrap();
         assert_eq!(cfg.local_node_id, 1);
+    }
+
+    /// Finding 28: the RHEL spelling must be probed too, and NOT be
+    /// masked by the Debian one being absent. The bug this guards is
+    /// silent — with only the Debian path probed, resolution fell
+    /// through to the hostname match, which answers correctly often
+    /// enough that a green test run proves nothing. So the pool here
+    /// deliberately contains NO entry matching this host: if the
+    /// second candidate is not read, nothing else can supply an id and
+    /// `local_node_id` stays -1.
+    #[test]
+    fn resolve_node_id_probes_the_second_family_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let debian = tmp.path().join("etc-pgpool2").join("pgpool_node_id");
+        let rhel = tmp.path().join("etc-pgpool-II");
+        std::fs::create_dir_all(&rhel).unwrap();
+        let rhel = rhel.join("pgpool_node_id");
+        std::fs::write(&rhel, "2\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "nowhere-0"), (1, "nowhere-1"), (2, "nowhere-2")]);
+        cfg.resolve_local_node_id_with_pgpool_files(&[debian.as_path(), rhel.as_path()])
+            .unwrap();
+        assert_eq!(cfg.local_node_id, 2, "second candidate should be read");
+    }
+
+    /// The first candidate wins when both exist — probe ORDER is part
+    /// of the contract, not an implementation detail, since a host
+    /// carrying both files (a migration, a leftover) must resolve the
+    /// same way every boot.
+    #[test]
+    fn resolve_node_id_prefers_the_first_pgpool_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::write(&first, "0\n").unwrap();
+        std::fs::write(&second, "1\n").unwrap();
+
+        let mut cfg = pool_cfg(&[(0, "nowhere-0"), (1, "nowhere-1")]);
+        cfg.resolve_local_node_id_with_pgpool_files(&[first.as_path(), second.as_path()])
+            .unwrap();
+        assert_eq!(cfg.local_node_id, 0);
     }
 
     #[test]
@@ -1182,7 +1243,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let mut cfg = pool_cfg(&[(0, &host), (1, "other")]);
-        cfg.resolve_local_node_id_with_pgpool_file(&missing)
+        cfg.resolve_local_node_id_with_pgpool_files(&[missing.as_path()])
             .unwrap();
         assert_eq!(cfg.local_node_id, 0, "hostname fallback should fire");
     }
@@ -1195,7 +1256,7 @@ mod tests {
 
         let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
         let err = cfg
-            .resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .resolve_local_node_id_with_pgpool_files(&[pgpool_file.as_path()])
             .unwrap_err();
         assert!(
             matches!(err, AgentError::NodeIdFile { ref message, .. } if message.starts_with("parse:")),
@@ -1211,7 +1272,7 @@ mod tests {
 
         let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
         let err = cfg
-            .resolve_local_node_id_with_pgpool_file(&pgpool_file)
+            .resolve_local_node_id_with_pgpool_files(&[pgpool_file.as_path()])
             .unwrap_err();
         assert!(
             matches!(err, AgentError::LocalNodeMissingFromPool { id: 99, .. }),
@@ -1227,7 +1288,7 @@ mod tests {
 
         let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
         cfg.node_id = Some(0);
-        cfg.resolve_local_node_id_with_pgpool_file(&pgpool_file)
+        cfg.resolve_local_node_id_with_pgpool_files(&[pgpool_file.as_path()])
             .unwrap();
         assert_eq!(cfg.local_node_id, 0, "explicit node_id should win");
     }
@@ -1242,7 +1303,7 @@ mod tests {
 
         let mut cfg = pool_cfg(&[(0, "a"), (1, "b")]);
         cfg.node_id_file = Some(custom_file);
-        cfg.resolve_local_node_id_with_pgpool_file(&pgpool_file)
+        cfg.resolve_local_node_id_with_pgpool_files(&[pgpool_file.as_path()])
             .unwrap();
         assert_eq!(cfg.local_node_id, 0);
     }

@@ -74,6 +74,24 @@ impl Ctx {
         println!("   {RED}FAIL{RESET} {desc}");
     }
 
+    /// True once a failure has been recorded and `FAIL_FAST` is set.
+    ///
+    /// For bringing a NEW matrix cell up. The suite is deliberately
+    /// cumulative — later scenarios inherit the cluster earlier ones
+    /// shaped — so on a cell where provisioning is still wrong, every
+    /// scenario after the first failure is reporting on a cluster that
+    /// never reached its starting state, at ~11 minutes a run for
+    /// findings that are all the same finding. Checked BETWEEN
+    /// scenarios rather than inside them: a half-run scenario leaves
+    /// the cluster in a state nobody can reason about, and the point
+    /// is to leave it exactly where it broke.
+    ///
+    /// Off by default. A normal run wants the full tally, including
+    /// which LATER things a failure knocked over.
+    pub fn stop_early(&self) -> bool {
+        !self.failures.is_empty() && std::env::var_os("FAIL_FAST").is_some()
+    }
+
     pub fn check(&mut self, desc: &str, cond: bool) {
         if cond {
             self.pass(desc);

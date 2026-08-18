@@ -40,10 +40,22 @@
 //! When `start_postgres`/`stop_postgres`/`reload_or_restart_*` fires,
 //! systemd invokes polkit to authorise
 //! `org.freedesktop.systemd1.manage-units` for the calling subject. Our
-//! rule grants this action to the `postgres` user for
-//! `postgresql@*.service` and `pgpool2.service`. No interactive prompt, no
-//! sudo, no root. The rule itself is installed by Ansible (see SPEC §13.1
-//! — pg_agent owns no /etc files).
+//! rule grants this action to the `postgres` user for the PostgreSQL
+//! and pgpool units — BOTH packaging families' spellings, since the
+//! agent is configured with whichever the host uses:
+//! `postgresql@<v>-main.service` (Debian) or `postgresql-<v>.service`
+//! (RHEL), and `pgpool2.service` (Debian) or `pgpool-II.service` (the
+//! RHEL/PGDG RPM). No interactive prompt, no sudo, no root.
+//!
+//! Matching these by PATTERN rather than by a pinned literal is not
+//! cosmetic: a rule that names one version or one family does not fail
+//! loudly, it falls through to polkit's default and returns
+//! `InteractiveAuthorizationRequired` — a prompt no daemon can answer
+//! (testing/README.md finding 27).
+//!
+//! The rule itself is installed by Ansible (see SPEC §13.1 — pg_agent
+//! owns no /etc files); testing/docker/50-pg-agent.rules is the
+//! reference copy the acceptance suite deploys.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;

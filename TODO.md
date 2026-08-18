@@ -309,16 +309,16 @@ decided.
 
 What remains from the original entry, unchanged in substance:
 
-- **Move off nfpm to Rust-native packaging** (`cargo-deb` +
-  `cargo-generate-rpm`). The dependency-derivation argument is weaker
-  now — a static binary has no shared-library deps to compute — so this
-  is back to being an ergonomics/consistency change: config in
-  `Cargo.toml` metadata instead of a separate YAML. One nfpm quirk
-  worth carrying over: it expands env vars in `version` but NOT in
-  `contents.src`, which is why the build script stages binaries into
-  `dist/staging/` rather than templating the target triple.
-- Rocky/RHEL near term, Alpine aspirational — both below, and the
-  `.rpm` is no longer blocked on the glibc question.
+- ~~**Move off nfpm to Rust-native packaging**~~ — **done**:
+  `cargo-deb` + `cargo-generate-rpm`, both configured from
+  `crates/pg-agentd/Cargo.toml` metadata, `nfpm.yaml` deleted. The
+  staging directory survived the move for a reason that outlived nfpm:
+  neither tool expands environment variables in asset paths either, so
+  the target triple still cannot be templated in. See
+  packaging/README.md for the gotchas each tool brought (silently
+  inlined script paths, `recommends` as a sub-table).
+- ~~Rocky/RHEL near term~~ — **done**, see below. Alpine remains
+  aspirational.
 
 ### Historical detail, kept for the reasoning
 
@@ -398,17 +398,41 @@ What remains from the original entry, unchanged in substance:
   finished" contract (systemd.rs gotcha #2) has to be rebuilt on
   polling. A design change, not a build flag.
 
-- **Rocky/RHEL — NEAR TERM, and the next real target after packaging.**
-  Tractable, but needs a distro profile. systemd is there, so the
-  mechanism holds; the layout does not. RHEL-family
-  PostgreSQL is `postgresql-17.service` (PGDG) or `postgresql.service`
-  (AppStream) with data at `/var/lib/pgsql/17/data` — no
-  `postgresql@VER-main`, no `pg_ctlcluster`, no `conf.d` convention, no
-  `start.conf`. Both the harness (`cluster::pg_unit`/`pg_log`,
-  provision.sh's `PGCONF_DIR`) and the AGENT's own defaults
-  (`DEFAULT_PG_SERVICE`, `DEFAULT_PG_DATA_DIR`) hardcode the Debian
-  shape. Gap item 9 (`.rpm`) needs the same abstraction, so do them
-  together.
+- **Rocky/RHEL — DONE as a supported, tested platform.** The
+  `rocky9-pg16` matrix cell installs the real `.rpm` on Rocky 9 and
+  runs the full suite green (257/257), so gap item 9 closed with it.
+  The mechanism needed no changes at all — systemd, D-Bus and polkit
+  behave identically — which was the bet. What needed changing was
+  every place something had *assumed* the layout instead of being told
+  it.
+
+  How it was resolved, since the answer was not the obvious one: the
+  harness does not detect the distro and it does not branch on a
+  version. Each image writes `/etc/pg-agent-matrix/env` with the ten
+  facts that differ, and provisioning, the pgpool setup, and the
+  harness all read that one file — the harness over `docker exec`
+  (`cluster::Facts`), before any scenario runs. One authority per
+  cell. The agent itself is already fully config-driven, so its
+  RHEL support is `config.toml` values that provisioning writes from
+  the same file.
+
+  Found on the way: finding 28 (the agent probed pgpool's node-id file
+  only at the Debian path — silent, because the hostname fallback
+  covers for it), the polkit rule not matching `pgpool-II.service`,
+  and three RHEL-only pgpool startup requirements (`pid_file_name`
+  under a tmpfiles directory that never got created, `pool_passwd`
+  which pgpool tries to CREATE in a root-owned directory, and no
+  packaged `initdb`).
+
+  **What remains is the operator ergonomics, not the capability:** the
+  AGENT's compiled defaults (`DEFAULT_PG_SERVICE`,
+  `DEFAULT_PG_DATA_DIR`, `DEFAULT_PG_INSTALL_PREFIX`,
+  `DEFAULT_POSTGRES_USER_HOME`, `DEFAULT_PGPOOL_SERVICE`) are still
+  Debian's, so a RHEL operator must set five path fields explicitly.
+  That is the distro-profile work in ROADMAP.md — a convenience now
+  rather than a blocker, and worth doing with `/etc/os-release`
+  auto-detection since there is now a cell that would catch it
+  regressing.
 
 - **Move off nfpm to Rust-native packaging** (`cargo-deb` +
   `cargo-generate-rpm`), which is wanted anyway and pays for itself
