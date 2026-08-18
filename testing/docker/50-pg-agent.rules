@@ -16,9 +16,15 @@ polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         subject.user == "postgres") {
         var unit = action.lookup("unit");
+        // Both families' spellings: Debian's per-cluster template
+        // (postgresql@17-main), RHEL's per-version unit
+        // (postgresql-16), and the plain meta-service. Matching by
+        // pattern rather than by literal is what finding 27 was about.
         if (/^postgresql@\d+-main\.service$/.test(unit) ||
+            /^postgresql-\d+\.service$/.test(unit) ||
             unit == "postgresql.service" ||
-            unit == "pgpool2.service") {
+            unit == "pgpool2.service" ||
+            unit == "pgpool.service") {
             return polkit.Result.YES;
         }
     }
