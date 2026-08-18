@@ -1,62 +1,101 @@
 # Packaging
 
-`nfpm` (https://github.com/goreleaser/nfpm) builds the `.deb` and
-`.rpm` from one YAML. Same binaries, same systemd unit, same
-scriptlets — no separate `debian/` and `rpm/spec` to keep in sync.
+`cargo-deb` and `cargo-generate-rpm` build the `.deb` and `.rpm`.
+Package metadata lives in `crates/pg-agentd/Cargo.toml` under
+`[package.metadata.deb]` and `[package.metadata.generate-rpm]` — the
+same file that declares the binary, rather than a separate YAML that
+can drift from it. Both formats ship the same binaries, the same
+systemd unit, and the same scriptlets.
+
+Packages are built from **statically linked musl binaries**. That is
+the point, not a detail: a dynamically linked build inherits the build
+host's glibc floor, and neither packager can invent a floor the binary
+does not declare — which is how a package came to install on Debian 12
+and then die at exec (testing/README.md finding 26). Both packagers run
+with `--no-build` so they package what `scripts/build-pkgs.sh` produced
+rather than triggering a second, host-native build.
 
 ## Layout
 
 ```
 packaging/
-├── nfpm.yaml            # single source of truth for both formats
 ├── pg_agentd.service    # systemd unit (matches SPEC §10.4)
 ├── config.toml.sample   # /usr/share/pg_agent/config.toml.sample
 └── scripts/
-    ├── postinstall.sh   # daemon-reload + restart-if-running
+    ├── postinstall.sh   # mkdir /etc/pg_agent, daemon-reload, restart-if-running
     ├── preremove.sh     # stop on real removal (skip on upgrade)
-    └── postremove.sh    # disable + daemon-reload on real removal
+    ├── postremove.sh    # disable + daemon-reload on real removal
+    └── deb/             # Debian-named symlinks to the three above
+        ├── postinst -> ../postinstall.sh
+        ├── prerm    -> ../preremove.sh
+        └── postrm   -> ../postremove.sh
 ```
 
+One set of scripts serves both formats: they were written to handle
+both argument conventions (deb's `configure`/`upgrade` strings and
+rpm's instance counts). cargo-deb wants a directory of Debian-named
+files, hence the symlinks; cargo-generate-rpm takes explicit paths.
+
 The scripts are deliberately **bare `systemctl`** — no
-`deb-systemd-helper`, no `dh_installsystemd`. nfpm doesn't ship
-those helpers anyway, and `systemctl` works identically on Debian
-and RHEL, so the same script file handles both formats. See SPEC
-§10.4 and BOOTSTRAP.md Phase 1.1 for the
+`deb-systemd-helper`, no `dh_installsystemd`. `systemctl` works
+identically on Debian and RHEL, so one implementation covers both. See
+SPEC §10.4 and BOOTSTRAP.md Phase 1.1 for the
 "deliberately-do-not-auto-enable" rationale.
+
+`/etc/pg_agent` is created by the post-install scriptlet rather than
+shipped as a packaged directory: neither tool has a file-less directory
+asset, and an empty directory is not worth a placeholder file.
+
+## Gotchas worth knowing before editing the metadata
+
+- **cargo-generate-rpm scripts take "a string OR a file path"** and
+  resolve the path themselves. A path it cannot resolve is not an
+  error — it becomes an inline script whose body is the path text, so
+  the package installs cleanly and does nothing. Verify with
+  `rpm -qp --scripts <pkg>` after any change.
+- **`recommends` is a sub-table** for the RPM (`name = "version-req"`,
+  Cargo-style) and a plain string for the deb. Sub-tables must stay
+  last in the section: TOML puts every key after a sub-table header
+  inside that sub-table.
+- **Asset paths are relative to `crates/pg-agentd/Cargo.toml`**, hence
+  the `../../` prefixes.
+- **The deb synopsis is the crate's `description` field** verbatim, so
+  that field is kept to one short line and the detail lives in
+  `extended-description`.
+- cargo-deb has no arbitrary control fields, so nfpm's `Bugs:` header
+  is gone; the issues URL is in the extended description instead.
 
 ## Build
 
-Use the wrapper script — it does the `cargo build --release`,
-extracts `VERSION` from `Cargo.toml`, exports it (nfpm requires the
-env var actually be in the environment, not just a shell var), and
-invokes `nfpm pkg` for both formats:
+Use the wrapper script. It builds the release binaries **for the musl
+target**, stages them into `dist/staging/`, and invokes both packagers
+against that staging directory:
 
 ```sh
 scripts/build-pkgs.sh             # both .deb and .rpm
 scripts/build-pkgs.sh deb         # just .deb
 scripts/build-pkgs.sh rpm         # just .rpm
 VERSION=1.2.3-rc1 scripts/build-pkgs.sh   # override the version
+TARGET=x86_64-unknown-linux-gnu scripts/build-pkgs.sh  # escape hatch
 ```
 
 Outputs land in `dist/` (git-ignored).
 
-If you really want to invoke nfpm by hand:
+Prerequisites: `cargo install cargo-deb cargo-generate-rpm`,
+`rustup target add x86_64-unknown-linux-musl`, and a musl C toolchain
+(`musl-tools` on Debian/Ubuntu) for ring's assembly.
 
-```sh
-cargo build --release
-export VERSION=$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)
-mkdir -p dist
-nfpm pkg --config packaging/nfpm.yaml --packager deb \
-         --target "dist/pg-agent-rs_${VERSION}_amd64.deb"
-nfpm pkg --config packaging/nfpm.yaml --packager rpm \
-         --target "dist/pg-agent-rs-${VERSION}-1.x86_64.rpm"
-```
+Staging exists because nfpm-era config could interpolate the target
+triple into a path and these tools cannot: cargo-deb resolves assets
+relative to the manifest, and neither expands environment variables in
+asset paths. Staging to a fixed location keeps one build feeding both
+packagers, and keeps the packaged artifact traceable to the build that
+produced it.
 
-`VERSION` MUST be exported — `VAR=val && cmd` is a shell-var
-assignment, not an env-var export, so nfpm's `${VERSION}`
-substitution won't see it. Forgetting the export → nfpm falls back
-to its `0.0.0~rc0` default and the package's `Version:` field is
-wrong.
+The `TARGET` escape hatch exists for debugging only. Shipping a
+dynamically linked package reintroduces finding 26 — and the
+`bookworm-pg15` matrix cell is the thing that will catch it, since that
+distro cannot run such a build at all.
 
 ## Behaviour matrix
 
@@ -78,9 +117,12 @@ See BOOTSTRAP.md Phase 1.7.
 ## Why not `--no-enable` via `dh_installsystemd`?
 
 We deliberately bypass `dh_installsystemd` entirely. The flag would
-work for the `.deb` half but doesn't exist for `.rpm`, and `nfpm`'s
-unified-script model is the simpler home for the "don't enable"
-posture. One script, two outputs.
+work for the `.deb` half but has no `.rpm` equivalent, so a shared
+scriptlet is the simpler home for the "don't enable" posture. One
+script, two outputs. cargo-deb has a `systemd-units` feature that
+would generate enable/start scriptlets for us; it is deliberately NOT
+used, because starting the daemon before Ansible has staged a
+`config.toml` is precisely what this posture avoids.
 
 ## Binary linkage
 

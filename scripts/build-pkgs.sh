@@ -71,14 +71,17 @@ echo "==> staged $(file -b dist/staging/pg_agentd | cut -d, -f1-2)"
 
 build_deb() {
     out="dist/pg-agent-rs_${VERSION}_amd64.deb"
-    echo "==> nfpm pkg deb → ${out}"
-    nfpm pkg --config packaging/nfpm.yaml --packager deb --target "$out"
+    # --no-build: the static musl build above IS the artifact. Letting
+    # cargo-deb rebuild would produce a host-native dynamic binary —
+    # finding 26 walking straight back in.
+    echo "==> cargo deb → ${out}"
+    cargo deb --no-build --no-strip -p pg-agentd --output "$out"
 }
 
 build_rpm() {
     out="dist/pg-agent-rs-${VERSION}-1.x86_64.rpm"
-    echo "==> nfpm pkg rpm → ${out}"
-    nfpm pkg --config packaging/nfpm.yaml --packager rpm --target "$out"
+    echo "==> cargo generate-rpm → ${out}"
+    cargo generate-rpm -p crates/pg-agentd --output "$out"
 }
 
 case "${1:-all}" in

@@ -1,6 +1,10 @@
 [package]
 name        = "pg-agentd"
-description = "pg_agentd — coordinator daemon for pgpool-II clusters. Runs on every PostgreSQL backend, owns local PostgreSQL operations and cluster coordination over mTLS gRPC."
+# Kept to one short line: cargo-deb uses this verbatim as the package
+# SYNOPSIS, where Debian policy wants a brief noun phrase rather than a
+# paragraph. The detail it used to carry now lives in the packaging
+# `extended-description` below.
+description = "Coordinator daemon for pgpool-II PostgreSQL clusters"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -11,6 +15,98 @@ repository.workspace   = true
 [[bin]]
 name = "pg_agentd"
 path = "src/main.rs"
+
+# --- packaging -----------------------------------------------------------
+#
+# The .deb and .rpm are built from THIS crate because it owns the primary
+# binary, but they ship all three (pg_agentd, pg_agentc, pg_agentctl) as
+# one package — the three are a single deployable unit and versioning them
+# apart would let a node run a CLI that disagrees with its daemon.
+#
+# Sources are `dist/staging/*`, populated by scripts/build-pkgs.sh from the
+# static musl build. Both packagers are invoked with --no-build so they
+# package what that script produced rather than triggering a second,
+# host-native build: a dynamically linked artifact silently replacing the
+# static one is exactly finding 26 coming back.
+#
+# Asset paths are relative to THIS manifest, hence ../../.
+
+[package.metadata.deb]
+name = "pg-agent-rs"
+maintainer = "pg-agent-rs contributors"
+section = "admin"
+priority = "optional"
+# No Debian revision: this package is built and shipped by this repo,
+# not derived from an upstream tarball, so `0.7.3-1` would imply a
+# packaging-only iteration that does not exist. Also keeps the version
+# identical to what the nfpm-built packages reported, so nothing
+# comparing versions across the switch sees a phantom bump.
+revision = ""
+# Static binary: there are no shared-library dependencies to compute.
+# Stated explicitly so cargo-deb does not emit an empty `Depends:`
+# field from a $auto scan that correctly found nothing.
+depends = ""
+# Soft deps only: a fresh host can install this before PostgreSQL exists.
+# Unversioned on purpose — pinning `postgresql-17` here would repeat the
+# mistake finding 27 caught in the polkit rule, on a package that is
+# verified against 15, 16 and 17.
+recommends = "postgresql, pgpool2"
+extended-description = """
+Runs on every PostgreSQL backend, owning local PostgreSQL operations and
+cluster coordination over mTLS gRPC.
+
+Ships three binaries:
+  - pg_agentd:   the long-running daemon (one per backend host)
+  - pg_agentc:   the hook client invoked by pgpool's pgpool_recovery
+                 C extension and by PostgreSQL's restore_command
+  - pg_agentctl: the operator CLI for cluster init / preflight /
+                 maintenance inspection
+
+Issues: https://github.com/ophymx/pg-agent-rs/issues"""
+maintainer-scripts = "../../packaging/scripts/deb"
+assets = [
+    ["../../dist/staging/pg_agentd", "usr/bin/", "755"],
+    ["../../dist/staging/pg_agentc", "usr/bin/", "755"],
+    ["../../dist/staging/pg_agentctl", "usr/bin/", "755"],
+    ["../../packaging/pg_agentd.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/config.toml.sample", "usr/share/pg_agent/", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/pg-agent-rs/", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/pg-agent-rs/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "pg-agent-rs"
+summary = "Coordinator daemon for pgpool-II PostgreSQL clusters"
+group = "Applications/Databases"
+assets = [
+    { source = "../../dist/staging/pg_agentd", dest = "/usr/bin/pg_agentd", mode = "755" },
+    { source = "../../dist/staging/pg_agentc", dest = "/usr/bin/pg_agentc", mode = "755" },
+    { source = "../../dist/staging/pg_agentctl", dest = "/usr/bin/pg_agentctl", mode = "755" },
+    { source = "../../packaging/pg_agentd.service", dest = "/usr/lib/systemd/system/pg_agentd.service", mode = "644" },
+    { source = "../../packaging/config.toml.sample", dest = "/usr/share/pg_agent/config.toml.sample", mode = "644" },
+    { source = "../../LICENSE-MIT", dest = "/usr/share/doc/pg-agent-rs/LICENSE-MIT", mode = "644", doc = true },
+    { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/pg-agent-rs/LICENSE-APACHE", mode = "644", doc = true },
+]
+# The same scriptlets the .deb uses — they were written to handle both
+# argument conventions (deb's "configure"/"upgrade" strings and rpm's
+# instance counts), so one implementation serves both formats.
+# Plain strings, not { path = ... }: this tool takes "a string OR a file
+# path" and resolves the latter itself. Worth verifying after any change
+# — a path it cannot resolve is not an error, it becomes an INLINE
+# script whose entire body is the path text, which would install
+# cleanly and do nothing.
+post_install_script = "../../packaging/scripts/postinstall.sh"
+pre_uninstall_script = "../../packaging/scripts/preremove.sh"
+post_uninstall_script = "../../packaging/scripts/postremove.sh"
+
+# RPM equivalent of the deb's Recommends: soft, and unversioned for the
+# same reason. A sub-table rather than an array — this tool spells
+# dependencies the way Cargo.toml spells them, `name = "version-req"`,
+# and "*" means any version. Must stay LAST in this section: TOML puts
+# every key after a sub-table header inside that sub-table.
+[package.metadata.generate-rpm.recommends]
+postgresql = "*"
+pgpool-II = "*"
 
 [dependencies]
 pg-agent-core     = { workspace = true }

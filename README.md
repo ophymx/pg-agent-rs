@@ -32,7 +32,7 @@ crates/
 ├── pg-agentc/           pgpool hook client (thin Unix-socket forwarder)
 └── pg-agentctl/         operator CLI
 proto/                   .proto source files (compiled by pg-agent-proto's build.rs)
-packaging/               nfpm.yaml + systemd unit + scriptlets (.deb + .rpm)
+packaging/               systemd unit + scriptlets (.deb + .rpm metadata lives in crates/pg-agentd/Cargo.toml)
 ```
 
 ## Build
@@ -41,7 +41,7 @@ packaging/               nfpm.yaml + systemd unit + scriptlets (.deb + .rpm)
 cargo check --workspace      # quick verify
 cargo build --release        # ships three binaries: pg_agentd, pg_agentc, pg_agentctl
 cargo test --workspace
-./scripts/build-pkgs.sh      # nfpm-produced .deb + .rpm
+./scripts/build-pkgs.sh      # static-musl .deb + .rpm (cargo-deb / cargo-generate-rpm)
 ```
 
 Requires `protoc` (3.x) on `$PATH` for the proto crate's build.rs.

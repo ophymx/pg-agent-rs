@@ -14,8 +14,16 @@
 
 set -e
 
+# The config directory Ansible writes config.toml into. Created here
+# rather than shipped as a packaged directory: neither cargo-deb nor
+# cargo-generate-rpm has a file-less directory asset, and an empty dir
+# is not worth a placeholder file. mkdir -p is idempotent, so upgrades
+# and reinstalls are no-ops.
+mkdir -p /etc/pg_agent
+chmod 0755 /etc/pg_agent
+
 if ! command -v systemctl >/dev/null 2>&1; then
-    # Container build or non-systemd host. Nothing to do.
+    # Container build or non-systemd host. Nothing further to do.
     exit 0
 fi
 
