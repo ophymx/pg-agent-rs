@@ -32,20 +32,16 @@ cd "$(dirname "$0")/.."
 CELLS=(
     "trixie-pg17   debian:trixie     17"
     "noble-pg16    ubuntu:24.04      16"
+    "bookworm-pg15 debian:bookworm   15"
 )
 #
-# NOT here, deliberately: debian:bookworm (PostgreSQL 15). The .deb this
-# repo builds is dynamically linked against the BUILD host's glibc and
-# declares no libc floor, so on bookworm (glibc 2.36) it installs
-# cleanly and then dies at exec:
-#
-#   /usr/bin/pg_agentd: /lib/x86_64-linux-gnu/libc.so.6:
-#   version `GLIBC_2.39' not found
-#
-# That is finding 26 — a packaging defect, not a cell to paper over.
-# Adding this cell back before the build grows a defined floor (build in
-# the oldest supported base, or declare `depends: libc6 (>= …)`) would
-# just paint the matrix red without telling anyone anything new.
+# bookworm was excluded while the package was dynamically linked: it
+# carried the build host's glibc floor, declared no dependency, and so
+# installed on Debian 12 (glibc 2.36) only to die at exec with
+# `GLIBC_2.39 not found` — finding 26. The build is static musl now, so
+# the floor is gone and the cell is real. It is also the cell that
+# proves it stays gone: if anyone reverts the build to a dynamic
+# target, this is where it fails.
 
 want=("$@")
 keep_going="${KEEP_GOING:-}"

@@ -40,15 +40,24 @@ recommends:
 
 contents:
   # Binaries — both Debian and RHEL put them in /usr/bin.
-  - src: ./target/release/pg_agentd
+  #
+  # scripts/build-pkgs.sh stages the built binaries here. It builds
+  # them STATICALLY (musl) on purpose: a dynamic build inherits the
+  # builder's glibc floor while this package declares no dependency at
+  # all, so it would install on Debian 12 or RHEL 9 and then die at
+  # exec (testing/README.md finding 26). Staged rather than pointed at
+  # target/<triple>/release directly because nfpm expands env vars in
+  # `version` but NOT in `contents.src` — a templated path there is
+  # taken literally and fails as "no matching files".
+  - src: ./dist/staging/pg_agentd
     dst: /usr/bin/pg_agentd
     file_info:
       mode: 0755
-  - src: ./target/release/pg_agentc
+  - src: ./dist/staging/pg_agentc
     dst: /usr/bin/pg_agentc
     file_info:
       mode: 0755
-  - src: ./target/release/pg_agentctl
+  - src: ./dist/staging/pg_agentctl
     dst: /usr/bin/pg_agentctl
     file_info:
       mode: 0755

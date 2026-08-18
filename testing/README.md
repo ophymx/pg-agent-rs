@@ -807,6 +807,25 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     permanently-red cell teaches nobody anything the finding has not
     already recorded.
 
+    **RESOLVED by switching the release build to static musl**
+    (`x86_64-unknown-linux-musl`), which removes the floor rather than
+    documenting it. Prerequisite was dropping an accidental
+    `aws-lc-rs`: the workspace pinned rustls to `ring`, but declared
+    `tokio-rustls` with default features on, and its default enables
+    `rustls/aws_lc_rs` — additive features then turned it on for the
+    whole graph, compiling a cmake+C crypto library nobody asked for.
+    (`tonic` had it right already; we were the only source.) With that
+    gone, ring's C/asm was the only native code left and the musl build
+    worked first try in 98s. All three binaries are `static-pie`, and
+    the resulting `.deb` installs AND runs on Debian 12, Ubuntu 24.04,
+    Rocky 9 (glibc 2.34 — gap item 9's target) and Alpine. The full
+    suite passes 257/257 against the static agent, which is the part
+    `--version` cannot tell you: mTLS peer mesh, D-Bus, tokio-postgres,
+    and peer hostname resolution through musl's resolver rather than
+    glibc's all work, including across G10's full-cluster restart.
+    Debian 12 is now a matrix cell, and it is the cell that will catch
+    a revert to dynamic linking.
+
     A second, smaller lesson from the same hour: the matrix's first run
     failed everywhere with "pgpool_node_id specifies id=0 which is not
     in pool". The cause was three layers from the symptom — the image's

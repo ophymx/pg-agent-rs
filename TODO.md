@@ -295,7 +295,32 @@ Two related issues around handoff's replication-slot management on the new prima
 - **Why now:** every command added past 0.6.0 will re-invent its own preflight. A shared validator means the consistency story is consistent across handlers and one place to look when something refuses. The 2026-06-11 split-brain wouldn't have happened with the `detached`-is-actually-down check alone.
 - **Caveat — this is defense in depth, not the fix.** The `detached`-is-actually-down check closes the known trigger but not the class: under a real partition, `get_status(detached)` is itself unreachable, and both branches are wrong (refuse → unavailable during the partition we exist to survive; promote → the original bug). Split-brain is structurally reachable as long as promotion authority lives in pgpool's `failover_command`. See [docs/promotion-authority.md](docs/promotion-authority.md). Land this anyway — it's cheap and it helps — but don't record it as closing the issue.
 
-### Packaging: the binary has no glibc floor, and nfpm cannot give it one
+### ~~Packaging: the binary has no glibc floor~~ — DONE (static musl)
+
+The floor is gone: release builds now target
+`x86_64-unknown-linux-musl` and the packaged binaries are `static-pie`
+with no dynamic dependencies. Verified installing and running on Debian
+12, Ubuntu 24.04, Rocky 9 and Alpine, with the full acceptance suite
+green (257/257) against the static agent — mTLS, D-Bus, tokio-postgres
+and musl peer-hostname resolution all exercised, including across a
+full-cluster restart. Debian 12 rejoined the matrix as the cell that
+catches a revert. NSS plugins are unsupported by construction, as
+decided.
+
+What remains from the original entry, unchanged in substance:
+
+- **Move off nfpm to Rust-native packaging** (`cargo-deb` +
+  `cargo-generate-rpm`). The dependency-derivation argument is weaker
+  now — a static binary has no shared-library deps to compute — so this
+  is back to being an ergonomics/consistency change: config in
+  `Cargo.toml` metadata instead of a separate YAML. One nfpm quirk
+  worth carrying over: it expands env vars in `version` but NOT in
+  `contents.src`, which is why the build script stages binaries into
+  `dist/staging/` rather than templating the target triple.
+- Rocky/RHEL near term, Alpine aspirational — both below, and the
+  `.rpm` is no longer blocked on the glibc question.
+
+### Historical detail, kept for the reasoning
 
 - **The defect (testing/README.md finding 26):** the `.deb` declares no
   `Depends` at all, so it installs happily on a distro whose glibc is

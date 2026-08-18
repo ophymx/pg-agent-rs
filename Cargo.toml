@@ -41,7 +41,20 @@ http       = { version = "1" }
 
 # TLS
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls   = { version = "0.26" }
+# default-features = false is load-bearing: tokio-rustls's default set
+# is ["logging", "tls12", "aws_lc_rs"], and Cargo features are additive
+# across the graph — so leaving defaults on here re-enabled
+# `rustls/aws_lc_rs` for EVERYONE, silently overriding the explicit
+# `ring` choice below and compiling aws-lc-sys (cmake + C) for nothing.
+# tonic already declares this dependency correctly; we were the only
+# source. Keeping ring as the single crypto backend also leaves ring's
+# C/asm as the only native code in the build, which is what makes the
+# musl target tractable.
+tokio-rustls   = { version = "0.26", default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+] }
 rustls-pemfile = { version = "2" }
 x509-parser    = { version = "0.16" }
 
