@@ -398,6 +398,64 @@ What remains from the original entry, unchanged in substance:
   finished" contract (systemd.rs gotcha #2) has to be rebuilt on
   polling. A design change, not a build flag.
 
+  **DEFERRED — scoped 2026-08-18, not scheduled.** Estimate is ~3–4
+  focused weeks to "supported", where supported means a green
+  `alpine-pg16` cell at 257/257. Recorded so it need not be re-derived:
+
+  | work | est. | risk |
+  |---|---|---|
+  | static musl binary on Alpine | **done** | — |
+  | `rc-service` impl behind the trait; rename `Systemd`→`ServiceManager` | 2–3d | low |
+  | **rebuild job-completion semantics** | 3–5d | **high** |
+  | readiness without `sd_notify` | 1d | low |
+  | privilege model without polkit (sudoers, or run as root) | 1–2d | med |
+  | logging without journald | 1–2d | med |
+  | `.apk` via abuild/APKBUILD + OpenRC init script | 2–3d | low |
+  | **harness + matrix cell** | 5–8d | **high** |
+
+  Two items carry the risk, and neither is mechanical:
+
+  - **Job completion.** systemd's `JobRemoved` is an EVENT with a
+    result code. `rc-service stop` returns an exit code meaning *the
+    stop script returned*, not that the postmaster is gone. Fencing
+    correctness and the audit invariant "every fence of a serving node
+    reached PostgreSQL shutdown" both rest on knowing a stop
+    completed, so this is re-deriving a safety predicate on a weaker
+    primitive. The honest fix — verify the EFFECT (postmaster gone,
+    port closed, `pg_isready` refusing) rather than trust the service
+    manager's word — would strengthen the systemd path too, and is
+    worth stealing back regardless of whether Alpine ever happens.
+  - **The harness.** 22 `systemctl` sites in `scenarios.rs`, 5
+    `journalctl` in `events.rs`, 6 in the provisioning scripts. The
+    facts-file pattern makes most of it mechanical, but G9's
+    crash-shape death has no OpenRC equivalent for its only evidence
+    (`Main process exited, code=killed` from the unit journal) and
+    needs a different evidence source.
+
+  Capability losses to accept up front: no watchdog, no `Type=notify`
+  readiness gate, no journal.
+
+  **Why deferred, and it is not a technical objection.** Alpine's draw
+  is small images, but this agent supervises a service-managed
+  PostgreSQL on a host and deploys via Ansible; container-native
+  deployments reach for an operator instead. The population that
+  benefits is bare-metal/VM Alpine shops, and in practice production
+  PostgreSQL overwhelmingly runs on Debian-slim-derived images — the
+  official `postgres` image is Debian-based by default, with Alpine as
+  the explicitly secondary variant. Three weeks for a small audience.
+
+  **What would change the decision:** framing it as "not locked to
+  systemd" rather than "runs on Alpine". ~80% of the cost above is
+  OpenRC, not Alpine, and it would equally buy Gentoo, Devuan, and any
+  non-systemd host. If that becomes a goal, this stops being a
+  single-distro port and the arithmetic changes.
+
+  **Cheaper middle option if it is ever wanted quickly (~1 week):**
+  ship the static binary plus an OpenRC init script as a tarball — no
+  `.apk`, no matrix cell — labelled community/unverified. Defers both
+  high-risk items entirely. The distinction that matters is that a
+  matrix cell is what earns the word "supported".
+
 - **Rocky/RHEL — DONE as a supported, tested platform.** The
   `rocky9-pg16` matrix cell installs the real `.rpm` on Rocky 9 and
   runs the full suite green (257/257), so gap item 9 closed with it.
