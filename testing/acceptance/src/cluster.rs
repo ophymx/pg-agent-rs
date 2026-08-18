@@ -12,25 +12,121 @@ use tokio::process::Command;
 pub const NODES: [&str; 3] = ["db0", "db1", "db2"];
 pub const COMPOSE: &str = "testing/compose.yaml";
 
-/// The PostgreSQL major version under test, from `PG_VERSION` (the
-/// same variable that selects the matrix cell's base image and
-/// packages). Defaults to the baseline so a plain `acceptance.sh` run
-/// needs no environment at all.
-pub fn pg_version() -> String {
-    std::env::var("PG_VERSION").unwrap_or_else(|_| "17".to_string())
+/// Where this cell's PostgreSQL actually lives.
+///
+/// Read from `/etc/pg-agent-matrix/env` inside the container rather
+/// than derived here, because the layout differs by packaging family
+/// in six independent ways and only the image knows which it is:
+///
+/// ```text
+///            Debian family                RHEL family
+///   unit     postgresql@17-main           postgresql-16
+///   data     /var/lib/postgresql/17/main  /var/lib/pgsql/16/data
+///   bins     /usr/lib/postgresql/17/bin   /usr/pgsql-16/bin
+///   config   /etc/postgresql/17/main      inside PGDATA
+///   home     /var/lib/postgresql          /var/lib/pgsql
+///   pgpool   pgpool2 + /etc/pgpool2       pgpool-II + /etc/pgpool-II
+/// ```
+///
+/// The suite stops, kills, and inspects these from dozens of places. A
+/// cell where half of them guessed the other family's spelling would
+/// fail in ways that read as product bugs, which is exactly what a
+/// pinned `postgresql@17-main` did on the PostgreSQL 16 cell (finding
+/// 27). Asking the image is the fix that does not need repeating.
+#[derive(Debug, Clone)]
+pub struct Facts {
+    pub family: String,
+    pub version: String,
+    /// Unit name WITHOUT the `.service` suffix.
+    pub pg_unit: String,
+    pub pg_log: String,
+    pub pgdata: String,
+    /// The `postgres` OS user's home — where the agent's `state_dir`
+    /// (and thus `pg_agent/raft`) is derived from.
+    pub pg_home: String,
+    pub pgpool_conf_dir: String,
 }
 
-/// Debian-family unit name for the cluster, e.g. `postgresql@17-main`.
-/// One definition: the suite stops, kills, and inspects this unit from
-/// a dozen places, and a matrix cell where half of them said "17"
-/// would fail in ways that look like product bugs.
+static FACTS: std::sync::OnceLock<Facts> = std::sync::OnceLock::new();
+
+/// Read the facts file from `db0` and cache it. Called once, right
+/// after the cluster is up and before any scenario runs.
+pub async fn init_facts() -> anyhow::Result<()> {
+    let raw = exec("db0", "cat /etc/pg-agent-matrix/env")
+        .await
+        .context("read /etc/pg-agent-matrix/env from db0")?;
+    let get = |key: &str| -> anyhow::Result<String> {
+        raw.lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("{key}=")))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .with_context(|| format!("{key} missing from /etc/pg-agent-matrix/env"))
+    };
+    // Every key is REQUIRED, including the four only the provisioning
+    // scripts consume. Those scripts fall back to Debian's spelling
+    // when a key is absent, so on a RHEL image a missing PG_BIN
+    // silently becomes /usr/lib/postgresql/16/bin and surfaces much
+    // later as a confusing "no such file". Demanding the full key set
+    // here turns that into one clear line before the suite starts.
+    for required in ["PG_BIN", "PG_CONF_DIR", "PGPOOL_UNIT"] {
+        get(required)?;
+    }
+    let facts = Facts {
+        family: get("PG_FAMILY")?,
+        version: get("PG_VERSION")?,
+        pg_unit: get("PG_UNIT")?,
+        pg_log: get("PG_LOG")?,
+        pgdata: get("PGDATA")?,
+        pg_home: get("PG_HOME")?,
+        pgpool_conf_dir: get("PGPOOL_CONF_DIR")?,
+    };
+    // The package format was chosen host-side before this image
+    // existed, so it is the one layout decision that can silently
+    // disagree with what actually booted. Catch it here rather than as
+    // a puzzling `dnf: command not found` forty seconds later.
+    let expected = std::env::var("PG_FAMILY").unwrap_or_else(|_| "debian".to_string());
+    anyhow::ensure!(
+        facts.family == expected,
+        "cell mismatch: host built for PG_FAMILY={expected}, image reports {}",
+        facts.family
+    );
+    println!(
+        "  facts: {} PostgreSQL {} — unit {}, data {}",
+        facts.family, facts.version, facts.pg_unit, facts.pgdata
+    );
+    let _ = FACTS.set(facts);
+    Ok(())
+}
+
+/// Panics if [`init_facts`] has not run — a missing initialisation is a
+/// harness bug, and defaulting to Debian here is how a RHEL cell would
+/// come to report Debian paths in its failure messages.
+pub fn facts() -> &'static Facts {
+    FACTS
+        .get()
+        .expect("cluster::init_facts() must run before any scenario")
+}
+
+/// Unit name for the cluster, e.g. `postgresql@17-main` (Debian) or
+/// `postgresql-16` (RHEL).
 pub fn pg_unit() -> String {
-    format!("postgresql@{}-main", pg_version())
+    facts().pg_unit.clone()
 }
 
 /// Server log path for the cluster.
 pub fn pg_log() -> String {
-    format!("/var/log/postgresql/postgresql-{}-main.log", pg_version())
+    facts().pg_log.clone()
+}
+
+/// pgpool's config directory: `/etc/pgpool2` or `/etc/pgpool-II`.
+pub fn pgpool_conf_dir() -> String {
+    facts().pgpool_conf_dir.clone()
+}
+
+/// The agent's state directory, derived the same way the agent derives
+/// it (`<postgres user home>/pg_agent`).
+pub fn agent_state_dir() -> String {
+    format!("{}/pg_agent", facts().pg_home)
 }
 
 pub fn node_id(node: &str) -> &str {

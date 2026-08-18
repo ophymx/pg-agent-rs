@@ -11,7 +11,7 @@
 #   bins     /usr/lib/postgresql/17/bin     /usr/pgsql-16/bin
 #   config   /etc/postgresql/17/main/       inside PGDATA
 #   initdb   done by the package            explicit postgresql-NN-setup
-#   pgpool   pgpool2.service                pgpool.service
+#   pgpool   pgpool2.service                pgpool-II.service
 #
 # PostgreSQL and pgpool both come from PGDG. Not a preference: RHEL's
 # AppStream ships PostgreSQL but NO pgpool-II (nor does EPEL), and this
@@ -28,12 +28,21 @@ ENV PG_VERSION=${PG_VERSION}
 # that produced an empty `[[pool]]` on the Debian side. The harness also
 # reads this file (over docker exec) to learn which unit and paths this
 # cell uses, so there is exactly one place that knows the layout.
+# PG_CONF_DIR == PGDATA is not a shortcut: RHEL genuinely keeps
+# postgresql.conf and pg_hba.conf inside the data directory, where
+# Debian keeps them under /etc and symlinks nothing. PG_LOG is the one
+# value provisioning MAKES true rather than reports — RHEL's default is
+# stderr-to-journal, and provision.sh turns the collector on and points
+# it here so the harness has one log path to tail on both families.
 RUN mkdir -p /etc/pg-agent-matrix && printf '%s\n' \
     "PG_VERSION=${PG_VERSION}" \
     "PG_FAMILY=rhel" \
     "PG_UNIT=postgresql-${PG_VERSION}" \
     "PGDATA=/var/lib/pgsql/${PG_VERSION}/data" \
     "PG_BIN=/usr/pgsql-${PG_VERSION}/bin" \
+    "PG_CONF_DIR=/var/lib/pgsql/${PG_VERSION}/data" \
+    "PG_HOME=/var/lib/pgsql" \
+    "PG_LOG=/var/log/postgresql/postgresql-${PG_VERSION}-main.log" \
     "PGPOOL_UNIT=pgpool-II" \
     "PGPOOL_CONF_DIR=/etc/pgpool-II" \
     > /etc/pg-agent-matrix/env

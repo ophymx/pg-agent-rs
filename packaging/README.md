@@ -62,8 +62,8 @@ asset, and an empty directory is not worth a placeholder file.
 - **The deb synopsis is the crate's `description` field** verbatim, so
   that field is kept to one short line and the detail lives in
   `extended-description`.
-- cargo-deb has no arbitrary control fields, so nfpm's `Bugs:` header
-  is gone; the issues URL is in the extended description instead.
+- cargo-deb has no arbitrary control fields, so there is no `Bugs:`
+  header; the issues URL lives in the extended description instead.
 
 ## Build
 
@@ -85,12 +85,11 @@ Prerequisites: `cargo install cargo-deb cargo-generate-rpm`,
 `rustup target add x86_64-unknown-linux-musl`, and a musl C toolchain
 (`musl-tools` on Debian/Ubuntu) for ring's assembly.
 
-Staging exists because nfpm-era config could interpolate the target
-triple into a path and these tools cannot: cargo-deb resolves assets
-relative to the manifest, and neither expands environment variables in
-asset paths. Staging to a fixed location keeps one build feeding both
-packagers, and keeps the packaged artifact traceable to the build that
-produced it.
+Staging exists because neither tool expands environment variables in
+asset paths, and cargo-deb resolves them relative to the manifest — so
+the target triple cannot be templated into the metadata. Staging to a
+fixed location keeps one build feeding both packagers, and keeps the
+packaged artifact traceable to the build that produced it.
 
 The `TARGET` escape hatch exists for debugging only. Shipping a
 dynamically linked package reintroduces finding 26 — and the
@@ -126,16 +125,29 @@ used, because starting the daemon before Ansible has staged a
 
 ## Binary linkage
 
-`cargo build --release` produces a dynamically-linked binary
-against glibc (+ libgcc_s, libm). No system OpenSSL or D-Bus
-library — rustls + zbus are pure-Rust. The resulting binary runs on
-any modern Debian/RHEL host without explicit package dependencies
-beyond what's in libc6 / glibc, which is universal.
+**Statically linked against musl. Zero runtime dependencies — no
+libc, no libgcc_s, no libm.** That is why both packages declare no
+`Depends:`/`Requires:` beyond soft recommends: there is nothing to
+depend on.
 
-For maximal portability (older distros, minimal containers) build
-against `x86_64-unknown-linux-musl` for a fully static binary — a
-few MB larger but zero runtime deps. Not the default; the glibc
-build is what `cargo build --release` produces today.
+This is feasible because the dependency set is pure Rust apart from
+ring's C/asm — no system OpenSSL (rustls) and no system D-Bus (zbus).
+Keeping it that way is a constraint, not an accident: see the
+`tokio-rustls` entry in the workspace `Cargo.toml`, which pins
+`default-features = false` precisely so a default-feature change
+cannot quietly reintroduce a C dependency and with it a glibc floor.
+
+A plain `cargo build --release` still produces a dynamically linked
+glibc binary — fine for development, **wrong to ship**. It carries the
+build host's glibc floor while the package declares none, so it
+installs on an older distro and dies at exec (finding 26). Always
+package via `scripts/build-pkgs.sh`.
+
+One accepted consequence: **NSS plugins do not work.** A static musl
+binary resolves names through DNS and `/etc/hosts` only, ignoring
+`nsswitch.conf`, so LDAP/SSSD/mDNS-based host resolution is
+unsupported. Stated rather than worked around — the deployments this
+targets discover peers through DNS.
 
 ## What's NOT in the package
 
@@ -148,8 +160,10 @@ build is what `cargo build --release` produces today.
   business.
 - `~postgres/.pcppass` — pgpool's PCP password file. Ansible
   writes it.
-- `/etc/pgpool2/pgpool_node_id` — pgpool's own per-host file; both
-  pg-agent and pgpool read it. Ansible writes it.
+- `pgpool_node_id` — pgpool's own per-host file; both pg-agent and
+  pgpool read it. Ansible writes it, into pgpool's config directory:
+  `/etc/pgpool2` on Debian, `/etc/pgpool-II` on RHEL. The agent probes
+  both (finding 28).
 
 The package ships **only the bits we own**: binaries, the systemd
 unit, the sample config, the license texts.

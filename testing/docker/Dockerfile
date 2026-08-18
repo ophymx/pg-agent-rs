@@ -19,15 +19,31 @@ ARG PG_VERSION=17
 ENV PG_VERSION=${PG_VERSION}
 ENV DEBIAN_FRONTEND=noninteractive
 
-# ALSO on disk, because the image's ENV does not reach the provisioning
-# unit: systemd (PID 1) gives its services a clean environment, so
-# `PG_VERSION` is set for `docker exec` and unset for anything systemd
-# starts. Under provision.sh's `set -u` that aborted the script inside
-# a heredoc and left a config.toml with an EMPTY pool — which surfaced
-# three layers away as "pgpool_node_id specifies id=0 which is not in
-# pool". A file is read the same way by both.
-RUN mkdir -p /etc/pg-agent-matrix \
-    && echo "PG_VERSION=${PG_VERSION}" > /etc/pg-agent-matrix/env
+# Distro facts, on disk. ON DISK because the image's ENV does not reach
+# the provisioning unit: systemd (PID 1) gives its services a clean
+# environment, so `PG_VERSION` is set for `docker exec` and unset for
+# anything systemd starts. Under provision.sh's `set -u` that aborted
+# the script inside a heredoc and left a config.toml with an EMPTY pool
+# — which surfaced three layers away as "pgpool_node_id specifies id=0
+# which is not in pool". A file is read the same way by both.
+#
+# The KEY SET is the contract, not just the version: Dockerfile.rhel
+# writes the same keys with RHEL's answers, provision.sh and
+# pgpool-setup.sh source this file, and the harness reads it over
+# docker exec (cluster::Facts). One authority per cell, so no layer has
+# to infer another layer's layout.
+RUN mkdir -p /etc/pg-agent-matrix && printf '%s\n' \
+    "PG_VERSION=${PG_VERSION}" \
+    "PG_FAMILY=debian" \
+    "PG_UNIT=postgresql@${PG_VERSION}-main" \
+    "PGDATA=/var/lib/postgresql/${PG_VERSION}/main" \
+    "PG_BIN=/usr/lib/postgresql/${PG_VERSION}/bin" \
+    "PG_CONF_DIR=/etc/postgresql/${PG_VERSION}/main" \
+    "PG_HOME=/var/lib/postgresql" \
+    "PG_LOG=/var/log/postgresql/postgresql-${PG_VERSION}-main.log" \
+    "PGPOOL_UNIT=pgpool2" \
+    "PGPOOL_CONF_DIR=/etc/pgpool2" \
+    > /etc/pg-agent-matrix/env
 
 # Mask pgpool2 BEFORE any install, per BOOTSTRAP.md Phase 1.1 — the
 # Debian postinst would otherwise enable + start it. (Masking works in

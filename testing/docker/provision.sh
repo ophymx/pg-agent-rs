@@ -4,12 +4,32 @@
 # Plays the role Ansible plays in production (BOOTSTRAP.md Phase 1).
 set -euo pipefail
 
-# Which PostgreSQL this image was built against (matrix cell). Read from
-# disk, not the environment: systemd hands its units a clean env, so the
-# image's ENV is invisible here even though `docker exec` sees it.
+# --- this cell's layout ------------------------------------------------
+# Read from disk, not the environment: systemd hands its units a clean
+# env, so the image's ENV is invisible here even though `docker exec`
+# sees it. The Dockerfiles write this file; see cluster::Facts for the
+# key set and why the image is the authority on it.
+#
+# The defaults below are Debian's, so this script still works against
+# an image built before the facts file existed. They are NOT a fallback
+# worth relying on: on a RHEL image with no facts file every path here
+# would be wrong in a way that looks like PostgreSQL is broken.
 # shellcheck disable=SC1091
 [ -r /etc/pg-agent-matrix/env ] && . /etc/pg-agent-matrix/env
 PG_VERSION="${PG_VERSION:-17}"
+PG_FAMILY="${PG_FAMILY:-debian}"
+PG_UNIT="${PG_UNIT:-postgresql@${PG_VERSION}-main}"
+PGDATA="${PGDATA:-/var/lib/postgresql/${PG_VERSION}/main}"
+PG_BIN="${PG_BIN:-/usr/lib/postgresql/${PG_VERSION}/bin}"
+PG_CONF_DIR="${PG_CONF_DIR:-/etc/postgresql/${PG_VERSION}/main}"
+PG_HOME="${PG_HOME:-/var/lib/postgresql}"
+PG_LOG="${PG_LOG:-/var/log/postgresql/postgresql-${PG_VERSION}-main.log}"
+PGPOOL_UNIT="${PGPOOL_UNIT:-pgpool2}"
+PGPOOL_CONF_DIR="${PGPOOL_CONF_DIR:-/etc/pgpool2}"
+
+# The installation prefix is the parent of bin/ — that is exactly the
+# distinction pg_install_prefix draws (config.rs PostgresConfig docs).
+PG_PREFIX="${PG_BIN%/bin}"
 
 NODE_ID="${HOSTNAME#db}"
 case "$NODE_ID" in
@@ -18,11 +38,13 @@ case "$NODE_ID" in
 esac
 MARKER=/var/lib/pg-agent-provisioned
 
-echo "provision: node id $NODE_ID ($HOSTNAME)"
+echo "provision: node id $NODE_ID ($HOSTNAME), $PG_FAMILY PostgreSQL $PG_VERSION"
 
 # --- pgpool node id (agent's implicit local-id source) -----------------
-mkdir -p /etc/pgpool2
-echo "$NODE_ID" > /etc/pgpool2/pgpool_node_id
+# In pgpool's OWN config dir, which differs by family — the whole point
+# of this file is that pgpool and the agent read the same one.
+mkdir -p "$PGPOOL_CONF_DIR"
+echo "$NODE_ID" > "$PGPOOL_CONF_DIR/pgpool_node_id"
 
 # --- TLS material (mounted read-only at /certs by compose) -------------
 mkdir -p /etc/pg_agent/tls
@@ -53,17 +75,25 @@ id       = 2
 hostname = "db2"
 
 [postgres]
-# Written explicitly rather than left to the agent's defaults: those
-# name PostgreSQL 17, and the OS/version matrix runs 15 and 16 too. A
-# matrix cell that silently fell back to 17 paths would fail in a way
-# that looks like a product bug.
-pg_install_prefix = "/usr/lib/postgresql/${PG_VERSION}"
-data_dir          = "/var/lib/postgresql/${PG_VERSION}/main"
-service           = "postgresql@${PG_VERSION}-main.service"
+# Every path written explicitly rather than left to the agent's
+# defaults. Those defaults name Debian's PostgreSQL 17 layout, and this
+# matrix runs 15/16/17 across two packaging families whose directory
+# conventions agree on nothing. A cell that silently fell back to the
+# Debian 17 answers would fail in a way that looks like a product bug.
+pg_install_prefix = "${PG_PREFIX}"
+data_dir          = "${PGDATA}"
+user_home         = "${PG_HOME}"
+archive_dir       = "${PG_HOME}/archive"
+service           = "${PG_UNIT}.service"
 
 # Container-to-container replication without client certs.
 [postgres.replication]
 sslmode = "disable"
+
+[pcp]
+# pgpool's unit is pgpool2.service on Debian and pgpool-II.service on
+# RHEL. The agent only ever manages it through this name.
+pgpool_service = "${PGPOOL_UNIT}.service"
 
 # Fresh-cluster bootstrap: all three nodes initdb as TL1 primaries, so
 # peer evidence is unavailable/contradictory until ClusterInit shapes
@@ -77,7 +107,7 @@ phantom_check_required_peers = 0
 pgpool = false
 
 # EXECUTE MODE FROM FIRST BOOT - the greenfield deployment shape the
-# suite validates, and now the only shape there is: `enabled` alone
+# suite validates, and now the only shape there is: \`enabled\` alone
 # selects it, since the pgpool-led path and the log-only shadow mode
 # are both deleted.
 #
@@ -100,10 +130,30 @@ leader_ttl_secs     = 10
 election_timeout_ms = 1000
 EOF
 
+# --- RHEL: create the cluster the package does not create for you ------
+# Debian's postgresql-common initdb's a `main` cluster in the package's
+# postinst, which is why the Debian path here has nothing to do. RHEL
+# ships the software and leaves the data directory to the operator, so
+# this is the step that has no Debian counterpart rather than a
+# different spelling of one.
+if [ "$PG_FAMILY" = "rhel" ] && [ ! -f "$PGDATA/PG_VERSION" ]; then
+    echo "provision: initdb $PGDATA (RHEL has no packaged cluster)"
+    "/usr/pgsql-${PG_VERSION}/bin/postgresql-${PG_VERSION}-setup" initdb
+fi
+
 # --- PostgreSQL config -------------------------------------------------
-PGCONF_DIR=/etc/postgresql/${PG_VERSION}/main
-mkdir -p "$PGCONF_DIR/conf.d"
-cat > "$PGCONF_DIR/conf.d/10-pg-agent-acceptance.conf" <<EOF
+# On Debian PG_CONF_DIR is /etc/postgresql/<v>/main and postgresql.conf
+# already carries `include_dir = 'conf.d'`. On RHEL the config lives
+# INSIDE PGDATA and initdb writes no include_dir at all, so the drop-in
+# directory has to be created and wired up once.
+mkdir -p "$PG_CONF_DIR/conf.d"
+if [ "$PG_FAMILY" = "rhel" ]; then
+    if ! grep -q "^include_dir = 'conf.d'" "$PG_CONF_DIR/postgresql.conf"; then
+        printf "\ninclude_dir = 'conf.d'\n" >> "$PG_CONF_DIR/postgresql.conf"
+    fi
+fi
+
+cat > "$PG_CONF_DIR/conf.d/10-pg-agent-acceptance.conf" <<EOF
 listen_addresses = '*'
 # The retention floor slots structurally cannot provide (finding 22): a
 # slot created at promotion cannot retroactively protect segments
@@ -131,9 +181,35 @@ wal_receiver_status_interval = '2s'
 # The agent writes standby recovery settings to \$PGDATA/myrecovery.conf
 # (SPEC §5.10, pgpool convention); PostgreSQL only reads it if the main
 # config includes it. Ansible owns this line in production.
-include_if_exists = '/var/lib/postgresql/${PG_VERSION}/main/myrecovery.conf'
+include_if_exists = '${PGDATA}/myrecovery.conf'
 EOF
-chown -R postgres:postgres "$PGCONF_DIR/conf.d"
+
+if [ "$PG_FAMILY" = "rhel" ]; then
+    # Give the harness the one server log path it tails on both
+    # families. Debian gets this for free — pg_ctlcluster redirects the
+    # postmaster's stderr into /var/log/postgresql/postgresql-<v>-main.log
+    # — while RHEL's unit lets stderr go to the journal.
+    #
+    # The collector rather than the journal on purpose: journald rate
+    # limits (10k messages / 30 s by default) and DROPS the excess, and
+    # this suite asserts on the ORDER of specific log lines under G11's
+    # write load. A silently dropped line would read as a safety
+    # violation. A file cannot rate limit.
+    #
+    # Rotation is off in all three of its forms so the path stays
+    # valid for the whole run rather than becoming a stale inode that
+    # `tail -F` has to notice.
+    cat >> "$PG_CONF_DIR/conf.d/10-pg-agent-acceptance.conf" <<EOF
+logging_collector = on
+log_directory = '$(dirname "$PG_LOG")'
+log_filename = '$(basename "$PG_LOG")'
+log_rotation_age = 0
+log_rotation_size = 0
+log_truncate_on_rotation = off
+unix_socket_directories = '/var/run/postgresql, /tmp'
+EOF
+fi
+chown -R postgres:postgres "$PG_CONF_DIR/conf.d"
 
 # PostgreSQL is AGENT-managed: the OS must never autostart it. Debian's
 # generator starts every 'auto' cluster at boot through the postgresql
@@ -144,9 +220,14 @@ chown -R postgres:postgres "$PGCONF_DIR/conf.d"
 # path went untested). 'manual' closes autostart while leaving explicit
 # `systemctl start postgresql@<ver>-main` (provision bootstrap, recover,
 # cold start) untouched.
-echo manual > "$PGCONF_DIR/start.conf"
+#
+# RHEL needs no equivalent: its unit is a plain per-version service
+# with no generator and no meta-service, and the Dockerfile disables it.
+if [ "$PG_FAMILY" = "debian" ]; then
+    echo manual > "$PG_CONF_DIR/start.conf"
+fi
 
-HBA="$PGCONF_DIR/pg_hba.conf"
+HBA="$PG_CONF_DIR/pg_hba.conf"
 if ! grep -q "pg-agent-acceptance" "$HBA"; then
     cat >> "$HBA" <<'EOF'
 # pg-agent-acceptance: replication + rewind + pgpool sr_check/health
@@ -159,15 +240,20 @@ EOF
 fi
 
 # --- filesystem bits ---------------------------------------------------
-install -d -o postgres -g postgres /var/lib/postgresql/archive
+install -d -o postgres -g postgres "${PG_HOME}/archive"
+# Both exist already on Debian; on RHEL the log directory is this
+# harness's invention and the socket directory is created by a
+# tmpfiles.d entry that has no reason to have run yet.
+install -d -o postgres -g postgres "$(dirname "$PG_LOG")"
+install -d -o postgres -g postgres /var/run/postgresql
 
 # --- first-boot cluster shaping ---------------------------------------
 if [ ! -e "$MARKER" ]; then
     if [ "$NODE_ID" = "0" ]; then
         echo "provision: bootstrap primary — starting PostgreSQL"
-        systemctl start "postgresql@${PG_VERSION}-main.service"
-        until runuser -u postgres -- pg_isready -q; do sleep 0.5; done
-        runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
+        systemctl start "${PG_UNIT}.service"
+        until runuser -u postgres -- "$PG_BIN/pg_isready" -q; do sleep 0.5; done
+        runuser -u postgres -- "$PG_BIN/psql" -v ON_ERROR_STOP=1 <<'SQL'
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'repl') THEN
     CREATE ROLE repl WITH LOGIN REPLICATION;
@@ -178,7 +264,7 @@ DO $$ BEGIN
 END $$;
 CREATE EXTENSION IF NOT EXISTS pgpool_recovery;
 SQL
-        runuser -u postgres -- psql -d template1 -v ON_ERROR_STOP=1 \
+        runuser -u postgres -- "$PG_BIN/psql" -d template1 -v ON_ERROR_STOP=1 \
             -c 'CREATE EXTENSION IF NOT EXISTS pgpool_recovery;'
     else
         echo "provision: standby node — PostgreSQL stays down until ClusterInit"

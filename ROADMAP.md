@@ -291,32 +291,49 @@ in v1.x and v2 should not foreclose them.
   `/etc/pgpool-II/pgpool_node_id`). Today: an operator on a non-Debian
   distro overrides every path field in `config.toml` — feasible but
   error-prone, and BOOTSTRAP.md reads as Debian-only.
+  **Status: RHEL WORKS — what is left is not having to spell it out.**
+  The `rocky9-pg16` matrix cell installs the `.rpm` on Rocky 9 and runs
+  the full acceptance suite green, so this is no longer a portability
+  question. An operator on RHEL sets five path fields in `config.toml`
+  and everything works; the remaining items are about deleting that
+  chore.
+
+  Work done:
+  - ~~**`.rpm` packaging**~~ — shipped, via `cargo-generate-rpm`, from
+    the same static musl binary and the same scriptlets as the `.deb`.
+  - ~~**CI matrix on a RHEL-flavoured container**~~ — shipped, and it
+    immediately earned its keep: finding 28 (the agent probed pgpool's
+    node-id file only at `/etc/pgpool2`, silently falling back to the
+    hostname match on RHEL) plus a polkit rule that did not match
+    `pgpool-II.service`.
+
   Work to do:
   1. **Distro profiles** — ship a `distro = "debian" | "rhel"` knob (or
      auto-detect from `/etc/os-release`) that selects a default set
      for `pg_install_prefix`, `user_home`, `data_dir`, `service`,
-     `pcp.pgpool_service`, `DEFAULT_PGPOOL_NODE_ID_FILE`. Operator
-     overrides still win per-field.
-  2. **`.rpm` packaging** alongside the `.deb`. Same
-     `dh_installsystemd --no-enable` / "restart-if-running on upgrade"
-     posture, but expressed as `%post`/`%postun` scriptlets.
-  3. **`ensure_hook_symlinks` discovery** — currently looks for
-     `pg_agentc` as a sibling of `pg_agentd` (Debian: both in
-     `/usr/bin`). On RHEL the layout may be the same, but verify and
-     codify; the PATH fallback already covers oddballs.
-  4. **BOOTSTRAP "distro matrix"** appendix listing the path-pair
+     `pcp.pgpool_service`. Operator overrides still win per-field. Now
+     a convenience rather than a blocker — and there is a cell to keep
+     it honest. (`DEFAULT_PGPOOL_NODE_ID_FILES` no longer belongs on
+     this list: it probes both families' paths already, because it is
+     pgpool's file rather than a field anyone sets.)
+  2. **`ensure_hook_symlinks` discovery** — currently looks for
+     `pg_agentc` as a sibling of `pg_agentd`. Confirmed the same on
+     RHEL (`/usr/bin` for both, since our own package places them), so
+     this is codification rather than a fix.
+  3. **BOOTSTRAP "distro matrix"** appendix listing the path-pair
      differences between supported distros, plus a "this is what
-     Ansible writes differently per OS family" inventory snippet.
-  5. **CI matrix** — run the test suite on a RHEL-flavoured container
-     too, just to catch path / service-name assumptions that creep
-     into tests.
+     Ansible writes differently per OS family" inventory snippet. The
+     table now exists in three places (testing/README.md,
+     Dockerfile.rhel, `cluster::Facts`); BOOTSTRAP is where an
+     operator would look for it.
 
-  Not v1 because it's pure portability — no new behaviour, just
-  reach. But foreclosing this would mean baking RHEL out of the
-  product permanently, so we keep design choices distro-neutral
-  (e.g., never hardcode `/etc/pgpool2/` in code outside the
-  `DEFAULT_*` consts; never assume `postgresql@*-main` instance
-  naming in subprocess args).
+  The discipline that made this cheap, kept because the remaining
+  items depend on it: no Debian path outside the `DEFAULT_*` consts,
+  and no `postgresql@*-main` instance naming assumed in subprocess
+  args. Every RHEL surprise turned out to be somewhere that rule had
+  been broken — a hardcoded `/etc/pgpool2` (finding 28) and a literal
+  unit name in the polkit rule (finding 27). Nothing in the decision
+  logic needed touching.
 
 - **VIP failover via pgpool watchdog `delegate_IP`** — support
   deployments that put pgpool's watchdog VIP in front of the cluster

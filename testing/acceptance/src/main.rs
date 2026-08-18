@@ -49,21 +49,45 @@ async fn run() -> anyhow::Result<bool> {
     let skip_build = std::env::var_os("SKIP_BUILD").is_some();
     let t0 = Instant::now();
 
+    // Which package this cell installs. The host has to decide before
+    // the image exists (the package goes INTO the build context), so
+    // unlike every other layout fact this one cannot come from
+    // /etc/pg-agent-matrix/env — it comes from the environment
+    // testing/matrix.sh sets, and init_facts() cross-checks that the
+    // image that came out agrees.
+    let family = std::env::var("PG_FAMILY").unwrap_or_else(|_| "debian".to_string());
+    let (fmt, glob, staged) = match family.as_str() {
+        "rhel" => (
+            "rpm",
+            "ls -t dist/pg-agent-rs-*.x86_64.rpm | head -1",
+            "testing/docker/pg-agent.rpm",
+        ),
+        _ => (
+            "deb",
+            "ls -t dist/pg-agent-rs_*_amd64.deb | head -1",
+            "testing/docker/pg-agent.deb",
+        ),
+    };
+
     say_raw("build", t0);
     if !skip_build {
-        cluster::host(&["./scripts/build-pkgs.sh", "deb"]).await?;
+        cluster::host(&["./scripts/build-pkgs.sh", fmt]).await?;
     }
-    let deb = cluster::host(&["bash", "-c", "ls -t dist/pg-agent-rs_*_amd64.deb | head -1"])
+    let pkg = cluster::host(&["bash", "-c", glob])
         .await?
         .trim()
         .to_string();
-    anyhow::ensure!(!deb.is_empty(), "no .deb in dist/ (build first?)");
-    cluster::host(&["cp", &deb, "testing/docker/pg-agent.deb"]).await?;
+    anyhow::ensure!(!pkg.is_empty(), "no .{fmt} in dist/ (build first?)");
+    cluster::host(&["cp", &pkg, staged]).await?;
     cluster::host(&["./testing/gen-certs.sh"]).await?;
 
     say_raw("cluster up", t0);
     cluster::compose_down().await;
     cluster::compose_up().await?;
+
+    // Learn this cell's layout before anything asks for a unit name or
+    // a data directory. The image is the authority (see cluster::Facts).
+    cluster::init_facts().await?;
 
     // Event tails from container start; PG connections once the nodes
     // have addresses.

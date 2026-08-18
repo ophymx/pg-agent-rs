@@ -28,6 +28,10 @@ services:
     <<: *node
     build:
       context: ./docker
+      # Two Dockerfiles, not one with branches: the families differ in
+      # what repos to add, which packages exist, and which units to
+      # mask, and a single file carrying both would be mostly `if`.
+      dockerfile: ${DOCKERFILE:-Dockerfile}
       args:
         BASE_IMAGE: ${BASE_IMAGE:-debian:trixie}
         PG_VERSION: ${PG_VERSION:-17}

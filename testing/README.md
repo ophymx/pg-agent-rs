@@ -36,32 +36,64 @@ opt-in entry point that runs the whole suite once per cell:
 testing/matrix.sh                  # every cell, sequentially
 testing/matrix.sh noble-pg16       # one named cell
 KEEP_GOING=1 testing/matrix.sh     # do not stop at the first failing cell
+FAIL_FAST=1 testing/matrix.sh …    # stop a cell at its first failure
 ```
 
-Cells pair each base with the PostgreSQL version it ships **natively**
-(no PGDG repo), so a build failure means "this pairing does not exist"
-rather than "an external repo moved". Cells run sequentially — they
-share the docker daemon and the compose project name — and each one
-tears down the previous cluster first, because a leftover container
-from cell N runs cell N's PostgreSQL.
+| cell | base | PostgreSQL | package |
+|------|------|-----------|---------|
+| `trixie-pg17`   | debian:trixie  | 17 | `.deb` |
+| `noble-pg16`    | ubuntu:24.04   | 16 | `.deb` |
+| `bookworm-pg15` | debian:bookworm| 15 | `.deb` |
+| `rocky9-pg16`   | rockylinux:9   | 16 | `.rpm` |
+
+The Debian-family cells pair each base with the PostgreSQL version it
+ships **natively** (no PGDG repo), so a build failure means "this
+pairing does not exist" rather than "an external repo moved". The Rocky
+cell cannot follow that rule and does not pretend to: RHEL ships no
+pgpool-II from any of its own repos, so PGDG is the only source — which
+is also what RHEL deployments actually use.
+
+The three Debian-family cells vary the PostgreSQL version against one
+layout. `rocky9-pg16` varies the **layout**, which is the part that had
+never been tested: a per-version unit instead of a per-cluster
+template, `postgresql.conf` inside `PGDATA` instead of under `/etc`, no
+packaged `initdb`, no `pg_ctlcluster`, a different postgres home, and
+pgpool under a different name in a different directory. Every one of
+those is a place where something could have been hard-coded, and two
+things were (findings 27 and 28).
+
+Nothing in the suite is allowed to *guess* which layout it is in. Each
+image writes `/etc/pg-agent-matrix/env`, and provisioning, the pgpool
+setup, and the harness (`cluster::Facts`, read over `docker exec`) all
+read that one file. `FAIL_FAST=1` stops a cell at its first failure,
+which is what you want when standing up a NEW cell: the suite is
+cumulative, so once provisioning is wrong every later scenario is
+reporting the same finding for another ten minutes.
+
+Cells run sequentially — they share the docker daemon and the compose
+project name — and each one tears down the previous cluster first,
+because a leftover container from cell N runs cell N's PostgreSQL.
 
 It costs a full suite run per cell, which is why it is not wired into
 the everyday path: its job is answering "does this still hold on the
 other distro" now and then, not taxing every iteration.
 
-Debian 12 (bookworm, PostgreSQL 15) is **absent on purpose** — see
-finding 26: the `.deb` this repo builds carries no glibc floor, so it
-installs there and dies at exec. That is a packaging defect to fix, not
-a cell to paper over.
+`bookworm-pg15` earns its place twice over: it is the oldest supported
+base, and it is the cell that catches a regression to a dynamically
+linked build. Under one, the package installs there and dies at exec
+with `GLIBC_2.39 not found` (finding 26). The build is static musl, so
+that floor is gone — and this is where it stays gone.
 
 ## Layout
 
 | File | Role |
 |---|---|
 | `compose.yaml` | 3 nodes (`db0..db2`), privileged + `cgroup: host` so systemd is PID 1 |
-| `docker/Dockerfile` | debian:trixie + systemd + postgresql-17 + the `.deb`; pgpool2 installed but masked (BOOTSTRAP.md Phase 1.1) |
-| `docker/provision.sh` | boot-time provisioning = Ansible's Phase-1 role: node id, TLS, config.toml, pg_hba, roles/extension, archive dir |
-| `docker/pgpool-setup.sh` | operator-run pgpool config + start (BOOTSTRAP Phase 1.4 + 3.1), in the target hook-contract shape |
+| `docker/Dockerfile` | Debian-family base + systemd + PostgreSQL + the `.deb`; pgpool2 installed but masked (BOOTSTRAP.md Phase 1.1) |
+| `docker/Dockerfile.rhel` | the same, for Rocky 9: PostgreSQL + pgpool-II from PGDG (RHEL ships no pgpool at all), the `.rpm`, `pgpool-II.service` masked |
+| *(both)* `/etc/pg-agent-matrix/env` | the cell's layout facts — unit, PGDATA, bins, config dir, postgres home, log path, pgpool unit + config dir. Written by the image, read by everything below and by the harness (`cluster::Facts`) over `docker exec`. Nothing infers the layout; one file states it |
+| `docker/provision.sh` | boot-time provisioning = Ansible's Phase-1 role: node id, TLS, config.toml, pg_hba, roles/extension, archive dir. Branches on `PG_FAMILY` only where the families genuinely differ in KIND rather than in spelling — RHEL has no packaged cluster (explicit `initdb`), no `conf.d` convention (adds the `include_dir`), no `start.conf`, and logs to the journal (turns the collector on so both families have one log file to tail) |
+| `docker/pgpool-setup.sh` | operator-run pgpool config + start (BOOTSTRAP Phase 1.4 + 3.1), in the target hook-contract shape. `pid_file_name`, `logdir` and `pool_passwd` are set explicitly: their compiled-in defaults differ per family, and on RHEL two of them point somewhere pgpool cannot write, which it reports by exiting 3 in a restart loop |
 | `docker/50-pg-agent.rules` | polkit grant (postgres user → manage PG/pgpool units) |
 | `gen-certs.sh` | one CA + per-node certs, SAN = compose hostname (matches the peer SAN allowlist) |
 | `acceptance.sh` | thin launcher for the Rust harness below |
@@ -263,7 +295,11 @@ cluster; the discovery rate on new probes says these will pay):
    not.
 8. `detach_false_primary` storm behavior (hook-contract §5.5), which
    needs a false primary manufactured out of band.
-9. `.rpm` flavor on a RHEL-family image (ROADMAP distro matrix).
+9. ~~`.rpm` flavor on a RHEL-family image (ROADMAP distro matrix)~~ —
+   **done**: `rocky9-pg16` installs the real `.rpm` on Rocky 9 and runs
+   the full suite. It found one product bug (finding 28) and one
+   fixture bug, and cost less than the Debian version cells did,
+   because the layout is read from the image rather than assumed.
 10. ~~Close finding 22's slot race in the product~~ — **done**, and
     the investigation corrected the plan: slots-at-promote alone does
     NOT close the race, because a slot cannot retroactively protect
@@ -865,6 +901,41 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     124) and was wrong; the versions were a coincidence. The tell was
     that db0 could manage its OWN PostgreSQL — provisioning starts it
     as root — while only agent-issued peer operations failed.
+
+28. **The agent read pgpool's node-id file at a Debian-only path, so
+    on RHEL it silently skipped the file it exists to share.**
+    `resolve_local_node_id` probes `/etc/pgpool2/pgpool_node_id` as
+    step 3 of four, the whole point being that one Ansible step writes
+    one file that *both* pgpool and the agent read. RHEL's pgpool keeps
+    its config in `/etc/pgpool-II`, so on that family step 3 always
+    missed and resolution fell through to step 4, the hostname match.
+
+    What makes this worth a finding rather than a one-line diff is that
+    it is **invisible when it fires**. There is no error: the hostname
+    fallback answers correctly whenever the host is named like a pool
+    entry, which is true of this harness (`db0`..`db2`) and true of
+    plenty of real deployments. The agent would come up, resolve the
+    right id, and log nothing — until a RHEL host whose hostname is not
+    its pool name, where the agent gets `NoLocalNode` (or, worse, the
+    operator's intended id is simply ignored in favour of a matching
+    hostname that means something else). A green Rocky run does not
+    disprove it; the fallback is what kept the run green.
+
+    Fixed by probing both spellings in order. The contrast with the
+    other family-specific paths is the lesson: `data_dir`,
+    `pg_install_prefix`, and `service` are all config keys, so an
+    operator on RHEL sets them and moves on. This one was never a key,
+    because "it's pgpool's own file" — which is exactly why it had to
+    learn both of pgpool's own spellings.
+
+    A fixture bug of the same shape came out with it, and this one the
+    suite could *not* have caught: the polkit rule matched
+    `pgpool2.service` and `pgpool.service` but not RHEL's actual
+    `pgpool-II.service`. The suite runs with `[supervisor] pgpool =
+    false`, so it never asks polkit about pgpool at all — the rule is
+    production's, not the suite's. Fixed by inspection, prompted by
+    knowing the unit name at last; noted here because "the matrix went
+    green" is not the same claim as "the matrix exercised it".
 
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death

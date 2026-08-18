@@ -17,7 +17,7 @@
 //! vice-versa. Splitting localhost-correctness from mesh-correctness
 //! lets each node's preflight pass on its own merits.
 
-use crate::config::{Config, DEFAULT_PGPOOL_NODE_ID_FILE};
+use crate::config::{Config, DEFAULT_PGPOOL_NODE_ID_FILES};
 use crate::localdb::LocalDb;
 use std::io::Write;
 use std::path::Path;
@@ -197,7 +197,14 @@ fn fs_tls_material(cfg: &Config, r: &mut PreflightReport) {
 }
 
 fn fs_pgpool_node_id(cfg: &Config, r: &mut PreflightReport) {
-    let path = Path::new(DEFAULT_PGPOOL_NODE_ID_FILE);
+    // Same probe order the agent itself uses, so preflight reports on
+    // the file the agent would actually read rather than on one
+    // family's spelling of it.
+    let path = DEFAULT_PGPOOL_NODE_ID_FILES
+        .iter()
+        .map(Path::new)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| Path::new(DEFAULT_PGPOOL_NODE_ID_FILES[0]));
     let name = format!("pgpool_node_id: {}", path.display());
     match std::fs::read_to_string(path) {
         Ok(raw) => match raw.trim().parse::<i32>() {

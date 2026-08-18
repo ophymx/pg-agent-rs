@@ -20,10 +20,19 @@ polkit.addRule(function(action, subject) {
         // (postgresql@17-main), RHEL's per-version unit
         // (postgresql-16), and the plain meta-service. Matching by
         // pattern rather than by literal is what finding 27 was about.
+        //
+        // pgpool is spelled THREE ways across packagings —
+        // pgpool2.service (Debian), pgpool-II.service (the RHEL/PGDG
+        // RPM), pgpool.service (built from source). The acceptance
+        // suite runs with [supervisor] pgpool = false and so never
+        // asked polkit for pgpool at all, which is why the missing
+        // RHEL spelling here was invisible on a green Rocky run: this
+        // rule is production's, not the suite's.
         if (/^postgresql@\d+-main\.service$/.test(unit) ||
             /^postgresql-\d+\.service$/.test(unit) ||
             unit == "postgresql.service" ||
             unit == "pgpool2.service" ||
+            unit == "pgpool-II.service" ||
             unit == "pgpool.service") {
             return polkit.Result.YES;
         }

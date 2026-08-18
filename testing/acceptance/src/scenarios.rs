@@ -135,37 +135,53 @@ async fn cluster_recover(cx: &Ctx, via: &str, target: &str) {
     }
 }
 
+/// Run one scenario, unless `FAIL_FAST` and something already failed.
+///
+/// Bailing out returns from `run_all` entirely, which also skips the
+/// audit: the auditor reasons over the whole run's event order, and on
+/// a truncated run its complaints are artifacts of the truncation
+/// rather than findings.
+macro_rules! stage {
+    ($cx:expr, $call:expr) => {{
+        if $cx.stop_early() {
+            $cx.note("FAIL_FAST: stopping at the first failure");
+            return;
+        }
+        $call
+    }};
+}
+
 pub async fn run_all(cx: &mut Ctx) {
     let mut marks: HashMap<&'static str, Cursor> = NODES.iter().map(|n| (*n, Cursor(0))).collect();
 
-    g0(cx).await;
-    g1(cx).await;
-    g1b(cx).await;
-    g2(cx).await;
-    g2b(cx).await;
-    let w1 = g3(cx).await;
-    g4(cx, w1, "db0", &mut marks).await;
-    g4b(cx, w1, &mut marks).await;
-    let w2 = g5(cx, w1).await;
-    g5b(cx, w1, w2, &mut marks).await;
-    g6(cx, w2).await;
-    let w3 = g7(cx, w2, &mut marks).await;
-    let w4 = g8(cx, w3, &mut marks).await;
-    let w5 = g9(cx, w4, &mut marks).await;
-    g10(cx, w5).await;
-    let w6 = g11(cx, w5, &mut marks).await;
-    let w7 = g12(cx, w6, &mut marks).await;
-    g13(cx, w7, &mut marks).await;
-    g14(cx, w7, &mut marks).await;
-    let w8 = g15(cx, w7, &mut marks).await;
-    g16(cx, w8).await;
-    g17(cx, w8).await;
-    g18(cx, w8, &mut marks).await;
+    stage!(cx, g0(cx).await);
+    stage!(cx, g1(cx).await);
+    stage!(cx, g1b(cx).await);
+    stage!(cx, g2(cx).await);
+    stage!(cx, g2b(cx).await);
+    let w1 = stage!(cx, g3(cx).await);
+    stage!(cx, g4(cx, w1, "db0", &mut marks).await);
+    stage!(cx, g4b(cx, w1, &mut marks).await);
+    let w2 = stage!(cx, g5(cx, w1).await);
+    stage!(cx, g5b(cx, w1, w2, &mut marks).await);
+    stage!(cx, g6(cx, w2).await);
+    let w3 = stage!(cx, g7(cx, w2, &mut marks).await);
+    let w4 = stage!(cx, g8(cx, w3, &mut marks).await);
+    let w5 = stage!(cx, g9(cx, w4, &mut marks).await);
+    stage!(cx, g10(cx, w5).await);
+    let w6 = stage!(cx, g11(cx, w5, &mut marks).await);
+    let w7 = stage!(cx, g12(cx, w6, &mut marks).await);
+    stage!(cx, g13(cx, w7, &mut marks).await);
+    stage!(cx, g14(cx, w7, &mut marks).await);
+    let w8 = stage!(cx, g15(cx, w7, &mut marks).await);
+    stage!(cx, g16(cx, w8).await);
+    stage!(cx, g17(cx, w8).await);
+    stage!(cx, g18(cx, w8, &mut marks).await);
     let w9 = cx.pg.current_primary().await.unwrap_or(w8);
-    g19(cx, w9).await;
-    let w10 = g20(cx, w9, &mut marks).await;
-    g21(cx, w10, &mut marks).await;
-    crate::audit::run(cx);
+    stage!(cx, g19(cx, w9).await);
+    let w10 = stage!(cx, g20(cx, w9, &mut marks).await);
+    stage!(cx, g21(cx, w10, &mut marks).await);
+    stage!(cx, crate::audit::run(cx));
 }
 
 async fn g0(cx: &mut Ctx) {
@@ -309,7 +325,8 @@ async fn g2(cx: &mut Ctx) {
     cx.say("G2: the hook contract holds (check-hooks fully clean)");
     // The deployed conf ends with the canonical gen-pgpool block, no
     // overrides — check-hooks must pass verbatim: hooks AND settings.
-    match exec_pg("db0", "pg_agentctl check-hooks /etc/pgpool2/pgpool.conf").await {
+    let conf = format!("{}/pgpool.conf", cluster::pgpool_conf_dir());
+    match exec_pg("db0", &format!("pg_agentctl check-hooks {conf}")).await {
         Ok(_) => cx.pass("check-hooks passes on the deployed conf (exit 0)"),
         Err(e) => {
             let text = e.to_string();
@@ -2055,8 +2072,10 @@ async fn g19(cx: &mut Ctx, prim: &'static str) {
         &format!("{victim}: agent stopped and raft store deleted"),
         exec_ok(
             victim,
-            "systemctl stop pg_agentd && rm -rf /var/lib/postgresql/pg_agent/raft && \
-             test ! -d /var/lib/postgresql/pg_agent/raft",
+            &format!(
+                "systemctl stop pg_agentd && rm -rf {raft} && test ! -d {raft}",
+                raft = format!("{}/raft", cluster::agent_state_dir())
+            ),
         )
         .await,
     );
