@@ -19,8 +19,9 @@
 
 use crate::config::{Config, DEFAULT_PGPOOL_NODE_ID_FILES};
 use crate::localdb::LocalDb;
+use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Recommended `wal_keep_size` floor, in MB. Covers the failover gap
@@ -29,6 +30,22 @@ use std::sync::Arc;
 /// freshly promoted primary without a reclone. A deployment with heavy
 /// write bursts should raise it — the check is a floor, not a target.
 const WAL_KEEP_SIZE_FLOOR_MB: i64 = 512;
+
+/// The standby recovery include the agent writes into `$PGDATA`
+/// (`pgman::pgstandby`'s `write_recovery_conf`). PostgreSQL reads it
+/// only if the effective `postgresql.conf` includes it, and nothing in
+/// the write path can tell the difference: `ConfigureStandby` reports
+/// success, the standby starts, and it simply never streams — no
+/// `primary_conninfo`, no error (testing/README.md finding 6). That is
+/// the class of silent localhost misconfiguration `validate-env` exists
+/// to catch, so the missing include is an ERR.
+const RECOVERY_CONF_FILE: &str = "myrecovery.conf";
+
+/// Ceiling on the number of files the include walk will read. A
+/// `postgresql.conf` tree is a handful of files; this only bounds the
+/// pathological case (an operator's `include_dir` pointing somewhere
+/// enormous) so `validate-env` can't turn into a filesystem crawl.
+const INCLUDE_SCAN_MAX_FILES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStatus {
@@ -157,6 +174,10 @@ pub async fn preflight(cfg: &Config, db: Option<Arc<dyn LocalDb>>) -> PreflightR
     fs_pgpool_node_id(cfg, &mut r);
     fs_postgres_home_defaults(cfg, &mut r);
     fs_recovery_tools(cfg, &mut r);
+    // Filesystem-shaped, but reads `config_file` / `data_directory`
+    // from the server when there is one — the only source that is
+    // right on both layouts and after any operator override.
+    fs_recovery_conf_include(cfg, db.as_ref(), &mut r).await;
     raft_prerequisites(cfg, &mut r);
 
     // ---- db-backed checks ----------------------------------------------
@@ -294,6 +315,315 @@ fn fs_recovery_tools(cfg: &Config, r: &mut PreflightReport) {
         let path = prefix.join("bin").join(tool);
         check_executable(r, &format!("recovery tool: {tool}"), &path);
     }
+}
+
+/// Assert that the effective `postgresql.conf` includes the
+/// `myrecovery.conf` the agent writes into `$PGDATA`.
+///
+/// Without the include, a node can be reconfigured as a standby
+/// successfully and still never stream: `ConfigureStandby` writes the
+/// file and reports success, PostgreSQL starts, and nothing anywhere
+/// reads `primary_conninfo`. There is no error to find — which is why
+/// this belongs in the deploy gate rather than in the recovery path.
+///
+/// The check resolves the include the way PostgreSQL does, and that
+/// resolution is the point: **a relative include is taken as relative
+/// to the directory holding the file that references it, not to
+/// `data_directory`.** On the Debian layout — config under
+/// `/etc/postgresql/<ver>/<cluster>/`, `$PGDATA` under
+/// `/var/lib/postgresql/<ver>/<cluster>/` — a bare
+/// `include_if_exists = 'myrecovery.conf'` therefore points at a file
+/// in `/etc` that nothing ever writes. It looks right, it parses, PG
+/// starts clean, and the standby never streams. So "an include naming
+/// `myrecovery.conf`" is not enough to pass: it has to resolve to the
+/// path `pgman` actually writes.
+async fn fs_recovery_conf_include(
+    cfg: &Config,
+    db: Option<&Arc<dyn LocalDb>>,
+    r: &mut PreflightReport,
+) {
+    const NAME: &str = "recovery conf include";
+
+    // Prefer the running server's own answer: it is right on both
+    // layouts and after any operator override of either path. Fall
+    // back to config + layout probing when PG is down — the normal
+    // case for the `ExecStartPre=` invocation.
+    let mut data_dir = cfg.postgres.data_dir.clone();
+    let mut config_file: Option<PathBuf> = None;
+    if let Some(db) = db {
+        if let Ok(v) = db.setting("data_directory").await {
+            if !v.trim().is_empty() {
+                data_dir = Some(PathBuf::from(v.trim()));
+            }
+        }
+        if let Ok(v) = db.setting("config_file").await {
+            if !v.trim().is_empty() {
+                config_file = Some(PathBuf::from(v.trim()));
+            }
+        }
+    }
+
+    let Some(data_dir) = data_dir else {
+        r.checks.push(Check::warn(
+            NAME,
+            format!("postgres.data_dir unset; cannot locate {RECOVERY_CONF_FILE}"),
+        ));
+        return;
+    };
+    let want = data_dir.join(RECOVERY_CONF_FILE);
+
+    let (config_file, tried) = match config_file {
+        Some(p) => (Some(p), Vec::new()),
+        None => {
+            let candidates = config_file_candidates(&data_dir);
+            (candidates.iter().find(|p| p.is_file()).cloned(), candidates)
+        }
+    };
+    let Some(config_file) = config_file else {
+        r.checks.push(Check::warn(
+            NAME,
+            format!(
+                "could not locate postgresql.conf (tried {}); cannot confirm {} is included",
+                tried
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                want.display()
+            ),
+        ));
+        return;
+    };
+
+    match scan_for_recovery_include(&config_file, &want) {
+        Some(IncludeHit::Optional { in_file }) => r.checks.push(Check::ok(
+            NAME,
+            format!("{} includes {}", in_file.display(), want.display()),
+        )),
+        Some(IncludeHit::Required { in_file }) => r.checks.push(Check::warn(
+            NAME,
+            format!(
+                "{} includes {} with `include` rather than `include_if_exists` — \
+                 PostgreSQL refuses to start whenever that file is absent, which is a \
+                 primary's normal state",
+                in_file.display(),
+                want.display()
+            ),
+        )),
+        Some(IncludeHit::Elsewhere {
+            in_file,
+            raw,
+            resolved,
+        }) => r.checks.push(Check::err(
+            NAME,
+            format!(
+                "{} includes '{raw}', which resolves to {} — but the agent writes {}. \
+                 A relative include resolves against the directory of the file that \
+                 references it, not the data directory; spell it absolutely",
+                in_file.display(),
+                resolved.display(),
+                want.display()
+            ),
+        )),
+        None => r.checks.push(Check::err(
+            NAME,
+            format!(
+                "no include in {} names {} — a standby configured on this node would \
+                 start with no primary_conninfo and silently never stream. Add \
+                 `include_if_exists = '{}'`",
+                config_file.display(),
+                want.display(),
+                want.display()
+            ),
+        )),
+    }
+}
+
+/// Where `postgresql.conf` might live when the server is down and
+/// can't be asked, most specific first.
+fn config_file_candidates(data_dir: &Path) -> Vec<PathBuf> {
+    // RHEL family (and any initdb-default layout): inside PGDATA.
+    let mut out = vec![data_dir.join("postgresql.conf")];
+    // Debian family: PGDATA is /var/lib/postgresql/<ver>/<cluster>,
+    // and the config is the same tail under /etc/postgresql.
+    if let (Some(cluster), Some(ver)) = (
+        data_dir.file_name(),
+        data_dir.parent().and_then(|p| p.file_name()),
+    ) {
+        out.push(
+            Path::new("/etc/postgresql")
+                .join(ver)
+                .join(cluster)
+                .join("postgresql.conf"),
+        );
+    }
+    out
+}
+
+/// What the include walk found, best outcome wins.
+#[derive(Debug)]
+enum IncludeHit {
+    /// `include_if_exists` naming the file the agent writes. Correct.
+    Optional { in_file: PathBuf },
+    /// Plain `include` naming it — works, but couples PostgreSQL's
+    /// ability to start to a file that only exists on standbys.
+    Required { in_file: PathBuf },
+    /// An include names `myrecovery.conf`, but not the one that gets
+    /// written. The silent case this check exists for.
+    Elsewhere {
+        in_file: PathBuf,
+        raw: String,
+        resolved: PathBuf,
+    },
+}
+
+impl IncludeHit {
+    fn rank(&self) -> u8 {
+        match self {
+            IncludeHit::Optional { .. } => 3,
+            IncludeHit::Required { .. } => 2,
+            IncludeHit::Elsewhere { .. } => 1,
+        }
+    }
+}
+
+/// Walk `root` and everything it includes, looking for the directive
+/// that pulls in the agent's recovery file. Follows `include`,
+/// `include_if_exists` and `include_dir` the way PostgreSQL does;
+/// missing include targets are skipped rather than reported (PG's own
+/// `include_if_exists` semantics, and a plain missing `include` is the
+/// server's complaint to make, not ours).
+fn scan_for_recovery_include(root: &Path, want: &Path) -> Option<IncludeHit> {
+    let mut best: Option<IncludeHit> = None;
+    let mut queue: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut budget = INCLUDE_SCAN_MAX_FILES;
+
+    while let Some(file) = queue.pop() {
+        if !seen.insert(file.clone()) {
+            continue; // include cycles are the operator's problem, not a hang
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let dir = file.parent().unwrap_or(Path::new("."));
+
+        for line in text.lines() {
+            let Some((key, value)) = parse_include_directive(line) else {
+                continue;
+            };
+            let target = if Path::new(&value).is_absolute() {
+                PathBuf::from(&value)
+            } else {
+                dir.join(&value)
+            };
+
+            if key == "include_dir" {
+                let Ok(entries) = std::fs::read_dir(&target) else {
+                    continue;
+                };
+                let mut confs: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "conf"))
+                    .collect();
+                confs.sort();
+                queue.extend(confs);
+                continue;
+            }
+
+            if target.file_name().is_some_and(|n| n == RECOVERY_CONF_FILE) {
+                let hit = if same_target(&target, want) {
+                    if key == "include_if_exists" {
+                        IncludeHit::Optional {
+                            in_file: file.clone(),
+                        }
+                    } else {
+                        IncludeHit::Required {
+                            in_file: file.clone(),
+                        }
+                    }
+                } else {
+                    IncludeHit::Elsewhere {
+                        in_file: file.clone(),
+                        raw: value.clone(),
+                        resolved: target.clone(),
+                    }
+                };
+                if best.as_ref().is_none_or(|b| hit.rank() > b.rank()) {
+                    best = Some(hit);
+                }
+            } else {
+                queue.push(target);
+            }
+        }
+    }
+
+    best
+}
+
+/// Parse one `postgresql.conf` line into an include directive.
+/// Accepts both spellings PostgreSQL does (`include 'x'` and
+/// `include = 'x'`), quoted or bare, and ignores everything else.
+fn parse_include_directive(line: &str) -> Option<(String, String)> {
+    let line = strip_comment(line).trim();
+    let key_end = line.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+    let (key, rest) = line.split_at(key_end);
+    let key = key.to_ascii_lowercase();
+    if !matches!(
+        key.as_str(),
+        "include" | "include_if_exists" | "include_dir"
+    ) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+    let value = match rest.strip_prefix('\'') {
+        Some(quoted) => quoted[..quoted.find('\'')?].to_string(),
+        None => rest.split_whitespace().next()?.to_string(),
+    };
+    if value.is_empty() {
+        return None;
+    }
+    Some((key, value))
+}
+
+/// Everything before the first unquoted `#`.
+fn strip_comment(line: &str) -> &str {
+    let mut in_quote = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '\'' => in_quote = !in_quote,
+            '#' if !in_quote => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Do two paths name the same recovery file? Compared through the
+/// parent directory so a symlinked `$PGDATA` (Debian's
+/// `/var/lib/postgresql/<ver>/<cluster>` on some deployments) doesn't
+/// read as a mismatch. The file itself usually does not exist — a
+/// primary never has one — so it can't be canonicalized directly.
+fn same_target(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let norm = |p: &Path| -> PathBuf {
+        let parent = p.parent().unwrap_or(Path::new("/"));
+        let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        match p.file_name() {
+            Some(n) => parent.join(n),
+            None => parent,
+        }
+    };
+    norm(a) == norm(b)
 }
 
 fn check_readable(r: &mut PreflightReport, name: &str, path: &Path) {
@@ -694,6 +1024,223 @@ mod tests {
             !r.checks.iter().any(|c| c.name.contains("peer")),
             "preflight should not emit any peer-* rows"
         );
+    }
+
+    // ----- recovery conf include ---------------------------------------
+
+    /// Build a cfg whose `$PGDATA` is a real temp dir, plus a config
+    /// directory beside it — the Debian shape (config outside PGDATA)
+    /// in miniature, which is the shape that makes the relative-include
+    /// trap reachable.
+    fn make_include_cfg(tmp: &TempDir) -> (Config, PathBuf, PathBuf) {
+        let mut cfg = make_cfg(tmp);
+        let data_dir = tmp.path().join("pgdata");
+        let conf_dir = tmp.path().join("etc");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+        cfg.postgres.data_dir = Some(data_dir.clone());
+        (cfg, data_dir, conf_dir)
+    }
+
+    fn include_check(r: &PreflightReport) -> &Check {
+        find(&r.checks, "recovery conf include")
+    }
+
+    #[tokio::test]
+    async fn recovery_include_ok_when_pgdata_conf_names_it() {
+        // RHEL shape: postgresql.conf lives inside PGDATA, so the
+        // relative spelling BOOTSTRAP prescribes resolves correctly.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, data_dir, _conf_dir) = make_include_cfg(&tmp);
+        fs::write(
+            data_dir.join("postgresql.conf"),
+            "wal_level = replica\ninclude_if_exists = 'myrecovery.conf'\n",
+        )
+        .unwrap();
+
+        let r = preflight(&cfg, None).await;
+        let c = include_check(&r);
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.detail);
+    }
+
+    #[tokio::test]
+    async fn recovery_include_err_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg, data_dir, _conf_dir) = make_include_cfg(&tmp);
+        fs::write(
+            data_dir.join("postgresql.conf"),
+            "wal_level = replica\nhot_standby = on\n",
+        )
+        .unwrap();
+
+        let r = preflight(&cfg, None).await;
+        let c = include_check(&r);
+        assert_eq!(c.status, CheckStatus::Err, "{}", c.detail);
+        assert!(c.detail.contains("never stream"), "{}", c.detail);
+        // The message hands the operator the exact line to paste.
+        assert!(
+            c.detail
+                .contains(&format!("include_if_exists = '{}", data_dir.display())),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_include_err_when_relative_resolves_outside_pgdata() {
+        // The silent one. The config lives outside PGDATA (Debian), so
+        // a bare `include_if_exists = 'myrecovery.conf'` names a file
+        // in the CONFIG directory — which nothing ever writes. PG
+        // starts clean and the standby never streams.
+        let tmp = TempDir::new().unwrap();
+        let (mut cfg, data_dir, conf_dir) = make_include_cfg(&tmp);
+        let conf = conf_dir.join("postgresql.conf");
+        fs::write(&conf, "include_if_exists = 'myrecovery.conf'\n").unwrap();
+        // No postgresql.conf inside PGDATA; point the probe at the
+        // config we wrote by making it the only candidate that exists.
+        cfg.postgres.data_dir = Some(data_dir.clone());
+
+        // Probe order is PGDATA first, then the Debian /etc path — in
+        // a test neither resolves, so drive the scan directly.
+        let want = data_dir.join("myrecovery.conf");
+        let hit = scan_for_recovery_include(&conf, &want);
+        match hit {
+            Some(IncludeHit::Elsewhere { resolved, raw, .. }) => {
+                assert_eq!(raw, "myrecovery.conf");
+                assert_eq!(resolved, conf_dir.join("myrecovery.conf"));
+            }
+            other => panic!("expected an Elsewhere hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_include_ok_on_the_real_debian_shape() {
+        // What the acceptance images actually provision, and what
+        // BOOTSTRAP now prescribes: config outside PGDATA, the line in
+        // a conf.d drop-in, path spelled absolutely. The walk has to
+        // cross both hops — include_dir, then the drop-in — and accept
+        // the absolute target.
+        let tmp = TempDir::new().unwrap();
+        let (_cfg, data_dir, conf_dir) = make_include_cfg(&tmp);
+        let dropins = conf_dir.join("conf.d");
+        fs::create_dir_all(&dropins).unwrap();
+        let conf = conf_dir.join("postgresql.conf");
+        fs::write(
+            &conf,
+            format!(
+                "data_directory = '{}'\ninclude_dir = 'conf.d'\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dropins.join("10-pg-agent.conf"),
+            format!(
+                "wal_keep_size = 512MB\ninclude_if_exists = '{}/myrecovery.conf'\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let want = data_dir.join("myrecovery.conf");
+        match scan_for_recovery_include(&conf, &want) {
+            Some(IncludeHit::Optional { in_file }) => {
+                assert!(in_file.ends_with("10-pg-agent.conf"), "{in_file:?}");
+            }
+            other => panic!("expected an Optional hit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_include_found_through_include_dir() {
+        // The line may live in a conf.d drop-in rather than the main
+        // file; the walk must follow include_dir to find it.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, data_dir, _conf_dir) = make_include_cfg(&tmp);
+        let dropins = data_dir.join("conf.d");
+        fs::create_dir_all(&dropins).unwrap();
+        fs::write(data_dir.join("postgresql.conf"), "include_dir = 'conf.d'\n").unwrap();
+        fs::write(
+            dropins.join("90-standby.conf"),
+            format!(
+                "include_if_exists = '{}/myrecovery.conf'\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let r = preflight(&cfg, None).await;
+        let c = include_check(&r);
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.detail);
+        assert!(c.detail.contains("90-standby.conf"), "{}", c.detail);
+    }
+
+    #[tokio::test]
+    async fn recovery_include_warns_on_non_optional_include() {
+        // Plain `include` works — until the file is absent, which is
+        // every primary, and then PostgreSQL refuses to start.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, data_dir, _conf_dir) = make_include_cfg(&tmp);
+        fs::write(
+            data_dir.join("postgresql.conf"),
+            "include 'myrecovery.conf'\n",
+        )
+        .unwrap();
+
+        let r = preflight(&cfg, None).await;
+        let c = include_check(&r);
+        // Working-but-fragile is a warning, not a start-blocking ERR.
+        assert_eq!(c.status, CheckStatus::Warn, "{}", c.detail);
+        assert!(c.detail.contains("include_if_exists"), "{}", c.detail);
+    }
+
+    #[tokio::test]
+    async fn recovery_include_warns_when_no_config_file_is_findable() {
+        // PG down and no postgresql.conf where either layout keeps it:
+        // "cannot confirm" is a warning, not a false accusation.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, _data_dir, _conf_dir) = make_include_cfg(&tmp);
+        let r = preflight(&cfg, None).await;
+        let c = include_check(&r);
+        assert_eq!(c.status, CheckStatus::Warn, "{}", c.detail);
+        assert!(c.detail.contains("could not locate"), "{}", c.detail);
+    }
+
+    #[test]
+    fn include_directive_parsing_covers_the_spellings_pg_accepts() {
+        let p = parse_include_directive;
+        assert_eq!(
+            p("include_if_exists = 'myrecovery.conf'"),
+            Some(("include_if_exists".into(), "myrecovery.conf".into()))
+        );
+        // No `=`, PG accepts it.
+        assert_eq!(
+            p("  include 'conf.d/extra.conf'  "),
+            Some(("include".into(), "conf.d/extra.conf".into()))
+        );
+        // Bare (unquoted) value.
+        assert_eq!(
+            p("include_dir = conf.d"),
+            Some(("include_dir".into(), "conf.d".into()))
+        );
+        // Trailing comment is not part of the value.
+        assert_eq!(
+            p("include_if_exists = 'myrecovery.conf'  # written by the agent"),
+            Some(("include_if_exists".into(), "myrecovery.conf".into()))
+        );
+        // A `#` inside the quotes is a filename character.
+        assert_eq!(
+            p("include_if_exists = 'odd#name.conf'"),
+            Some(("include_if_exists".into(), "odd#name.conf".into()))
+        );
+        // Commented-out lines must not count as configuration — this
+        // is the one that would turn the whole check into a rubber
+        // stamp, since the stanza ships commented in some templates.
+        assert_eq!(p("#include_if_exists = 'myrecovery.conf'"), None);
+        assert_eq!(p("  # include 'myrecovery.conf'"), None);
+        // Not an include directive at all.
+        assert_eq!(p("wal_level = replica"), None);
+        assert_eq!(p(""), None);
     }
 
     #[tokio::test]

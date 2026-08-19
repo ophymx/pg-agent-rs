@@ -1225,6 +1225,15 @@ impl PgAgentLocal for LocalServer {
     /// eight layers deep inside the basebackup safety check. With the
     /// flag, the daemon issues `peer.stop` and then proceeds.
     ///
+    /// Post-recovery, the target's PostgreSQL start is a **gate**, not
+    /// a best-effort step: if it fails, the call returns `ok=false`
+    /// with the peer's error verbatim and the target is left detached
+    /// in every pgpool — a backend whose PostgreSQL is down must not
+    /// take traffic. The reclone's data and slot survive on disk; the
+    /// operator fixes the start failure and re-runs. Steps past that
+    /// gate (pgpool start, local attach, attach fan-out) stay
+    /// best-effort and are reported individually in the message.
+    ///
     /// Resolves the local node as primary (its config-sourced
     /// `NodeConfig` — same source of truth as `cluster init`) and the
     /// target by pool id, then delegates to `recovery_first_stage`.
@@ -1363,25 +1372,53 @@ impl PgAgentLocal for LocalServer {
         // `pcp_attach_node`. That's three nodes worth of yak-shave in
         // the middle of recovery — fold it into one RPC.
         //
-        // Each post-step is best-effort: a failure does NOT roll back
-        // recovery_first_stage (it already succeeded) and does NOT
-        // fail the whole RPC, because the operator can retry these
-        // steps independently. The final message reports which steps
-        // worked.
+        // The PostgreSQL start is the gate. Every step after it exists
+        // to put the target back into rotation, and none of them are
+        // correct when its PostgreSQL is down: attaching a dead backend
+        // makes pgpool route writes at it until a health check catches
+        // up, and the operator reading `ok=true` has no reason to look.
+        // (Observed live 2026-06-12: "OK: recovery complete …; postgres
+        // start failed: …; pgpool started; attached node 2 in pgpool".)
+        //
+        // So a start failure is terminal for the recover: return
+        // ok=false carrying the peer's error verbatim, and leave the
+        // target detached everywhere. Not starting the target's pgpool
+        // is part of that — a fresh pgpool there would health-check its
+        // own dead backend down and fire failover_command, which is a
+        // slot-drop hook aimed at the node we just rebuilt.
+        //
+        // The basebackup and slot work already done stays on disk; the
+        // op stays journaled in `inflight_ops`. The operator fixes
+        // whatever systemd reported and re-runs.
+        //
+        // The REMAINING post-steps are still best-effort: past this
+        // gate the node is serving, and a failed pgpool start or attach
+        // is a routing-convergence problem the operator can retry
+        // independently — not a reason to fail a completed recovery.
+        // The final message reports which steps worked.
         let mut post_status = Vec::with_capacity(3);
 
         info!(target = %standby.hostname, "cluster_recover: starting postgres on target");
-        match peer.start().await {
-            Ok(()) => post_status.push("postgres started".to_string()),
-            Err(e) => {
-                warn!(
-                    target = %standby.hostname,
-                    ?e,
-                    "cluster_recover: peer start (postgres) failed"
-                );
-                post_status.push(format!("postgres start failed: {e}"));
-            }
+        if let Err(e) = peer.start().await {
+            warn!(
+                target = %standby.hostname,
+                ?e,
+                "cluster_recover: peer start (postgres) failed — not attaching the target \
+                 in pgpool; recovery data is on disk, re-run once the start problem is fixed"
+            );
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: format!(
+                    "cluster_recover: reclone of {} completed but PostgreSQL failed to \
+                     start there: {e}. The target has NOT been attached in pgpool (a \
+                     backend whose PostgreSQL is down must not take traffic). Fix the \
+                     start failure on that host — `systemctl status` / `journalctl` name \
+                     the cause — then re-run `pg_agentctl cluster recover --target {}`.",
+                    standby.hostname, standby.id
+                ),
+            }));
         }
+        post_status.push("postgres started".to_string());
 
         info!(target = %standby.hostname, "cluster_recover: starting pgpool on target");
         match peer.start_pgpool().await {
@@ -5547,15 +5584,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_recover_continues_when_post_steps_fail() {
-        // recovery_first_stage succeeds; peer.start fails; pgpool start
-        // fails; pcp attach fails. We must still return ok=true (the
-        // recovery itself was destructive enough that rolling back is
-        // worse than surfacing partial completion to the operator) and
+    async fn cluster_recover_continues_when_post_gate_steps_fail() {
+        // recovery_first_stage succeeds; PostgreSQL starts (the gate);
+        // pgpool start fails; pcp attach fails. We must still return
+        // ok=true — past the gate the node is serving, and these are
+        // routing-convergence failures the operator can retry — and
         // report each failure in the message.
         let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) =
             make_recovery_setup();
-        standby.start_fails.store(true, Ordering::SeqCst);
         standby.start_pgpool_fails.store(true, Ordering::SeqCst);
         pcp.attach_fails.store(true, Ordering::SeqCst);
 
@@ -5569,15 +5605,67 @@ mod tests {
             .into_inner();
         assert!(
             resp.ok,
-            "recovery_1st_stage succeeded; post-step failures must not fail the RPC"
+            "recovery_1st_stage succeeded and PG started; post-gate failures must not \
+             fail the RPC: {}",
+            resp.message
         );
-        assert!(resp.message.contains("postgres start failed"));
         assert!(resp.message.contains("pgpool start failed"));
         assert!(resp.message.contains("pgpool attach failed"));
-        // All three were attempted (best-effort, no short-circuit on failure).
-        assert_eq!(standby.start_calls.load(Ordering::SeqCst), 1);
+        // Both were attempted (best-effort, no short-circuit on failure).
         assert_eq!(standby.start_pgpool_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn cluster_recover_fails_and_skips_attach_when_postgres_start_fails() {
+        // The gate. recovery_first_stage succeeded, but PostgreSQL
+        // would not start on the target. Attaching it in pgpool would
+        // point traffic at a dead backend while the operator reads
+        // "OK: recovery complete" (observed live 2026-06-12), so the
+        // RPC must report ok=false and touch no routing map — neither
+        // the local pcp nor the fan-out — and must not start the
+        // target's pgpool, whose health check would fire
+        // failover_command at the node we just rebuilt.
+        let (s, _db, _peers, _maint, _replay, standby, pcp, _sd, _standby, _inflight) =
+            make_recovery_setup();
+        standby.start_fails.store(true, Ordering::SeqCst);
+
+        let resp = s
+            .cluster_recover(Request::new(ClusterRecoverRequest {
+                target_node_id: 1,
+                stop_target_pg: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            !resp.ok,
+            "a target whose PostgreSQL failed to start is not a completed recovery"
+        );
+        // The peer's own error reaches the operator verbatim, next to
+        // the re-run instruction.
+        assert!(resp.message.contains("failed to start"), "{}", resp.message);
+        assert!(
+            resp.message.contains("NOT been attached"),
+            "message must say the target was left out of pgpool: {}",
+            resp.message
+        );
+        assert!(
+            resp.message.contains("cluster recover --target 1"),
+            "message must name the re-run: {}",
+            resp.message
+        );
+        assert_eq!(standby.start_calls.load(Ordering::SeqCst), 1);
+        // Nothing downstream of the gate ran.
+        assert_eq!(standby.start_pgpool_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            pcp.attach_calls.lock().unwrap().is_empty(),
+            "a dead backend must not be attached locally"
+        );
+        assert!(
+            standby.attach_fanout_calls.lock().unwrap().is_empty(),
+            "a dead backend must not be attached on any member"
+        );
     }
 
     #[tokio::test]
