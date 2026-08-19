@@ -209,7 +209,36 @@ scheduled. Items roughly in priority order within each section.
   before it: while pgpool still drives failover the current block is
   correct.
 
-### `validate-env`: assert `include_if_exists` for `myrecovery.conf`
+### ~~`validate-env`: assert `include_if_exists` for `myrecovery.conf`~~ — DONE
+
+> Landed as the `recovery conf include` check
+> (`preflight.rs::fs_recovery_conf_include`). It walks the effective
+> `postgresql.conf` — following `include`, `include_if_exists` and
+> `include_dir` the way PostgreSQL does — and takes `config_file` /
+> `data_directory` from the running server when there is one, falling
+> back to layout probing (PGDATA first, then
+> `/etc/postgresql/<ver>/<cluster>/`) for the `ExecStartPre=`
+> invocation where PG is down.
+>
+> **The fix shape in the original report was not sufficient**, and
+> that is the interesting part. "An include naming `myrecovery.conf`"
+> passes on a config that can never work: PostgreSQL resolves a
+> relative include against the directory of the *referencing file*,
+> not `data_directory`, so on the Debian layout
+> `include_if_exists = 'myrecovery.conf'` names a file under `/etc`
+> that nothing ever writes. It parses, PG starts clean, the standby
+> never streams. The check therefore asserts the include *resolves to*
+> `$PGDATA/myrecovery.conf`, and reports the misresolving spelling as
+> its own ERR with both paths named.
+>
+> **BOOTSTRAP.md §1.3 prescribed exactly that broken relative line**
+> (the acceptance images always used the absolute form, which is why
+> no run ever caught it) — corrected in the same change. Statuses:
+> ERR absent, ERR resolves elsewhere, WARN plain `include` (PG refuses
+> to start when the file is absent, which is a primary's normal
+> state), WARN cannot locate a `postgresql.conf` at all.
+
+### (historical) `validate-env`: assert `include_if_exists` for `myrecovery.conf`
 
 - **Where:** `crates/pg-agent-core/src/preflight.rs` (a new `fs_*` check).
 - **Why:** a standby reads `$PGDATA/myrecovery.conf` only if
@@ -223,7 +252,30 @@ scheduled. Items roughly in priority order within each section.
   an `include_if_exists`/`include` naming `myrecovery.conf`; ERR when
   absent. Cheap, local, no DB round-trip.
 
-### `cluster_recover` reports OK + attaches pgpool even when PG start failed
+### ~~`cluster_recover` reports OK + attaches pgpool even when PG start failed~~ — FIXED
+
+> The target's PostgreSQL start is now a **gate**, not a best-effort
+> post-step. On failure `cluster_recover` returns `ok=false` carrying
+> the peer's error verbatim plus the re-run instruction, and nothing
+> downstream runs: no local `pcp_attach_node`, no attach fan-out, and
+> no pgpool start on the target either — a fresh pgpool there would
+> health-check its own dead backend down and fire `failover_command`
+> at the node just rebuilt, which is a slot-drop hook. The reclone's
+> data and slot stay on disk and the op stays journaled, so the
+> operator fixes the start failure and re-runs.
+>
+> Steps *past* the gate (pgpool start, attach, fan-out) stay
+> best-effort and are still reported individually: past it the node is
+> serving, and a stale routing map is a retryable convergence problem,
+> not a reason to fail a completed recovery. Two tests pin the split —
+> start failure attaches nowhere, post-gate failures still return
+> `ok=true`.
+>
+> Phased re-entry (resuming the journaled `Recovery` op instead of
+> restarting the ladder) is still the open piece, tracked under the
+> `recovery_first_stage` item above.
+
+### (historical) `cluster_recover` reports OK + attaches pgpool even when PG start failed
 
 - **Where:** `crates/pg-agent-core/src/localserver.rs::cluster_recover` (recovery_1st_stage path). Observed live 2026-06-12: recover --target 2 returned `OK: recovery complete for db2.home.ophymx.com; postgres start failed: ...; pgpool started; attached node 2 in pgpool`. The peer start error was concatenated into the message but the response was `ok=true` and `pcp_attach_node` ran anyway.
 - **Why it bites:** pgpool now routes to a backend whose PG is down. Health-check eventually flags it, but in the meantime any write trying that backend errors out, and the operator sees `READY=yes` ish lines in `cluster status` that misrepresent the real state.

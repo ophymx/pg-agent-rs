@@ -157,8 +157,20 @@ PGDATA in `/var/lib/postgresql/17/main/`):
   ssl_ca_file        = '/var/lib/postgresql/.postgresql/root.crt'
   ssl_cert_file      = '/var/lib/postgresql/.postgresql/postgresql.crt'
   ssl_key_file       = '/var/lib/postgresql/.postgresql/postgresql.key'
-  include_if_exists  = 'myrecovery.conf'
+  include_if_exists  = '/var/lib/postgresql/17/main/myrecovery.conf'
 ```
+
+**Spell that last path absolutely.** The agent writes standby recovery
+settings to `$PGDATA/myrecovery.conf`, but PostgreSQL resolves a
+relative include against *the directory holding the file that
+references it* — here `/etc/postgresql/17/main/`, which nothing ever
+writes. A bare `include_if_exists = 'myrecovery.conf'` on this layout
+parses, starts clean, and silently never streams: `ConfigureStandby`
+reports success and the standby comes up with no `primary_conninfo`.
+`pg_agentd validate-env` now fails on both the missing and the
+misresolving spelling (`recovery conf include`). On layouts that keep
+`postgresql.conf` inside `PGDATA` (RHEL family) the relative form
+happens to work — the absolute one works on both.
 
 ```
 /etc/postgresql/17/main/pg_hba.conf
