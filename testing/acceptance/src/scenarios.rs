@@ -181,6 +181,12 @@ pub async fn run_all(cx: &mut Ctx) {
     stage!(cx, g19(cx, w9).await);
     let w10 = stage!(cx, g20(cx, w9, &mut marks).await);
     stage!(cx, g21(cx, w10, &mut marks).await);
+    // Last on purpose: the one scenario whose claim is that nothing
+    // happens reads best against the most-abused cluster the suite can
+    // hand it, and it needs a primary the soak settled on rather than
+    // one this list predicted.
+    let w11 = cx.pg.current_primary().await.unwrap_or(w10);
+    stage!(cx, g22(cx, w11).await);
     stage!(cx, crate::audit::run(cx));
 }
 
@@ -1944,6 +1950,118 @@ async fn g17(cx: &mut Ctx, prim: &'static str) {
     .await;
 }
 
+/// Whether `node`'s own daemon answers `cluster status` AND got an
+/// answer out of consensus.
+///
+/// [`pause_status`] cannot say this on its own: it renders the empty
+/// string both for "not paused" and for "the CLI never got a document
+/// back at all", so waiting for it to go empty is satisfied by a
+/// daemon that is simply down. The daemon serving the fan-out is the
+/// local one, so a parseable document proves liveness, and a
+/// `pause_status` that does not start with "unknown" proves the
+/// linearizable read behind it completed.
+async fn consensus_readable(node: &str) -> bool {
+    let out = exec_pg(node, "pg_agentctl cluster status --json")
+        .await
+        .unwrap_or_default();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) else {
+        return false;
+    };
+    let answered = v["pause_status"]
+        .as_str()
+        .map(|s| !s.starts_with("unknown"))
+        .unwrap_or(false);
+    answered
+        && v["nodes"]
+            .as_array()
+            .map(|n| !n.is_empty())
+            .unwrap_or(false)
+}
+
+/// One of systemd's own monotonic timestamps for `pg_agentd`, in
+/// microseconds since boot. Asking systemd rather than polling
+/// `is-active` is what makes a sub-second restart measurable at all.
+async fn agent_stamp_us(node: &str, property: &str) -> Option<u64> {
+    exec(
+        node,
+        &format!("systemctl show pg_agentd -p {property} --value"),
+    )
+    .await
+    .ok()?
+    .trim()
+    .parse()
+    .ok()
+}
+
+/// How long `pg_agentd` was down over the restart caused since
+/// `after_us`, in milliseconds: the span between systemd recording the
+/// old process gone and the new one answering `sd_notify READY`.
+/// `Type=notify` makes that second edge the moment the agent is
+/// functional again, which is the edge the lease cares about.
+///
+/// `None` unless BOTH edges belong to that restart — the unit went
+/// inactive after the caller's mark, and came back after that. Without
+/// the freshness test a node whose agent was restarted by an earlier
+/// scenario reports THAT window instead: a plausible-looking number
+/// measuring the wrong event, which is worse than no number at all.
+async fn agent_restart_gap_ms(node: &str, after_us: Option<u64>) -> Option<u64> {
+    let active = agent_stamp_us(node, "ActiveEnterTimestampMonotonic").await?;
+    let inactive = agent_stamp_us(node, "InactiveEnterTimestampMonotonic").await?;
+    let floor = after_us.unwrap_or(0);
+    (inactive > floor && active > inactive).then_some((active - inactive) / 1000)
+}
+
+/// This cluster's configured `leader_ttl`, read from the config the
+/// nodes actually booted with rather than assumed. The acceptance
+/// cluster runs a deliberately tight 10s against production's 30s
+/// default, so a margin proven here is a margin with room to spare.
+async fn leader_ttl_secs(node: &str) -> u64 {
+    exec(
+        node,
+        "awk -F= '/leader_ttl_secs/ {gsub(/[^0-9]/, \"\", $2); print $2}' \
+         /etc/pg_agent/config.toml",
+    )
+    .await
+    .ok()
+    .and_then(|v| v.trim().parse().ok())
+    .unwrap_or(10)
+}
+
+/// The package this cell staged for the image build, and where the
+/// scenario drops it inside a container. Same artifact the nodes were
+/// installed from — an upgrade to the identical version, because what
+/// is under test is the scriptlet path, not a version bump.
+///
+/// `/var/tmp`, NOT `/tmp`: compose mounts a tmpfs over `/tmp` in every
+/// node, and `docker cp` writes into the image layer UNDERNEATH that
+/// mount. The copy reports success, the file is invisible to everything
+/// running in the container, and the install fails with "cannot access
+/// archive" — which is how this landed on the first run.
+fn staged_package() -> (&'static str, &'static str) {
+    match cluster::facts().family.as_str() {
+        "rhel" => (
+            "testing/docker/pg-agent.rpm",
+            "/var/tmp/pg-agent-upgrade.rpm",
+        ),
+        _ => (
+            "testing/docker/pg-agent.deb",
+            "/var/tmp/pg-agent-upgrade.deb",
+        ),
+    }
+}
+
+/// Install the staged package over the running one, the way an
+/// operator's package manager does. `--replacepkgs` / plain `dpkg -i`
+/// because the version is identical; `postinstall.sh` does not branch
+/// on install-vs-upgrade anyway — its restart-if-active check is the
+/// whole mechanism under test.
+fn package_upgrade_cmd(dest: &str) -> String {
+    match cluster::facts().family.as_str() {
+        "rhel" => format!("rpm -Uvh --replacepkgs {dest}"),
+        _ => format!("dpkg -i {dest}"),
+    }
+}
+
 /// The `pause_status` line from a node's own `cluster status`.
 async fn pause_status(node: &str) -> String {
     let out = exec_pg(node, "pg_agentctl cluster status --json || true")
@@ -2322,6 +2440,179 @@ async fn g21(cx: &mut Ctx, start: &'static str, marks: &mut HashMap<&'static str
         || async move { sync_commit_state(prim).await == "armed" },
     )
     .await;
+}
+
+async fn g22(cx: &mut Ctx, prim: &'static str) {
+    cx.say("G22: rolling agent upgrade — the routine operation nothing asserted");
+    // Every other scenario kills the agent to see what breaks. This one
+    // upgrades it the way an operator does — the real package, through
+    // the real package manager, letting `postinstall.sh`'s
+    // restart-if-active branch be the thing that stops and starts the
+    // daemon — and asserts that NOTHING happens. No takeover, no
+    // promotion, no fence, no PostgreSQL touched, same primary at the
+    // end, writes acknowledged throughout.
+    //
+    // The hazard is arithmetic, which is why this is a scenario rather
+    // than a unit test. A holder that stops renewing its lease is
+    // deposed once `leader_ttl` expires, and an upgrade stops renewal
+    // for exactly as long as the restart takes. NOTHING IN THE PRODUCT
+    // RELATES THOSE TWO NUMBERS — the margin is a property of the
+    // deployment, not an invariant the code maintains — so the
+    // scenario measures the gap on every node and reports it against
+    // the ttl instead of merely observing that things worked out. On
+    // this cluster the ttl is 10s against production's 30s default,
+    // so a restart that fits here fits there three times over.
+    //
+    // Ordering is the operator's: standbys first, the lease holder
+    // last. Only the holder's restart can cost anything, and by then
+    // its two witnesses are already running the new binary.
+    let ttl_s = leader_ttl_secs(prim).await;
+    cx.note(&format!(
+        "leader_ttl on this cluster is {ttl_s}s (production default: 30s)"
+    ));
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit armed before the roll"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    write_sentinel(cx, prim, "g22").await;
+    let since = cx.log.cursor();
+
+    let mut order: Vec<&'static str> = NODES.iter().copied().filter(|n| *n != prim).collect();
+    order.push(prim);
+    let (staged, dest) = staged_package();
+    let mut gaps: Vec<(&'static str, u64)> = Vec::new();
+
+    for node in order {
+        let role = if node == prim { "holder" } else { "standby" };
+        let before = agent_stamp_us(node, "ActiveEnterTimestampMonotonic").await;
+        // `docker cp` exiting 0 is not evidence the file is readable
+        // inside the container (see `staged_package`), so the node has
+        // to see it too.
+        let staged_ok = cluster::host(&["docker", "cp", staged, &format!("pga-{node}:{dest}")])
+            .await
+            .is_ok()
+            && exec_ok(node, &format!("test -s {dest}")).await;
+        cx.check(
+            &format!("{node} ({role}): package staged where the container can read it"),
+            staged_ok,
+        );
+        match exec(node, &package_upgrade_cmd(dest)).await {
+            Ok(_) => cx.pass(&format!("{node}: package installed over the running one")),
+            Err(e) => {
+                cx.fail(&format!("{node}: package installed over the running one"));
+                // The package manager's own last word, so a failure is
+                // diagnosable from the transcript instead of a re-run.
+                let text = e.to_string();
+                let tail = text.lines().rfind(|l| !l.trim().is_empty());
+                cx.note(&format!("{node}: {}", tail.unwrap_or("(no output)").trim()));
+            }
+        }
+        // The upgrade must have RESTARTED the daemon. A postinst that
+        // quietly skipped the restart would leave every assertion
+        // below green while testing nothing at all — finding 28's
+        // lesson, where a fallback kept a run green and hid the bug.
+        // systemd's own ActiveEnter stamp moving forward is the proof.
+        cx.wait_until(
+            60,
+            &format!("{node}: the package restarted pg_agentd (ActiveEnter advanced)"),
+            || async move {
+                unit_active(node, "pg_agentd").await
+                    && agent_stamp_us(node, "ActiveEnterTimestampMonotonic").await > before
+            },
+        )
+        .await;
+        match agent_restart_gap_ms(node, before).await {
+            Some(ms) => {
+                gaps.push((node, ms));
+                cx.check(
+                    &format!("{node}: agent down {ms}ms over the upgrade, inside the {ttl_s}s ttl"),
+                    ms < ttl_s * 1000,
+                );
+            }
+            None => cx.fail(&format!(
+                "{node}: systemd records no restart window belonging to this upgrade"
+            )),
+        }
+        // Back in the mesh, not merely back as a process: the node
+        // answers its own status fan-out and the linearizable read
+        // behind it completed.
+        cx.wait_until(
+            60,
+            &format!("{node}: rejoined consensus after the upgrade"),
+            || async move { consensus_readable(node).await },
+        )
+        .await;
+        // The cluster kept serving through it — asserted per node, so
+        // a stall is attributed to the restart that caused it.
+        cx.check(
+            &format!("writes still acknowledged after {node}'s upgrade"),
+            timed_write(prim, "g22", 10).await,
+        );
+    }
+
+    // The whole point, stated as absences over the entire roll.
+    cx.check_absent("no takeover across the rolling upgrade", since, |ev| {
+        agent_any(ev, "TookOver")
+    });
+    cx.check_absent("no promotion across the rolling upgrade", since, |ev| {
+        agent_any(ev, "roleexec: promotion complete")
+    });
+    cx.check_absent("no fence across the rolling upgrade", since, |ev| {
+        agent_any(ev, "FENCING")
+    });
+    // An agent upgrade is not a PostgreSQL event. The agent owns the
+    // postmaster's lifecycle, so "restarting the agent leaves the
+    // database alone" is a claim worth holding it to.
+    cx.check_absent(
+        "no PostgreSQL shutdown across the rolling upgrade",
+        since,
+        |ev| {
+            ev.source == Source::Postgres
+                && (ev.line.contains("shutdown request")
+                    || ev.line.contains("database system is shut down"))
+        },
+    );
+    for n in NODES {
+        cx.check(
+            &format!("{n}: PostgreSQL still running after its agent was upgraded"),
+            unit_active(n, &cluster::pg_unit()).await,
+        );
+    }
+    cx.check(
+        &format!("{prim} still holds the lease after all three agents were upgraded"),
+        cx.pg.current_primary().await == Some(prim),
+    );
+    cx.check(
+        "exactly one primary after the roll",
+        cx.pg.count_primaries().await == 1,
+    );
+    let pg = cx.pg.clone();
+    cx.wait_until(
+        60,
+        &format!("{prim} still has 2 streaming standbys after the roll"),
+        || {
+            let pg = pg.clone();
+            async move { pg.streaming_count(prim).await == Some(2) }
+        },
+    )
+    .await;
+    check_sentinel(cx, prim, "g22").await;
+    cx.wait_until(
+        60,
+        &format!("{prim}: quorum commit still armed after the roll"),
+        || async move { sync_commit_state(prim).await == "armed" },
+    )
+    .await;
+    // The number an operator actually needs, printed whether or not
+    // anything failed: how much of the lease the slowest restart ate.
+    if let Some((worst, ms)) = gaps.iter().copied().max_by_key(|(_, ms)| *ms) {
+        cx.note(&format!(
+            "worst restart window: {worst} at {ms}ms — {}% of this cluster's {ttl_s}s ttl",
+            ms * 100 / (ttl_s * 1000)
+        ));
+    }
 }
 
 /// Operator path: rebuild broken standbys via `cluster recover` —
