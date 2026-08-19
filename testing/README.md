@@ -326,6 +326,37 @@ cluster; the discovery rate on new probes says these will pay):
     shape. Three unit tests pin the behavior: defer to a fresh
     witness, proceed once no witness has seen the holder either, and
     never let an UNREACHABLE witness's stale map veto a takeover.
+12. ~~The rolling agent upgrade~~ — **done: G22**, and it was the one
+    routine operation the suite had never run. Every other scenario
+    kills the agent; this one UPGRADES it, installing the staged
+    package over the running one (`dpkg -i` / `rpm -Uvh
+    --replacepkgs`) so `postinstall.sh`'s restart-if-active branch is
+    what stops and starts the daemon. Standbys first, holder last.
+    Asserts absences — no takeover, no promotion, no fence, no
+    PostgreSQL shutdown, same holder, quorum commit still armed.
+
+    **The hazard is arithmetic, so the scenario measures rather than
+    concludes.** A holder that stops renewing is deposed at
+    `leader_ttl`, and an upgrade stops renewal for exactly as long as
+    the restart takes; nothing in the product relates those two
+    numbers, so the margin is a property of the deployment. G22 reads
+    the window off systemd's own `ActiveEnter`/`InactiveEnter` stamps
+    and prints the worst against the ttl. First green run: 88ms / 73ms
+    / 123ms (the holder's is the slowest, as expected — it is the one
+    that also re-arms), a worst case of **1% of this cluster's 10s
+    ttl**, and 0.4% of production's 30s default.
+
+    Two harness bugs first, both of the vacuous-pass shape this list
+    keeps rediscovering: `docker cp` into `/tmp` reported success
+    while compose's tmpfs hid the file from everything in the
+    container (now `/var/tmp`, and the node must `test -s` it itself);
+    and the window measurement had no freshness test, so it reported a
+    plausible 96ms belonging to a restart an EARLIER scenario caused,
+    for an upgrade that never happened. Both edges must now fall after
+    the caller's mark or the check fails outright. The non-vacuity
+    assert that catches the whole class — `ActiveEnter` must have
+    ADVANCED — is what turned "everything is green" into "the package
+    never restarted anything".
 
 ## Findings log
 
