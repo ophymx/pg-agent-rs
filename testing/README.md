@@ -968,6 +968,44 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     knowing the unit name at last; noted here because "the matrix went
     green" is not the same claim as "the matrix exercised it".
 
+29. **PGDG's RHEL unit ships `Restart=on-failure` ACTIVE, so on that
+    family systemd resurrects a postmaster the suite just killed —
+    and, in production, one the agent just fenced.** Debian's
+    `postgresql@.service` ships the same line commented out. G9's own
+    comment relied on that ("Debian's unit ships Restart commented
+    out, so the corpse stays down"), and the assumption held for as
+    long as Debian was the only family.
+
+    On the Rocky cell the SIGKILLed primary was back inside a second
+    (`database system is ready to accept connections`), so the lease
+    never expired, no standby was ever deposed, and the harness then
+    tried to recover *via* a node that had never been promoted
+    (`cluster recover: local node is not the primary (in recovery)`).
+    Thirteen scenarios ran against a cluster no assertion expected: 32
+    failures, every one downstream of this single fact, and the run
+    read as "Rocky is slow" because failures are timeout budgets.
+
+    The suite's fix is a `Restart=no` drop-in in provisioning, written
+    for both families rather than branching on the RHEL one — a suite
+    whose crash shape depends on which distro it booted proves less
+    than it appears to.
+
+    **The product question is the interesting half and is NOT closed
+    by that drop-in.** Disabling the unit — which the deployment does
+    — stops boot-time autostart, not `Restart=`. So on RHEL, a fence
+    that stops PostgreSQL can be undone by systemd if the stop is
+    recorded as a failure, and the agent's "a fenced node stays down"
+    assumption is Debian-shaped. Tracked in TODO.md; `validate-env` is
+    the natural place to catch it, since it is precisely the class of
+    silent localhost misconfiguration that check exists for.
+
+    Two meta-lessons, both familiar from finding 28. The suite went
+    green on this cell yesterday with the same unit file, so the
+    behaviour is timing-dependent and a single green run proved less
+    than it looked like. And the difference lives in a file nobody
+    writes — a packaged unit, not a config key — which is the same
+    place the pgpool node-id path was hiding.
+
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death
     deposal under a continuous ledger writer) ran its kill and then
