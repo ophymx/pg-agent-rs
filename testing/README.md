@@ -1006,6 +1006,55 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     writes — a packaged unit, not a config key — which is the same
     place the pgpool node-id path was hiding.
 
+30. **The Rocky cell is timing-marginal: failures track how SLOW the
+    run was, not what the code did.** After finding 29's drop-in
+    removed the cascade, 8 failures remained. Four runs, and the
+    correlation is the whole finding:
+
+        cell time   failures
+        1127s       9
+        1223s       8
+        1354s       8
+         743s       0   (+1 from an over-strict new audit check)
+
+    Slow run, failures; fast run, clean. Every failure was an
+    `await_event` blowing its budget while the `wait_until` polls
+    around it passed — the outcomes were all there, the awaited log
+    lines just arrived late. The suite runs against `leader_ttl = 10s`
+    (deliberately tight, see the provisioning comment), so the margin
+    on a loaded host is thin. **A red Rocky cell is not evidence of a
+    product bug until the cell time is checked.**
+
+    Two hypotheses died on the way here, and how they died is the
+    useful part.
+
+    *Journald rate limiting.* Plausible — the agent's events ride
+    `journalctl -f`, and journald drops above 10k/30s. Measured
+    instead: **0 lines in 60s** at idle, 52 since boot, zero
+    suppression anywhere on the box. The agent is nearly silent by
+    design (`log_decision` drops to `debug` when the decision is
+    unchanged), which is the opposite of the assumed failure.
+
+    *A silently dying event tail.* `spawn_tail` respawns tail-only, so
+    a died exec loses its gap for good — and two consecutive runs had
+    byte-identical failure lists that all named db0, with G21 failing
+    exactly the cycles db0 won (1 and 3) and passing the one db1 won
+    (2). A compelling story, and wrong. The census added here says all
+    18 deaths in a clean run happen in **G10**, which SIGKILLs PID 1 in
+    all three containers by design — every stream on every node dies
+    there, and every assertion still passed. Two identical runs are not
+    determinism; the third contradicted both.
+
+    What survives is the instrumentation, which is worth having on its
+    own terms. Every run now prints a per-stream event census and
+    names any tail that died, because `check_absent` — used throughout
+    the suite — passes VACUOUSLY on a stream nobody is listening to.
+    A dead tail would report a well-behaved cluster that simply never
+    acted: silent, and in the reassuring direction, which is the worst
+    way for a test to be wrong. The audit also fails outright if any
+    node produced no agent events at all. Neither condition has fired
+    in anger yet; both are cheap insurance against the class.
+
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death
     deposal under a continuous ledger writer) ran its kill and then
