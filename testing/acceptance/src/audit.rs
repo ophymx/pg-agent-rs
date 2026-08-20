@@ -80,6 +80,55 @@ pub fn run(cx: &mut Ctx) {
     cx.say("AUDIT: event-order invariants over the whole run");
     let all = cx.log.find_all(Cursor(0), |_| true);
 
+    // Before any claim about what the cluster did: did we hear every
+    // node at all? Every invariant below, and every `check_absent` in
+    // every scenario, is only as good as the stream it reads. A node
+    // whose agent tail died reports as a well-behaved cluster that
+    // simply never acted — silently, and in the *safe*-looking
+    // direction, which is the worst way for a test to be wrong.
+    let census = cx.log.census();
+    let (counts, deaths) = (&census.counts, &census.deaths);
+    cx.note(&format!(
+        "stream census: {}",
+        counts
+            .iter()
+            .map(|((node, source), n)| format!("{node}/{source:?}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    for ((node, source), n) in deaths {
+        cx.note(&format!("tail deaths: {node}/{source:?} respawned {n}x"));
+    }
+    // Deliberately a NOTE and not a check: G10 SIGKILLs PID 1 in all
+    // three containers, so every stream on every node dies there by
+    // design, and a run with zero deaths would mean G10 did not do its
+    // job. Measured: 18 deaths in a clean 290/1 run, all of them
+    // inside G10. What the census is FOR is the other case — a death
+    // in a scenario that never touched the container, which is the
+    // one worth reading the surrounding failures with suspicion.
+    // A node that contributed no agent events at all never had a
+    // stream to lose — a different bug from one that died mid-run, and
+    // equally fatal to every claim made about that node.
+    let silent: Vec<&'static str> = crate::cluster::NODES
+        .iter()
+        .copied()
+        .filter(|n| {
+            !counts
+                .iter()
+                .any(|((node, source), c)| node == n && *source == Source::Agent && *c > 0)
+        })
+        .collect();
+    cx.check(
+        &format!("audit: every node produced agent events{}", {
+            if silent.is_empty() {
+                String::new()
+            } else {
+                format!(" — silent: {}", silent.join(", "))
+            }
+        }),
+        silent.is_empty(),
+    );
+
     let takeovers: Vec<(&Event, u64)> = all
         .iter()
         .filter(|ev| ev.source == Source::Agent && ev.line.contains("TookOver"))

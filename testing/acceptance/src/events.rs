@@ -75,9 +75,24 @@ pub struct Event {
 #[derive(Clone, Copy, Debug)]
 pub struct Cursor(pub usize);
 
+/// One stream's identity: which node, which of its logs.
+pub type StreamKey = (&'static str, Source);
+
+/// What the run actually heard, per stream — the ground truth behind
+/// every event-order claim the auditor makes.
+pub struct Census {
+    /// Events received per stream.
+    pub counts: Vec<(StreamKey, usize)>,
+    /// Tail deaths per stream. Each one is a hole in `counts` of
+    /// unknown size, because the respawn resumes tail-only.
+    pub deaths: Vec<(StreamKey, usize)>,
+}
+
 #[derive(Default)]
 struct Inner {
     events: Vec<Event>,
+    /// How many times each stream's tail has died and respawned.
+    tail_deaths: Vec<(StreamKey, usize)>,
 }
 
 pub struct EventLog {
@@ -91,6 +106,37 @@ impl EventLog {
             inner: Mutex::new(Inner::default()),
             notify: Notify::new(),
         })
+    }
+
+    fn record_tail_death(&self, node: &'static str, source: Source) {
+        let mut inner = self.inner.lock().unwrap();
+        match inner
+            .tail_deaths
+            .iter_mut()
+            .find(|(k, _)| *k == (node, source))
+        {
+            Some((_, n)) => *n += 1,
+            None => inner.tail_deaths.push(((node, source), 1)),
+        }
+    }
+
+    /// Per-stream event counts and tail deaths, for the end-of-run
+    /// census. A stream that went quiet is the difference between "the
+    /// cluster did not do it" and "we were not listening", and only
+    /// this can tell them apart.
+    pub fn census(&self) -> Census {
+        let inner = self.inner.lock().unwrap();
+        let mut counts: Vec<(StreamKey, usize)> = Vec::new();
+        for ev in &inner.events {
+            match counts.iter_mut().find(|(k, _)| *k == (ev.node, ev.source)) {
+                Some((_, n)) => *n += 1,
+                None => counts.push(((ev.node, ev.source), 1)),
+            }
+        }
+        counts.sort_by_key(|((node, source), _)| (*node, format!("{source:?}")));
+        let mut deaths = inner.tail_deaths.clone();
+        deaths.sort_by_key(|((node, source), _)| (*node, format!("{source:?}")));
+        Census { counts, deaths }
     }
 
     fn append(&self, mut ev: Event) {
@@ -238,6 +284,28 @@ impl EventLog {
                 }
                 // Exec died (container recreate, docker hiccup). Tail
                 // from "now" — history is already in the log.
+                //
+                // SAY SO. The respawn resumes tail-only, so every line
+                // written between the death and the new tail attaching
+                // is gone from the event log for good — and the suite's
+                // event awaits would then fail as "the cluster never
+                // did X" when the truth is "we stopped listening",
+                // which is indistinguishable from a product bug at
+                // every call site.
+                //
+                // Most deaths are legitimate: G10 SIGKILLs PID 1 in all
+                // three containers, so every stream dies there by
+                // design (18 of them in a clean run, all in G10). The
+                // point is not to forbid it, it is to make the gap
+                // VISIBLE — see testing/README.md finding 30, where
+                // this instrumentation refuted the very hypothesis it
+                // was built to confirm.
+                log.record_tail_death(node, source);
+                println!(
+                    "     NOTE: tail died and respawned: {node}/{source:?} — events \
+                     logged in the gap are LOST (assertions over this window may \
+                     fail spuriously)"
+                );
                 cmd = respawn_cmd.clone();
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
