@@ -252,6 +252,48 @@ scheduled. Items roughly in priority order within each section.
   an `include_if_exists`/`include` naming `myrecovery.conf`; ERR when
   absent. Cheap, local, no DB round-trip.
 
+### RHEL's packaged unit resurrects a fenced postmaster (`Restart=on-failure`)
+
+- **Where:** deployment-owned, so `crates/pg-agent-core/src/preflight.rs`
+  is the place the product can speak about it; the fence itself is
+  `roleexec.rs` → `PostgresInstance::ensure_stopped`.
+- **What:** PGDG's `postgresql-<ver>.service` ships `Restart=on-failure`
+  **active**; Debian's `postgresql@.service` ships the same line
+  commented out. Disabling the unit — which BOOTSTRAP does — closes
+  boot-time autostart, NOT `Restart=`. So on the RHEL family systemd
+  will restart a postmaster that died badly, with no agent
+  involvement, and the agent's "a fenced node stays down until an
+  operator or the executor says otherwise" assumption is
+  Debian-shaped.
+- **How it surfaced:** the acceptance suite, not analysis
+  (testing/README.md finding 29). G9 SIGKILLs the primary's postmaster
+  and waits for the lease to depose it; on Rocky systemd handed the
+  primary straight back inside a second, nothing was deposed, and the
+  32 failures that followed all descend from that. The suite now
+  writes a `Restart=no` drop-in so its crash shape is uniform — which
+  fixes the harness and deliberately does **not** fix this.
+- **Why it matters beyond the suite:** the fence exists to stop a
+  deposed primary from serving. If systemd restarts that postmaster
+  before the executor's next tick, the node is serving again on a
+  timeline the cluster has moved past. Quorum commit means it cannot
+  ACK anything (docs/quorum-commit.md §3), so this is not an
+  acknowledged-write hole — but it is a node answering reads as a
+  primary after being fenced, which is exactly what the fence was for.
+- **Fix shape (needs deciding):** three candidates, not exclusive.
+  (a) `validate-env` reads the effective `Restart=` for the configured
+  PG unit (`systemctl show <unit> -p Restart --value`) and WARNs — or
+  ERRs — when it is not `no`; cheap, local, and the same shape as
+  every other silent-localhost check. (b) BOOTSTRAP ships the drop-in
+  as part of the RHEL path, making it Ansible's job. (c) the fence
+  masks the unit for the duration, which is the only option that
+  cannot be undone by a config drift, and the most invasive.
+  (a) + (b) together look right: state it, and hand the operator the
+  file.
+- **Unresolved:** the same cell passed 257/257 the day before with the
+  identical unit file, so whether systemd's restart wins is
+  timing-dependent (start rate limiting is the likely gate). Worth
+  understanding before choosing (c) over (a).
+
 ### ~~`cluster_recover` reports OK + attaches pgpool even when PG start failed~~ — FIXED
 
 > The target's PostgreSQL start is now a **gate**, not a best-effort

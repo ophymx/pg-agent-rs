@@ -227,6 +227,38 @@ if [ "$PG_FAMILY" = "debian" ]; then
     echo manual > "$PG_CONF_DIR/start.conf"
 fi
 
+# The same principle one level deeper: the OS must not RESURRECT it
+# either. PGDG's RHEL unit ships `Restart=on-failure` active, while
+# Debian's ships it commented out — so a SIGKILLed postmaster stays
+# dead on one family and is back within a second on the other, with no
+# agent involvement at all.
+#
+# That difference silently invalidated the crash scenarios on the RHEL
+# cell: G9 kills the primary's postmaster and waits for the lease to
+# depose it, but systemd handed the primary straight back, nothing was
+# ever deposed, and the next thirteen scenarios ran against a cluster
+# no assertion expected (32 failures, all of them downstream of this
+# one fact).
+#
+# Written for BOTH families, not just RHEL: the drop-in is identical
+# either way, and a suite whose crash shape depends on which distro it
+# booted is a suite that proves less than it appears to. This does not
+# touch the agent's own `systemctl start` — recover, cold start and
+# provisioning bootstrap all still work.
+#
+# NOTE: this is the TEST cluster's uniformity, not a product fix. A
+# real RHEL deployment inherits the packaged `Restart=on-failure` and
+# needs its own decision about it — see testing/README.md finding 29
+# and the TODO item it links.
+install -d "/etc/systemd/system/${PG_UNIT}.service.d"
+cat > "/etc/systemd/system/${PG_UNIT}.service.d/10-agent-managed.conf" <<'EOF'
+# pg-agent-acceptance: PostgreSQL's lifecycle belongs to the agent.
+# systemd may neither start it at boot nor restart it after a crash.
+[Service]
+Restart=no
+EOF
+systemctl daemon-reload
+
 HBA="$PG_CONF_DIR/pg_hba.conf"
 if ! grep -q "pg-agent-acceptance" "$HBA"; then
     cat >> "$HBA" <<'EOF'
