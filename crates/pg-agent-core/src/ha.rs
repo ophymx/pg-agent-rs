@@ -1,35 +1,36 @@
-//! The HA loop — shadow mode (docs/promotion-authority.md §"The HA
-//! loop", sequencing step 5).
+//! The HA loop (docs/promotion-authority.md §"The HA loop").
 //!
 //! Every `loop_wait` the loop performs one *tick*: read the lease from
 //! the [`ConsensusStore`], observe local PostgreSQL and every peer, and
-//! produce exactly one [`HaDecision`]. This is the daemon's first
-//! non-reactive role logic — it runs on standbys too, because a standby
-//! is what detects a dead holder and becomes a candidate.
+//! produce exactly one [`HaDecision`], which the executor then acts on.
+//! It runs on standbys too — a standby is what detects a dead holder
+//! and becomes a candidate.
 //!
-//! # Shadow mode, enforced by construction
+//! # A decision function, with the acting kept out of it
 //!
-//! The current implementation computes decisions and logs them; it
-//! **cannot** act on PostgreSQL. This is not a runtime flag — the
-//! struct holds no `Systemd`, no `Pcp`, no `StandbyOps`, and
-//! never dials a peer mutation RPC — unless an executor is attached
-//! ([`HaLoop::with_executor`], the step-7 cutover switch), in which
-//! case every decision is handed to [`crate::roleexec::RoleExecutor`]
-//! after logging. Without one, the loop's only writes go to the
-//! [`ConsensusStore`], which today is the process-local
-//! [`InMemoryConsensusStore`](crate::consensus::InMemoryConsensusStore)
-//! — private bookkeeping, authoritative for
-//! nothing. At cutover (step 7) the decisions gain executors and this
-//! module's docs change; until then a bug here can mislead a log reader
-//! and nothing else.
+//! The loop itself computes; it never touches PostgreSQL. The struct
+//! holds no `Systemd`, no `Pcp`, no `StandbyOps`, and never dials a
+//! peer mutation RPC. Everything destructive goes through
+//! [`crate::roleexec::RoleExecutor`], which the daemon always attaches
+//! ([`HaLoop::with_executor`]).
+//!
+//! That split is a testing seam, not a mode. It used to be one: a loop
+//! with no executor was "shadow mode", the staged migration's way of
+//! watching decisions against a live pgpool-led cluster without letting
+//! them act. There is no pgpool-led cluster to shadow any more — the
+//! lease is the only promotion authority — so an executor-less loop
+//! would be a daemon that watches a cluster nobody is running. The
+//! daemon builds the loop, its executor and the store as one value
+//! (`agent::HaWiring`); only this module's own unit tests construct a
+//! loop without one, to assert the decision and not its consequences.
 //!
 //! # How the decisions are judged
 //!
-//! **Not against pgpool.** The logged stream (target `ha_shadow`) is
-//! asserted against ground truth — which node actually held the most
-//! WAL, whether the announced-dead node was actually dead, whether
-//! exactly one node became promotable — in the dockerized acceptance
-//! suite (`testing/`), where those facts are manufactured rather than
+//! **Not against pgpool.** The logged stream (target `ha`) is asserted
+//! against ground truth — which node actually held the most WAL,
+//! whether the announced-dead node was actually dead, whether exactly
+//! one node became promotable — in the dockerized acceptance suite
+//! (`testing/`), where those facts are manufactured rather than
 //! inferred. Diffing against pgpool's live behavior was the design
 //! doc's original plan and is explicitly abandoned: pgpool's decisions
 //! are the defect this loop exists to replace (promotion-authority
@@ -52,18 +53,15 @@
 //!   — otherwise two candidates sampling each other at different
 //!   instants can each see the other ahead and both skip forever.
 //!   Stand-downs carry a jittered backoff for the same reason.
-//!
-//! # Shadow-only adoption
-//!
-//! With a process-local store the lease starts vacant even though the
-//! cluster has a working primary. To make the decision stream
-//! meaningful, a vacant tick that observes **exactly one** node running
-//! as primary adopts it into the local store
-//! ([`HaDecision::AdoptedObservedPrimary`]) — thereafter the loop
-//! exercises the real branches (follow / holder-unhealthy / candidacy)
-//! against observed reality. Adoption is a shadow artifact: at cutover
-//! the lease is seeded once by `ClusterInit`, not inferred, and this
-//! branch is removed with the mode.
+//! - **A vacant lease is never filled in on another node's behalf.**
+//!   A standby that sees no lease and a live primary elsewhere reports
+//!   the bootstrap gap and stands down. The primary claims for itself,
+//!   or `ClusterInit` seeds; inferring a holder from what is observed
+//!   is how a shared store learns something nobody committed. (The
+//!   loop did once adopt an observed primary, because each node's
+//!   store was private and would otherwise never leave the vacant
+//!   state. With one replicated store there is nothing to seed and
+//!   nobody to seed it for.)
 
 use crate::cluster_view::{collect_statuses, WalPosition, STATUS_FANOUT_BUDGET};
 use crate::config::{NodeConfig, NodePool};
@@ -88,7 +86,7 @@ pub struct HaTiming {
 }
 
 /// One tick's outcome. Exactly one per tick; the `run` loop logs them
-/// (deduplicated by variant) on the `ha_shadow` target.
+/// (deduplicated by variant) on the `ha` target.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HaDecision {
     /// Cluster is paused — no automatic role decisions.
@@ -137,9 +135,6 @@ pub enum HaDecision {
     TookOver { term: u64, already_primary: bool },
     /// Our takeover CAS lost — someone else moved first. Back off.
     LostTakeover { current_holder: Option<i32> },
-    /// Shadow-only: vacant lease + exactly one observed primary
-    /// elsewhere → recorded it as holder in the local store.
-    AdoptedObservedPrimary { node: i32 },
 }
 
 /// What the loop knows about local PostgreSQL this tick.
@@ -211,20 +206,11 @@ pub struct HaLoop {
     pool: NodePool,
     timing: HaTiming,
     state: Mutex<TickState>,
-    /// `Some` = execute mode: every tick's decision is handed to the
-    /// executor after logging. `None` = shadow — the decision stream
-    /// is the entire output, which is the structural guarantee shadow
-    /// mode has always rested on, now expressed as this field's
-    /// absence.
+    /// Every tick's decision is handed to the executor after logging.
+    /// `None` only in this module's unit tests, which assert the
+    /// decision rather than its consequences — see the module docs on
+    /// why that is a test seam and not a mode.
     executor: Option<Arc<crate::roleexec::RoleExecutor>>,
-    /// Shadow-only vacant-lease adoption (see the module docs). Off in
-    /// execute mode: with a shared store the primary claims the lease
-    /// for itself (`TookOver { already_primary: true }`) and everyone
-    /// else reads it — adoption existed for per-node stores where each
-    /// standby had to seed its own private view, and promotion-authority
-    /// step 7 removes it from the real path. `ClusterInit` seeding is
-    /// the deterministic bootstrap.
-    vacant_adoption: bool,
     /// Records which peers this loop reached, per tick. `None` in
     /// tests that do not exercise the second-opinion path.
     peer_seen: Option<Arc<crate::cluster_view::PeerSeen>>,
@@ -255,7 +241,6 @@ impl HaLoop {
                 settled_pos: std::collections::HashMap::new(),
             }),
             executor: None,
-            vacant_adoption: true,
             peer_seen: None,
         }
     }
@@ -268,35 +253,32 @@ impl HaLoop {
         self
     }
 
-    /// Attach the executor: every decision is now acted on, and
-    /// shadow-only vacant adoption turns off. This is the cutover
-    /// switch — a loop without this call can only ever write to its
-    /// store and its log.
+    /// Attach the executor: every decision is acted on. `pg_agentd`
+    /// always calls this — a loop without it writes only to its store
+    /// and its log, which is what the unit tests want and what no
+    /// deployment does.
     pub fn with_executor(mut self, executor: Arc<crate::roleexec::RoleExecutor>) -> Self {
         self.executor = Some(executor);
-        self.vacant_adoption = false;
-        self
-    }
-
-    /// Test-only: execute mode's adoption gating without an executor.
-    #[cfg(test)]
-    fn without_vacant_adoption(mut self) -> Self {
-        self.vacant_adoption = false;
         self
     }
 
     /// Continuous loop: tick every `loop_wait` until shutdown. Decisions
-    /// are logged on the `ha_shadow` target — info on variant change,
-    /// debug on repeats, warn for the destructive-would-be decisions.
+    /// are logged on the `ha` target — info on variant change, debug on
+    /// repeats, warn for the destructive decisions.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+        // The one line that says this node is participating: it has a
+        // lease to read and an executor to act with. There is no other
+        // way for the daemon to reach here, which is why the message no
+        // longer distinguishes an "execute mode" from anything else.
         info!(
             loop_wait_secs = self.timing.loop_wait.as_secs(),
-            "ha loop (shadow): starting"
+            acts_on_postgres = self.executor.is_some(),
+            "ha loop: starting"
         );
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("ha loop (shadow): stopping");
+                    info!("ha loop: stopping");
                     return;
                 }
                 _ = tokio::time::sleep(self.timing.loop_wait) => {}
@@ -475,9 +457,9 @@ impl HaLoop {
                 }
             }
             None => {
-                // Vacant. Shadow-only adoption first: if the cluster
-                // observably has exactly one primary, record it rather
-                // than treating a working cluster as leaderless.
+                // Vacant. Who, if anyone, is observably running as a
+                // primary decides whether this is a leaderless cluster
+                // or a cluster whose lease has not been seeded yet.
                 let mut observed: Vec<i32> = peers
                     .iter()
                     .filter(|p| p.running_as_primary)
@@ -487,31 +469,17 @@ impl HaLoop {
                     observed.push(local_id);
                 }
                 match observed.as_slice() {
-                    [only] if *only != local_id && !self.vacant_adoption => {
-                        // Execute mode: never write a lease on another
-                        // node's behalf. The primary claims for itself
-                        // (or ClusterInit seeds), and until one of those
-                        // happens a vacant lease with a live primary is
-                        // a bootstrap gap to report, not to paper over.
+                    [only] if *only != local_id => {
+                        // Never write a lease on another node's behalf.
+                        // The primary claims for itself (or ClusterInit
+                        // seeds), and until one of those happens a
+                        // vacant lease with a live primary is a
+                        // bootstrap gap to report, not to paper over.
                         HaDecision::StoodDown {
                             reason: format!(
                                 "lease vacant but node {only} runs as primary; \
                                  waiting for it to claim (or ClusterInit to seed)"
                             ),
-                        }
-                    }
-                    [only] if *only != local_id => {
-                        let node = *only;
-                        match self.store.try_takeover(node, None).await {
-                            Ok(TakeoverOutcome::Won { .. }) => {
-                                HaDecision::AdoptedObservedPrimary { node }
-                            }
-                            Ok(TakeoverOutcome::Lost { current }) => HaDecision::LostTakeover {
-                                current_holder: current.map(|l| l.holder),
-                            },
-                            Err(e) => HaDecision::StoodDown {
-                                reason: format!("adoption write failed: {e}"),
-                            },
                         }
                     }
                     [] | [_] => {
@@ -535,7 +503,6 @@ impl HaLoop {
             let mut ts = self.state.lock().unwrap();
             ts.last_holder = match &decision {
                 HaDecision::TookOver { .. } => Some(local_id),
-                HaDecision::AdoptedObservedPrimary { node } => Some(*node),
                 _ => state.lease.as_ref().map(|l| l.holder),
             };
         }
@@ -927,13 +894,13 @@ impl HaLoop {
             HaDecision::WouldDemote { .. }
             | HaDecision::TookOver { .. }
             | HaDecision::LostTakeover { .. } => {
-                warn!(target: "ha_shadow", ?decision, "ha shadow decision");
+                warn!(target: "ha", ?decision, "ha decision");
             }
             _ if changed => {
-                info!(target: "ha_shadow", ?decision, "ha shadow decision");
+                info!(target: "ha", ?decision, "ha decision");
             }
             _ => {
-                debug!(target: "ha_shadow", ?decision, "ha shadow decision");
+                debug!(target: "ha", ?decision, "ha decision");
             }
         }
     }
@@ -991,7 +958,7 @@ mod tests {
     #[async_trait]
     impl crate::localdb::LocalDb for StubDb {
         async fn promote(&self) -> anyhow::Result<()> {
-            unreachable!("shadow loop must never touch PG")
+            unreachable!("the loop must never touch PG — that is the executor's job")
         }
         async fn slot_active(&self, _: &str) -> anyhow::Result<bool> {
             Ok(false)
@@ -1063,49 +1030,52 @@ mod tests {
         async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
             Ok(self.status.clone())
         }
-        // Everything below is unreachable: the shadow loop only calls
-        // get_status, and a test that strays fails loudly.
+        // Everything below is unreachable: the loop only calls
+        // get_status — everything destructive belongs to the executor,
+        // which these tests do not attach. A test that strays into a
+        // mutation is asserting against a loop no deployment runs, so
+        // it fails loudly instead.
         async fn drop_slot(&self, _: &str) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn create_slot(&self, _: &str) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn get_node_config(&self) -> anyhow::Result<pb::NodeConfigResponse> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn start(&self) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn start_pgpool(&self) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn attach_node(&self, _: i32, _: i32) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn stop(&self) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn rewind(&self, _: crate::pgstandby::RewindOpts) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn basebackup(&self, _: crate::pgstandby::BasebackupOpts) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn configure_standby(
             &self,
             _: crate::pgstandby::WriteRecoveryConfOpts,
         ) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn promote(&self) -> anyhow::Result<()> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
         async fn fetch_wal(
             &self,
             _: &str,
         ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
-            unreachable!("shadow loop only calls get_status")
+            unreachable!("the loop only calls get_status")
         }
     }
 
@@ -1241,6 +1211,22 @@ mod tests {
         }
     }
 
+    /// Seed the lease the way `ClusterInit` does — one CAS against a
+    /// vacant store, committed before the loop ever ticks.
+    ///
+    /// These tests used to reach this state by letting the loop's first
+    /// tick ADOPT the observed primary. Adoption is gone (a node never
+    /// writes a lease on another node's behalf), and seeding is what
+    /// the cluster actually does, so the fixtures now say so out loud
+    /// instead of depending on a code path no deployment ran.
+    async fn seed_lease(f: &Fixture, holder: i32) {
+        match f.store.try_takeover(holder, None).await {
+            Ok(TakeoverOutcome::Won { .. }) => {}
+            other => panic!("seeding the lease for node {holder} failed: {other:?}"),
+        }
+        assert_eq!(f.store.snapshot().lease.unwrap().holder, holder);
+    }
+
     const BASE: u64 = 1 << 32;
 
     /// Drive a tick through the stability gate: candidacy compares
@@ -1258,41 +1244,18 @@ mod tests {
 
     // ----- scenarios --------------------------------------------------------
 
+    /// A standby seeing a vacant lease with a live primary elsewhere
+    /// must never write a lease on that primary's behalf — the primary
+    /// claims for itself through the shared store (or ClusterInit
+    /// seeds), and until then the honest decision is standing down, not
+    /// papering over the bootstrap gap.
     #[tokio::test]
-    async fn adopts_single_observed_primary_then_follows() {
-        // Local (node 1) is a standby; node 0 is the observed primary.
+    async fn reports_the_bootstrap_gap_instead_of_adopting_a_primary() {
         let f = fixture(1, StubDb::standby(2, BASE));
         f.peers.set(0, primary_status(2, BASE + 100));
         f.peers.set(2, standby_status(2, BASE));
 
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
-        assert_eq!(f.store.snapshot().lease.unwrap().holder, 0);
-        assert_eq!(f.ha.tick_once().await, HaDecision::Following { holder: 0 });
-    }
-
-    /// Execute mode: adoption is off. A standby seeing a vacant lease
-    /// with a live primary elsewhere must never write a lease on that
-    /// primary's behalf — the primary claims for itself through the
-    /// shared store (or ClusterInit seeds), and until then the honest
-    /// decision is standing down, not papering over the bootstrap gap.
-    #[tokio::test]
-    async fn execute_mode_reports_the_bootstrap_gap_instead_of_adopting() {
-        let f = fixture(1, StubDb::standby(2, BASE));
-        let ha = HaLoop::new(
-            f.store.clone(),
-            Arc::new(StubDb::standby(2, BASE)),
-            f.peers.clone(),
-            pool3(1),
-            timing(),
-        )
-        .without_vacant_adoption();
-        f.peers.set(0, primary_status(2, BASE + 100));
-        f.peers.set(2, standby_status(2, BASE));
-
-        match ha.tick_once().await {
+        match f.ha.tick_once().await {
             HaDecision::StoodDown { reason } => {
                 assert!(reason.contains("vacant"), "{reason}");
                 assert!(reason.contains("ClusterInit"), "{reason}");
@@ -1306,8 +1269,8 @@ mod tests {
 
         // And once the primary's own claim lands (as the shared store
         // delivers it), the standby follows normally.
-        f.store.try_takeover(0, None).await.unwrap();
-        assert_eq!(ha.tick_once().await, HaDecision::Following { holder: 0 });
+        seed_lease(&f, 0).await;
+        assert_eq!(f.ha.tick_once().await, HaDecision::Following { holder: 0 });
     }
 
     #[tokio::test]
@@ -1548,15 +1511,12 @@ mod tests {
 
     #[tokio::test]
     async fn dead_holder_watched_until_ttl_then_taken_over() {
-        // Node 0 held the lease (adopted), then dies. Local node 1 is
+        // Node 0 holds the seeded lease, then dies. Local node 1 is
         // the best surviving standby.
         let f = fixture(1, StubDb::standby(2, BASE + 100));
         f.peers.set(0, primary_status(2, BASE + 200));
         f.peers.set(2, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
 
         // Holder dies.
         f.peers.mark_unreachable(0);
@@ -1587,10 +1547,7 @@ mod tests {
         let f = fixture(1, StubDb::streaming_standby(2, BASE + 100));
         f.peers.set(0, primary_status(2, BASE + 200));
         f.peers.set(2, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
 
         // The holder's agent dies (its PostgreSQL may well still be
         // serving — that is exactly why the receiver still streams).
@@ -1626,10 +1583,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(2, BASE + 100));
         f.peers.set(0, primary_status(2, BASE + 200));
         f.peers.set(2, streaming_standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
         f.peers.mark_unreachable(0);
         let _ = f.ha.tick_once().await; // start the unhealthy clock
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1660,10 +1614,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(2, BASE + 500));
         f.peers.set(0, primary_status(2, BASE));
         f.peers.set(2, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
 
         // The holder becomes unreachable TO US only; node 2 still sees
         // it (and says so, freshly).
@@ -1694,10 +1645,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(2, BASE + 500));
         f.peers.set(0, primary_status(2, BASE));
         f.peers.set(2, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
         f.peers.mark_unreachable(0);
         // The witness last reached the holder LONGER ago than the ttl:
         // its evidence has expired too, so the cluster agrees.
@@ -1725,10 +1673,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(2, BASE + 500));
         f.peers.set(0, primary_status(2, BASE));
         f.peers.set(2, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
         // The holder's PostgreSQL dies; its AGENT stays up and
         // reachable to everyone, including us.
         f.peers.set(
@@ -1760,10 +1705,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(2, BASE + 500));
         f.peers.set(0, primary_status(2, BASE));
         f.peers.set(2, standby_seeing(2, BASE, 0, 10)); // fresh, but…
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
         f.peers.mark_unreachable(0);
         f.peers.mark_unreachable(2); // …we cannot ask it
         let _ = f.ha.tick_once().await;
@@ -1786,10 +1728,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(3, BASE));
         f.peers.set(0, primary_status(3, BASE + 200));
         f.peers.set(2, standby_status(3, BASE + 50));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
         f.peers.mark_unreachable(0);
         let _ = f.ha.tick_once().await; // unhealthy clock starts
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1826,10 +1765,7 @@ mod tests {
         let f = fixture(1, StubDb::standby(2, BASE + 100));
         f.peers.set(0, primary_status(2, BASE + 200));
         f.peers.set(2, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
 
         // Holder 0 dies; local watches it well past leader_ttl (50ms).
         f.peers.mark_unreachable(0);
@@ -1886,10 +1822,7 @@ mod tests {
         let f = fixture(2, StubDb::standby(2, BASE));
         f.peers.set(0, primary_status(2, BASE + 10));
         f.peers.set(1, standby_status(2, BASE));
-        assert_eq!(
-            f.ha.tick_once().await,
-            HaDecision::AdoptedObservedPrimary { node: 0 }
-        );
+        seed_lease(&f, 0).await;
         assert_eq!(f.ha.tick_once().await, HaDecision::Following { holder: 0 });
 
         // Simulate the lease moving to node 1 (as the real store would

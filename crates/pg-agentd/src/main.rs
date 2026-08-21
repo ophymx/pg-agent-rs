@@ -219,6 +219,13 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         node_id = config.local_node_id,
         "config loaded"
     );
+    // A config file that still carries `[raft] enabled = true` is
+    // correct about what happens and wrong that it has a say in it.
+    // `validate-env` reports the same thing; this is for the operator
+    // who only ever reads the journal.
+    if let Some(msg) = config.raft.obsolete_enabled_warning() {
+        warn!("{msg}");
+    }
 
     // Projections used by Agent.
     let serve = config.to_serve_settings();
@@ -315,52 +322,43 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         wal,
     };
 
-    // Consensus, when `[raft] enabled = true`. Built here rather than
-    // inside the Agent because it opens redb and starts openraft's core
-    // task, and a failure to do either should stop the daemon loudly
-    // instead of degrading into a node that silently is not a member.
-    let raft = if config.raft.effective_enabled() {
-        let rt = pg_agent_core::raftconsensus::RaftRuntime::start(
-            config
-                .state_dir
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("[raft] enabled but state_dir is unset"))?,
-            &node_pool,
-            serve.agent_port,
-            cert_reloader
-                .as_ref()
-                .map(pg_agent_core::peers::build_client_config),
-            &config.raft,
-        )
-        .await?;
-        Some(rt)
-    } else {
-        None
-    };
+    // Consensus. Unconditional: the lease is the only promotion
+    // authority this daemon has, so a node that does not join it is not
+    // a cluster member — it is a node that cannot learn it has been
+    // deposed. Built here rather than inside the Agent because it opens
+    // redb and starts openraft's core task, and a failure to do either
+    // should stop the daemon loudly instead of degrading into a node
+    // that silently is not a member.
+    let raft = pg_agent_core::raftconsensus::RaftRuntime::start(
+        config.state_dir.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "state_dir is unset — consensus needs somewhere durable for its log and vote"
+            )
+        })?,
+        &node_pool,
+        serve.agent_port,
+        cert_reloader
+            .as_ref()
+            .map(pg_agent_core::peers::build_client_config),
+        &config.raft,
+    )
+    .await?;
 
-    // Raft on → the loop runs and its decisions ACT. Raft off → no loop
-    // at all. The staged-migration middle grounds (a loop that only
-    // narrates, over a process-local store or a real one) are gone with
-    // the `shadow` flag: under the shipped design they describe a
-    // cluster where nothing manages PostgreSQL.
-    let ha_execute = config.raft.effective_enabled();
-    let ha_timing = ha_execute.then(|| pg_agent_core::ha::HaTiming {
-        loop_wait: config.raft.effective_loop_wait(),
-        retry_timeout: config.raft.effective_retry_timeout(),
-        leader_ttl: config.raft.effective_leader_ttl(),
-    });
-    // The executor's instance is only ever built here, alongside a real
-    // Raft — executing against a process-local store is not a
-    // configuration that exists.
-    let pg_instance: Option<Arc<dyn pgman::instance::PostgresInstance>> = if ha_execute {
-        Some(Arc::new(pgman::instance::Instance::new(
+    // The store, the executor and the loop's timing go in as one value
+    // — see `agent::HaWiring` for why they are no longer separable.
+    let ha = Some(pg_agent_core::agent::HaWiring {
+        raft,
+        instance: Arc::new(pgman::instance::Instance::new(
             sd.clone(),
             db.clone(),
             standby.clone(),
-        )))
-    } else {
-        None
-    };
+        )),
+        timing: pg_agent_core::ha::HaTiming {
+            loop_wait: config.raft.effective_loop_wait(),
+            retry_timeout: config.raft.effective_retry_timeout(),
+            leader_ttl: config.raft.effective_leader_ttl(),
+        },
+    });
 
     let opts = Options {
         serve: serve.clone(),
@@ -371,9 +369,7 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         phantom_check_required_peers: config.startup.effective_required_peers(),
         supervisor_pgpool_enabled: config.supervisor.effective_pgpool_enabled(),
         cert_reloader: cert_reloader.clone(),
-        ha_shadow: ha_timing,
-        raft,
-        pg_instance,
+        ha,
     };
 
     // Bind listeners synchronously — every fd exists once this returns.

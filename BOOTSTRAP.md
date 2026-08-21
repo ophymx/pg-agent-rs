@@ -343,6 +343,28 @@ falling back to hostname match against `[[pool]]` if the pgpool file
 isn't present. So **no `node_id` / `node_id_file` field** in this
 config in normal deployments.
 
+**Nothing turns HA on.** There is no switch: every `pg_agentd` joins
+the Raft lease and acts on it, or refuses to start. The minimum config
+above is a working HA cluster once Phase 2 seeds the lease. The
+`[raft]` block in the sample file is timing only, and the defaults
+(`loop_wait 10s`, `retry_timeout 10s`, `leader_ttl 30s`,
+`election_timeout 5s`) are the ones to ship unless you have measured a
+reason to change them.
+
+Two things the pool itself has to satisfy, both refused by
+`validate-env` (Phase 1.7) rather than discovered during an outage:
+**at least three nodes** — a 2-node Raft cluster tolerates zero
+failures, since losing either loses quorum and the survivor demotes
+itself — and **mTLS configured**, because the consensus plane rides the
+peer listener, so an unauthenticated port is an unauthenticated
+promotion authority.
+
+> **Upgrading a cluster built before this?** Delete any `[raft] enabled`
+> line from `config.toml` before rolling the package. `enabled = false`
+> now fails config load outright (it asks for a node that cannot learn
+> it has been deposed); `enabled = true` still starts, with a warning
+> in the journal.
+
 ### 1.6 Initialise the chosen primary's PG instance
 
 ```

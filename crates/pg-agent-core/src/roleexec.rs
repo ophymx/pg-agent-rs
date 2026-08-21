@@ -2,10 +2,8 @@
 //!
 //! [`RoleExecutor`] consumes [`HaDecision`]s and drives the local
 //! PostgreSQL instance toward what the lease says. The split matters:
-//! the loop decides and never touches PostgreSQL, so **shadow mode is
-//! the executor's absence** — the same structural guarantee shadow
-//! always had, now expressed at the composition root instead of inside
-//! the loop.
+//! everything destructive lives here, so the loop can be read as a
+//! decision function and tested as one.
 //!
 //! The loop is a decision function, not a *pure* one, and the
 //! distinction has grown teeth. It carries per-tick state — the
@@ -14,8 +12,8 @@
 //! compares against (`ha::TickState`, eight fields) — so a decision
 //! can legitimately take more than one tick to reach, and its tests
 //! must drive ticks in order rather than assert on a single call.
-//! What stays true, and is what shadow mode rests on, is that the
-//! loop's only writes go to the consensus store.
+//! What stays true is that the loop's only writes go to the consensus
+//! store; every byte of PostgreSQL state changes from in here.
 //!
 //! # The contract is convergence
 //!
@@ -250,8 +248,7 @@ impl RoleExecutor {
             | HaDecision::StoreUnknown { .. }
             | HaDecision::HolderUnhealthy { .. }
             | HaDecision::StoodDown { .. }
-            | HaDecision::LostTakeover { .. }
-            | HaDecision::AdoptedObservedPrimary { .. } => {}
+            | HaDecision::LostTakeover { .. } => {}
         }
     }
 

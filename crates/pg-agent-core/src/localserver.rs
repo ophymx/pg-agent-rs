@@ -218,8 +218,9 @@ pub struct LocalServer {
     /// Peers recently failed/timed out on FetchWal, and when. See
     /// [`RESTORE_WAL_PEER_COOLDOWN`].
     wal_peer_cooldown: std::sync::Mutex<std::collections::HashMap<i32, std::time::Instant>>,
-    /// Present when `[raft] enabled = true`. `ClusterInit` uses it to
-    /// form the Raft cluster's initial membership — the one moment
+    /// Always present under `pg_agentd`; `None` only in unit tests that
+    /// exercise a handler needing no consensus. `ClusterInit` uses it
+    /// to form the Raft cluster's initial membership — the one moment
     /// where an operator, not the protocol, decides who the members
     /// are.
     raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
@@ -1140,9 +1141,9 @@ impl PgAgentLocal for LocalServer {
         let raft_note = match &self.raft {
             Some(rt) => match rt.bootstrap_membership().await {
                 Ok(outcome) => {
-                    // Seed the lease for this primary (promotion-authority
-                    // step 7: seeding replaces shadow-only vacant
-                    // adoption as the bootstrap). CAS on observed
+                    // Seed the lease for this primary. This is the only
+                    // way a lease is ever born: no node infers a holder
+                    // from what it observes. CAS on observed
                     // vacancy: losing means a holder already exists,
                     // which is the goal state, not an error — exactly
                     // the membership-bootstrap idempotency argument
@@ -1899,8 +1900,10 @@ impl PgAgentLocal for LocalServer {
         let Some(rt) = &self.raft else {
             return Ok(Response::new(OpResult {
                 ok: false,
-                message: "pause requires consensus ([raft] enabled = true); without it \
-                          there is no cluster-wide decision loop to suspend"
+                message: "pause requires consensus, and this daemon has none — which \
+                          should be impossible in a real deployment, since pg_agentd \
+                          refuses to start without it. Check the journal for what came \
+                          up instead"
                     .into(),
             }));
         };
