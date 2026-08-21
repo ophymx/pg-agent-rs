@@ -178,6 +178,7 @@ pub async fn preflight(cfg: &Config, db: Option<Arc<dyn LocalDb>>) -> PreflightR
     // from the server when there is one — the only source that is
     // right on both layouts and after any operator override.
     fs_recovery_conf_include(cfg, db.as_ref(), &mut r).await;
+    unit_restart_policy(cfg, &mut r).await;
     raft_prerequisites(cfg, &mut r);
 
     // ---- db-backed checks ----------------------------------------------
@@ -861,6 +862,130 @@ async fn db_roles(db: &Arc<dyn LocalDb>, cfg: &Config, r: &mut PreflightReport) 
 }
 
 // ---------------------------------------------------------------------------
+// PostgreSQL unit restart policy
+// ---------------------------------------------------------------------------
+
+/// The drop-in that fixes a resurrecting unit. Same filename the
+/// acceptance suite writes (`testing/docker/provision.sh`) and the same
+/// one BOOTSTRAP §1.1 hands the operator, so a node, a fixture and a
+/// playbook all name the same file.
+const RESTART_DROPIN: &str = "10-agent-managed.conf";
+
+/// Is systemd allowed to restart PostgreSQL behind the agent's back?
+///
+/// PGDG's `postgresql-<ver>.service` ships `Restart=on-failure`
+/// **active**; Debian's `postgresql@.service` ships the same line
+/// commented out. Nothing in BOOTSTRAP closes that: `systemctl disable`
+/// stops boot-time autostart, not `Restart=`.
+///
+/// **The hazard is not the agent's own fence.** systemd never restarts
+/// a unit it stopped by an explicit stop job, so `ensure_stopped` is
+/// safe on either family. The hazard is a postmaster that dies on its
+/// own terms — crash, OOM, an operator's `kill -9` — on a node the
+/// cluster has since moved past. systemd hands it straight back with no
+/// agent involvement, and if the node's agent died with it (the G8/G9
+/// shapes) nothing is left to fence it. Quorum commit means it cannot
+/// acknowledge a write (docs/quorum-commit.md §3), so this is not an
+/// acknowledged-write hole — it is a node answering reads as a primary
+/// after the cluster deposed it, which is what the fence exists to
+/// prevent.
+///
+/// Found by the acceptance suite rather than by reading unit files
+/// (testing/README.md finding 29): G9 SIGKILLs the primary's postmaster
+/// and waits for the lease to depose it. On Rocky systemd returned the
+/// primary inside a second, nothing was ever deposed, and the thirteen
+/// scenarios that followed ran against a cluster no assertion expected.
+///
+/// ERR, not WARN, and with no opt-out — the same standing as the pool
+/// size and mTLS refusals. A deployment where PostgreSQL's lifecycle is
+/// half systemd's and half the lease's has no coherent answer to "who
+/// decides whether this node serves", and the failure only ever shows
+/// up during an outage.
+async fn unit_restart_policy(cfg: &Config, r: &mut PreflightReport) {
+    let Some(unit) = cfg.postgres.service.as_deref() else {
+        // `apply_defaults` fills this, so reaching here means a caller
+        // skipped it. The unit-name check belongs to config validation;
+        // say why this check could not run and move on.
+        r.checks.push(Check::warn(
+            "postgres unit: restart policy",
+            "no [postgres] service configured — cannot ask systemd about it",
+        ));
+        return;
+    };
+    let raw = tokio::process::Command::new("systemctl")
+        .args(["show", unit, "--property=Restart", "--property=LoadState"])
+        .output()
+        .await;
+    let verdict = match raw {
+        Ok(out) if out.status.success() => {
+            restart_policy_verdict(unit, &String::from_utf8_lossy(&out.stdout))
+        }
+        Ok(out) => Check::warn(
+            "postgres unit: restart policy",
+            format!(
+                "systemctl show {unit} exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ),
+        Err(e) => Check::warn(
+            "postgres unit: restart policy",
+            format!("could not run systemctl: {e}"),
+        ),
+    };
+    r.checks.push(verdict);
+}
+
+/// The verdict, split out from the subprocess so the interesting part
+/// is testable without a systemd to ask.
+///
+/// Parsed as `KEY=VALUE` lines rather than with `--value`, because two
+/// `--value` properties come back as bare lines in an order the manual
+/// does not promise. `LoadState` is read alongside for a reason:
+/// `systemctl show` answers for a unit that does not exist by printing
+/// defaults, and `Restart=no` is that default — so without it, a typo'd
+/// unit name reports a clean bill of health.
+fn restart_policy_verdict(unit: &str, stdout: &str) -> Check {
+    let name = "postgres unit: restart policy";
+    let mut restart = None;
+    let mut load_state = None;
+    for line in stdout.lines() {
+        match line.split_once('=') {
+            Some(("Restart", v)) => restart = Some(v.trim()),
+            Some(("LoadState", v)) => load_state = Some(v.trim()),
+            _ => {}
+        }
+    }
+    match load_state {
+        Some("loaded") => {}
+        Some(other) => {
+            return Check::warn(
+                name,
+                format!(
+                    "{unit} is {other}, not loaded — cannot assess its restart policy \
+                     (and the agent will not be able to manage it either)"
+                ),
+            )
+        }
+        None => return Check::warn(name, format!("systemctl said nothing about {unit}")),
+    }
+    match restart {
+        Some("no") => Check::ok(name, format!("{unit}: Restart=no")),
+        Some(policy) => Check::err(
+            name,
+            format!(
+                "{unit}: Restart={policy} — systemd will restart a postmaster that dies \
+                 badly, with no agent involvement, on a node the lease may have already \
+                 moved past. Fix: printf '[Service]\\nRestart=no\\n' > \
+                 /etc/systemd/system/{unit}.d/{RESTART_DROPIN} (mkdir -p first), then \
+                 systemctl daemon-reload"
+            ),
+        ),
+        None => Check::warn(name, format!("systemctl reported no Restart= for {unit}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Consensus prerequisites
 // ---------------------------------------------------------------------------
 
@@ -1411,6 +1536,86 @@ mod tests {
         assert_eq!(j["has_errors"], serde_json::Value::Bool(true));
         assert_eq!(j["checks"][0]["status"], "ERR");
         assert_eq!(j["checks"][0]["name"], "x");
+    }
+
+    // ----- postgres unit restart policy ------------------------------------
+
+    /// Debian's shape: the line is in the unit but commented out, so
+    /// the effective policy is `no` and the agent owns the lifecycle.
+    #[test]
+    fn restart_policy_accepts_no() {
+        let c = restart_policy_verdict(
+            "postgresql@17-main.service",
+            "Restart=no\nLoadState=loaded\n",
+        );
+        assert_eq!(c.status, CheckStatus::Ok);
+    }
+
+    /// PGDG's shape, and the whole point of the check. The detail has
+    /// to carry the remedy: an operator reading an ExecStartPre failure
+    /// at 3am should not have to go find the drop-in's filename.
+    #[test]
+    fn restart_policy_refuses_on_failure_and_names_the_fix() {
+        let c = restart_policy_verdict(
+            "postgresql-16.service",
+            "Restart=on-failure\nLoadState=loaded\n",
+        );
+        assert_eq!(c.status, CheckStatus::Err);
+        assert!(c.detail.contains("dies badly"), "{}", c.detail);
+        assert!(c.detail.contains(RESTART_DROPIN), "{}", c.detail);
+        assert!(c.detail.contains("daemon-reload"), "{}", c.detail);
+    }
+
+    /// Every policy other than `no` can resurrect a postmaster the
+    /// cluster has moved past. The check does not rank them: the
+    /// remedy is the same file either way.
+    #[test]
+    fn restart_policy_refuses_every_restarting_policy() {
+        for policy in [
+            "always",
+            "on-abnormal",
+            "on-abort",
+            "on-watchdog",
+            "on-success",
+        ] {
+            let c = restart_policy_verdict(
+                "pg.service",
+                &format!("Restart={policy}\nLoadState=loaded\n"),
+            );
+            assert_eq!(c.status, CheckStatus::Err, "{policy} must be refused");
+        }
+    }
+
+    /// The false-clean-bill case. `systemctl show` answers for a unit
+    /// that does not exist by printing defaults — and the default is
+    /// `Restart=no`. Without reading LoadState, a typo'd unit name
+    /// would report OK, which is the worst direction for a check to be
+    /// wrong in.
+    #[test]
+    fn restart_policy_will_not_pass_a_unit_that_is_not_loaded() {
+        let c = restart_policy_verdict("typo.service", "Restart=no\nLoadState=not-found\n");
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.detail.contains("not-found"), "{}", c.detail);
+    }
+
+    /// Property order is not promised, and neither is the presence of
+    /// either key on an old systemd. Parse, don't index.
+    #[test]
+    fn restart_policy_reads_properties_in_any_order() {
+        let c = restart_policy_verdict("pg.service", "LoadState=loaded\nRestart=always\n");
+        assert_eq!(c.status, CheckStatus::Err);
+    }
+
+    #[test]
+    fn restart_policy_warns_when_systemctl_says_nothing_useful() {
+        assert_eq!(
+            restart_policy_verdict("pg.service", "").status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            restart_policy_verdict("pg.service", "LoadState=loaded\n").status,
+            CheckStatus::Warn
+        );
     }
 
     // ----- consensus prerequisites -----------------------------------------

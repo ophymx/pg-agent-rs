@@ -245,10 +245,13 @@ fi
 # touch the agent's own `systemctl start` — recover, cold start and
 # provisioning bootstrap all still work.
 #
-# NOTE: this is the TEST cluster's uniformity, not a product fix. A
-# real RHEL deployment inherits the packaged `Restart=on-failure` and
-# needs its own decision about it — see testing/README.md finding 29
-# and the TODO item it links.
+# This started as the TEST cluster's uniformity, before the product
+# had anything to say about it. It is now also what BOOTSTRAP §1.1
+# tells a real deployment to write — same filename, same content — and
+# `validate-env` refuses to start the daemon without it. Provisioning
+# writes it here for the same reason Ansible does there, which is why
+# the two stayed identical rather than the fixture keeping a private
+# workaround. See testing/README.md finding 29.
 install -d "/etc/systemd/system/${PG_UNIT}.service.d"
 cat > "/etc/systemd/system/${PG_UNIT}.service.d/10-agent-managed.conf" <<'EOF'
 # pg-agent-acceptance: PostgreSQL's lifecycle belongs to the agent.

@@ -252,7 +252,49 @@ scheduled. Items roughly in priority order within each section.
   an `include_if_exists`/`include` naming `myrecovery.conf`; ERR when
   absent. Cheap, local, no DB round-trip.
 
-### RHEL's packaged unit resurrects a fenced postmaster (`Restart=on-failure`)
+### ~~RHEL's packaged unit resurrects a fenced postmaster (`Restart=on-failure`)~~ — FIXED
+
+> Closed with (a) + (b), as the fix-shape note below argued: state it,
+> and hand the operator the file.
+>
+> **(a)** `validate-env` grew a `postgres unit: restart policy` check.
+> It reads the EFFECTIVE policy (`systemctl show <unit>
+> --property=Restart --property=LoadState`) — effective, so a drop-in
+> counts and a commented-out line in the packaged unit counts — and
+> ERRs on anything but `no`, with the drop-in's path in the message.
+> ERR rather than WARN, and with no opt-out, on the same footing as the
+> pool-size and mTLS refusals: a deployment where PostgreSQL's
+> lifecycle is half systemd's and half the lease's has no coherent
+> answer to "who decides whether this node serves".
+>
+> `LoadState` is read alongside `Restart` because `systemctl show`
+> answers for a unit that does not exist by printing DEFAULTS, and the
+> default is `Restart=no` — so without it a typo'd unit name would
+> report a clean bill of health. Verified against real systemd:
+> `systemctl show definitely-not-a-unit.service` prints `Restart=no` /
+> `LoadState=not-found` and exits 0. Six unit tests over the parse,
+> including that one.
+>
+> **(b)** BOOTSTRAP §1.1 now ships the drop-in
+> (`10-agent-managed.conf`, the same filename the acceptance suite
+> writes) for BOTH families, with the reasoning inline.
+>
+> **The framing was sharpened in the process.** "A fenced node stays
+> down" was never actually at risk: systemd does not restart a unit it
+> stopped by an explicit stop job, so `ensure_stopped` is safe on
+> either family. The hazard is a postmaster that dies on its OWN terms
+> — crash, OOM, `kill -9` — on a node whose agent may have died with
+> it, leaving nothing to fence it. That is G8/G9's shape, which is
+> exactly where the suite found it.
+>
+> **(c) not taken.** Masking the unit for the fence's duration is still
+> the only option config drift cannot undo, and the "unresolved" note
+> below — whether systemd's restart wins is timing-dependent — is still
+> unresolved. But (a) turns the drift into a startup refusal, which
+> covers the same ground without the fence acquiring a systemd-state
+> side effect it has to unwind on every path.
+
+### (historical) RHEL's packaged unit resurrects a fenced postmaster
 
 - **Where:** deployment-owned, so `crates/pg-agent-core/src/preflight.rs`
   is the place the product can speak about it; the fence itself is
