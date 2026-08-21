@@ -97,6 +97,43 @@ once Ansible has staged everything.
 `pgpool2.service` is the *only* unit that needs explicit masking
 (its upstream postinst would auto-enable + auto-start).
 
+#### PostgreSQL's restart policy — the drop-in every node needs
+
+PostgreSQL's lifecycle belongs to the agent. systemd must neither start
+it at boot nor restart it after a crash:
+
+```
+install -d /etc/systemd/system/postgresql-16.service.d   # your PG unit
+cat > /etc/systemd/system/postgresql-16.service.d/10-agent-managed.conf <<'EOF'
+# PostgreSQL's lifecycle belongs to pg_agentd. systemd may neither
+# start it at boot nor restart it after a crash: a postmaster that
+# comes back on its own is a node the cluster may have already moved
+# past, serving reads on a timeline nobody else is on.
+[Service]
+Restart=no
+EOF
+systemctl daemon-reload
+```
+
+**On the RHEL family this is load-bearing, not hygiene.** PGDG's
+`postgresql-<ver>.service` ships `Restart=on-failure` **active**;
+Debian's `postgresql@.service` ships the same line commented out, which
+is why the Debian path has never needed the file. `systemctl disable`
+does *not* cover this — it closes boot-time autostart, not `Restart=`.
+
+The agent's own fence is safe either way: systemd never restarts a unit
+it stopped by an explicit stop job. What `Restart=` resurrects is a
+postmaster that died on its own terms — crash, OOM, `kill -9` — on a
+node whose agent may have died with it, so nothing is left to fence it.
+Quorum commit means it cannot acknowledge a write, but it will answer
+reads as a primary after the cluster deposed it.
+
+`validate-env` (Phase 1.7) refuses to start the daemon when the
+effective policy is anything but `no`, and prints this file's path.
+Write it for both families rather than branching: the content is
+identical, and a fleet whose crash behavior depends on which distro a
+node booted is a fleet with two failure models to reason about.
+
 ### 1.2 mTLS material
 
 Two cert populations, in two different homes. Ansible owns both —

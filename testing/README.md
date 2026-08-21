@@ -989,14 +989,20 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     whose crash shape depends on which distro it booted proves less
     than it appears to.
 
-    **The product question is the interesting half and is NOT closed
-    by that drop-in.** Disabling the unit — which the deployment does
-    — stops boot-time autostart, not `Restart=`. So on RHEL, a fence
-    that stops PostgreSQL can be undone by systemd if the stop is
-    recorded as a failure, and the agent's "a fenced node stays down"
-    assumption is Debian-shaped. Tracked in TODO.md; `validate-env` is
-    the natural place to catch it, since it is precisely the class of
-    silent localhost misconfiguration that check exists for.
+    **The product question was the interesting half, and it is now
+    closed** — `validate-env` reads the effective `Restart=` for the
+    configured unit and refuses to start the daemon on anything but
+    `no`, BOOTSTRAP §1.1 ships the drop-in, and provisioning here
+    writes the same file for the same reason rather than keeping a
+    private workaround.
+
+    Closing it corrected the framing. The agent's own fence was never
+    at risk: systemd does not restart a unit it stopped by an explicit
+    stop job. What `Restart=` resurrects is a postmaster that died on
+    its OWN terms, on a node whose agent may have died with it — which
+    is G8/G9's shape, and precisely why this cell is where it surfaced.
+    "A fenced node stays down" was the wrong sentence; "a node the
+    cluster moved past does not come back on its own" is the right one.
 
     Two meta-lessons, both familiar from finding 28. The suite went
     green on this cell yesterday with the same unit file, so the
