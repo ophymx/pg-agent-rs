@@ -806,9 +806,9 @@ must still complete. Use a detached, time-bounded context:
 
 ### 5.15 Lease-driven roles (agent-led failover)
 
-Active when `[raft] enabled = true` and `shadow = false`. The full
-design, its invariants, and its history live in
-[docs/promotion-authority.md](docs/promotion-authority.md); this
+Always active — every daemon joins consensus and runs the loop, or
+fails to start. The full design, its invariants, and its history live
+in [docs/promotion-authority.md](docs/promotion-authority.md); this
 section is the behavioral contract.
 
 **Decision layer** (`ha` module): every `loop_wait`, each node performs
@@ -822,8 +822,8 @@ node id breaks exact ties only — `max_lag_on_failover_bytes` is
 accepted in config but vestigial. Terms are fencing tokens, minted
 monotonically; the lease is seeded by `ClusterInit` at bootstrap.
 
-**Execution layer** (`roleexec` module): shadow mode is the executor's
-absence. With `shadow = false`:
+**Execution layer** (`roleexec` module): every decision is handed to
+the executor after logging.
 
 - Winning a takeover → journaled promotion (`inflight_ops` `promote`
   op), `pg_promote(false)` + a poll bounded by `leader_ttl`.
@@ -1099,9 +1099,11 @@ healthz.port          = 9702
 - `[raft]` (docs/promotion-authority.md §5): `leader_ttl >= loop_wait +
   2 * retry_timeout`, and `retry_timeout > election_timeout`. Violating
   either is a config error, because each converts routine events into
-  spurious failovers. `shadow = true` additionally spawns the HA loop
-  in shadow mode — role decisions computed and logged every `loop_wait`
-  on the `ha_shadow` tracing target, nothing acted on.
+  spurious failovers. The block is timing only — consensus itself is
+  not configurable. The obsolete `enabled` key is refused rather than
+  ignored: `false` fails the load, `true` loads with a warning to
+  delete the line. Decisions are logged every `loop_wait` on the `ha`
+  tracing target.
 
 ### 8.4 Local-node id resolution
 

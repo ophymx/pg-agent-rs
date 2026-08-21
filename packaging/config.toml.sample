@@ -113,25 +113,28 @@ hostname = "pg3.example.com"
 
 
 # --- consensus / HA loop ----------------------------------------------
-# docs/promotion-authority.md §5. Off by default: without it there is no
-# HA loop at all, and nothing here changes who runs PostgreSQL.
+# docs/promotion-authority.md §5.
 #
-# One switch:
+# THERE IS NO SWITCH HERE. Every pg_agentd joins the embedded Raft
+# cluster (opens <state_dir>/raft/, serves PgAgentRaft on the peer
+# listener) and runs the HA loop, whose decisions act on local
+# PostgreSQL — promote on lease takeover, stop on lost lease/quorum,
+# re-point standbys onto the holder. The lease is the only promotion
+# authority the daemon has, so a node that did not join it could not
+# learn it had been deposed.
 #
-# enabled = join the embedded Raft cluster (open <state_dir>/raft/, serve
-#           PgAgentRaft on the peer listener) AND let the HA loop's
-#           decisions act on local PostgreSQL — promote on lease
-#           takeover, stop on lost lease/quorum, re-point standbys onto
-#           the holder.
+# `[raft] enabled` used to select that, back when pgpool's
+# failover_command was the other way to decide who is primary. The key
+# is now refused: `enabled = false` fails config load, and a leftover
+# `enabled = true` loads with a warning telling you to delete it.
 #
 # A demoted node stays stopped: rejoining a fenced ex-primary is the
 # operator's call (`pg_agentctl cluster recover`), never automatic.
 #
-# `enabled = true` requires a pool of at least THREE nodes and mTLS —
-# validate-env refuses otherwise. Under Raft a 2-node cluster tolerates
-# zero failures (losing either node loses quorum, so the survivor
-# demotes itself rather than serve without one), where the same pool
-# without Raft merely degraded badly. And because the consensus plane
+# REQUIREMENTS, checked by validate-env on every daemon start: a pool of
+# at least THREE nodes, and mTLS. A 2-node Raft cluster tolerates zero
+# failures — losing either node loses quorum, so the survivor demotes
+# itself rather than serve without one. And because the consensus plane
 # shares the peer listener, running it without mTLS would expose lease
 # takeover to anyone who can reach the port.
 #
@@ -151,7 +154,6 @@ hostname = "pg3.example.com"
 # together and split the vote. The default is deliberately long, so an
 # Ansible rolling restart of the agents does not cascade into elections.
 # [raft]
-# enabled                = false
 # loop_wait_secs         = 10
 # retry_timeout_secs     = 10
 # leader_ttl_secs        = 30

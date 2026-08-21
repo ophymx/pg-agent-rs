@@ -103,27 +103,39 @@ pub struct Options {
     /// ensuring `serve.reject_insecure_remote_peer()` is false. The check
     /// runs again inside [`Agent::serve`] as a defense in depth.
     pub cert_reloader: Option<Arc<CertReloader>>,
-    /// `Some(timing)` spawns the HA loop in shadow mode (compute + log
-    /// role decisions, act on nothing — see `crate::ha`). Projected from
-    /// `[raft] shadow = true` + the `[raft]` timing knobs. `None` (the
-    /// default) spawns nothing.
-    pub ha_shadow: Option<crate::ha::HaTiming>,
-    /// `Some(runtime)` when `[raft] enabled = true`: this node serves
-    /// `PgAgentRaft` on the peer listener and the HA loop reads the
-    /// replicated state machine instead of a process-local one.
+    /// The HA subsystem. `None` is reachable only from unit tests that
+    /// build an `Agent` to exercise an RPC handler; `pg_agentd` always
+    /// constructs it. See [`HaWiring`].
+    pub ha: Option<HaWiring>,
+}
+
+/// Consensus, the executor, and the loop's timing — as one value,
+/// because they are one thing.
+///
+/// They used to be three independent `Option`s, which spelled four
+/// states the daemon could be in and only one it should ever have been
+/// in. The other three were the staged migration's: a loop reading a
+/// process-local store authoritative for nothing, a loop that narrated
+/// decisions with no executor to act on them (shadow mode), consensus
+/// running under no loop at all. Each was reachable by a config file,
+/// and none of them is a cluster anyone wants to be paged for.
+///
+/// Binding them together makes those states unrepresentable rather than
+/// merely discouraged: there is no lease without something to act on
+/// it, and no executor without a lease to act for.
+pub struct HaWiring {
+    /// Serves `PgAgentRaft` on the peer listener and backs the loop,
+    /// `cluster pause`, and cold-start reconciliation with the
+    /// replicated state machine.
     ///
     /// Built before `Agent::new` because it opens redb and starts
     /// openraft's core task, and `Agent::new` is documented as cheap
     /// and I/O-free.
-    pub raft: Option<Arc<crate::raftconsensus::RaftRuntime>>,
-    /// `Some` = **execute mode**: the HA loop gets a
-    /// [`crate::roleexec::RoleExecutor`] over this instance and acts on
-    /// its decisions. `None` = shadow (decisions log, nothing moves).
-    /// Built by daemon main only when `[raft] enabled = true` and
-    /// `shadow = false` — executing against a process-local store is
-    /// structurally impossible because the instance is only constructed
-    /// alongside a real Raft.
-    pub pg_instance: Option<Arc<dyn pgman::instance::PostgresInstance>>,
+    pub raft: Arc<crate::raftconsensus::RaftRuntime>,
+    /// The PostgreSQL handle every decision acts through.
+    pub instance: Arc<dyn pgman::instance::PostgresInstance>,
+    /// Projected from the `[raft]` timing knobs.
+    pub timing: crate::ha::HaTiming,
 }
 
 impl Options {
@@ -142,9 +154,7 @@ impl Options {
             phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
             supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
             cert_reloader: None,
-            ha_shadow: None,
-            raft: None,
-            pg_instance: None,
+            ha: None,
         }
     }
 }
@@ -309,7 +319,7 @@ impl Agent {
             let standby = self.deps.standby.clone();
             let pool = self.opts.node_pool.clone();
             let pg = self.opts.postgres.clone();
-            let raft = self.opts.raft.clone();
+            let raft = self.opts.ha.as_ref().map(|ha| ha.raft.clone());
             let peer_seen = self.peer_seen.clone();
             js.spawn(async move {
                 let mut server = LocalServer::new(
@@ -335,7 +345,7 @@ impl Agent {
             let wal = self.deps.wal.clone();
             let inflight = self.deps.inflight.clone();
             let pcp = self.deps.pcp.clone();
-            let raft = self.opts.raft.clone();
+            let raft = self.opts.ha.as_ref().map(|ha| ha.raft.clone());
             js.spawn(async move {
                 let mut server = PeerServer::new(me, sd, db, standby, wal, inflight, pcp);
                 if let Some(rt) = raft {
@@ -455,7 +465,10 @@ impl Agent {
         // "holder with unknown local state" fence. `start_postgres`
         // waits for readiness (pg_ctl -w), so the loop's first tick
         // sees the recovered primary and retains.
-        self.cold_start_reconcile().await;
+        if let Some(wiring) = &self.opts.ha {
+            let store: Arc<dyn crate::consensus::ConsensusStore> = wiring.raft.store.clone();
+            self.cold_start_reconcile(&wiring.instance, &store).await;
+        }
 
         // PgpoolSupervisor — only spawn on a verdict that says "this
         // node should be serving." A Phantom/SplitBrain/Unverifiable
@@ -467,55 +480,41 @@ impl Agent {
             verdict,
             PrimaryVerdict::Confirmed | PrimaryVerdict::NotApplicable
         );
-        // HA loop, shadow mode (see crate::ha) — spawned regardless of
-        // the phantom verdict: it acts on nothing, and its decision
-        // stream is most interesting exactly when the cluster is in a
-        // degraded shape.
-        if let Some(timing) = self.opts.ha_shadow.clone() {
-            let executor = self.opts.pg_instance.clone().map(|instance| {
-                Arc::new(crate::roleexec::RoleExecutor::new(
-                    instance,
-                    self.deps.db.clone(),
-                    self.deps.peers.clone(),
-                    self.opts.node_pool.clone(),
-                    self.deps.inflight.clone(),
-                    self.deps.pcp.clone(),
-                    // Promote budget = leader_ttl: the clock rivals run
-                    // against a fresh holder (see roleexec docs).
-                    timing.leader_ttl,
-                    &self.opts.postgres,
-                    follow_wedged.clone(),
-                ))
-            });
-            // With Raft running the loop reads a replicated state
-            // machine; without it, a process-local one that is
-            // authoritative for nothing. The loop itself cannot tell
-            // the difference, which is the seam's whole purpose.
-            let store: Arc<dyn crate::consensus::ConsensusStore> = match &self.opts.raft {
-                Some(rt) => {
-                    info!("ha loop: backed by raft consensus store");
-                    rt.store.clone()
-                }
-                None => {
-                    info!("ha loop: backed by the process-local in-memory store");
-                    Arc::new(crate::consensus::InMemoryConsensusStore::new())
-                }
-            };
-            let mut ha = crate::ha::HaLoop::new(
-                store,
+        // The HA loop — spawned regardless of the phantom verdict.
+        // A node whose PostgreSQL the phantom check just stopped is
+        // still a cluster member: it can follow, it can be a candidate,
+        // and it is the node most in need of the lease telling it what
+        // it is. Withholding the loop from exactly that node would
+        // leave it stopped with nothing able to reconcile it.
+        if let Some(wiring) = &self.opts.ha {
+            let timing = wiring.timing.clone();
+            let executor = Arc::new(crate::roleexec::RoleExecutor::new(
+                wiring.instance.clone(),
                 self.deps.db.clone(),
                 self.deps.peers.clone(),
                 self.opts.node_pool.clone(),
-                timing,
-            )
-            // The loop records who it reached each tick; get_status
-            // ships those ages to peers as the second opinion.
-            .with_peer_seen(self.peer_seen.clone());
-            if let Some(executor) = executor {
-                info!("ha loop: EXECUTE mode — decisions act on local PostgreSQL");
-                ha = ha.with_executor(executor);
-            }
-            let ha = Arc::new(ha);
+                self.deps.inflight.clone(),
+                self.deps.pcp.clone(),
+                // Promote budget = leader_ttl: the clock rivals run
+                // against a fresh holder (see roleexec docs).
+                timing.leader_ttl,
+                &self.opts.postgres,
+                follow_wedged.clone(),
+            ));
+            let store: Arc<dyn crate::consensus::ConsensusStore> = wiring.raft.store.clone();
+            let ha = Arc::new(
+                crate::ha::HaLoop::new(
+                    store,
+                    self.deps.db.clone(),
+                    self.deps.peers.clone(),
+                    self.opts.node_pool.clone(),
+                    timing,
+                )
+                // The loop records who it reached each tick; get_status
+                // ships those ages to peers as the second opinion.
+                .with_peer_seen(self.peer_seen.clone())
+                .with_executor(executor),
+            );
             let s = shutdown.clone();
             js.spawn(async move {
                 ha.run(s).await;
@@ -768,10 +767,17 @@ impl Agent {
     /// check and the HA-loop spawn: the loop's first tick then sees
     /// the started primary and retains, instead of racing a fence
     /// against a PostgreSQL still in crash recovery.
-    pub(crate) async fn cold_start_reconcile(&self) {
-        let Some(instance) = &self.opts.pg_instance else {
-            return;
-        };
+    ///
+    /// Takes its two dependencies as arguments rather than reading
+    /// `self.opts`: the reconcile is a decision about local PostgreSQL
+    /// given a lease, and passing both in lets the tests drive every
+    /// branch (holder / not holder / no quorum) against a real store
+    /// double instead of a runtime they cannot construct.
+    pub(crate) async fn cold_start_reconcile(
+        &self,
+        instance: &Arc<dyn pgman::instance::PostgresInstance>,
+        store: &Arc<dyn crate::consensus::ConsensusStore>,
+    ) {
         if !matches!(instance.state().await, pgman::instance::InstanceState::Down) {
             return;
         }
@@ -790,11 +796,6 @@ impl Agent {
         // still the cluster's primary — poll for a quorum read, since
         // on a full-site restart the peers' raft servers are booting
         // too and the store answers only once a majority is back.
-        let Some(rt) = &self.opts.raft else {
-            info!("cold start: primary-shaped pgdata but no raft store; staying down");
-            return;
-        };
-        let store: Arc<dyn crate::consensus::ConsensusStore> = rt.store.clone();
         let local_id = self.opts.node_pool.local_node_id;
         let deadline = std::time::Instant::now() + COLD_START_QUORUM_BUDGET;
         loop {
@@ -1596,9 +1597,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
-                ha_shadow: None,
-                raft: None,
-                pg_instance: None,
+                ha: None,
             },
         )
     }
@@ -1607,19 +1606,30 @@ mod tests {
         make_deps_with_peers(db, sd, Arc::new(StubPeers::default()))
     }
 
-    /// Agent wired for cold-start reconcile tests: a real (temp)
-    /// pgdata path and a scripted instance state; no raft, so the
-    /// primary-shaped arm resolves immediately to "no authority".
-    fn make_agent_cold(
-        deps: AgentDeps,
-        data_dir: PathBuf,
-        state: pgman::instance::InstanceState,
-    ) -> Arc<Agent> {
+    /// Agent wired for cold-start reconcile tests: a real (temp) pgdata
+    /// path. The instance and the store are passed to the reconcile
+    /// directly (see `cold_start_reconcile`), so these tests exercise
+    /// the same code the daemon runs — including the primary-shaped
+    /// arm, which used to be untestable here because the harness had no
+    /// raft and the method returned early on its absence.
+    fn make_agent_cold(deps: AgentDeps, data_dir: PathBuf) -> Arc<Agent> {
         let base = make_agent(deps);
         let mut opts_agent = Arc::into_inner(base).expect("sole owner");
         opts_agent.opts.postgres.data_dir = data_dir;
-        opts_agent.opts.pg_instance = Some(Arc::new(FixedStateInstance(state)));
         Arc::new(opts_agent)
+    }
+
+    fn cold_instance(
+        state: pgman::instance::InstanceState,
+    ) -> Arc<dyn pgman::instance::PostgresInstance> {
+        Arc::new(FixedStateInstance(state))
+    }
+
+    /// An empty store: the lease is vacant, every read succeeds. The
+    /// primary-shaped arm must still refuse to start, because a vacant
+    /// lease is not this node's claim to be primary.
+    fn vacant_store() -> Arc<dyn crate::consensus::ConsensusStore> {
+        Arc::new(crate::consensus::InMemoryConsensusStore::new())
     }
 
     /// Instance whose `state()` is fixed; the reconcile must never
@@ -1667,12 +1677,13 @@ mod tests {
         std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
         std::fs::write(dir.path().join("standby.signal"), "").unwrap();
         let (deps, sd) = cold_deps();
-        let agent = make_agent_cold(
-            deps,
-            dir.path().to_path_buf(),
-            pgman::instance::InstanceState::Down,
-        );
-        agent.cold_start_reconcile().await;
+        let agent = make_agent_cold(deps, dir.path().to_path_buf());
+        agent
+            .cold_start_reconcile(
+                &cold_instance(pgman::instance::InstanceState::Down),
+                &vacant_store(),
+            )
+            .await;
         assert_eq!(starts(&sd), 1, "standby-shaped pgdata is safe to start");
     }
 
@@ -1680,30 +1691,68 @@ mod tests {
     async fn cold_start_ignores_uninitialized_pgdata() {
         let dir = tempfile::tempdir().unwrap();
         let (deps, sd) = cold_deps();
-        let agent = make_agent_cold(
-            deps,
-            dir.path().to_path_buf(),
-            pgman::instance::InstanceState::Down,
-        );
-        agent.cold_start_reconcile().await;
+        let agent = make_agent_cold(deps, dir.path().to_path_buf());
+        agent
+            .cold_start_reconcile(
+                &cold_instance(pgman::instance::InstanceState::Down),
+                &vacant_store(),
+            )
+            .await;
         assert_eq!(starts(&sd), 0, "nothing startable pre-init / mid-reclone");
     }
 
+    /// Primary-shaped pgdata, vacant lease. Nobody has claimed the
+    /// cluster, and a cold ex-primary is the one node that must not
+    /// claim it by simply starting: candidacy is for running standbys
+    /// that can prove a WAL position.
     #[tokio::test]
-    async fn cold_start_leaves_primary_shaped_down_without_authority() {
+    async fn cold_start_leaves_primary_shaped_down_on_a_vacant_lease() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
-        // No standby.signal: primary-shaped. raft is None in the test
-        // harness — no lease authority, so the conservative answer is
-        // to stay down rather than resurrect a possible stale primary.
         let (deps, sd) = cold_deps();
-        let agent = make_agent_cold(
-            deps,
-            dir.path().to_path_buf(),
-            pgman::instance::InstanceState::Down,
-        );
-        agent.cold_start_reconcile().await;
+        let agent = make_agent_cold(deps, dir.path().to_path_buf());
+        agent
+            .cold_start_reconcile(
+                &cold_instance(pgman::instance::InstanceState::Down),
+                &vacant_store(),
+            )
+            .await;
         assert_eq!(starts(&sd), 0, "primary-shaped needs the lease's say-so");
+    }
+
+    /// The finding-21 case the harness could not reach before: the site
+    /// came back, this node still holds the persisted lease, so it is
+    /// still the primary and starts (crash recovery and all).
+    #[tokio::test]
+    async fn cold_start_starts_primary_shaped_pgdata_when_we_hold_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
+        let (deps, sd) = cold_deps();
+        let agent = make_agent_cold(deps, dir.path().to_path_buf());
+        let store = vacant_store();
+        // local_node_id is 0 in this harness — seed the lease to us.
+        store.try_takeover(0, None).await.expect("seed the lease");
+        agent
+            .cold_start_reconcile(&cold_instance(pgman::instance::InstanceState::Down), &store)
+            .await;
+        assert_eq!(starts(&sd), 1, "the lease says this node is the primary");
+    }
+
+    /// Deposed while the site was dark. The lease names someone else,
+    /// so this pgdata is a stale timeline — starting it would put a
+    /// second primary on the network.
+    #[tokio::test]
+    async fn cold_start_leaves_a_deposed_ex_primary_down() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
+        let (deps, sd) = cold_deps();
+        let agent = make_agent_cold(deps, dir.path().to_path_buf());
+        let store = vacant_store();
+        store.try_takeover(1, None).await.expect("seed the lease");
+        agent
+            .cold_start_reconcile(&cold_instance(pgman::instance::InstanceState::Down), &store)
+            .await;
+        assert_eq!(starts(&sd), 0, "another node holds the lease");
     }
 
     #[tokio::test]
@@ -1712,12 +1761,13 @@ mod tests {
         std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
         std::fs::write(dir.path().join("standby.signal"), "").unwrap();
         let (deps, sd) = cold_deps();
-        let agent = make_agent_cold(
-            deps,
-            dir.path().to_path_buf(),
-            pgman::instance::InstanceState::Standby { streaming: true },
-        );
-        agent.cold_start_reconcile().await;
+        let agent = make_agent_cold(deps, dir.path().to_path_buf());
+        agent
+            .cold_start_reconcile(
+                &cold_instance(pgman::instance::InstanceState::Standby { streaming: true }),
+                &vacant_store(),
+            )
+            .await;
         assert_eq!(starts(&sd), 0, "a running instance needs no reconciling");
     }
 
@@ -1944,9 +1994,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
-                ha_shadow: None,
-                raft: None,
-                pg_instance: None,
+                ha: None,
             },
         );
         let shutdown = CancellationToken::new();
@@ -2014,9 +2062,7 @@ mod tests {
                         crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                     supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                     cert_reloader: None,
-                    ha_shadow: None,
-                    raft: None,
-                    pg_instance: None,
+                    ha: None,
                 },
             );
             let shutdown = CancellationToken::new();
@@ -2078,9 +2124,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
-                ha_shadow: None,
-                raft: None,
-                pg_instance: None,
+                ha: None,
             },
         );
         let res = agent.serve(listeners, CancellationToken::new()).await;
@@ -2135,9 +2179,7 @@ mod tests {
                 phantom_check_required_peers,
                 supervisor_pgpool_enabled,
                 cert_reloader: None,
-                ha_shadow: None,
-                raft: None,
-                pg_instance: None,
+                ha: None,
             },
         );
         (agent, listeners, tmp)
@@ -2310,9 +2352,7 @@ mod tests {
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
                 cert_reloader: None,
-                ha_shadow: None,
-                raft: None,
-                pg_instance: None,
+                ha: None,
             },
         )
     }

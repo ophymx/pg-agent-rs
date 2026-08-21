@@ -364,9 +364,19 @@ impl SupervisorConfig {
 pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 
 /// `[raft]` — timing knobs for the lease-backed HA loop
-/// (docs/promotion-authority.md §5). Parsed and invariant-checked now;
-/// consumed by the HA loop when it lands (sequencing steps 5–6).
-/// Absent block = all defaults, which satisfy both invariants.
+/// (docs/promotion-authority.md §5). Absent block = all defaults, which
+/// satisfy both invariants.
+///
+/// **There is no switch here.** Consensus is not a mode: the lease is
+/// the only promotion authority the daemon has, so a node that does not
+/// join it is not a cluster member — it is a node with no way to learn
+/// it has been deposed. Every live field below is timing.
+///
+/// **Three nodes is a hard minimum.** A 2-node Raft cluster tolerates
+/// zero failures — losing either loses quorum, so the survivor cannot
+/// confirm its own lease and demotes itself. `validate-env` refuses a
+/// smaller pool rather than letting that be discovered during an
+/// outage.
 ///
 /// Two invariants are enforced at config load, because violating either
 /// converts routine events into spurious failovers:
@@ -382,16 +392,23 @@ pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 ///    §"Prior art").
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaftConfig {
-    /// Join the embedded Raft cluster: open `<state_dir>/raft/`, serve
-    /// `PgAgentRaft`, and back the HA loop with the replicated state
-    /// machine instead of a process-local one. Off by default.
+    /// **Obsolete, and parsed only so it can be refused.** `enabled`
+    /// selected whether the node joined consensus at all, back when
+    /// pgpool's `failover_command` was the other way to decide who is
+    /// primary. That path is gone (there is no second authority to fall
+    /// back to), so the knob has exactly one honest setting left.
     ///
-    /// **Three nodes is a hard minimum.** Under Raft a 2-node cluster
-    /// tolerates zero failures, where the pre-consensus arrangement
-    /// merely degraded badly — `validate-env` refuses a smaller pool
-    /// rather than letting that be discovered during an outage.
-    #[serde(default)]
-    pub enabled: Option<bool>,
+    /// It survives as a field because deleting it outright would let
+    /// serde IGNORE a leftover `enabled = false`, and a config line
+    /// that reads like it disables HA while doing nothing is the same
+    /// lie the `max_lag_on_failover_bytes` note below refuses to tell.
+    /// [`RaftConfig::validate`] errors on `false`;
+    /// [`RaftConfig::obsolete_enabled_warning`] hands `true` to the
+    /// startup log and `validate-env` as a "delete this line" WARN, so
+    /// a node whose package upgrades before Ansible rewrites its
+    /// config.toml still starts.
+    #[serde(default, rename = "enabled", skip_serializing)]
+    pub obsolete_enabled: Option<bool>,
     #[serde(default)]
     pub loop_wait_secs: Option<u64>,
     #[serde(default)]
@@ -420,9 +437,11 @@ pub struct RaftConfig {
     // scaffolding (promotion-authority steps 5-6) whose S/R/E
     // acceptance suites were deleted at the greenfield cutover. Under
     // the shipped design it selected a cluster where the loop narrates
-    // and nothing manages PostgreSQL. Shadow mode still exists exactly
-    // where it always structurally did — as the executor's absence
-    // (`HaLoop::with_executor`), which the loop's own tests use.
+    // and nothing manages PostgreSQL, which is not a deployment anyone
+    // wants; it went with the migration it existed for. The daemon now
+    // builds the loop, the executor and the raft runtime as one unit
+    // (`agent::HaWiring`), so "consensus without executors" is not a
+    // state that can be spelled.
 }
 
 pub const DEFAULT_RAFT_LOOP_WAIT_SECS: u64 = 10;
@@ -431,8 +450,20 @@ pub const DEFAULT_RAFT_LEADER_TTL_SECS: u64 = 30;
 pub const DEFAULT_RAFT_ELECTION_TIMEOUT_MS: u64 = 5_000;
 
 impl RaftConfig {
-    pub fn effective_enabled(&self) -> bool {
-        self.enabled.unwrap_or(false)
+    /// `Some(msg)` when the config still carries an obsolete
+    /// `[raft] enabled = true`. The daemon logs it at startup and
+    /// `validate-env` reports it as a WARN; both say the same thing,
+    /// because the operator who reads one may not read the other.
+    /// `enabled = false` never reaches here — [`Self::validate`]
+    /// refuses to load that config at all.
+    pub fn obsolete_enabled_warning(&self) -> Option<&'static str> {
+        match self.obsolete_enabled {
+            Some(true) => Some(
+                "[raft] enabled is obsolete and ignored — consensus is not optional. \
+                 Delete the line.",
+            ),
+            _ => None,
+        }
     }
     pub fn effective_loop_wait(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.loop_wait_secs.unwrap_or(DEFAULT_RAFT_LOOP_WAIT_SECS))
@@ -453,6 +484,22 @@ impl RaftConfig {
         )
     }
     pub fn validate(&self) -> Result<(), AgentError> {
+        // Refused, not ignored. `enabled = false` asks for a daemon
+        // that watches a lease it will never act on and never learns
+        // it has been deposed; there is no longer any other authority
+        // to hand the decision to. Failing the load puts that in the
+        // journal at the moment the operator can still fix it, which
+        // is strictly better than starting a node that silently is not
+        // a cluster member.
+        if self.obsolete_enabled == Some(false) {
+            return Err(AgentError::RaftConfig(
+                "[raft] enabled = false is no longer a valid configuration — consensus is \
+                 not optional. The lease is the only promotion authority the daemon has, so \
+                 a node that does not join it cannot learn it has been deposed. Delete the \
+                 line (the rest of [raft] is timing and still applies)."
+                    .to_string(),
+            ));
+        }
         let loop_wait = self.effective_loop_wait();
         let retry = self.effective_retry_timeout();
         let ttl = self.effective_leader_ttl();
@@ -1402,6 +1449,50 @@ mod tests {
         assert!(err.contains("election_timeout"), "{err}");
     }
 
+    /// The knob is gone, but a fleet's config.toml files outlive the
+    /// package that read them. `false` must fail the load rather than
+    /// be ignored: it is the spelling that asks for a node which is not
+    /// a cluster member, and ignoring it would start exactly that node
+    /// under a config file claiming otherwise.
+    #[test]
+    fn raft_enabled_false_is_refused_not_ignored() {
+        let cfg: Config = toml::from_str("[raft]\nenabled = false\n").expect("parses");
+        let err = cfg.raft.validate().unwrap_err().to_string();
+        assert!(err.contains("not optional"), "{err}");
+        assert!(err.contains("Delete the line"), "{err}");
+    }
+
+    /// `true` says what the daemon now does unconditionally, so it
+    /// loads — a package upgrade must not strand a node whose Ansible
+    /// run has not caught up yet. It warns instead.
+    #[test]
+    fn raft_enabled_true_loads_with_a_warning() {
+        let cfg: Config = toml::from_str("[raft]\nenabled = true\n").expect("parses");
+        cfg.raft.validate().expect("true must still load");
+        let warning = cfg
+            .raft
+            .obsolete_enabled_warning()
+            .expect("a leftover `enabled = true` must be reported");
+        assert!(warning.contains("obsolete"), "{warning}");
+    }
+
+    #[test]
+    fn raft_without_the_obsolete_key_says_nothing() {
+        let cfg: Config = toml::from_str("[raft]\nloop_wait_secs = 10\n").expect("parses");
+        cfg.raft.validate().unwrap();
+        assert!(cfg.raft.obsolete_enabled_warning().is_none());
+    }
+
+    /// The rejection must never round-trip back into a rendered config:
+    /// `gen`-style writers serialize `RaftConfig`, and re-emitting
+    /// `enabled` would recreate the file that just failed to load.
+    #[test]
+    fn obsolete_enabled_never_serializes() {
+        let cfg: Config = toml::from_str("[raft]\nenabled = true\n").expect("parses");
+        let rendered = toml::to_string(&cfg.raft).expect("serializes");
+        assert!(!rendered.contains("enabled"), "{rendered}");
+    }
+
     /// Every key `packaging/config.toml.sample` documents under
     /// `[raft]`, uncommented. A sample that names a field the struct
     /// does not have is worse than no sample: the operator's config
@@ -1411,7 +1502,6 @@ mod tests {
     fn sample_config_raft_keys_all_exist() {
         let toml = r#"
             [raft]
-            enabled                   = false
             loop_wait_secs            = 10
             retry_timeout_secs        = 10
             leader_ttl_secs           = 30
@@ -1421,7 +1511,10 @@ mod tests {
         cfg.raft
             .validate()
             .expect("the documented defaults must satisfy both invariants");
-        assert!(!cfg.raft.effective_enabled());
+        assert!(
+            cfg.raft.obsolete_enabled.is_none(),
+            "the sample must not document `enabled` — it is refused, not configured"
+        );
         assert_eq!(cfg.raft.effective_loop_wait().as_secs(), 10);
         assert_eq!(cfg.raft.effective_retry_timeout().as_secs(), 10);
         assert_eq!(cfg.raft.effective_leader_ttl().as_secs(), 30);

@@ -1,11 +1,11 @@
 //! Acceptance suite driver. See testing/README.md.
 //!
-//! THE MODEL UNDER TEST IS LEASE-DRIVEN ROLES. Nodes boot with
-//! `[raft] enabled = true, shadow = false` — the greenfield deployment
-//! shape — and every failure/recovery scenario runs under the raft
-//! consensus lease, with pgpool present strictly as the router it is
-//! post-cutover. The pgpool-led promote path is deleted from the
-//! codebase, not merely untested.
+//! THE MODEL UNDER TEST IS LEASE-DRIVEN ROLES. Every failure/recovery
+//! scenario runs under the raft consensus lease — the only shape the
+//! daemon has, since a node either joins consensus or refuses to start
+//! — with pgpool present strictly as the router it is post-cutover.
+//! The pgpool-led promote path is deleted from the codebase, not
+//! merely untested.
 //!
 //! Usage (via testing/acceptance.sh, which builds and execs this):
 //!   testing/acceptance.sh              # build, up, run, down

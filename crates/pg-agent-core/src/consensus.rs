@@ -5,11 +5,11 @@
 //! state machine: the lease, the pause flag, a scheduled switchover,
 //! and a generation counter. It is deliberately *not* openraft's
 //! storage interface — it is the decision layer's contract, and what
-//! sits behind it is swappable: [`InMemoryConsensusStore`] for unit
-//! tests and shadow mode today, an openraft-backed implementation at
-//! cutover, an external store if embedded Raft ever proves untrustable.
-//! The HA loop is identical under any of them, which is what keeps the
-//! storage decision cheap to defer and cheap to revisit.
+//! sits behind it is swappable: [`crate::raftstore`]'s openraft-backed
+//! implementation in every deployment, [`InMemoryConsensusStore`] in
+//! unit tests, an external store if embedded Raft ever proves
+//! untrustable. The HA loop is identical under any of them, which is
+//! what keeps the storage decision cheap to revisit.
 //!
 //! # Semantics the trait promises (and impls must honor)
 //!
@@ -136,25 +136,23 @@ pub trait ConsensusStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// InMemoryConsensusStore — tests + shadow mode
+// InMemoryConsensusStore — tests
 // ---------------------------------------------------------------------------
 
-/// Deterministic in-memory [`ConsensusStore`].
+/// Deterministic in-memory [`ConsensusStore`], for **unit tests only**.
 ///
-/// Two consumers, neither of which needs (or wants) real consensus:
+/// The fault-injection switches turn partition and failure scenarios
+/// into ordinary assertions: "read fails mid-retain", "CAS races
+/// another candidate", "store goes dark past retry_timeout".
 ///
-/// - **Unit tests of the HA loop**, where the fault-injection switches
-///   turn partition and failure scenarios into ordinary assertions:
-///   "read fails mid-retain", "CAS races another candidate", "store
-///   goes dark past retry_timeout".
-/// - **Shadow mode** (sequencing step 5), where each node's loop runs
-///   against its own local instance, computes what it *would* decide,
-///   and logs it while pgpool keeps driving. Nothing here is
-///   authoritative, so nothing needs durability or agreement.
+/// No daemon has ever been able to run on this — the agent used to be
+/// able to, back when consensus was optional and a node could fall back
+/// to a process-local store authoritative for nothing. That fallback is
+/// gone: `pg_agentd` builds a raft-backed store or fails to start.
 ///
 /// Persistence is deliberately absent: durability only matters when a
 /// store's answers are authoritative promises (a vote, a committed
-/// entry must survive a crash). That begins at the openraft
+/// entry must survive a crash). That belongs to the openraft
 /// implementation, not here.
 #[derive(Default)]
 pub struct InMemoryConsensusStore {

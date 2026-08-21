@@ -2,9 +2,16 @@
 
 **Status:** implemented through step 7 (§10). The HA loop, embedded
 Raft, executors, and the flipped pgpool contract are all landed and
-exercised on the acceptance cluster; `[raft] enabled = true, shadow =
-false` is the cutover switch, off by default — deployments opt in.
-Step 8 (role-aware `/healthz` + the HAProxy split) remains.
+exercised on the acceptance cluster. Step 8 (role-aware `/healthz` +
+the HAProxy split) remains.
+
+**There is no cutover switch any more.** `[raft] enabled` and `shadow`
+were the staged migration's controls, and the migration is over: every
+daemon joins consensus and executes, or fails to start. `enabled` is
+refused at config load (`false`) or warned about (`true`); `shadow` is
+long gone. The sequencing in §10 below is kept as the historical record
+of how this landed — read its step-5/6/7 configuration talk as past
+tense.
 
 Companion to [SPEC.md](../SPEC.md) (SPEC §5.1),
 [ROADMAP.md](../ROADMAP.md) ("Shared cluster state"), and
@@ -1033,11 +1040,13 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    (construction + membership bootstrap), `[raft] enabled`, and the
    `validate-env` checks.
 
-   `enabled` is a separate switch from `shadow`, and they compose:
-   `enabled = true, shadow = true` is this step's configuration — real
-   consensus underneath, no executors on top. Step 7 turns `shadow`
-   off. Both default off, so nothing changes for any deployment that
-   does not opt in.
+   `enabled` was a separate switch from `shadow`, and they composed:
+   `enabled = true, shadow = true` was this step's configuration — real
+   consensus underneath, no executors on top. Step 7 turned `shadow`
+   off. Both defaulted off, so nothing changed for a deployment that
+   had not opted in. **Both switches are gone now** (see the Status
+   note at the top): consensus and execution are the daemon, not a
+   configuration of it.
 
    Membership is formed by `ClusterInit`, not at daemon startup and not
    implicitly at first election. It is already the operator-driven
@@ -1095,11 +1104,13 @@ Effort tags follow ROADMAP convention (**S** = days, **M** = weeks,
    (the concern layer: `promote_and_wait`, `ensure_stopped`, `follow`,
    `rebuild_as_standby`, one authoritative `InstanceState`) and
    `roleexec::RoleExecutor`, which consumes the decision stream. The
-   loop stays a pure decision function; **shadow mode is the executor's
-   absence** — `[raft] shadow = false, enabled = true` is the execute
-   switch, and the instance is only ever constructed alongside a real
-   Raft, so executing against a process-local store is not a
-   configuration that exists.
+   loop stays a pure decision function; everything destructive lives in
+   the executor. At the time this landed, **shadow mode was the
+   executor's absence** and `[raft] shadow = false, enabled = true` was
+   the execute switch. Both switches have since been deleted: the
+   daemon builds the store, the executor and the loop as one value
+   (`agent::HaWiring`), so neither "consensus without executors" nor
+   "executors without consensus" is a state that can be spelled.
 
    Decisions map to convergent actions: takeover → journaled
    promotion (deadline = `leader_ttl`, the same clock rivals run

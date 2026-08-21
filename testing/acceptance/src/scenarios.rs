@@ -191,9 +191,9 @@ pub async fn run_all(cx: &mut Ctx) {
 }
 
 async fn g0(cx: &mut Ctx) {
-    cx.say("G0: greenfield boot — execute mode from the first start");
-    // Nodes are provisioned with [raft] enabled = true, shadow = false.
-    // validate-env (the systemd ExecStartPre gate) runs the raft
+    cx.say("G0: greenfield boot — the loop acts from the first start");
+    // Consensus is not configurable: every daemon joins it or fails to
+    // start. validate-env (the systemd ExecStartPre gate) runs the raft
     // prerequisite checks on every start; the daemons coming up IS that
     // assertion. Before ClusterInit there is no membership and hence no
     // quorum: the loop must tick StoreUnknown — never vacant, never act.
@@ -216,11 +216,17 @@ async fn g0(cx: &mut Ctx) {
         );
     }
     for n in NODES {
+        // The loop is running, which means consensus opened and the
+        // executor is attached — the daemon cannot reach this line
+        // otherwise (`agent::HaWiring` binds all three together, and
+        // there is no config that spells any subset). The line used to
+        // say "EXECUTE mode", back when a loop could also be running
+        // in the mode that acts on nothing.
         cx.await_event(
             30,
-            &format!("{n}: raft started, EXECUTE mode"),
+            &format!("{n}: raft started, ha loop acting"),
             Cursor(0),
-            |ev| agent(ev, n, "EXECUTE mode"),
+            |ev| agent(ev, n, "ha loop: starting"),
         )
         .await;
     }
@@ -2228,7 +2234,7 @@ async fn g19(cx: &mut Ctx, prim: &'static str) {
         60,
         &format!("{victim}: participating in decisions again"),
         since,
-        |ev| agent(ev, victim, "ha shadow decision"),
+        |ev| agent(ev, victim, "ha decision"),
     )
     .await;
     // The cluster must not have noticed. A node rebuilding its own

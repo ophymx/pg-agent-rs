@@ -106,10 +106,10 @@ phantom_check_required_peers = 0
 [supervisor]
 pgpool = false
 
-# EXECUTE MODE FROM FIRST BOOT - the greenfield deployment shape the
-# suite validates, and now the only shape there is: \`enabled\` alone
-# selects it, since the pgpool-led path and the log-only shadow mode
-# are both deleted.
+# Timing only. There is no switch here any more: consensus is not
+# optional, so the daemon joins the lease or refuses to start. A
+# leftover \`enabled = true\` would still load (with a WARN); an
+# \`enabled = false\` would fail the config load outright.
 #
 # Test-friendly timing. Invariants:
 # leader_ttl >= loop_wait + 2*retry_timeout (10 >= 1+4);
@@ -123,7 +123,6 @@ pgpool = false
 # comes from cadence and detection, not from shaving the safety
 # window.
 [raft]
-enabled             = true
 loop_wait_secs      = 1
 retry_timeout_secs  = 2
 leader_ttl_secs     = 10

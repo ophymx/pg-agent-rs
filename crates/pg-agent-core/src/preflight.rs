@@ -864,30 +864,52 @@ async fn db_roles(db: &Arc<dyn LocalDb>, cfg: &Config, r: &mut PreflightReport) 
 // Consensus prerequisites
 // ---------------------------------------------------------------------------
 
-/// Preconditions for `[raft] enabled = true`
+/// Preconditions for the consensus plane
 /// (docs/promotion-authority.md §5).
 ///
-/// Silent — not even an OK row — when Raft is off, which is every
-/// deployment before cutover. A checklist that reports on things the
-/// operator has not turned on trains people to skim it.
+/// These run on every node, every time. They used to be skipped unless
+/// `[raft] enabled = true`, on the reasoning that a checklist should
+/// not report on things the operator has not turned on — sound while
+/// there was something to turn on, and obsolete the moment consensus
+/// became the only way this daemon decides anything. Now the four are
+/// unconditional preconditions for the daemon working at all.
 ///
-/// All three are refusals to start rather than warnings, because each
-/// one's failure mode only becomes visible during an outage, which is
-/// the worst possible time to learn about it.
+/// The deployment-shape two (pool size, transport auth) are refusals to
+/// start rather than warnings, because each one's failure mode only
+/// becomes visible during an outage, which is the worst possible time
+/// to learn about it — **except under `--dev`**, where they drop to
+/// WARN. A single-node dev instance genuinely is not an HA cluster and
+/// genuinely has no mTLS, and erroring on both would make `--dev`
+/// unstartable under the `ExecStartPre` gate. `--dev` already carries
+/// exactly this meaning everywhere else (`reject_insecure_remote_peer`,
+/// `PeerPool::new_dev`); it is the flag that says "I know".
 fn raft_prerequisites(cfg: &Config, r: &mut PreflightReport) {
-    if !cfg.raft.effective_enabled() {
-        return;
+    // Severity for the two checks a dev instance legitimately fails.
+    let shape = |name: &str, detail: String| {
+        if cfg.dev_mode {
+            Check::warn(name, detail)
+        } else {
+            Check::err(name, detail)
+        }
+    };
+    // 0. A config that still carries the obsolete switch. `false` never
+    //    reaches preflight (config load refuses it outright); `true`
+    //    lands here so the operator gets the same "delete this line"
+    //    from `validate-env` that the daemon's journal gives them.
+    if let Some(msg) = cfg.raft.obsolete_enabled_warning() {
+        r.checks.push(Check::warn("raft: obsolete config key", msg));
     }
 
-    // 1. Three nodes is a hard minimum. Under Raft a 2-node cluster
-    //    tolerates zero failures — losing either node loses quorum, so
-    //    the surviving node cannot even confirm it still holds the
-    //    lease and must demote itself. Without Raft, 2 nodes merely
-    //    degraded badly. This is the one place that difference can be
-    //    caught before it matters.
+    // 1. Three nodes is a hard minimum. A 2-node Raft cluster tolerates
+    //    zero failures — losing either node loses quorum, so the
+    //    survivor cannot even confirm it still holds the lease and must
+    //    demote itself. A 2-node pool is therefore not a degraded HA
+    //    cluster; it is a cluster that stops serving when either half
+    //    of it goes away. This is the one place to catch that before an
+    //    outage demonstrates it.
     let n = cfg.pool.len();
     if n < 3 {
-        r.checks.push(Check::err(
+        r.checks.push(shape(
             "raft: pool size",
             format!(
                 "{n} node(s); Raft needs at least 3 — a 2-node Raft cluster \
@@ -927,11 +949,12 @@ fn raft_prerequisites(cfg: &Config, r: &mut PreflightReport) {
         r.checks
             .push(Check::ok("raft: transport auth", "mTLS (peer listener)"));
     } else {
-        r.checks.push(Check::err(
+        r.checks.push(shape(
             "raft: transport auth",
             "no TLS configured — the consensus plane shares the peer \
              listener, so this would expose lease takeover to anyone who \
-             can reach the port",
+             can reach the port"
+                .to_string(),
         ));
     }
 
@@ -1405,26 +1428,101 @@ mod tests {
             .unwrap_or_else(|| panic!("no check named {name}; got {checks:?}"))
     }
 
-    /// Silent when Raft is off — which is every deployment before
-    /// cutover. Reporting on features nobody enabled trains operators
-    /// to skim the checklist.
+    /// The checks are unconditional now. A default config — no `[raft]`
+    /// block at all — must still be told whether this node can join
+    /// consensus, because there is no longer a configuration in which
+    /// it does not have to.
     #[test]
-    fn raft_checks_are_absent_when_raft_is_disabled() {
+    fn raft_checks_run_without_any_raft_block() {
         let tmp = TempDir::new().unwrap();
         let cfg = make_cfg(&tmp);
-        assert!(raft_checks(&cfg).is_empty());
+        let checks = raft_checks(&cfg);
+        assert!(
+            !checks.is_empty(),
+            "consensus preconditions are not opt-in any more"
+        );
+        find(&checks, "raft: pool size");
+        find(&checks, "raft: transport auth");
+        find(&checks, "raft: state dir");
     }
 
-    /// Two nodes is the one that matters. Under Raft a 2-node cluster
+    /// `--dev` is the flag that says "I know this is one node with no
+    /// mTLS". Erroring there would make a dev instance unstartable
+    /// under the ExecStartPre gate — but the checks must still SAY it,
+    /// so the warning survives even though the exit code does not.
+    #[test]
+    fn dev_mode_downgrades_the_deployment_shape_checks_to_warnings() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.dev_mode = true;
+        cfg.pool = vec![NodeConfig {
+            id: 0,
+            hostname: "solo".into(),
+        }];
+        cfg.local_node_id = 0;
+
+        let checks = raft_checks(&cfg);
+        assert_eq!(find(&checks, "raft: pool size").status, CheckStatus::Warn);
+        assert_eq!(
+            find(&checks, "raft: transport auth").status,
+            CheckStatus::Warn
+        );
+        let r = PreflightReport { checks };
+        assert!(!r.has_errors(), "a dev instance must still be startable");
+    }
+
+    /// The same pool WITHOUT `--dev` is a production cluster that
+    /// cannot survive a single failure, and must not start.
+    #[test]
+    fn a_real_deployment_still_errors_on_the_same_shape() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.pool = vec![NodeConfig {
+            id: 0,
+            hostname: "solo".into(),
+        }];
+        cfg.local_node_id = 0;
+
+        let checks = raft_checks(&cfg);
+        assert_eq!(find(&checks, "raft: pool size").status, CheckStatus::Err);
+        assert_eq!(
+            find(&checks, "raft: transport auth").status,
+            CheckStatus::Err
+        );
+    }
+
+    /// A leftover `enabled = true` is reported where the operator is
+    /// already looking. `false` cannot appear here at all — config load
+    /// refuses it, so the daemon never reaches preflight.
+    #[test]
+    fn raft_warns_about_a_leftover_enabled_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.raft.obsolete_enabled = Some(true);
+
+        let c = find(&raft_checks(&cfg), "raft: obsolete config key").clone();
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.detail.contains("Delete the line"), "{}", c.detail);
+    }
+
+    #[test]
+    fn raft_says_nothing_about_the_obsolete_key_when_it_is_absent() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = make_cfg(&tmp);
+        assert!(!raft_checks(&cfg)
+            .iter()
+            .any(|c| c.name == "raft: obsolete config key"));
+    }
+
+    /// Two nodes is the one that matters: a 2-node Raft cluster
     /// tolerates zero failures — losing either loses quorum, so the
-    /// survivor cannot confirm its own lease and demotes. Without Raft
-    /// the same pool merely degraded badly, so this is a regression an
-    /// operator could walk into by flipping one flag.
+    /// survivor cannot confirm its own lease and demotes itself. That
+    /// is not a degraded HA cluster, it is one that stops serving when
+    /// either half goes away.
     #[test]
     fn raft_refuses_a_pool_smaller_than_three() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = make_cfg(&tmp);
-        cfg.raft.enabled = Some(true);
         cfg.pool = vec![
             NodeConfig {
                 id: 0,
@@ -1449,7 +1547,6 @@ mod tests {
     fn raft_refuses_to_run_without_mtls() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = make_cfg(&tmp);
-        cfg.raft.enabled = Some(true);
         cfg.pool = (0..3)
             .map(|id| NodeConfig {
                 id,
@@ -1468,7 +1565,6 @@ mod tests {
     fn raft_refuses_when_the_local_node_is_unresolved() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = make_cfg(&tmp);
-        cfg.raft.enabled = Some(true);
         cfg.pool = (0..3)
             .map(|id| NodeConfig {
                 id,
@@ -1488,7 +1584,6 @@ mod tests {
     fn raft_passes_on_a_healthy_three_node_pool() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = make_cfg(&tmp);
-        cfg.raft.enabled = Some(true);
         cfg.pool = (0..3)
             .map(|id| NodeConfig {
                 id,

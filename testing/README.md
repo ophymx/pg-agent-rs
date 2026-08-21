@@ -6,14 +6,13 @@ nfpm-built `.deb`, the packaged systemd unit (sd_notify, ExecStartPre
 PostgreSQL 17 streaming replication — three systemd-booted Debian 13
 containers on a compose network.
 
-**The model under test is lease-driven roles.** `acceptance.sh` boots
-every node in execute mode (`[raft] enabled = true, shadow = false`) —
-the greenfield deployment shape — and runs deploy, failure, and
-recovery scenarios entirely under the raft consensus lease, with pgpool
-present strictly as the router it is post-cutover. There is no
-migration narrative: the pgpool-led promote path is deleted from the
-codebase, and the staged-migration suite that regression-tested it
-went with it (see "The migration suite" below).
+**The model under test is lease-driven roles** — the only model there
+is, since a daemon either joins the raft lease or refuses to start.
+`acceptance.sh` runs deploy, failure, and recovery scenarios entirely
+under that lease, with pgpool present strictly as the router it is
+post-cutover. There is no migration narrative: the pgpool-led promote
+path is deleted from the codebase, and the staged-migration suite that
+regression-tested it went with it (see "The migration suite" below).
 
 ## Run
 
