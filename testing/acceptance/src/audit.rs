@@ -22,6 +22,8 @@
 
 use std::collections::HashMap;
 
+use std::time::Instant;
+
 use crate::checks::Ctx;
 use crate::events::{Cursor, Event, Source};
 
@@ -76,7 +78,209 @@ fn serving_end(ev: &Event) -> bool {
             || ev.line.contains("Failed with result"))
 }
 
-pub fn run(cx: &mut Ctx) {
+/// What a timed-out await turned out to be, once the whole run's log
+/// is available to ask.
+#[derive(Debug, PartialEq)]
+pub enum TimeoutKind {
+    /// Nothing ever matched.
+    Never,
+    /// Matched, but only after the wait gave up — by this much.
+    Late(std::time::Duration),
+    /// Matched something the log already held when the wait gave up.
+    Missed,
+}
+
+/// How far before the give-up an event must be stamped before the
+/// sweep will call it a harness bug.
+///
+/// `gave_up_at` is read just *after* `await_matching` returns, so an
+/// event appended between its final scan and its deadline check lands
+/// microseconds on the wrong side of the line while being nobody's
+/// fault. Without a tolerance the MISSED check — the one assertion
+/// here — would flap on that race, and a flapping check teaches people
+/// to ignore it. A genuine "the log already had it" is seconds early,
+/// not milliseconds.
+const MISSED_TOLERANCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The verdict, split from the sweep so it is testable without a
+/// cluster: everything docker-shaped is in the caller, and the part
+/// that decides what a failure MEANS is a function of two timestamps.
+pub fn classify_timeout(gave_up_at: Instant, found: Option<&Event>) -> TimeoutKind {
+    match found {
+        None => TimeoutKind::Never,
+        Some(ev) if ev.at + MISSED_TOLERANCE < gave_up_at => TimeoutKind::Missed,
+        Some(ev) => TimeoutKind::Late(ev.at.saturating_duration_since(gave_up_at)),
+    }
+}
+
+/// Ask each node what it actually WROTE, and compare with what the run
+/// heard.
+///
+/// The census counts received events, which answers "were we
+/// listening" only in the total-silence case. It cannot size the hole a
+/// tail death leaves, and says so: *"a hole in `counts` of unknown
+/// size, because the respawn resumes tail-only."* Every event-order
+/// claim in this file, and every `check_absent` in every scenario,
+/// rests on that hole being small.
+///
+/// So ask the source. `journalctl -o cat` is the same view the tail
+/// consumes, so the counts are comparable line for line, and the
+/// difference is the size of what we missed.
+///
+/// Reported, not asserted. G10 SIGKILLs PID 1 in all three containers
+/// by design, so some loss is structural, and a threshold picked
+/// without data would be a number pretending to be a rule. What the
+/// number is FOR is reading a red run: a node missing hundreds of its
+/// own lines explains a failure that looks like the cluster went
+/// quiet, and one missing none rules that explanation out.
+async fn heard_vs_written(cx: &mut Ctx) {
+    let census = cx.log.census();
+    let heard = |node: &str, source: Source| -> usize {
+        census
+            .counts
+            .iter()
+            .find(|((n, s), _)| *n == node && *s == source)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    };
+    let unit = crate::cluster::pg_unit();
+    let log_path = crate::cluster::pg_log();
+    let mut rows = Vec::new();
+    for node in crate::cluster::NODES {
+        // Agent: one unit, one tail, a clean comparison.
+        let written = count_lines(node, "journalctl -u pg_agentd --no-pager -o cat").await;
+        rows.push((node, "Agent", heard(node, Source::Agent), written));
+        // Postgres is two tails merged into one source (the server log
+        // file and the unit journal), so the comparison has to add the
+        // same two things back together.
+        let file = count_lines(node, &format!("cat {log_path} 2>/dev/null")).await;
+        let journal = count_lines(
+            node,
+            &format!("journalctl -u {unit} --no-pager -o cat 2>/dev/null"),
+        )
+        .await;
+        rows.push((
+            node,
+            "Postgres",
+            heard(node, Source::Postgres),
+            file.zip(journal).map(|(f, j)| f + j),
+        ));
+    }
+    let rendered: Vec<String> = rows
+        .iter()
+        .map(|(node, source, heard, written)| match written {
+            // A negative delta means the source has FEWER lines than we
+            // received, which is not us missing anything — it is the
+            // journal having been rotated or wiped (the container's
+            // journald is volatile, and G10 restarts it). Say that
+            // rather than printing a nonsense deficit.
+            Some(w) if *w >= *heard => format!("{node}/{source}={heard}/{w}"),
+            Some(w) => format!("{node}/{source}={heard}/{w}(rotated)"),
+            None => format!("{node}/{source}={heard}/?"),
+        })
+        .collect();
+    cx.note(&format!("heard/written: {}", rendered.join(" ")));
+    let missed: Vec<String> = rows
+        .iter()
+        .filter_map(|(node, source, heard, written)| {
+            written
+                .filter(|w| w > heard)
+                .map(|w| format!("{node}/{source} missed {}", w - heard))
+        })
+        .collect();
+    if !missed.is_empty() {
+        cx.note(&format!(
+            "lines written but never heard: {} — every absence claim over \
+             the affected windows is that much weaker",
+            missed.join(", ")
+        ));
+    }
+}
+
+/// `wc -l` over a command's output inside a node, or `None` if the node
+/// could not be asked (a torn-down container is not a measurement).
+async fn count_lines(node: &str, script: &str) -> Option<usize> {
+    crate::cluster::exec(node, &format!("{script} | wc -l"))
+        .await
+        .ok()
+        .and_then(|out| out.trim().parse().ok())
+}
+
+/// Re-run every timed-out await against the finished log, and say which
+/// kind of failure each one was.
+///
+/// `await_event` can only report "not within the budget". That is three
+/// different findings wearing one label, and finding 30 is what it
+/// costs to not separate them:
+///
+/// - **LATE** — the line is in the log, stamped after the wait gave up.
+///   The cluster did announce it; the budget (or the pipe carrying it)
+///   was too tight for how slow this run was. Reading these as product
+///   failures is what made a slow Rocky cell look broken.
+/// - **NEVER** — nothing ever matched. The awaited thing genuinely did
+///   not happen, or its stream was not being listened to. This is the
+///   only kind worth reading as a product failure without more work.
+/// - **MISSED** — the line was already in the log when the wait gave
+///   up. That is not a cluster fact at all, it is `await_matching`
+///   failing to see something it held; a harness bug, and a check
+///   rather than a note.
+///
+/// The delay is the discriminator, and it is reported rather than
+/// thresholded: a match 2s past a 60s budget is the awaited line, while
+/// one 400s past it is probably a later occurrence of the same message
+/// in a different scenario. The predicate cannot tell those apart — a
+/// reader with the number can.
+fn late_arrival_sweep(cx: &mut Ctx) {
+    let watches = std::mem::take(&mut cx.late_watches);
+    if watches.is_empty() {
+        return;
+    }
+    let mut missed = Vec::new();
+    for w in &watches {
+        let found = cx.log.find(w.from, &*w.pred);
+        match classify_timeout(w.gave_up_at, found.as_ref()) {
+            TimeoutKind::Never => cx.note(&format!(
+                "timeout was NEVER: {} — nothing matched in the whole run \
+                 (budget {}s)",
+                w.desc,
+                w.budget.as_secs()
+            )),
+            TimeoutKind::Late(by) => cx.note(&format!(
+                "timeout was LATE: {} — matched {}s after the {}s budget expired, on {}",
+                w.desc,
+                by.as_secs(),
+                w.budget.as_secs(),
+                found.as_ref().map(|e| e.node).unwrap_or("?")
+            )),
+            TimeoutKind::Missed => {
+                missed.push(w.desc.clone());
+                cx.note(&format!(
+                    "timeout was MISSED: {} — the matching line was already in the log \
+                     when the wait gave up ({})",
+                    w.desc,
+                    found.as_ref().map(|e| e.line.as_str()).unwrap_or("")
+                ));
+            }
+        }
+    }
+    // Only this one is an assertion. LATE and NEVER describe the
+    // cluster (or the budget); MISSED describes the suite, and a suite
+    // that cannot see what it is holding invalidates every await in the
+    // run, not just the one that reported.
+    cx.check(
+        &format!(
+            "audit: no await timed out on an event the log already had{}",
+            if missed.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", missed.join("; "))
+            }
+        ),
+        missed.is_empty(),
+    );
+}
+
+pub async fn run(cx: &mut Ctx) {
     cx.say("AUDIT: event-order invariants over the whole run");
     let all = cx.log.find_all(Cursor(0), |_| true);
 
@@ -99,6 +303,15 @@ pub fn run(cx: &mut Ctx) {
     for ((node, source), n) in deaths {
         cx.note(&format!("tail deaths: {node}/{source:?} respawned {n}x"));
     }
+    // A re-attach is a death the watchdog got ahead of: the container
+    // restarted, so the old exec was attached to a corpse whether or
+    // not it had noticed yet. The gap is bounded by the poll interval,
+    // where a death's gap is bounded by nothing.
+    for ((node, source), n) in &census.reattaches {
+        cx.note(&format!(
+            "container restarts: {node}/{source:?} re-attached {n}x"
+        ));
+    }
     // Deliberately a NOTE and not a check: G10 SIGKILLs PID 1 in all
     // three containers, so every stream on every node dies there by
     // design, and a run with zero deaths would mean G10 did not do its
@@ -109,6 +322,9 @@ pub fn run(cx: &mut Ctx) {
     // A node that contributed no agent events at all never had a
     // stream to lose — a different bug from one that died mid-run, and
     // equally fatal to every claim made about that node.
+    late_arrival_sweep(cx);
+    heard_vs_written(cx).await;
+
     let silent: Vec<&'static str> = crate::cluster::NODES
         .iter()
         .copied()
@@ -364,4 +580,71 @@ pub fn run(cx: &mut Ctx) {
                 && ev.line.contains("WAL segment")
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ev_at(at: Instant) -> Event {
+        Event {
+            seq: 0,
+            node: "db0",
+            source: Source::Agent,
+            line: "ha decision".into(),
+            at,
+        }
+    }
+
+    /// The finding-30 case, and the only one the suite could not name
+    /// before: the cluster DID announce it, after the budget ran out.
+    /// A failure like this says the budget was too tight for how slow
+    /// the run was — not that the product stopped working.
+    #[test]
+    fn a_match_after_the_give_up_is_late_with_the_delay_measured() {
+        let gave_up = Instant::now();
+        let found = ev_at(gave_up + Duration::from_secs(7));
+        assert_eq!(
+            classify_timeout(gave_up, Some(&found)),
+            TimeoutKind::Late(Duration::from_secs(7))
+        );
+    }
+
+    /// The only kind that should be read as a product failure without
+    /// further work.
+    #[test]
+    fn no_match_anywhere_is_never() {
+        assert_eq!(classify_timeout(Instant::now(), None), TimeoutKind::Never);
+    }
+
+    /// A harness bug, not a cluster fact: the log already held the line
+    /// when the wait gave up, so `await_matching` failed to see
+    /// something in front of it. This one is a check, because it
+    /// invalidates every await in the run rather than just its own.
+    #[test]
+    fn a_match_well_before_the_give_up_is_a_missed_event() {
+        let gave_up = Instant::now();
+        let found = ev_at(gave_up - Duration::from_secs(1));
+        assert_eq!(classify_timeout(gave_up, Some(&found)), TimeoutKind::Missed);
+    }
+
+    /// The boundary is the one place this can flap. `gave_up_at` is
+    /// read just after the waiter returns, so an event appended between
+    /// its last scan and its deadline check is stamped a hair EARLY
+    /// through nobody's fault. Inside the tolerance it must not be
+    /// called a harness bug — the MISSED check is an assertion, and an
+    /// assertion that fires on timing noise gets ignored.
+    #[test]
+    fn the_give_up_race_is_not_reported_as_a_harness_bug() {
+        let gave_up = Instant::now();
+        for early_ms in [0, 1, 50, 249] {
+            let found = ev_at(gave_up - Duration::from_millis(early_ms));
+            assert_eq!(
+                classify_timeout(gave_up, Some(&found)),
+                TimeoutKind::Late(Duration::ZERO),
+                "{early_ms}ms early must not be a harness bug"
+            );
+        }
+    }
 }

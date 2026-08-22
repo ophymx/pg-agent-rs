@@ -187,7 +187,7 @@ pub async fn run_all(cx: &mut Ctx) {
     // one this list predicted.
     let w11 = cx.pg.current_primary().await.unwrap_or(w10);
     stage!(cx, g22(cx, w11).await);
-    stage!(cx, crate::audit::run(cx));
+    stage!(cx, crate::audit::run(cx).await);
 }
 
 async fn g0(cx: &mut Ctx) {
@@ -573,7 +573,7 @@ async fn g5(cx: &mut Ctx, w1: &'static str) -> &'static str {
         90,
         &format!("isolated {w1} PostgreSQL fully shut down"),
         since,
-        |ev| {
+        move |ev| {
             ev.node == w1
                 && ev.source == Source::Postgres
                 && ev.line.contains("database system is shut down")
@@ -581,9 +581,12 @@ async fn g5(cx: &mut Ctx, w1: &'static str) -> &'static str {
     )
     .await;
     let winner_ev = cx
-        .await_event(60, "majority completed a real promotion", since, |ev| {
-            ev.node != w1 && agent_any(ev, "roleexec: promotion complete")
-        })
+        .await_event(
+            60,
+            "majority completed a real promotion",
+            since,
+            move |ev| ev.node != w1 && agent_any(ev, "roleexec: promotion complete"),
+        )
         .await;
     let w2: &'static str = match winner_ev {
         Some(ev) => {
@@ -878,7 +881,7 @@ async fn g8(
             90,
             "majority deposed the dead-agent holder and promoted",
             since,
-            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+            move |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
         )
         .await;
     let w: &'static str = match winner_ev {
@@ -953,7 +956,7 @@ async fn g8(
         90,
         &format!("{prim} PostgreSQL fully shut down (dual-serving window closed)"),
         since,
-        |ev| {
+        move |ev| {
             ev.node == prim
                 && ev.source == Source::Postgres
                 && ev.line.contains("database system is shut down")
@@ -1041,7 +1044,7 @@ async fn g9(
         30,
         &format!("{prim}: systemd recorded the crash (the only death event)"),
         since,
-        |ev| {
+        move |ev| {
             ev.node == prim
                 && ev.source == Source::Postgres
                 && (ev.line.contains("code=killed") || ev.line.contains("Failed with result"))
@@ -1053,7 +1056,7 @@ async fn g9(
             60,
             "the lease promoted past the crashed primary",
             since,
-            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+            move |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
         )
         .await;
     let w: &'static str = match winner_ev {
@@ -1290,7 +1293,7 @@ async fn g11(
             90,
             "majority deposed the loaded holder and promoted",
             since,
-            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+            move |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
         )
         .await;
     let w: &'static str = match winner_ev {
@@ -1368,7 +1371,7 @@ async fn g11(
         90,
         &format!("{prim} PostgreSQL fully shut down (dual-serving window closed)"),
         since,
-        |ev| {
+        move |ev| {
             ev.node == prim
                 && ev.source == Source::Postgres
                 && ev.line.contains("database system is shut down")
@@ -1752,7 +1755,7 @@ async fn g15(
     )
     .await;
     let winner_ev = cx
-        .await_event(90, "the majority promoted a standby", since, |ev| {
+        .await_event(90, "the majority promoted a standby", since, move |ev| {
             ev.node != prim && agent_any(ev, "roleexec: promotion complete")
         })
         .await;
@@ -2150,7 +2153,7 @@ async fn g18(cx: &mut Ctx, prim: &'static str, marks: &mut HashMap<&'static str,
             90,
             "the failover pause was holding back completes on resume",
             resumed,
-            |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+            move |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
         )
         .await;
     let w: &'static str = match winner_ev {
@@ -2382,7 +2385,7 @@ async fn g21(cx: &mut Ctx, start: &'static str, marks: &mut HashMap<&'static str
                 90,
                 &format!("soak cycle {cycle}: a standby took over"),
                 since,
-                |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
+                move |ev| ev.node != prim && agent_any(ev, "roleexec: promotion complete"),
             )
             .await;
         let dead = prim;
