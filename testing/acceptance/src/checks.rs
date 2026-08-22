@@ -15,11 +15,35 @@ const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
+/// A timed-out [`Ctx::await_event`], kept so the audit can ask the one
+/// question the failure itself cannot answer: did the line arrive at
+/// all?
+///
+/// An `await_event` timeout means "not within the budget", and the
+/// suite has been reading that as "the cluster never did it". Finding
+/// 30 is what happens when those two are conflated — on a slow Rocky
+/// cell, eight awaits blew their budgets while the `wait_until` polls
+/// around them passed, so the outcomes demonstrably happened and only
+/// the announcements were missing. Nothing recorded whether those lines
+/// showed up a second later or never came, which is the difference
+/// between a suite whose budgets are too tight for a loaded host and a
+/// product that stopped talking.
+pub struct LateWatch {
+    pub desc: String,
+    pub from: Cursor,
+    pub budget: Duration,
+    /// When the budget expired — the zero point for "how late".
+    pub gave_up_at: Instant,
+    pub pred: Box<dyn Fn(&Event) -> bool + Send>,
+}
+
 pub struct Ctx {
     pub log: Arc<EventLog>,
     pub pg: Arc<Pg>,
     pub pass: usize,
     pub failures: Vec<String>,
+    /// Every await that timed out, for the audit's late-arrival sweep.
+    pub late_watches: Vec<LateWatch>,
     /// Declared dual-serving windows for the audit: `(from, node)` —
     /// the scenario asserts that `node` will keep serving as primary
     /// past a rival's promotion (the fence-less agent-death deposal is
@@ -39,6 +63,7 @@ impl Ctx {
             pg,
             pass: 0,
             failures: Vec::new(),
+            late_watches: Vec::new(),
             expected_dual_serving: Vec::new(),
             suite_t0: now,
             last_say: now,
@@ -128,6 +153,11 @@ impl Ctx {
 
     /// Await an event at/after `from` matching `pred`. PASS with the
     /// wait annotated; FAIL on budget expiry. Returns the event.
+    ///
+    /// A timeout is recorded as a [`LateWatch`] as well as a failure,
+    /// so the audit can re-run the predicate at the end of the run and
+    /// say whether the line was merely late. `pred` is `'static` for
+    /// that reason and no other.
     pub async fn await_event<F>(
         &mut self,
         budget: u64,
@@ -136,13 +166,11 @@ impl Ctx {
         pred: F,
     ) -> Option<Event>
     where
-        F: Fn(&Event) -> bool,
+        F: Fn(&Event) -> bool + Send + 'static,
     {
         let t0 = Instant::now();
-        let hit = self
-            .log
-            .await_matching(from, Duration::from_secs(budget), pred)
-            .await;
+        let budget = Duration::from_secs(budget);
+        let hit = self.log.await_matching(from, budget, &pred).await;
         match hit {
             Some(ev) => {
                 let waited = t0.elapsed().as_secs();
@@ -155,6 +183,13 @@ impl Ctx {
             }
             None => {
                 self.fail(&format!("timeout: {desc}"));
+                self.late_watches.push(LateWatch {
+                    desc: desc.to_string(),
+                    from,
+                    budget,
+                    gave_up_at: Instant::now(),
+                    pred: Box::new(pred),
+                });
                 None
             }
         }

@@ -1011,10 +1011,12 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     writes — a packaged unit, not a config key — which is the same
     place the pgpool node-id path was hiding.
 
-30. **The Rocky cell is timing-marginal: failures track how SLOW the
-    run was, not what the code did.** After finding 29's drop-in
-    removed the cascade, 8 failures remained. Four runs, and the
-    correlation is the whole finding:
+30. **~~The Rocky cell is timing-marginal~~ — RESOLVED, and the
+    correlation had the arrow backwards. A `docker exec` into a
+    restarted container stops delivering without dying, so the suite
+    went deaf to db0 for two thirds of the run.** After finding 29's
+    drop-in removed the cascade, 8 failures remained. Four runs, and
+    the correlation looked like the whole finding:
 
         cell time   failures
         1127s       9
@@ -1022,13 +1024,60 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
         1354s       8
          743s       0   (+1 from an over-strict new audit check)
 
-    Slow run, failures; fast run, clean. Every failure was an
-    `await_event` blowing its budget while the `wait_until` polls
-    around it passed — the outcomes were all there, the awaited log
-    lines just arrived late. The suite runs against `leader_ttl = 10s`
-    (deliberately tight, see the provisioning comment), so the margin
-    on a loaded host is thin. **A red Rocky cell is not evidence of a
-    product bug until the cell time is checked.**
+    The original reading was "slow run, failures; fast run, clean",
+    with every failure an `await_event` blowing its budget while the
+    `wait_until` polls around it passed — outcomes present, awaited
+    lines merely late. **Both halves of that were wrong**, and the two
+    measurements that showed it are now permanent:
+
+    *The awaited lines were not late. They never came.* The
+    late-arrival sweep (below) re-runs every timed-out predicate
+    against the finished log: 5 of 7 matched NOTHING in the entire run.
+    "Late" was an assumption, never a measurement.
+
+    *We were not listening.* The heard-vs-written comparison asks each
+    node what it actually WROTE and compares with what the run heard:
+
+        db0/Agent = 2052 heard / 3901 written  — 1849 lines missed
+
+    Two thirds of db0's post-restart agent output never reached the
+    event log. Every db0-named failure was an await for a line that was
+    written and never heard.
+
+    *The cause.* G10 SIGKILLs PID 1 in all three containers, docker
+    restarts them, and **a `docker exec` whose container restarts
+    underneath it does not reliably end** — no EOF, no exit, the stream
+    just stops. `spawn_tail` only notices an exec that DIES; db0/Agent
+    died once during G10, respawned, reported itself healthy, and then
+    delivered under half of what db0 wrote for the remaining ~1000s.
+    Nothing could tell that from a quiet node, because the agent is
+    nearly silent by design in steady state.
+
+    This is the "silently dying event tail" hypothesis the entry below
+    records as REFUTED — and it was refuted correctly, on the evidence
+    available: the census showed deaths only in G10, and a clean run
+    passed every assertion. What the census cannot see is a tail that
+    does not die. The hypothesis was right about the mechanism and
+    wrong about the symptom, which is why it took a measurement of what
+    was *written* rather than what was *received* to land it.
+
+    *The fix.* A per-node watchdog polls `docker inspect
+    {{.State.StartedAt}}` every 3s and forces the tails to re-attach
+    when it changes. The restart is the signal, taken from docker
+    rather than inferred from silence — a timeout-based stall detector
+    would fire constantly on a healthy quiet stream. The gap is now
+    bounded by the poll interval instead of by nothing.
+
+        before   PASS=283 FAIL=8   1252s   db0/Agent 2052/3901
+        after    PASS=290 FAIL=0    781s   db0/Agent 4910, deficit gone
+
+    *And the arrow.* 1252s − 781s = **471s**, which is what eight
+    awaits burning 60–90s budgets costs. The failures were not caused
+    by a slow run; **they were causing it.** Every red run in the table
+    above is a clean ~750s run plus its own timeouts — which is why the
+    fast run was the clean one, and why "check the cell time first"
+    read as sound advice for three runs running. A red cell was never
+    evidence of a slow host. It was evidence of a deaf suite.
 
     Two hypotheses died on the way here, and how they died is the
     useful part.
@@ -1050,6 +1099,15 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     there, and every assertion still passed. Two identical runs are not
     determinism; the third contradicted both.
 
+    > **This one was half right, and the half it got wrong is why it
+    > took another three runs to land.** The tail was indeed the
+    > problem and db0 indeed the victim — the byte-identical failure
+    > lists were the signal, not noise. What was wrong was *dying*: the
+    > exec stops delivering without dying, so the death counter clears
+    > it. Refuting "the tail DIED" is not refuting "the tail went
+    > deaf", and the census can only measure the first. See the
+    > resolution above.
+
     What survives is the instrumentation, which is worth having on its
     own terms. Every run now prints a per-stream event census and
     names any tail that died, because `check_absent` — used throughout
@@ -1059,6 +1117,37 @@ tests exist to surface. Promote items to TODO.md as they're triaged.
     way for a test to be wrong. The audit also fails outright if any
     node produced no agent events at all. Neither condition has fired
     in anger yet; both are cheap insurance against the class.
+
+    **The late-arrival sweep** (added after the two dead hypotheses)
+    is what this finding was actually missing. `await_event` can only
+    report "not within the budget", and the suite had been reading that
+    as "the cluster never did it" — which is what made a slow cell look
+    like a broken product. Every timed-out await is now re-run against
+    the finished log, and the audit labels it:
+
+    - **LATE** — matched, but after the wait gave up, with the delay
+      printed. The announcement happened; the budget was too tight for
+      how slow the run was.
+    - **NEVER** — nothing matched in the whole run. The only kind worth
+      reading as a product failure without more work.
+    - **MISSED** — the log ALREADY held the line when the wait gave up.
+      Not a cluster fact at all: `await_matching` failing to see what
+      it was holding. That one is a check, not a note, because it
+      invalidates every await in the run rather than just its own.
+
+    The delay is reported rather than thresholded, because the
+    predicate cannot tell the awaited line from a later occurrence of
+    the same message in another scenario — 2s past a 60s budget is the
+    former, 400s past it is the latter, and a reader with the number
+    can tell. Only the MISSED boundary is tolerance-guarded (250ms):
+    `gave_up_at` is read just after the waiter returns, so an event
+    appended between its final scan and its deadline check is stamped a
+    hair early through nobody's fault, and an assertion that fires on
+    that race would get ignored.
+
+    The classification is a function of two timestamps, unit-tested
+    without a cluster (`audit::tests`); the docker-shaped half is in
+    the caller.
 
 23. **Strict flush-max candidacy livelocks under write load — the
     fence-less deposal never completes.** G11 (the G8 agent-death

@@ -5,6 +5,39 @@ scheduled. Items roughly in priority order within each section.
 
 ## Active
 
+### ~~The Rocky cell's 8 unexplained failures (finding 30)~~ — FIXED, and it was the suite
+
+> Not timing, and not the product. A `docker exec` whose container
+> restarts underneath it **stops delivering without dying** — no EOF,
+> no exit — so `spawn_tail`, which only notices an exec that dies,
+> reported db0's agent stream healthy while it carried under half of
+> what db0 wrote. Measured: `db0/Agent = 2052 heard / 3901 written`,
+> 1849 lines lost, every db0-named failure an await for a line that
+> was written and never heard.
+>
+> Fixed with a per-node watchdog on `docker inspect
+> {{.State.StartedAt}}` (3s poll) that forces a re-attach when the
+> container restarts. The restart is the signal, taken from docker
+> rather than inferred from silence — a stall detector based on "no
+> lines for N seconds" would fire constantly on a healthy quiet
+> stream, since the agent is nearly silent by design in steady state.
+>
+>     before   PASS=283 FAIL=8   1252s
+>     after    PASS=290 FAIL=0    781s
+>
+> **The correlation the finding was named for had the arrow
+> backwards.** 1252 − 781 = 471s, which is what eight awaits burning
+> 60–90s budgets costs. Slow runs did not cause failures; failures
+> caused slow runs. Every red run in that table was a clean ~750s run
+> plus its own timeouts.
+>
+> Two instruments landed with it, and they are the durable part —
+> either one alone would have found this years sooner than the three
+> runs of hypothesis it actually took. `await_event` timeouts are now
+> classified LATE / NEVER / MISSED by re-running the predicate against
+> the finished log, and the audit asks each node what it WROTE and
+> compares with what the run heard. See testing/README.md finding 30.
+
 ### ~~Quorum commit — make the lease's terms bind writes~~ — DONE (all four phases)
 
 - **Design:** [docs/quorum-commit.md](docs/quorum-commit.md). The gap:

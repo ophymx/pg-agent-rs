@@ -15,7 +15,11 @@
 //! Tails run over `docker exec`, which rides the API socket, not
 //! `pga-net` — a partitioned node's events keep flowing, which is
 //! exactly when they matter most. Each tail restarts itself (without
-//! replaying history) if its exec dies.
+//! replaying history) if its exec dies, and a per-node watchdog forces
+//! a re-attach when the CONTAINER restarts, because an exec into a
+//! restarted container does not reliably die — it can just stop
+//! producing, which is indistinguishable from a quiet node until
+//! something asks the node what it wrote (finding 30).
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -23,7 +27,16 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
+
+/// `counts`-style tally bump, shared by the death and re-attach
+/// recorders.
+fn bump(tally: &mut Vec<(StreamKey, usize)>, node: &'static str, source: Source) {
+    match tally.iter_mut().find(|(k, _)| *k == (node, source)) {
+        Some((_, n)) => *n += 1,
+        None => tally.push(((node, source), 1)),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
@@ -84,8 +97,14 @@ pub struct Census {
     /// Events received per stream.
     pub counts: Vec<(StreamKey, usize)>,
     /// Tail deaths per stream. Each one is a hole in `counts` of
-    /// unknown size, because the respawn resumes tail-only.
+    /// unknown size, because the respawn resumes tail-only. The
+    /// audit's heard-vs-written comparison is what sizes them.
     pub deaths: Vec<(StreamKey, usize)>,
+    /// Forced re-attaches per stream: the container restarted and the
+    /// watchdog rebuilt the tail rather than trusting the old exec to
+    /// notice. A hole too, but a BOUNDED one — at most one poll
+    /// interval — where a death is unbounded.
+    pub reattaches: Vec<(StreamKey, usize)>,
 }
 
 #[derive(Default)]
@@ -93,6 +112,9 @@ struct Inner {
     events: Vec<Event>,
     /// How many times each stream's tail has died and respawned.
     tail_deaths: Vec<(StreamKey, usize)>,
+    /// How many times each stream was re-attached after its container
+    /// restarted.
+    reattaches: Vec<(StreamKey, usize)>,
 }
 
 pub struct EventLog {
@@ -110,14 +132,12 @@ impl EventLog {
 
     fn record_tail_death(&self, node: &'static str, source: Source) {
         let mut inner = self.inner.lock().unwrap();
-        match inner
-            .tail_deaths
-            .iter_mut()
-            .find(|(k, _)| *k == (node, source))
-        {
-            Some((_, n)) => *n += 1,
-            None => inner.tail_deaths.push(((node, source), 1)),
-        }
+        bump(&mut inner.tail_deaths, node, source);
+    }
+
+    fn record_reattach(&self, node: &'static str, source: Source) {
+        let mut inner = self.inner.lock().unwrap();
+        bump(&mut inner.reattaches, node, source);
     }
 
     /// Per-stream event counts and tail deaths, for the end-of-run
@@ -136,7 +156,13 @@ impl EventLog {
         counts.sort_by_key(|((node, source), _)| (*node, format!("{source:?}")));
         let mut deaths = inner.tail_deaths.clone();
         deaths.sort_by_key(|((node, source), _)| (*node, format!("{source:?}")));
-        Census { counts, deaths }
+        let mut reattaches = inner.reattaches.clone();
+        reattaches.sort_by_key(|((node, source), _)| (*node, format!("{source:?}")));
+        Census {
+            counts,
+            deaths,
+            reattaches,
+        }
     }
 
     fn append(&self, mut ev: Event) {
@@ -219,12 +245,18 @@ impl EventLog {
     /// PostgreSQL server log. History is replayed once (`-n all` /
     /// `-n +1`) so the log covers everything since container start;
     /// respawns after a died exec resume tail-only.
+    ///
+    /// Also starts the node's restart watchdog — see
+    /// [`spawn_restart_watchdog`] for why waiting for the exec to die
+    /// is not enough.
     pub fn spawn_node_tails(self: &Arc<Self>, node: &'static str) {
+        let restart = spawn_restart_watchdog(node);
         self.spawn_tail(
             node,
             Source::Agent,
             "journalctl -u pg_agentd -f -n all --no-pager -o cat".to_string(),
             "journalctl -u pg_agentd -f -n 0 --no-pager -o cat".to_string(),
+            restart.clone(),
         );
         let log = crate::cluster::pg_log();
         self.spawn_tail(
@@ -232,6 +264,7 @@ impl EventLog {
             Source::Postgres,
             format!("tail -F -n +1 {log} 2>/dev/null"),
             format!("tail -F -n 0 {log} 2>/dev/null"),
+            restart.clone(),
         );
         // The unit journal, also as Postgres events: a SIGKILLed
         // postmaster writes nothing to its log file — systemd's
@@ -246,6 +279,7 @@ impl EventLog {
             Source::Postgres,
             format!("journalctl -u {unit} -f -n all --no-pager -o cat"),
             format!("journalctl -u {unit} -f -n 0 --no-pager -o cat"),
+            restart,
         );
     }
 
@@ -255,6 +289,7 @@ impl EventLog {
         source: Source,
         first_cmd: String,
         respawn_cmd: String,
+        mut restarted: watch::Receiver<u64>,
     ) {
         let log = Arc::clone(self);
         tokio::spawn(async move {
@@ -267,20 +302,42 @@ impl EventLog {
                     .stderr(Stdio::null())
                     .kill_on_drop(true)
                     .spawn();
+                let mut forced = false;
                 if let Ok(mut child) = child {
                     if let Some(stdout) = child.stdout.take() {
                         let mut lines = BufReader::new(stdout).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            log.append(Event {
-                                seq: 0, // assigned in append
-                                node,
-                                source,
-                                line,
-                                at: Instant::now(),
-                            });
+                        loop {
+                            tokio::select! {
+                                line = lines.next_line() => match line {
+                                    Ok(Some(line)) => log.append(Event {
+                                        seq: 0, // assigned in append
+                                        node,
+                                        source,
+                                        line,
+                                        at: Instant::now(),
+                                    }),
+                                    _ => break,
+                                },
+                                // The container restarted under us. Do
+                                // not wait to find out whether this exec
+                                // notices — see the watchdog's docs.
+                                _ = restarted.changed() => {
+                                    forced = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    let _ = child.wait().await;
+                    // Dropping the child kills the local `docker exec`
+                    // (kill_on_drop), which is the whole point when it
+                    // is attached to a container that no longer exists.
+                    drop(child);
+                }
+                if forced {
+                    log.record_reattach(node, source);
+                    println!("     NOTE: re-attaching {node}/{source:?} — its container restarted");
+                    cmd = respawn_cmd.clone();
+                    continue;
                 }
                 // Exec died (container recreate, docker hiccup). Tail
                 // from "now" — history is already in the log.
@@ -295,11 +352,16 @@ impl EventLog {
                 //
                 // Most deaths are legitimate: G10 SIGKILLs PID 1 in all
                 // three containers, so every stream dies there by
-                // design (18 of them in a clean run, all in G10). The
-                // point is not to forbid it, it is to make the gap
-                // VISIBLE — see testing/README.md finding 30, where
-                // this instrumentation refuted the very hypothesis it
-                // was built to confirm.
+                // design. The point is not to forbid it, it is to make
+                // the gap VISIBLE.
+                //
+                // Necessary but NOT sufficient, and finding 30 is the
+                // proof: this counter says how many times a tail died,
+                // never how many lines that cost, and it cannot see a
+                // tail that stops delivering WITHOUT dying — which is
+                // what an exec into a restarted container does. The
+                // watchdog below closes the cause; the audit's
+                // heard-vs-written comparison sizes whatever is left.
                 log.record_tail_death(node, source);
                 println!(
                     "     NOTE: tail died and respawned: {node}/{source:?} — events \
@@ -311,4 +373,73 @@ impl EventLog {
             }
         });
     }
+}
+
+/// How often the watchdog asks docker whether a node's container is
+/// still the one the tails attached to. Bounds the gap a restart costs:
+/// lines written between the restart and the re-attach are lost, and
+/// this is the ceiling on that window.
+const RESTART_POLL: Duration = Duration::from_secs(3);
+
+/// Watch one node's container for a restart, and tell its tails to
+/// re-attach.
+///
+/// **Why waiting for the exec to die is not enough.** A `docker exec`
+/// whose container restarts underneath it does not reliably end: the
+/// stream can simply stop producing, with no EOF and no exit, and a
+/// tail blocked on `next_line()` then waits forever on a container that
+/// is long gone. Nothing downstream can tell that apart from a quiet
+/// node — the agent is nearly silent by design in steady state, so
+/// "no lines for ten minutes" is also what healthy looks like.
+///
+/// Measured, on the Rocky cell (testing/README.md finding 30): db0's
+/// agent tail died once during G10's PID-1 kill, respawned, reported
+/// itself healthy — and then delivered 2052 of the 3901 lines db0
+/// wrote. Every failure in that run came after G10, all but two were
+/// awaits for db0 lines that were written and never heard, and the
+/// death counter said one death, all recovered.
+///
+/// So the restart itself is the signal, taken from docker rather than
+/// inferred from the silence. `StartedAt` changing means every exec
+/// into that container is now attached to a corpse.
+fn spawn_restart_watchdog(node: &'static str) -> watch::Receiver<u64> {
+    let (tx, rx) = watch::channel(0u64);
+    tokio::spawn(async move {
+        let mut last: Option<String> = None;
+        let mut generation = 0u64;
+        loop {
+            let started = Command::new("docker")
+                .args([
+                    "inspect",
+                    "-f",
+                    "{{.State.StartedAt}}",
+                    &format!("pga-{node}"),
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            if let Some(started) = started {
+                match &last {
+                    // First observation is not a restart.
+                    None => last = Some(started),
+                    Some(prev) if *prev != started => {
+                        generation += 1;
+                        last = Some(started);
+                        // A watch send is edge-persistent: a tail
+                        // between select iterations still sees the
+                        // change when it next awaits, which a Notify
+                        // would have dropped on the floor.
+                        let _ = tx.send(generation);
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(RESTART_POLL).await;
+        }
+    });
+    rx
 }
