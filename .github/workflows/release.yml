@@ -1,0 +1,120 @@
+# Cut a release from a `v*` tag: verify, build the packages, attach them.
+#
+# The artifacts are the point. `scripts/build-pkgs.sh` produces a
+# statically-linked musl `.deb` and `.rpm` — one binary that installs on
+# Debian 12, Ubuntu 24.04, Rocky 9 and Alpine alike (testing/README.md
+# finding 26 is what a dynamic build cost) — and this workflow does
+# nothing to that build but run it somewhere reproducible and hang the
+# results off the tag.
+#
+# NOT a substitute for the acceptance suite. `testing/matrix.sh` needs
+# privileged containers running systemd as PID 1, with `cgroup: host`,
+# and G10 SIGKILLs PID 1 to force a container restart — none of which a
+# hosted runner will do. The suite stays a thing you run before you tag.
+# What this gate catches is a tag cut from a commit that does not build,
+# does not lint, or does not pass its unit tests.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # protoc: pg-agent-proto's build.rs compiles the .proto sources.
+      # musl-tools: the static target needs musl-gcc as its linker.
+      - name: System build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler musl-tools
+
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
+
+      # `cargo install` from source is the slow step (minutes). Cached
+      # on the exact versions so a re-run of the same release is cheap
+      # and a toolchain bump invalidates it honestly.
+      - name: Cache packaging tools
+        id: cache-packagers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deb
+            ~/.cargo/bin/cargo-generate-rpm
+          key: packagers-${{ runner.os }}-cargo-deb-2-generate-rpm-0.16
+
+      - name: Install packaging tools
+        if: steps.cache-packagers.outputs.cache-hit != 'true'
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      # The tag names the release; Cargo.toml names the artifacts.
+      # `build-pkgs.sh` derives VERSION from Cargo.toml and never looks
+      # at the tag, so without this check `v0.9.0` would cheerfully
+      # publish `pg-agent-rs_0.8.0_amd64.deb` under it — a mismatch
+      # nobody notices until an operator's `apt list --upgradable`
+      # disagrees with the release page.
+      - name: Tag must match the workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          echo "tag=$tag workspace=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${version} — bump Cargo.toml or retag" >&2
+            exit 1
+          fi
+
+      # Same script the maintainer runs locally, same checks. A release
+      # cut from a red commit is worse than no release.
+      - name: precommit-check
+        run: ./scripts/precommit-check.sh
+
+      - name: Build packages
+        run: ./scripts/build-pkgs.sh
+
+      # Static linkage is the property the whole distro matrix rests
+      # on, and it is one `cargo build` flag away from silently
+      # regressing. Assert it on the artifact rather than trusting the
+      # build to have used the target we asked for.
+      # Phrased as "not dynamic" rather than "is static" on purpose:
+      # `file` says "static-pie linked" for this build and "statically
+      # linked" for a non-PIE one, so asserting a positive phrasing
+      # fails on a CORRECT binary the moment the build flags shift.
+      # The regression being guarded has exactly one spelling.
+      - name: Assert the binary is static
+        run: |
+          desc="$(file -b dist/staging/pg_agentd)"
+          echo "$desc"
+          case "$desc" in
+            *"dynamically linked"*)
+              echo "::error::pg_agentd is dynamically linked — the glibc floor is back (testing/README.md finding 26)" >&2
+              exit 1
+              ;;
+            *static*) ;;
+            *)
+              echo "::error::cannot tell whether pg_agentd is static from: $desc" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist/
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.deb dist/*.rpm \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
