@@ -27,7 +27,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # protoc: pg-agent-proto's build.rs compiles the .proto sources.
       # musl-tools: the static target needs musl-gcc as its linker.
@@ -36,28 +36,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends protobuf-compiler musl-tools
 
+      # No version here on purpose: rust-toolchain.toml pins the
+      # channel, the components and the musl target, so the runner
+      # compiles with exactly what a developer does. `rustup show`
+      # installs that toolchain and fails loudly if it cannot, rather
+      # than letting the first `cargo` invocation do it silently
+      # halfway through a step that is about something else.
+      #
+      # The float this replaces is what broke the v0.8.0 release: CI
+      # ran three versions ahead of the machine the change was verified
+      # on, and clippy 1.98's `result_large_err` turned a green
+      # precommit into a red release.
       - name: Rust toolchain
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add rustfmt clippy
-          rustup target add x86_64-unknown-linux-musl
+          rustup show active-toolchain || rustup show
+          rustc --version
+          cargo --version
 
-      # `cargo install` from source is the slow step (minutes). Cached
-      # on the exact versions so a re-run of the same release is cheap
-      # and a toolchain bump invalidates it honestly.
+      # Pinned, for the same reason the toolchain is: `build-pkgs.sh`
+      # passes flags these two parse (`--no-build --no-strip -p ...
+      # --output`), and an unpinned `cargo install` compiles whatever
+      # released this morning. These are the versions the artifacts
+      # were verified with locally; bumping them is a commit, not a
+      # Tuesday.
+      #
+      # `--locked` so their own dependency resolution is reproducible
+      # too — the install is the slow step here (minutes), and it is
+      # not the place to discover a transitive break.
       - name: Cache packaging tools
         id: cache-packagers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/cargo-deb
             ~/.cargo/bin/cargo-generate-rpm
-          key: packagers-${{ runner.os }}-cargo-deb-2-generate-rpm-0.16
+          key: packagers-${{ runner.os }}-deb-3.7.0-rpm-0.21.0
 
       - name: Install packaging tools
         if: steps.cache-packagers.outputs.cache-hit != 'true'
-        run: cargo install cargo-deb cargo-generate-rpm
+        run: cargo install --locked cargo-deb@3.7.0 cargo-generate-rpm@0.21.0
 
       # The tag names the release; Cargo.toml names the artifacts.
       # `build-pkgs.sh` derives VERSION from Cargo.toml and never looks
