@@ -1,0 +1,18 @@
+# `tonic::Status` is 176 bytes and is the `Err` type of every method on
+# every service trait tonic generates for us — `Result<Response<T>,
+# Status>` is the signature, not a choice. The helpers that feed those
+# handlers mirror it deliberately, so `result_large_err`'s advice (box
+# the error) would mean boxing at the helper and unboxing at every call
+# site inside a trait impl whose signature cannot change anyway: churn
+# that makes the code worse to satisfy a lint about a dependency's
+# struct size.
+#
+# Raised rather than allowed outright, so the lint still fires on an
+# error type that is genuinely bloated and IS ours to fix. The headroom
+# above 176 absorbs a minor tonic change without breaking a release; a
+# large jump should be looked at rather than papered over again.
+#
+# Default is 128. Landed because clippy 1.98 began flagging this and
+# broke the first tagged release — see the toolchain pin in
+# rust-toolchain.toml for the other half of that story.
+large-error-threshold = 192

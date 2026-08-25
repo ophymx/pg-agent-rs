@@ -1,0 +1,22 @@
+# Pinned, and the pin is load-bearing.
+#
+# `precommit-check.sh` runs `clippy -D warnings`, which makes every new
+# lint in every new Rust release a build break. With a floating
+# `stable` that break lands wherever the release happens to be running
+# — which for v0.8.0 was the release workflow, on a compiler three
+# versions ahead of the one the change was written and verified on
+# (local 1.95, CI 1.98). The tag was already pushed by then.
+#
+# So: everyone compiles with the same rustc, and a compiler upgrade is
+# a deliberate commit that can be tested like any other, rather than
+# something that happens to a release at the worst moment. The cost is
+# that new lints wait for the bump instead of arriving on their own.
+#
+# This is the TOOLCHAIN, not the MSRV. `rust-version` in Cargo.toml
+# (1.89) is the floor consumers must clear and is a separate promise.
+[toolchain]
+channel    = "1.98.0"
+components = ["rustfmt", "clippy"]
+# The release build target. Declared here so a fresh checkout — and a
+# CI runner — has it without a separate `rustup target add`.
+targets    = ["x86_64-unknown-linux-musl"]
