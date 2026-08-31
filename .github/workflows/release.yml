@@ -29,12 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # protoc: pg-agent-proto's build.rs compiles the .proto sources.
-      # musl-tools: the static target needs musl-gcc as its linker.
+      # musl-tools only: the static target needs musl-gcc as its linker.
+      # protoc is NOT here — pg-agent-proto's build.rs uses the vendored
+      # binary from protoc-bin-vendored, so the .proto sources compile with
+      # nothing installed. Putting it back would hide a regression in that,
+      # since the build would succeed either way on this runner.
       - name: System build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler musl-tools
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       # No version here on purpose: rust-toolchain.toml pins the
       # channel, the components and the musl target, so the runner
@@ -91,6 +94,17 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${version} — bump Cargo.toml or retag" >&2
             exit 1
           fi
+
+      # The license gate, run unconditionally here. precommit-check.sh runs
+      # the same check but SKIPS it when cargo-deny is not installed, which
+      # is right for a contributor's machine and wrong for a tag — the
+      # artifacts this workflow attaches are the thing NOTICE describes, so
+      # the one place the check must not be skippable is the one place it
+      # is about to be shipped.
+      - name: Licenses (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
 
       # Same script the maintainer runs locally, same checks. A release
       # cut from a red commit is worse than no release.

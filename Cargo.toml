@@ -31,6 +31,21 @@ tonic       = { version = "0.12", default-features = false }
 prost       = { version = "0.13" }
 prost-types = { version = "0.13" }
 tonic-build = { version = "0.12" }
+# The protoc binary itself, vendored as a build dependency instead of
+# required from the host. `cargo build` on a fresh checkout then needs
+# nothing but a Rust toolchain — which it previously did not: with no
+# system protoc installed, EVERY crate in the workspace failed to compile
+# at pg-agent-proto's build script, and the fix was an apt line in CI plus
+# a `require protoc` guard in precommit-check.sh to make the error legible.
+# Neither is needed now; both are gone. saltator has always done it this
+# way.
+#
+# The vendored binary runs on the BUILD host, so it is unrelated to the
+# musl target — but it does assume the build host is a platform
+# protoc-bin-vendored ships a binary for (Linux/macOS/Windows on x86_64 or
+# aarch64). Building on a host it does not cover means setting PROTOC by
+# hand, the same escape hatch prost-build documents.
+protoc-bin-vendored = { version = "3" }
 
 # Web (healthz + REST)
 axum       = { version = "0.7" }
@@ -102,6 +117,28 @@ nix       = { version = "0.29", features = ["signal", "fs", "hostname"] }
 sd-notify = { version = "0.4" }
 tempfile  = { version = "3" }
 rcgen     = { version = "0.13" }
+
+# Debug info, not debug *builds* — the same split chapbook and saltator
+# carry, for the same reason: DWARF is the majority of a debug tree's
+# bytes and it is rewritten to disk on every relink. `testing/acceptance`
+# is a workspace member, so every acceptance target is another binary
+# paying for it.
+#
+# Line tables, not the full DWARF, for our own crates. `.debug_line` still
+# resolves a backtrace frame to `crates/…/foo.rs:214`, so panics,
+# `#[should_panic]` and RUST_BACKTRACE read exactly as before. What goes is
+# variable and type DWARF — stepping in a debugger and printing locals.
+# Reaching for gdb on pg-agent-rs's own code? Build that crate with
+# `--config 'profile.dev.debug=2'`.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies get none at all: nobody steps into tokio, tonic or redb
+# from here, and their debug info is the overwhelming majority of it.
+# Frames through a dependency still carry symbol names, only not file and
+# line.
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto           = "thin"

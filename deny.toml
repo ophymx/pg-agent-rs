@@ -1,0 +1,50 @@
+# cargo-deny license policy. Run by CI and by `precommit-check.sh` as
+# `cargo deny check licenses`.
+#
+# The point is not to discover that the tree is permissive — it is, and
+# NOTICE explains where it is not purely MIT/Apache. The point is that the
+# next dependency bump cannot quietly widen this list. If a new crate
+# arrives under a license not named here, the build fails and somebody has
+# to decide, rather than finding out at release time — which for this
+# repository means finding out after a `.deb` and an `.rpm` are already
+# hanging off a tag and installed on somebody's database host.
+#
+# Targets are deliberately unset, so every platform's dependencies are
+# checked — including the Windows- and macOS-only crates a Linux build
+# never sees, and the UEFI-only ones `getrandom` reaches for.
+
+[licenses]
+# Every license the graph currently resolves to. Where a crate offers a
+# choice, cargo-deny takes the first allowed option, so listing MIT and
+# Apache-2.0 covers the great majority of the ~357 crates.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # rustix, linux-raw-sys
+    "BSD-2-Clause",
+    "BSD-3-Clause",                   # subtle, and matchit's second half
+    "BSL-1.0",                        # ryu, whoami
+    "ISC",                            # ring's second half, rustls-webpki, untrusted
+    "MIT",
+    "Unicode-3.0",                    # unicode-ident, required not optional
+    "Unlicense",
+    "Zlib",
+]
+
+# Deliberately absent, and each absence is load-bearing:
+#
+#   LGPL-2.1-or-later  `r-efi` is "MIT OR Apache-2.0 OR LGPL-2.1-or-later".
+#                      Leaving LGPL out is what forces the MIT option to be
+#                      taken. (It arrives via getrandom's UEFI support and
+#                      is never compiled for any target we ship, but the
+#                      policy should not depend on that staying true.)
+#   MPL-2.0            not in the graph. saltator's is, via ruma; ours is
+#                      not, and a new one should be a decision rather than
+#                      a surprise.
+#   OpenSSL            not in the graph — the TLS stack is rustls over ring
+#                      — and would want a conscious decision, since it also
+#                      means native code beyond ring's and therefore a
+#                      harder static musl build.
+#
+# A crate whose license text does not match its SPDX declaration closely
+# enough gets flagged rather than guessed at.
+confidence-threshold = 0.8
