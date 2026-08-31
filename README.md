@@ -44,7 +44,9 @@ cargo test --workspace
 ./scripts/build-pkgs.sh      # static-musl .deb + .rpm (cargo-deb / cargo-generate-rpm)
 ```
 
-Requires `protoc` (3.x) on `$PATH` for the proto crate's build.rs.
+Needs nothing but a Rust toolchain: the proto crate's build.rs uses the
+`protoc` vendored by `protoc-bin-vendored`, so there is no system package
+to install first.
 
 ## Status
 

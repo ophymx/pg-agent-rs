@@ -19,6 +19,11 @@ const PROTOS: &[&str] = &[
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // No system protoc required — use the vendored binary. Set rather than
+    // passed to `tonic_build` because prost-build sources protoc from the
+    // environment, and this is the variable it reads.
+    std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
+
     for p in PROTOS {
         println!("cargo:rerun-if-changed={PROTO_ROOT}/{p}");
     }

@@ -62,7 +62,11 @@ require() {
 }
 
 require cargo  "rustup component add cargo"
-require protoc "apt install -y protobuf-compiler  # or your distro equivalent"
+# No `require protoc`: the .proto sources compile against the vendored
+# binary (protoc-bin-vendored, a build-dependency of pg-agent-proto), so a
+# checkout needs nothing but a Rust toolchain. The guard that used to be
+# here existed only to turn "command not found" into a legible message,
+# and there is no longer a command to not find.
 
 # rustup components — surface a useful error instead of cargo's own.
 if ! cargo fmt --version >/dev/null 2>&1; then
@@ -111,6 +115,20 @@ if [ "$QUICK" -ne 1 ]; then
   step "cargo doc --workspace --no-deps"
   RUSTDOCFLAGS="-D warnings" cargo doc \
     --workspace --no-deps --document-private-items
+fi
+
+# ----- licenses -------------------------------------------------------------
+# Skipped rather than failed when cargo-deny is absent: it is a separate
+# `cargo install`, and a contributor without it should still get a usable
+# precommit run. The release workflow runs the same check unconditionally,
+# so a widened license set cannot reach a tag through this gap.
+
+if command -v cargo-deny >/dev/null 2>&1; then
+  step "cargo deny check licenses"
+  cargo deny check licenses
+else
+  step "cargo deny check licenses (SKIPPED — cargo-deny not installed)"
+  echo "  install hint: cargo install --locked cargo-deny" >&2
 fi
 
 # ----- release build (opt-in) -----------------------------------------------

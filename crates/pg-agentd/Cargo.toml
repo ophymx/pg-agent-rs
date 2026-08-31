@@ -72,6 +72,7 @@ assets = [
     ["../../packaging/config.toml.sample", "usr/share/pg_agent/", "644"],
     ["../../LICENSE-MIT", "usr/share/doc/pg-agent-rs/", "644"],
     ["../../LICENSE-APACHE", "usr/share/doc/pg-agent-rs/", "644"],
+    ["../../NOTICE", "usr/share/doc/pg-agent-rs/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -86,6 +87,7 @@ assets = [
     { source = "../../packaging/config.toml.sample", dest = "/usr/share/pg_agent/config.toml.sample", mode = "644" },
     { source = "../../LICENSE-MIT", dest = "/usr/share/doc/pg-agent-rs/LICENSE-MIT", mode = "644", doc = true },
     { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/pg-agent-rs/LICENSE-APACHE", mode = "644", doc = true },
+    { source = "../../NOTICE", dest = "/usr/share/doc/pg-agent-rs/NOTICE", mode = "644", doc = true },
 ]
 # The same scriptlets the .deb uses — they were written to handle both
 # argument conventions (deb's "configure"/"upgrade" strings and rpm's

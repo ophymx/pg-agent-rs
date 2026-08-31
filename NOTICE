@@ -1,0 +1,117 @@
+pg-agent-rs — third-party notices
+=================================
+
+pg-agent-rs itself is licensed under either of Apache License 2.0
+(LICENSE-APACHE) or the MIT license (LICENSE-MIT), at your option.
+
+This file is about the *other* code a pg_agentd binary contains. A source
+checkout of this repository contains none of it — the crates below are
+fetched from crates.io at build time — so this matters when you distribute
+the `.deb` or the `.rpm`, not when you clone the repo.
+
+The list is the Linux dependency graph with every feature enabled, which is
+the largest a pg-agent-rs build gets: 252 third-party crates, of which 240
+are satisfiable by taking the MIT option alone. The remaining 12 are named
+below, because each carries a term the MIT/Apache pair does not.
+
+Nothing here conflicts with releasing pg-agent-rs under MIT OR Apache-2.0.
+There is no GPL-, AGPL-, or LGPL-only dependency in the graph, and — unlike
+most server software of this shape — no vendored C or C++ library beyond
+ring's. That is not an accident; see "Native code" below.
+
+
+Regenerating this list, and the caveat
+--------------------------------------
+
+    cargo deny check licenses          # the CI gate; policy in deny.toml
+    cargo tree -e normal --all-features \
+        --target x86_64-unknown-linux-gnu \
+        --prefix none --format '{l}|{p}' | sort -u
+
+This file is a human-scale summary, not a substitute for shipping license
+texts. MIT and the BSD licenses require the copyright notice and permission
+text to travel with a binary, and reproducing 252 of those here would go
+stale on the first `cargo update`. Generate the full bundle at release time:
+
+    cargo about generate about.hbs > THIRD-PARTY-LICENSES.html
+
+
+ISC
+---
+
+    ring                 Apache-2.0 AND ISC   https://github.com/briansmith/ring
+    rustls-webpki        ISC                  https://github.com/rustls/webpki
+    untrusted            ISC                  https://github.com/briansmith/untrusted
+
+`ring` is an AND, not a choice: both Apache-2.0 and ISC terms apply. It is
+the sole rustls crypto provider, and deliberately so — the workspace
+Cargo.toml explains at length why aws-lc-rs is kept out of the graph.
+
+
+BSD licenses
+------------
+
+    subtle               BSD-3-Clause         https://github.com/dalek-cryptography/subtle
+    matchit              MIT AND BSD-3-Clause https://github.com/ibraheemdev/matchit
+
+`matchit` is an AND: axum's router carries both sets of terms.
+
+
+Unicode License v3
+------------------
+
+    unicode-ident        (MIT OR Apache-2.0) AND Unicode-3.0
+                         https://github.com/dtolnay/unicode-ident
+
+The Unicode half is required, not optional — the crate embeds Unicode
+character tables, and Unicode-3.0's one substantive requirement is that
+this notice accompany them. It reaches the graph through `syn`, i.e.
+through every derive macro in the tree.
+
+
+No MIT option
+-------------
+
+These offer no MIT arm, so a pg-agent-rs binary is distributed with at
+least one of them under Apache-2.0. Apache-2.0 §4(d) propagates any NOTICE
+file the upstream ships, which is part of why this file exists.
+
+    prost                Apache-2.0    protobuf runtime, via tonic
+    prost-derive         Apache-2.0
+    prost-types          Apache-2.0
+    anyerror             Apache-2.0    via openraft
+    sync_wrapper         Apache-2.0    via tower/axum
+    ryu                  Apache-2.0 OR BSL-1.0
+
+
+Native code
+-----------
+
+Worth stating explicitly, because it is a property the packaging depends on
+and one a dependency bump could silently end: **ring's C and assembly are
+the only native code in this build.** Everything else is pure Rust.
+
+That is what makes `x86_64-unknown-linux-musl` tractable, and the static
+musl binary is in turn what lets one `.deb` and one `.rpm` install on
+Debian 12, Ubuntu 24.04, Rocky 9 and Alpine alike (see
+`scripts/build-pkgs.sh` and testing/README.md finding 26). A dependency
+that vendors a C++ library — RocksDB and its five compression backends are
+the canonical example, and are why saltator cannot do this — would take
+that away, and would also add a body of license terms that `cargo deny`
+structurally cannot see, since it reads crate manifests and not vendored
+sources.
+
+So: if a future dependency brings native code, this file and the packaging
+story both need revisiting, and neither the license gate nor the build will
+tell you on its own. The release workflow's "Assert the binary is static"
+step is the one thing that would notice.
+
+
+What is not covered here
+------------------------
+
+Build-time-only dependencies are excluded (`cargo tree -e normal`), because
+they do not ship in the binary: `protoc-bin-vendored` and its per-platform
+protoc binaries, `tonic-build`, and the proc-macro crates' build machinery.
+If pg-agent-rs ever ships a source bundle rather than a binary, that
+exclusion stops being safe.
