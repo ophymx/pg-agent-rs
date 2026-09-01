@@ -386,6 +386,58 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::sync::CancellationToken;
 
+    /// Retry `op` while Raft is between leaders.
+    ///
+    /// Leadership can move at any instant, and these tests assert on
+    /// consensus SEMANTICS — who wins a CAS, whether a term advances —
+    /// not on one node staying leader for the length of a test. A
+    /// production caller treats "not the leader" as a transient and
+    /// retries; so does this. `propose` itself forwards exactly one hop,
+    /// so a leader that moves twice lands here rather than being handled
+    /// underneath.
+    ///
+    /// The predicate is deliberately narrow, and that narrowness is the
+    /// whole point. `try_takeover` is a CAS whose `expected: None` arm
+    /// means "win only if the lease is VACANT" (`raftstore`'s
+    /// `observed_holds`), so re-issuing a command that DID commit would
+    /// observe its own lease and return `Lost` — a flake turned into a
+    /// false assertion, which is worse than the flake. Both tolerated
+    /// errors are pre-proposal rejections: openraft's own leader check
+    /// and the remote's `FailedPrecondition` both fire before any entry
+    /// is appended, so the command provably did not apply. Anything
+    /// ambiguous — a transport failure, a timeout — is NOT retried and
+    /// fails the test, because there it may well have committed.
+    async fn settled<T, F, Fut>(what: &str, mut op: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match op().await {
+                Ok(v) => return v,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let between_leaders =
+                        msg.contains("no leader known") || msg.contains("not the leader");
+                    if !between_leaders {
+                        panic!("{what}: not a leadership transient: {e:#}");
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("{what}: still between leaders after 20s: {e:#}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// Backstop for [`cluster`]'s readiness gate. Generous because it
+    /// guards against a genuinely broken cluster rather than tuning
+    /// anything — a healthy one clears it in a fraction of it, and the
+    /// suite's runtime is unchanged.
+    const CLUSTER_READY: Duration = Duration::from_secs(15);
+
     struct Node {
         store: RaftConsensusStore,
         raft: PgAgentRaftHandle,
@@ -447,16 +499,38 @@ mod tests {
         }
         nodes[0].raft.initialize(members).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if nodes[0].raft.current_leader().await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("no leader elected");
+        // Readiness is NOT "node 0 believes someone leads". That belief
+        // arrives the moment a vote is won, which is before the winner has
+        // committed anything — and a node that has not yet established
+        // itself can revert to candidate, at which point `current_leader`
+        // goes back to `None`. A proposal issued in that window fails with
+        // `ForwardToLeader { leader_id: None }`, and `propose`'s fallback
+        // has nobody to forward to either, which is the observed
+        // `consensus: no leader known (has to forward request to: None,
+        // None)`.
+        //
+        // Wait for the `initialize` entries to be APPLIED instead. That is
+        // strictly stronger and it is what the callers actually need:
+        // entries only commit through a leader that holds a quorum, so an
+        // applied entry 1 is proof the election really finished rather
+        // than proof that somebody briefly thought so.
+        //
+        // All three nodes, not just the one we hold: several callers write
+        // through a FOLLOWER, so a gate covering only node 0 would leave
+        // exactly those tests racing.
+        for (i, n) in nodes.iter().enumerate() {
+            n.raft
+                .wait(Some(CLUSTER_READY))
+                .metrics(
+                    |m| {
+                        m.current_leader.is_some()
+                            && m.last_applied.map(|l| l.index).unwrap_or(0) >= 1
+                    },
+                    "leader elected and the initialize entries applied",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("node {i} never became ready: {e}"));
+        }
         nodes
     }
 
@@ -475,11 +549,10 @@ mod tests {
         let leader = leader_index(&nodes).await;
         let follower = (0..3).find(|i| *i != leader).unwrap();
 
-        let outcome = nodes[follower]
-            .store
-            .try_takeover(follower as i32, None)
-            .await
-            .unwrap();
+        let outcome = settled("takeover by follower", || {
+            nodes[follower].store.try_takeover(follower as i32, None)
+        })
+        .await;
         match outcome {
             TakeoverOutcome::Won { lease } => assert_eq!(lease.holder, follower as i32),
             other => panic!("follower should have won an uncontested lease, got {other:?}"),
@@ -487,7 +560,7 @@ mod tests {
 
         // And every node — leader included — can read it back.
         for (i, n) in nodes.iter().enumerate() {
-            let state = n.store.read_state().await.unwrap();
+            let state = settled("read_state", || n.store.read_state()).await;
             assert_eq!(
                 state.lease.as_ref().map(|l| l.holder),
                 Some(follower as i32),
@@ -505,10 +578,10 @@ mod tests {
         let shutdown = CancellationToken::new();
         let nodes = cluster(&shutdown).await;
 
-        let a = nodes[0].store.try_takeover(0, None).await.unwrap();
+        let a = settled("takeover 0", || nodes[0].store.try_takeover(0, None)).await;
         // Node 1 still believes the lease is vacant — a stale
         // observation, and its CAS must lose on that basis.
-        let b = nodes[1].store.try_takeover(1, None).await.unwrap();
+        let b = settled("takeover 1", || nodes[1].store.try_takeover(1, None)).await;
 
         let won = [&a, &b]
             .iter()
@@ -539,21 +612,31 @@ mod tests {
         let shutdown = CancellationToken::new();
         let nodes = cluster(&shutdown).await;
 
-        let TakeoverOutcome::Won { lease } = nodes[0].store.try_takeover(0, None).await.unwrap()
+        let TakeoverOutcome::Won { lease } =
+            settled("takeover 0", || nodes[0].store.try_takeover(0, None)).await
         else {
             panic!("uncontested takeover should win");
         };
 
         // A node that is not the holder cannot release it.
-        let out = nodes[1].store.release(1, lease.term).await.unwrap();
+        let out = settled("release by non-holder", || {
+            nodes[1].store.release(1, lease.term)
+        })
+        .await;
         assert!(matches!(out, ReleaseOutcome::NotHolder { .. }));
 
-        let out = nodes[0].store.release(0, lease.term).await.unwrap();
+        let out = settled("release by holder", || {
+            nodes[0].store.release(0, lease.term)
+        })
+        .await;
         assert!(matches!(out, ReleaseOutcome::Released));
-        assert!(nodes[2].store.read_state().await.unwrap().lease.is_none());
+        assert!(settled("read_state", || nodes[2].store.read_state())
+            .await
+            .lease
+            .is_none());
 
         let TakeoverOutcome::Won { lease: again } =
-            nodes[2].store.try_takeover(2, None).await.unwrap()
+            settled("takeover 2", || nodes[2].store.try_takeover(2, None)).await
         else {
             panic!("vacant lease should be takeable");
         };
@@ -698,25 +781,23 @@ mod tests {
         let shutdown = CancellationToken::new();
         let nodes = cluster(&shutdown).await;
 
-        nodes[1]
-            .store
-            .set_paused(Some(Paused {
+        settled("set_paused", || {
+            nodes[1].store.set_paused(Some(Paused {
                 reason: "maintenance".into(),
                 set_by: "operator".into(),
                 at: Utc::now(),
             }))
-            .await
-            .unwrap();
-        nodes[2]
-            .store
-            .set_switchover(Some(Switchover {
+        })
+        .await;
+        settled("set_switchover", || {
+            nodes[2].store.set_switchover(Some(Switchover {
                 target: 1,
                 not_before: None,
             }))
-            .await
-            .unwrap();
+        })
+        .await;
 
-        let state = nodes[0].store.read_state().await.unwrap();
+        let state = settled("read_state", || nodes[0].store.read_state()).await;
         assert_eq!(state.paused.unwrap().reason, "maintenance");
         assert_eq!(state.switchover.unwrap().target, 1);
 
