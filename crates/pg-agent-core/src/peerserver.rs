@@ -55,7 +55,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{codec::CompressionEncoding, transport::Server, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ impl PeerServer {
         let raft = self.raft.take();
         Server::builder()
             .add_optional_service(raft)
-            .add_service(PgAgentPeerServer::new(self))
+            .add_service(peer_service(self))
             .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
             .await
             .map(|()| {
@@ -388,7 +388,7 @@ impl PeerServer {
         let raft = self.raft.take();
         let serve_result = Server::builder()
             .add_optional_service(raft)
-            .add_service(PgAgentPeerServer::new(self))
+            .add_service(peer_service(self))
             .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
             .await;
 
@@ -742,19 +742,31 @@ impl PgAgentPeer for PeerServer {
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut file = file;
-            let mut buf = vec![0u8; WAL_CHUNK_SIZE];
+            // `WalChunk.data` is a `Bytes` (see pg-agent-proto/build.rs), so
+            // the segment is read straight into a `BytesMut` and each filled
+            // prefix is split off and frozen. `split` leaves the untouched
+            // tail capacity behind, and `reserve` is a no-op whenever that
+            // tail is already a full chunk wide — so a 16 MiB segment costs
+            // a handful of allocations and no per-chunk copy. The previous
+            // `read` into a reused `Vec` plus `buf[..n].to_vec()` paid an
+            // allocation and a full 1 MiB memcpy on every chunk.
+            let mut buf = bytes::BytesMut::with_capacity(WAL_CHUNK_SIZE);
             loop {
-                let n = match file.read(&mut buf).await {
+                // The reserve also keeps `Ok(0)` unambiguous: `read_buf`
+                // returns 0 both at EOF and when there is no spare capacity
+                // to read into, and this guarantees there always is some.
+                buf.reserve(WAL_CHUNK_SIZE);
+                match file.read_buf(&mut buf).await {
                     Ok(0) => return, // EOF — channel closes when tx drops
-                    Ok(n) => n,
+                    Ok(_) => {}
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(format!("read: {e}")))).await;
                         return;
                     }
-                };
+                }
                 if tx
                     .send(Ok(WalChunk {
-                        data: buf[..n].to_vec(),
+                        data: buf.split().freeze(),
                     }))
                     .await
                     .is_err()
@@ -780,6 +792,34 @@ fn ok() -> OpResult {
 /// 1 MiB. Kept well under tonic's default 4 MiB max message size so a
 /// chunk + framing overhead never trips the encoder.
 const WAL_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// The peer service with zstd negotiated in both directions.
+///
+/// This exists for `FetchWal`: a 16 MiB WAL segment is highly
+/// compressible, and one closed early by `archive_timeout` or a forced
+/// switch is mostly zero padding, which collapses to almost nothing.
+/// tonic 0.12 configures compression per *service*, not per method, so
+/// the small RPCs (`GetStatus`, `OpResult`, …) ride along; at a few
+/// hundred bytes and a low call rate that CPU is noise.
+///
+/// zstd rather than gzip because tonic hardcodes the level: gzip is
+/// `flate2::Compression::new(6)`, roughly 30–50 MB/s, slow enough to
+/// become the bottleneck on a LAN faster than ~400 Mbps — it would trade
+/// bandwidth for wall-clock on exactly the promotion-critical path we
+/// are trying to speed up. zstd's default level 3 runs an order of
+/// magnitude faster at a better ratio.
+///
+/// Negotiation makes this safe across a rolling upgrade in both
+/// directions. `send_compressed` only takes effect when the caller
+/// advertised zstd in `grpc-accept-encoding`, so this server still
+/// answers a pre-upgrade peer in plain identity framing; and a
+/// post-upgrade client asking for zstd from a pre-upgrade server simply
+/// gets an uncompressed reply.
+fn peer_service(inner: PeerServer) -> PgAgentPeerServer<PeerServer> {
+    PgAgentPeerServer::new(inner)
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd)
+}
 
 /// Bounded buffer between the subprocess progress callback and the gRPC
 /// stream consumer. Progress events are non-essential — `try_send` drops
@@ -1192,7 +1232,7 @@ mod tests {
         async fn write_restore(
             &self,
             _: &std::path::Path,
-            _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            _: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         ) -> Result<(), pgman::walstore::WalStoreError> {
             Ok(())
         }
@@ -1748,6 +1788,63 @@ mod tests {
         let chunks = drain::<WalChunk>(resp).await.expect("stream");
         let assembled: Vec<u8> = chunks.into_iter().flat_map(|c| c.data).collect();
         assert_eq!(assembled, content);
+    }
+
+    /// The handler tests above call `fetch_wal` directly, which bypasses
+    /// the service wrapper and so proves nothing about compression. This
+    /// one goes over a real socket through the generated client, which is
+    /// the only place the zstd negotiation, the `Bytes` codec and the
+    /// multi-chunk read loop all run together.
+    #[tokio::test]
+    async fn fetch_wal_round_trips_compressed_over_a_real_channel() {
+        use futures_util::StreamExt;
+        use pg_agent_proto::pgagentpb::pg_agent_peer_client::PgAgentPeerClient;
+
+        let (server, _sd, _db, _standby, wal) = make_server();
+
+        // Two chunks and a bit, and compressible the way a real segment
+        // is: a repeating body followed by the zero padding PostgreSQL
+        // leaves behind when a segment is closed early.
+        let mut content: Vec<u8> = (0..(2 * WAL_CHUNK_SIZE)).map(|i| (i % 251) as u8).collect();
+        content.extend(std::iter::repeat_n(0u8, WAL_CHUNK_SIZE / 2));
+        wal.stage("000000010000000000000007", content.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.serve(listener, None, s).await });
+
+        let mut peer = PgAgentPeerClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap()
+            .accept_compressed(CompressionEncoding::Zstd);
+
+        let resp = peer
+            .fetch_wal(Request::new(FetchWalRequest {
+                wal_file: "000000010000000000000007".into(),
+            }))
+            .await
+            .expect("fetch_wal");
+
+        // The server must have taken up the offer — otherwise this test
+        // would still pass on content alone while silently shipping
+        // uncompressed, which is the regression worth catching.
+        assert_eq!(
+            resp.metadata().get("grpc-encoding").map(|v| v.as_bytes()),
+            Some(&b"zstd"[..]),
+            "server should compress once the client advertises zstd"
+        );
+
+        let mut stream = resp.into_inner();
+        let mut assembled: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            assembled.extend_from_slice(&chunk.expect("chunk").data);
+        }
+        assert_eq!(assembled, content, "segment must survive the round trip");
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     #[tokio::test]

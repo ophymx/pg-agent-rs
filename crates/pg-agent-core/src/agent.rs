@@ -1339,7 +1339,7 @@ mod tests {
         async fn fetch_wal(
             &self,
             _: &str,
-        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>> {
             unreachable!()
         }
     }
@@ -1507,7 +1507,7 @@ mod tests {
         async fn write_restore(
             &self,
             _: &std::path::Path,
-            _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            _: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         ) -> Result<(), pgman::walstore::WalStoreError> {
             Ok(())
         }

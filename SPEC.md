@@ -535,8 +535,13 @@ the segment (see notes §6).
        (`ErrDestOutsidePgData`) → abort entire `RestoreWal` (every peer
        would fail identically).
      - Write to a hidden temp file in the same dir
-       (`."<base>"-<8 hex>"`), `O_EXCL`, mode `0600`. Copy. Close (syncs).
-       Rename onto `dest_path`. Remove temp on any error.
+       (`."<base>"-<8 hex>"`), `O_EXCL`, mode `0600`. Copy. **`fsync` before
+       the rename** — closing does not sync, and renaming over still-dirty
+       page cache lets a host crash leave a correctly-named segment full of
+       zeros, which PostgreSQL reads as end-of-WAL and stops recovery on.
+       Rename onto `dest_path`. Remove temp on any error. The parent
+       directory is deliberately not synced: losing the rename just means
+       `restore_command` asks for the segment again.
    - On `NotFound` from the peer → try next peer.
    - On context deadline / cancel → try next peer.
    - On success → return `ok=true`.
@@ -588,7 +593,7 @@ no password.
 | `ConfigureStandby`  | validate (`primary_host` regex, port>0, repl_user regex, slot regex). Write `$PGDATA/myrecovery.conf` (template — see §5.10) and create empty `$PGDATA/standby.signal`. Both files mode `0640`. |
 | `Basebackup`        | refuse if PostgreSQL is running (`FailedPrecondition`). Clear `$PGDATA` contents. Exec `<pg_install_prefix>/bin/pg_basebackup --pgdata <data> --dbname '<conninfo>' --wal-method=stream --checkpoint=fast --no-password [--slot <name>] [--progress]`. Scan stderr line-by-line (split on `\r` *or* `\n`), forward `done/total kB` lines as `OpProgress { phase="streaming", bytes_done=done*1024, bytes_total=total*1024 }`, log other lines, capture last ~4 KiB into the error tail if the subprocess exits non-zero. Final `OpProgress { phase="done" }`. |
 | `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pg_install_prefix>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |
-| `FetchWal`          | validate filename. Open `<archive_dir>/<wal_file>` (after `filepath.Localize`-equivalent rejection of `..`/absolute paths). Stream 1 MiB chunks. `NotFound` if absent. |
+| `FetchWal`          | validate filename. Open `<archive_dir>/<wal_file>` (after `filepath.Localize`-equivalent rejection of `..`/absolute paths). Stream 1 MiB chunks. `NotFound` if absent. Chunks are read into a `BytesMut` and shipped as `bytes::Bytes` (`WalChunk.data` carries the prost `bytes` override) so neither side copies a chunk out of its transport buffer. The service negotiates **zstd** — a 16 MiB segment compresses well, and one closed early by `archive_timeout` is mostly zero padding; zstd rather than gzip because tonic hardcodes gzip to level 6, slow enough to bottleneck a LAN. Compression is per-service in tonic, so the small peer RPCs ride along. |
 | `RemoveVip`         | always `Unimplemented`. |
 | `GetStatus` / `GetNodeConfig` | delegate to `NodeInfo`. |
 
