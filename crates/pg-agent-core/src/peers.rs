@@ -116,7 +116,7 @@ pub trait PeerClient: Send + Sync {
     async fn fetch_wal(
         &self,
         wal_file: &str,
-    ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>;
+    ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>>;
 
     /// Mirror of `PgAgentLocal::GetStatus` — read the peer's runtime view.
     /// Used by `FollowPrimary` to skip a deliberately-stopped detached
@@ -330,7 +330,18 @@ impl PeerRegistry for PeerPool {
         let channel = self.dial(node).await?;
         let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let client: Arc<dyn PeerClient> = Arc::new(PeerChannel {
-            inner: PgAgentPeerClient::new(channel),
+            // `accept_compressed` advertises zstd in `grpc-accept-encoding`,
+            // which is what licenses the peer to compress its replies — see
+            // `peerserver::peer_service` for why zstd and why service-wide.
+            // It costs nothing against a peer that predates this and answers
+            // in identity framing.
+            //
+            // No `send_compressed`: every request on this service is small
+            // (`FetchWal`'s is one filename), and compressing them would make
+            // us unintelligible to a pre-upgrade peer, which has no such
+            // negotiation escape hatch on the request side.
+            inner: PgAgentPeerClient::new(channel)
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd),
             poisoned: poisoned.clone(),
         });
         map.insert(
@@ -593,7 +604,7 @@ impl PeerClient for PeerChannel {
     async fn fetch_wal(
         &self,
         wal_file: &str,
-    ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+    ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>> {
         use futures_util::TryStreamExt;
         let mut client = self.inner.clone();
         let req = FetchWalRequest {
@@ -621,8 +632,13 @@ impl PeerClient for PeerChannel {
                 // Map gRPC stream items to bytes::Bytes (Buf) + io::Error
                 // for tokio_util::io::StreamReader. Errors mid-stream
                 // surface to the caller (write_restore) as io::Error.
+                //
+                // `chunk.data` is already a `Bytes` — the `bytes` override in
+                // pg-agent-proto/build.rs makes prost decode it as a refcount
+                // bump on tonic's buffer rather than copying a fresh Vec per
+                // chunk. Taking it by move keeps that all the way to the file.
                 let bytes_stream = stream
-                    .map_ok(|chunk| bytes::Bytes::from(chunk.data))
+                    .map_ok(|chunk| chunk.data)
                     .map_err(|s| std::io::Error::other(s.to_string()));
                 Ok(Some(Box::new(tokio_util::io::StreamReader::new(
                     bytes_stream,
@@ -1038,7 +1054,7 @@ mod tests {
         async fn write_restore(
             &self,
             _: &std::path::Path,
-            _: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            _: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         ) -> Result<(), pgman::walstore::WalStoreError> {
             Ok(())
         }

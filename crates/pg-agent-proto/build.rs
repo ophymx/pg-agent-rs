@@ -33,6 +33,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // `WalChunk.data` carries the FetchWal payload — 16 MiB per WAL
+        // segment in 1 MiB chunks. As a `Vec<u8>` prost copies every chunk
+        // out of tonic's decode buffer on the receiving side; as a
+        // `bytes::Bytes` the decode is a refcount bump on that same buffer,
+        // and the sender can hand a `BytesMut` slice straight in. Scoped to
+        // this one field on purpose: the `payload` fields on the raft and
+        // local services are small and their `Vec<u8>` callers are not worth
+        // churning.
+        .bytes(["pgagentpb.WalChunk.data"])
         .compile_protos(&proto_paths, &[PROTO_ROOT.to_string()])?;
 
     Ok(())

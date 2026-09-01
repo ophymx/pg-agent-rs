@@ -1074,7 +1074,7 @@ mod tests {
         async fn fetch_wal(
             &self,
             _: &str,
-        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>> {
             unreachable!("the loop only calls get_status")
         }
     }
