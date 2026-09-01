@@ -708,26 +708,57 @@ mod tests {
         // Wait for a leader rather than assuming node 0 wins — which one
         // leads is Raft's business, and asserting on it would make this
         // test a timing coin flip.
-        let leader = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(l) = nodes[0].raft.current_leader().await {
-                    return l;
+        //
+        // Gate on the `initialize` entries being APPLIED rather than on a
+        // leader merely being believed in: the write below goes straight
+        // to that leader and fails if it has not committed its own log
+        // yet. See `raftconsensus::tests::cluster` for the full account.
+        for (i, n) in nodes.iter().enumerate() {
+            n.raft
+                .wait(Some(Duration::from_secs(15)))
+                .metrics(
+                    |m| {
+                        m.current_leader.is_some()
+                            && m.last_applied.map(|l| l.index).unwrap_or(0) >= 1
+                    },
+                    "leader elected and the initialize entries applied",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("node {i} never became ready: {e}"));
+        }
+        // Leadership can move between the gate above and the write
+        // below, and `ForwardToLeader` names whoever holds it now — so
+        // re-read the leader and follow the redirect rather than caching
+        // the first answer. The redirect is a pre-proposal rejection, so
+        // nothing was appended and re-issuing the takeover is safe; a CAS
+        // is not idempotent and a blind retry of a COMMITTED one would
+        // wrongly report `Lost`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let write = loop {
+            let leader = nodes[0]
+                .raft
+                .current_leader()
+                .await
+                .expect("a leader is known once the initialize entries are applied");
+            let attempt = nodes[leader as usize]
+                .raft
+                .client_write(ConsensusCommand::Takeover {
+                    candidate: 2,
+                    expected: None,
+                    at: chrono::DateTime::from_timestamp(1_000, 0).unwrap(),
+                })
+                .await;
+            match attempt {
+                Ok(w) => break w,
+                Err(openraft::error::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(..),
+                )) if tokio::time::Instant::now() < deadline => {
+                    // Leadership moved; go around and ask again.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err(e) => panic!("client_write to the leader failed: {e}"),
             }
-        })
-        .await
-        .expect("no leader elected within 10s");
-
-        let write = nodes[leader as usize]
-            .raft
-            .client_write(ConsensusCommand::Takeover {
-                candidate: 2,
-                expected: None,
-                at: chrono::DateTime::from_timestamp(1_000, 0).unwrap(),
-            })
-            .await
-            .unwrap();
+        };
 
         match write.data {
             crate::raftstore::CommandResponse::Takeover(

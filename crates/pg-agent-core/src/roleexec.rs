@@ -794,7 +794,7 @@ mod tests {
         async fn fetch_wal(
             &self,
             _: &str,
-        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>> {
             unreachable!()
         }
         async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {

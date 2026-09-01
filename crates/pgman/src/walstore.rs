@@ -41,7 +41,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead};
 use tracing::debug;
 
 /// WAL-store failures, typed so transport handlers can map each to a
@@ -88,10 +88,17 @@ pub trait WalStore: Send + Sync {
     /// [`WalStoreError::DestOutsidePgData`] when `dest_path` doesn't resolve
     /// inside the configured `pg_data_dir` (handler maps to gRPC
     /// `InvalidArgument`).
+    ///
+    /// `src` is [`AsyncBufRead`], not [`AsyncRead`], so the copy can hand
+    /// the reader's own buffer straight to the file. The production `src`
+    /// is a `StreamReader` over `FetchWal`'s 1 MiB chunks; behind a bare
+    /// `AsyncRead` the copy would drag all 16 MiB through
+    /// `tokio::io::copy`'s 8 KiB scratch buffer, turning ~16 writes into
+    /// ~2048 — and every `tokio::fs` write is a blocking-pool dispatch.
     async fn write_restore(
         &self,
         dest_path: &Path,
-        src: Box<dyn AsyncRead + Send + Unpin>,
+        src: Box<dyn AsyncBufRead + Send + Unpin>,
     ) -> Result<(), WalStoreError>;
 }
 
@@ -180,7 +187,7 @@ impl WalStore for FileWalStore {
     async fn write_restore(
         &self,
         dest_path: &Path,
-        mut src: Box<dyn AsyncRead + Send + Unpin>,
+        mut src: Box<dyn AsyncBufRead + Send + Unpin>,
     ) -> Result<(), WalStoreError> {
         let resolved = self.resolve_dest_path(dest_path).await?;
 
@@ -208,10 +215,30 @@ impl WalStore for FileWalStore {
         // an async block so we can capture the Result and dispatch
         // cleanup uniformly without futures::TryFutureExt gymnastics.
         let body = async {
-            tokio::io::copy(&mut src, &mut tmp_file)
+            // copy_buf, not copy: `src` is already buffered, so each 1 MiB
+            // chunk goes to the file whole instead of via an 8 KiB scratch
+            // buffer. See the trait doc.
+            tokio::io::copy_buf(&mut src, &mut tmp_file)
                 .await
                 .map_err(WalStoreError::Io)?;
-            tmp_file.flush().await.map_err(WalStoreError::Io)?;
+            // `sync_all`, not `flush`: flush only pushes the bytes to the
+            // kernel, which is not enough here. Rename the temp file while
+            // its contents are still dirty page cache and a host crash can
+            // leave the directory entry durable but the data not — a
+            // correctly-named WAL segment full of zeros. PostgreSQL would
+            // fail that segment's CRC and read it as end-of-WAL, quietly
+            // ending recovery early rather than erroring. Syncing before
+            // the rename closes the window: the data is on disk before the
+            // name that promises it exists.
+            //
+            // `sync_all` subsumes the old `flush` — it completes the
+            // in-flight write before issuing the fsync.
+            //
+            // The parent directory is deliberately *not* fsynced after the
+            // rename. Losing the rename is safe: the segment simply isn't
+            // there, and PostgreSQL's restore_command asks for it again.
+            // Only the data-without-name ordering above is dangerous.
+            tmp_file.sync_all().await.map_err(WalStoreError::Io)?;
             // Drop closes the file before the rename — explicit so the
             // ordering reads obvious. POSIX doesn't strictly require
             // close-before-rename but it makes the lifecycle explicit.
@@ -388,7 +415,7 @@ mod tests {
         let (_tmp, store) = fixture();
         // pg_basebackup creates pg_wal/; mirror that so the parent canonicalises.
         std::fs::create_dir(store.pg_data_dir.join("pg_wal")).unwrap();
-        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"wal bytes"[..]);
+        let src: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(&b"wal bytes"[..]);
         store
             .write_restore(Path::new("pg_wal/000000010000000000000001"), src)
             .await
@@ -404,7 +431,7 @@ mod tests {
     async fn write_restore_rejects_relative_path_with_missing_parent() {
         let (_tmp, store) = fixture();
         // pg_wal/ deliberately NOT created.
-        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"x"[..]);
+        let src: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(&b"x"[..]);
         let e = store
             .write_restore(Path::new("pg_wal/000000010000000000000001"), src)
             .await
@@ -420,7 +447,7 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         let dest = outside.join("foo");
 
-        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"x"[..]);
+        let src: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(&b"x"[..]);
         let e = store.write_restore(&dest, src).await.unwrap_err();
         assert!(matches!(e, WalStoreError::DestOutsidePgData));
     }
@@ -436,7 +463,7 @@ mod tests {
         symlink(&outside, store.pg_data_dir.join("escape")).unwrap();
 
         let dest = store.pg_data_dir.join("escape").join("evil");
-        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(&b"x"[..]);
+        let src: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(&b"x"[..]);
         let e = store.write_restore(&dest, src).await.unwrap_err();
         assert!(
             matches!(e, WalStoreError::DestOutsidePgData),
@@ -453,7 +480,7 @@ mod tests {
         let dest = pg_wal.join("000000010000000000000003");
 
         let payload: &[u8] = b"the brown fox jumps over the WAL";
-        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(payload);
+        let src: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(payload);
         store.write_restore(&dest, src).await.unwrap();
 
         // File exists with the right contents.
@@ -481,7 +508,9 @@ mod tests {
         let dest = store.pg_data_dir.join("000000010000000000000004");
 
         // Reader that errors after the first read — exercises the
-        // tmp-file cleanup path.
+        // tmp-file cleanup path. `copy_buf` only ever drives
+        // `poll_fill_buf`/`consume`, but `AsyncBufRead`'s supertrait
+        // still demands a `poll_read`, so both are supplied.
         struct Failing {
             yielded: bool,
         }
@@ -499,7 +528,21 @@ mod tests {
                 }
             }
         }
-        let src: Box<dyn AsyncRead + Send + Unpin> = Box::new(Failing { yielded: false });
+        impl AsyncBufRead for Failing {
+            fn poll_fill_buf(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<&[u8]>> {
+                if !self.yielded {
+                    self.yielded = true;
+                    std::task::Poll::Ready(Err(std::io::Error::other("simulated read failure")))
+                } else {
+                    std::task::Poll::Ready(Ok(&[]))
+                }
+            }
+            fn consume(self: std::pin::Pin<&mut Self>, _: usize) {}
+        }
+        let src: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(Failing { yielded: false });
 
         let err = store.write_restore(&dest, src).await.unwrap_err();
         assert!(matches!(err, WalStoreError::Io(_)));

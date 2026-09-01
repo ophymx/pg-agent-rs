@@ -4165,7 +4165,7 @@ mod tests {
         async fn fetch_wal(
             &self,
             wal_file: &str,
-        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+        ) -> anyhow::Result<Option<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>> {
             self.fetch_wal_calls.fetch_add(1, Ordering::SeqCst);
             if self.fetch_wal_hangs.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
@@ -4175,7 +4175,7 @@ mod tests {
             }
             let content = self.wal_content.lock().unwrap().get(wal_file).cloned();
             Ok(content.map(|c| {
-                Box::new(std::io::Cursor::new(c)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                Box::new(std::io::Cursor::new(c)) as Box<dyn tokio::io::AsyncBufRead + Send + Unpin>
             }))
         }
         async fn get_status(&self) -> anyhow::Result<NodeStatus> {
@@ -4476,7 +4476,7 @@ mod tests {
         async fn write_restore(
             &self,
             dest_path: &Path,
-            mut src: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            mut src: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         ) -> Result<(), pgman::walstore::WalStoreError> {
             if self.dest_outside_pgdata.load(Ordering::SeqCst) {
                 return Err(pgman::walstore::WalStoreError::DestOutsidePgData);
