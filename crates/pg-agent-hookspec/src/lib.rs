@@ -355,7 +355,7 @@ pub struct PgpoolHookEntry {
 ///   open question 4, resolved at cutover).
 /// - `follow_primary_command` is **empty, not notify-only**: a
 ///   non-empty value makes pgpool degenerate every healthy standby
-///   after a primary failover (hook-contract §5.4, measured in
+///   after a primary failover (hook-contract §2, measured in
 ///   acceptance S12). The agent re-points standbys off the lease
 ///   instead.
 ///

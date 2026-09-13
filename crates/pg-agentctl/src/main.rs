@@ -980,7 +980,7 @@ fn render_pgpool_fragment(rows: &[BackendRow]) -> String {
     const KEY_WIDTH: usize = 26;
     s.push_str("# --- canonical hook block (agent-led failover) ---\n");
     s.push_str("# failover_command is a notify-only poke: the HA loop decides.\n");
-    s.push_str("# follow_primary_command MUST stay empty (hook-contract §5.4).\n");
+    s.push_str("# follow_primary_command MUST stay empty (hook-contract §2).\n");
     for h in hookspec::pgpool_hooks() {
         let _ = writeln!(s, "{:<width$} = '{}'", h.key, h.value, width = KEY_WIDTH);
     }

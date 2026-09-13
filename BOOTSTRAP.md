@@ -103,8 +103,10 @@ PostgreSQL's lifecycle belongs to the agent. systemd must neither start
 it at boot nor restart it after a crash:
 
 ```
-install -d /etc/systemd/system/postgresql-16.service.d   # your PG unit
-cat > /etc/systemd/system/postgresql-16.service.d/10-agent-managed.conf <<'EOF'
+# Debian: postgresql@17-main.service   RHEL: postgresql-17.service
+unit=postgresql@17-main.service
+install -d /etc/systemd/system/$unit.d
+cat > /etc/systemd/system/$unit.d/10-agent-managed.conf <<'EOF'
 # PostgreSQL's lifecycle belongs to pg_agentd. systemd may neither
 # start it at boot nor restart it after a crash: a postmaster that
 # comes back on its own is a node the cluster may have already moved
@@ -396,12 +398,6 @@ itself — and **mTLS configured**, because the consensus plane rides the
 peer listener, so an unauthenticated port is an unauthenticated
 promotion authority.
 
-> **Upgrading a cluster built before this?** Delete any `[raft] enabled`
-> line from `config.toml` before rolling the package. `enabled = false`
-> now fails config load outright (it asks for a node that cannot learn
-> it has been deposed); `enabled = true` still starts, with a warning
-> in the journal.
-
 ### 1.6 Initialise the chosen primary's PG instance
 
 ```
@@ -438,12 +434,19 @@ by stopping and re-basebackup'ing).
 ```
 on every node:
   # The polkit rule grants the postgres user the systemctl verbs the
-  # agent dispatches over D-Bus (start/stop/reload postgresql + pgpool2).
-  # The .deb does NOT ship this file — it's pure Ansible. See SPEC §10.5
-  # for the canonical content; the matching grant on pg_agentd's targets
-  # is what lets the agent's RemoteStart / Stop / Reload RPCs succeed
-  # without a setuid shim. validate-env (below) refuses to pass if the
-  # file is missing.
+  # agent dispatches over D-Bus (start/stop/reload postgresql + pgpool).
+  # The package does NOT ship this file — it's pure Ansible. See SPEC
+  # §10.5 for the canonical content; the matching grant on pg_agentd's
+  # targets is what lets the agent's Start / Stop RPCs succeed without a
+  # setuid shim.
+  #
+  # NOTE: validate-env does NOT check this file. A missing or
+  # non-matching rule surfaces as peer operations failing with
+  # `org.freedesktop.DBus.Error.InteractiveAuthorizationRequired`
+  # during `cluster init` — polkit's fallback is to ask a human, which
+  # no daemon can answer. Match the unit patterns, not literal names:
+  # a rule pinned to one PostgreSQL version silently covers no other
+  # (finding 27).
   copy /etc/polkit-1/rules.d/50-pg-agent.rules   # mode 0644 root:root
 
   # Optional belt-and-braces — the unit also runs this as
@@ -458,11 +461,15 @@ on every node:
 
 `pg_agentd validate-env` is the `nginx -t` equivalent: load + validate
 the same config the daemon would load, then walk SPEC §14's localhost
-checklist (TLS material readability, `pgpool_node_id` consistency,
-`.pcppass` perms, PostgreSQL running, `pg_hba.conf` has the repl
-entries we expect, `pgpool_recovery` extension installed, recovery
-tool binaries present). Exit 0 iff every row is `OK` or `WARN` — Ansible
-parses `--json` and fails the play on `has_errors`.
+checklist. Exit 0 iff every row is `OK` or `WARN` — Ansible parses
+`--json` and fails the play on `has_errors`.
+
+**What it does not cover** is worth knowing before you lean on it. There
+is no check for the polkit rule, `pcp.conf`, `pool_passwd`, or
+`pg_hba.conf`; those four fail later and less informatively (a
+basebackup that cannot authenticate, a pcp call that hangs, a peer stop
+that returns `InteractiveAuthorizationRequired`). Ansible asserting them
+directly is the practical answer today.
 
 Each node's validate-env passes on its own merits: there's no cross-node
 dependency at this stage. Cluster-wide mesh validation happens after
@@ -501,18 +508,19 @@ This is the last gate before ClusterInit.
 
 ## Phase 2 — `pg_agentctl cluster init`
 
-Operator runs this **once**, from any node (or a workstation):
+Operator runs this **once, on the chosen primary**:
 
 ```
-pg_agentctl cluster init --primary pg1.example.com
-# or:
-pg_agentctl cluster init --primary pg1.example.com --only-node-id 2
+pg_agentctl cluster init
+# or, to bring up one standby only:
+pg_agentctl cluster init --only-node 2
 ```
 
-`pg_agentctl` dials the Unix socket of the local pg_agentd, which
-forwards to the primary's `LocalServer::ClusterInit`. (If you're
-running it from a workstation, you SSH to the primary and dial the
-socket there — `pg_agentctl` doesn't speak gRPC over the network.)
+There is no `--primary` flag: `pg_agentctl` dials the local pg_agentd's
+Unix socket and does not speak gRPC over the network, so the node you run
+it on *is* the primary it initialises from. Running it on a standby is
+refused (the handler checks `pg_is_in_recovery()`). From a workstation,
+SSH to the primary first.
 
 The primary's `ClusterInit` handler does **only this**:
 
@@ -524,7 +532,7 @@ The primary's `ClusterInit` handler does **only this**:
    CREATE ROLE repl WITH LOGIN REPLICATION
    42710 (already exists) → ok
 
-3. For each non-local pool entry (or the one in --only-node-id):
+3. For each non-local pool entry (or the one in --only-node):
    a. db.create_slot(node.slot_name())          # "node1", "node2", ...
    b. peer.stop()                               # defensive — basebackup
                                                 # needs empty pgdata
@@ -598,11 +606,16 @@ for node in pg1 pg2 pg3; do
 done
 ```
 
-`cluster status` should show one primary + (N-1) standbys, every
-row `reachable`, standbys with `streaming` and finite lag. `/healthz`
-on every node should report `is_postgres_running=true`,
-`is_pgpool_running=true`, and on standbys
-`is_in_recovery=true, replication_state=streaming`.
+`cluster status` should show one primary + (N-1) standbys, every row
+`reachable`, standbys with `streaming` and finite lag.
+
+`/healthz` should return **200** on every node, with a body reporting
+`"ready": true`, `postgres.reachable: true`, every `pgpool.backends[]`
+entry `"status": "up"`, and on standbys `postgres.in_recovery: true` with
+`replication.wal_receiver_state: "streaming"`. On the primary,
+`sync_commit` should read `"armed"` once the first standby has attached —
+`"blocked"` there means commits are hanging for want of a standby and is
+a page, not a bootstrap state.
 
 ### 3.3 Create app database + users via Ansible
 
@@ -622,14 +635,17 @@ postgres_users:
 
 Ansible's `postgres` role does three things in one pass:
 1. `CREATE DATABASE` + `CREATE ROLE … LOGIN PASSWORD` on the cluster
-2. Writes the md5 of the password into
-   `/etc/pgpool2/pool_passwd` on every pgpool host
+2. Writes the **AES** entry (`pg_enc -k ~postgres/.pgpoolkey`) into
+   `/etc/pgpool2/pool_passwd` on every pgpool host — not md5, for the
+   reason in Phase 1.4
 3. Reloads `pgpool2.service` (or restarts if `pool_passwd` semantics
    require it on that pgpool version)
 
-Don't `CREATE ROLE` from `psql` by hand — `pool_passwd` ends up
-stale on the pgpool side and connections refuse for a reason that's
-non-obvious from PG's perspective. See [resolved decisions](#resolved-design-decisions) above.
+Don't `CREATE ROLE` from `psql` by hand. The password also has to land in
+`pool_passwd` on every pgpool host, so the psql path leaves `pool_passwd`
+stale and connections then refuse for a reason that is non-obvious from
+PostgreSQL's side — and reproducing the cluster from inventory should
+always recover the same state.
 
 ### 3.4 Point applications at HAProxy
 
@@ -659,7 +675,8 @@ backend pg_pool
   server db2 db2.example.com:9999 check port 9702
 ```
 
-Two load-bearing constraints (SPEC §13.1):
+Two load-bearing constraints, both verified against pgpool 4.6 — HAProxy
+must stay a pure L4 forwarder:
 
 1. **No PROXY protocol** on the backend (`send-proxy`, `send-proxy-v2`).
    Pgpool doesn't parse PROXY headers; bytes get treated as garbage
@@ -689,7 +706,8 @@ Two load-bearing constraints (SPEC §13.1):
 
 **Three CAs, in principle, all separate:**
 - `/etc/pg_agent/tls/ca.crt` — the agent peer mesh
-- `/etc/pg_agent/tls/replication/ca.crt` — PG replication
+- `~postgres/.postgresql/root.crt` — PG replication (libpq's default
+  location; pg-agent never names this path, see Phase 1.2)
 - (HAProxy's CA if it does TLS, but that's the app layer)
 
 Most deployments use the **same** CA for the first two — simpler key
@@ -771,15 +789,18 @@ Re-run the same command. Idempotent steps:
 
 - `create_replication_role` already done → 42710 → ok.
 - `create_slot` for a node whose slot already exists → 42710 → ok.
-- `peer.stop()` on an already-stopped node → no-op.
-- `peer.basebackup()` on a half-populated `$PGDATA` → **REFUSES** (pg_basebackup
-  declines a non-empty target).
-- Workaround: SSH to the bad standby, `rm -rf /var/lib/postgresql/17/main/*`,
-  then re-run `cluster init --only-node-id <that-one>`.
+- `peer.stop()` on an already-stopped node → no-op. (systemd's `StopUnit`
+  accepts an already-inactive unit and reports `done`. The unit must
+  EXIST, though: on a host where `pg_createcluster` never ran, `StopUnit`
+  returns "Unit not loaded" and you get a clear startup error.)
+- `peer.basebackup()` on a half-populated `$PGDATA` → **REFUSES**
+  (pg_basebackup declines a non-empty target).
+- Workaround: on the bad standby, stop PostgreSQL and clear its `$PGDATA`
+  contents, then re-run `cluster init --only-node <that-one>`.
 
-A future v1.x improvement: `cluster init --force` that wipes the
-standby's pgdata via `peer.stop() + clear` before basebackup. Today
-it's manual.
+Once the cluster is up, `pg_agentctl cluster recover --target <id>
+--stop-target-pg` is the supported reclone and does the stop-and-wipe for
+you. `cluster init` is only for nodes that have never joined.
 
 ### "Need to add a new standby to an existing cluster"
 
@@ -787,9 +808,11 @@ it's manual.
 1. Ansible: provision the new node (configs, certs, packages).
 2. Update [[pool]] in config.toml on EVERY node to include the new entry.
 3. Restart pg_agentd on every node so the new pool config takes effect.
-4. Run: pg_agentctl cluster init --primary <primary> --only-node-id <new-id>
+4. On the primary: pg_agentctl cluster init --only-node <new-id>
 5. pg_agentctl gen-pgpool --write && systemctl reload pgpool2
    (regenerate pgpool.conf with the new backend block)
+6. Attach the new backend on EVERY pgpool instance (pcp_attach_node).
+   Backend maps do not propagate with the watchdog off.
 ```
 
 `cluster init` and `recovery_1st_stage` cover overlapping ground.
@@ -806,85 +829,3 @@ to `pg_agentd` (which the cert reloader picks up) and to `postgres`
 
 If you ever switch to password auth (not recommended), the password
 lives in `~postgres/.pgpass` and is Ansible's responsibility.
-
----
-
-## Resolved design decisions
-
-### `peer.stop()` on a never-started standby — works as a no-op
-
-systemd's `StopUnit` D-Bus call accepts an already-inactive unit: the
-job is submitted, processed as a no-op, and `JobRemoved` fires with
-`result = "done"`. Our `DbusSystemd::stop_postgres` is wired exactly
-for that — `job_result_ok("done") → true → Ok(())`. No code change.
-
-Precondition: the unit must EXIST. The Debian `postgresql-17`
-package's `pg_createcluster 17 main` step creates the templated unit
-instance, so on a standard install the unit is present even before
-its first start. If the cluster was never created (e.g., manual
-install without `pg_createcluster`), `StopUnit` returns "Unit not
-loaded" — surfaced as a clear startup error.
-
-### `pg_basebackup` against a misconfigured `pg_hba.conf` — validate-env catches it
-
-SPEC §14 already lists `pg_hba.conf` checks under "TLS / pg_hba":
-
-> verify `pg_hba.conf` has `hostssl replication <repl_user> … cert
-> clientcert=verify-full` (or equivalent).
-
-`pg_agentd validate-env` (Phase 1.7) runs this check, plus the systemd
-unit's `ExecStartPre=` re-runs it on every start — an `ERR` from
-either path stops the deploy before basebackup gets a chance to fail
-less informatively.
-
-### App user creation — Ansible owns it, not psql
-
-Don't recommend the operator do `CREATE ROLE app_user PASSWORD ...`
-in psql by hand. Two reasons:
-
-1. The password also has to land in `/etc/pgpool2/pool_passwd` as
-   md5, and on every pgpool host. The psql path leaves `pool_passwd`
-   stale.
-2. Operators forget what they typed. Reproducing the cluster from
-   the Ansible inventory should always recover the same state.
-
-**Pattern:** declare app users in the Ansible inventory (or a
-secrets vault). Ansible's postgres role does both `CREATE ROLE` AND
-writes the md5 hash to `pool_passwd` AND reloads pgpool. The
-operator's only manual step is the inventory edit + Ansible run.
-
-Phase 3.3 above is shorthand for "re-run the Ansible playbook with
-the new app user in the inventory." Updated to say so.
-
-### `pcp_attach_node` in ClusterInit — deliberately omitted
-
-ClusterInit runs BEFORE pgpool starts (Phase 2 of this doc). There's
-no PCP endpoint to attach to. Matches SPEC §5.7 + §17 invariant #6
-(`pcp_attach_node` is `FollowPrimary`-only).
-
-**Adding a standby to a running cluster** is a separate use case
-covered by `pg_agentctl cluster init --only-node-id <id>` followed
-by a manual `pcp_attach_node` (or a future `pg_agentctl cluster
-attach <id>` wrapper — see [ROADMAP.md](ROADMAP.md) v1.x "Cluster
-control plane").
-
-### Slot cleanup on ClusterInit failure — drop, for consistency
-
-Earlier ambiguity: ClusterInit was operator-driven, so leaving
-slots around for forensic value might be OK. Resolved as: drop the
-slot on mid-flow failure, same pattern as `FollowPrimary` and
-`RecoveryFirstStage`. Three reasons:
-
-1. **WAL pinning.** A standby that never came up still ties up the
-   primary's WAL via the slot. The operator might not notice for
-   hours; meanwhile the primary's pg_wal grows unbounded.
-2. **Consistency.** All three slot-creating flows now follow the
-   same shape: drop on mid-flow failure, queue a `DropSlotCleanup`
-   maintenance intent if the drop itself fails. No special case.
-3. **Re-run idempotency.** `db.create_slot` is 42710-idempotent, so
-   re-running cluster init after a failure creates a fresh slot
-   regardless of whether the old one survived. Dropping costs
-   nothing; pinning WAL costs the operator real space.
-
-SPEC §5.7 to be updated to spell out the cleanup pattern when
-ClusterInit lands.

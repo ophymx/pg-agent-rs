@@ -1,14 +1,15 @@
 # pg-agent-rs — SPEC
 
-A Rust port of [`pg_agent`](../pg_agent), the daemon that replaces pgpool-II's
-shell-script hooks (`failover.sh`, `follow_primary.sh`, `recovery_1st_stage`,
-`pgpool_remote_start`, `escalation.sh`) and the SSH-based remote execution
-they depend on.
+The daemon that replaces pgpool-II's shell-script hooks (`failover.sh`,
+`follow_primary.sh`, `recovery_1st_stage`, `pgpool_remote_start`,
+`escalation.sh`) and the SSH-based remote execution they depend on — and
+that owns the promotion decision pgpool cannot safely make.
 
-This spec is distilled from the Go implementation. It does not document Go
-internals — it describes **what the Rust implementation must do**, what
-choices are fixed by the on-the-wire / on-disk contract, and what choices the
-Rust port is free to make differently.
+This describes what the system does and which choices are load-bearing.
+Where a contract lives in a file that is itself authoritative — `proto/`
+for the wire, `--help` for the CLI surface, the `DEFAULT_*` consts for
+configuration defaults — this document says what the contract *means*
+rather than restating it.
 
 ---
 
@@ -19,9 +20,9 @@ node (which also runs pgpool-II and HAProxy):
 
 | Binary        | Role | Loads config? | Talks to peers? |
 |---------------|------|---------------|-----------------|
-| `pg_agentd`   | Daemon (`pg_agentd serve`, the default). Owns local PostgreSQL operations + cluster coordination. Serves a Unix-socket RPC for local callers and an mTLS TCP RPC for peer agents. Plus a plain-HTTP `/healthz` listener (see §9.2 for why no TLS). Also `pg_agentd validate-env` (see §14). | yes | yes |
+| `pg_agentd`   | Daemon (`pg_agentd serve`, the default). Owns local PostgreSQL operations + cluster coordination. Serves a Unix-socket RPC for local callers, an mTLS TCP RPC for peer agents and the consensus plane, and a plain-HTTP `/healthz` listener (see §9.2 for why no TLS). Also `pg_agentd validate-env` (see §14). | yes | yes |
 | `pg_agentc`   | One-shot hook client. Marshals pgpool's positional argv into a single gRPC call on the local Unix socket, then exits. Also `pg_agentc status`. **No config. No node resolution. No PostgreSQL logic.** | no | no |
-| `pg_agentctl` | Operator CLI. `print-hooks`, `check-hooks`, `gen-pgpool`, `maintenance {list,show,retry}`, `cluster {init,status}`. May dial peer agents. | yes | yes |
+| `pg_agentctl` | Operator CLI (§13). May dial peer agents, but only ever through the local daemon. | yes | yes |
 
 The hook client must stay tiny — if it can reach the socket, it works. Every
 new piece of operator functionality goes in `pg_agentctl`, not `pg_agentc`.
@@ -30,22 +31,28 @@ The shared positional-argument schemas (one per pgpool/PostgreSQL hook) live
 in a single crate so the dispatcher (`pg_agentc`) and the validator/printer
 (`pg_agentctl`) cannot drift.
 
-### 1.1 Cluster layout (unchanged from Go)
+### 1.1 Cluster layout
 
 ```
 clients → HAProxy (TCP LB, 5432) → Pgpool-II (9999) → PostgreSQL backends
-                                          ↑
-                            watchdog (leader election, no VIP)
+                                                              ↕
+                                         agent mesh: peer RPC + Raft (9701)
 ```
 
-| Node    | Pgpool | PCP  | WD   | Heartbeat  | Agent gRPC | Agent /healthz |
-|---------|--------|------|------|------------|------------|----------------|
-| serverN | 9999   | 9898 | 9000 | 9694/udp   | 9701 mTLS  | 9702 HTTP      |
+| Node    | Pgpool | PCP  | Agent gRPC + Raft | Agent /healthz |
+|---------|--------|------|-------------------|----------------|
+| serverN | 9999   | 9898 | 9701 mTLS         | 9702 HTTP      |
 
-VIP management is intentionally absent — HAProxy replaces it. The
-`Escalation`/`DeEscalation` watchdog hooks are no-ops in this deployment. The
-`RemoveVip` peer RPC is reserved in the proto for forward compatibility but
-returns `Unimplemented`.
+The agents *are* the quorum — there is no separate consensus box and no
+external DCS (docs/promotion-authority.md §5).
+
+pgpool's watchdog is **off** (§5.15): it was running quorum-only with no
+VIP, and what it provided — single execution of the hooks, a quorum gate
+on failover, and backend-status sync between instances — is either
+subsumed by the lease or paid for explicitly (the attach fan-out).
+
+VIP management is intentionally absent; HAProxy replaces it. The
+`Escalation`/`DeEscalation` hooks are therefore no-ops that never fire.
 
 **Co-location assumption:** pgpool-II runs on every PostgreSQL backend. The
 agent reaches its local pgpool via PCP on `localhost` and manages
@@ -62,236 +69,119 @@ service, which runs the operation locally on the peer. There is no
 
 ---
 
-## 2. Recommended Rust crates
+## 2. Where each contract actually lives
 
-The Rust port is greenfield; the proto + on-disk contracts are fixed, the
-implementation language is not. Default choices:
+This document drifted once by restating things that live elsewhere, so:
+when the two disagree, the artifact wins, and the fix is to delete the
+restatement rather than sync it.
 
-| Concern                          | Crate                                              | Notes |
-|----------------------------------|----------------------------------------------------|-------|
-| async runtime                    | `tokio` (full)                                     | multi-threaded scheduler |
-| gRPC server + client             | `tonic` + `tonic-build`, `prost`                   | matches the Go grpc surface; supports server-streaming for `Basebackup`/`Rewind`/`FetchWal` |
-| protovalidate (field constraints) | `protovalidate` (Rust port) or hand-rolled        | only one rule in use today — see §3.3. A hand-rolled regex check is acceptable if `protovalidate` lags. |
-| TLS                              | `rustls` + `tokio-rustls`                          | peer mTLS only — `/healthz` is plain HTTP (see §9.2) |
-| TOML config                      | `toml` + `serde`                                   | matches BurntSushi/toml semantics |
-| CLI                              | `clap` (derive)                                    | one binary per crate inside the workspace |
-| Logging                          | `tracing` + `tracing-subscriber` (JSON or fmt)     | replace Go's `log/slog` |
-| PostgreSQL client (local DB)     | `tokio-postgres` + `deadpool-postgres`             | direct port of pgx — keep the pool single-host (Unix socket) |
-| systemd D-Bus                    | `zbus` (async)                                     | replace `coreos/go-systemd/v22/dbus`; talk to `org.freedesktop.systemd1` |
-| sd_notify                        | `sd-notify` crate, or the documented `NOTIFY_SOCKET` envelope written directly | for `READY=1` / `STOPPING=1` |
-| Atomic snapshot pointers         | `arc-swap` (`ArcSwap<T>`, `ArcSwapOption<T>`)      | for `CertReloader` bundle and `HealthSnapshotter` snapshot |
-| HTTP server for /healthz         | `axum`                                             | request path does no async I/O; one route |
-| Concurrent peer map              | `tokio::sync::Mutex<HashMap<…>>` or `dashmap`      | small N (3 peers); a `parking_lot::Mutex` is fine |
-| Signal handling                  | `tokio::signal::unix` (`SIGINT`, `SIGTERM`, `SIGHUP`) | drives shutdown + cert reload |
-| Subprocess                       | `tokio::process::Command`                          | drives `pg_basebackup`, `pg_rewind`, `pcp_attach_node`, `pcp_node_info -a` |
-| Error model                      | `thiserror` for typed errors, `anyhow` only at binary entrypoints | mirror the named errors used in the Go agent (`ErrInsecureRemotePeer`, `ErrReplicationTLSPartial`, etc.) |
+| Contract | Authority | What this doc adds |
+|---|---|---|
+| Wire format | `proto/*.proto` | why each service exists, and what must not cross between them (§3) |
+| CLI surface | `--help` | what each command is for, and which ones are destructive (§13, §15) |
+| Config defaults | the `DEFAULT_*` consts and `config.toml.sample` | which fields are load-bearing, and why (§8) |
+| Hook argv layout | `pg-agent-hookspec` | the token semantics pgpool documents badly (§6) |
+| Promotion, quorum commit | `docs/` | the behavioral contract only (§5.15) |
+| Failure discoveries | `testing/FINDINGS.md` | cited by number wherever a rule exists because of one |
 
-### 2.1 Suggested workspace layout
-
-```
-pg-agent-rs/
-├── Cargo.toml                  # workspace
-├── crates/
-│   ├── pg-agent-proto/         # .proto + tonic-build output (re-exports)
-│   ├── pg-agent-hookspec/      # positional-arg schemas (no proto dep)
-│   ├── pgman/                  # single-instance PostgreSQL management:
-│   │                           # localdb, pgstandby, walstore, process
-│   │                           # (agent-agnostic; see its crate docs)
-│   ├── pg-agent-core/          # Agent, config, peers, systemd, consensus,
-│   │                           # HA loop, maintenance, healthz, certreload,
-│   │                           # preflight (no transport)
-│   ├── pg-agentd/              # daemon binary
-│   ├── pg-agentc/              # hook-client binary
-│   └── pg-agentctl/            # operator CLI binary
-└── proto/                      # .proto files copied/maintained verbatim
-```
-
-`pg-agent-core` should expose traits for every external collaborator (see
-§4) so unit tests can swap in in-process fakes and multi-node functional
-tests can swap in cross-process HTTP-observable fakes (mirroring the Go
-`agent/fakes` vs `agent/funcfakes` split).
+Section numbers are referenced from code comments, so they stay stable
+when a section is removed.
 
 ---
 
 ## 3. Protocol surface
 
-Two gRPC services. Both are versioned by the `.proto` file. Wire
-compatibility is required **across Rust deployments** (so rolling upgrades
-work between any two pg-agent-rs versions) but not back to the original Go
-agent — pg-agent-rs is a successor, not a peer; mixed Go/Rust clusters are
-not a supported topology.
+Three gRPC services, defined in `proto/`. **The `.proto` files are the
+contract** — message fields, comments and all. This section says what
+each service is *for* and which properties must not drift; it does not
+restate the schema.
 
-Common messages (`common.proto`):
-
-```proto
-message OpResult {
-  bool   ok      = 1;
-  string message = 2;
-}
-
-message OpProgress {
-  int64  bytes_done  = 1;
-  int64  bytes_total = 2;  // 0 = unknown
-  string phase       = 3;  // "streaming" | "rewinding" | "done" | …
-  string message     = 4;
-}
-
-message NodeStatus {
-  bool   is_running              = 1;
-  bool   is_in_recovery          = 2;  // true = standby
-  bool   is_ready                = 3;  // accepting conns AND every probe succeeded
-  int64  replication_lag_bytes   = 4;  // 0 if primary/unknown
-  string replication_state       = 5;  // "streaming" | "catchup" | "" (primary)
-  bool   is_postgres_running     = 6;
-  bool   is_pgpool_running       = 7;
-  bool   is_postgres_status_ok   = 8;  // false = systemd unreachable; _running is unknown
-  bool   is_pgpool_status_ok     = 9;
-}
-
-message GetStatusRequest {}
-message NodeConfigRequest {}
-message NodeConfigResponse {
-  int32  pg_port     = 1;
-  string pg_data_dir = 2;
-}
-```
+Wire compatibility is required across pg-agent-rs versions so a rolling
+agent upgrade works (the acceptance suite measures the restart window
+against `leader_ttl` on every run).
 
 ### 3.1 `PgAgentLocal` — Unix socket, no auth
 
-Filesystem permissions on the socket are the access control. The socket is
-`0600 postgres:postgres` under the systemd-managed `RuntimeDirectory=pg_agentd`.
+`proto/pgagent_local.proto`. Filesystem permissions on the socket are the
+access control: `0600 postgres:postgres` under the systemd-managed
+`RuntimeDirectory=pg_agentd`. Every legitimate caller already runs as
+`postgres`.
 
-```proto
-service PgAgentLocal {
-  rpc Failover         (FailoverRequest)      returns (OpResult);
-  rpc FollowPrimary    (FollowPrimaryRequest) returns (OpResult);
-  rpc RecoveryFirstStage (RecoveryRequest)    returns (OpResult);
-  rpc RemoteStart      (RemoteStartRequest)   returns (OpResult);
-  rpc Escalation       (EscalationRequest)    returns (OpResult);   // no-op
-  rpc RestoreWal       (RestoreWalRequest)    returns (OpResult);
+Three families of caller:
 
-  rpc GetStatus        (GetStatusRequest)     returns (NodeStatus);
-  rpc GetNodeConfig    (NodeConfigRequest)    returns (NodeConfigResponse);
-
-  rpc ClusterInit      (ClusterInitRequest)      returns (ClusterInitResponse);
-
-  rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);
-  rpc GetMaintenance   (GetMaintenanceRequest)   returns (MaintenanceIntent);
-  rpc RetryMaintenance (RetryMaintenanceRequest) returns (OpResult);
-}
-
-message NodeRef {
-  int32  id       = 1;   // pgpool node ID, -1 == unset
-  string hostname = 2;
-  int32  pg_port  = 3;   // informational; agent uses config-sourced value
-  string pg_data  = 4;   // informational; same
-}
-
-// Hook arg layout — see §6 for token mapping.
-message FailoverRequest {
-  NodeRef detached    = 1;
-  NodeRef new_main    = 2;
-  NodeRef old_primary = 3;
-  NodeRef old_main    = 4;
-}
-message FollowPrimaryRequest {
-  NodeRef detached    = 1;
-  NodeRef new_primary = 2;
-  NodeRef old_main    = 3;
-  NodeRef old_primary = 4;
-}
-message RecoveryRequest    { NodeRef standby = 1; NodeRef primary = 2; }
-message RemoteStartRequest { NodeRef target = 1; }
-message EscalationRequest  {}
-
-message RestoreWalRequest {
-  // ^([0-9A-F]{24}|[0-9A-F]{8}\.history)$
-  string wal_file  = 1;
-  string dest_path = 2;  // absolute, must resolve inside PGDATA
-}
-
-// Maintenance — durable retry queue for failed peer DropSlot calls.
-message MaintenanceIntent {
-  string id            = 1;
-  string op            = 2;
-  string status        = 3;  // "pending" | "done" | "abandoned"
-  bytes  payload       = 4;
-  int32  attempts      = 5;
-  string last_error    = 6;
-  string created_at    = 7;  // RFC3339Nano UTC
-  string updated_at    = 8;
-  string next_retry_at = 9;  // RFC3339Nano UTC, empty when unset
-}
-message ListMaintenanceRequest    { repeated string statuses = 1; }
-message ListMaintenanceResponse   {
-  repeated MaintenanceIntent       intents = 1;
-  repeated SkippedMaintenanceIntent skipped = 2;
-}
-message SkippedMaintenanceIntent  { string path = 1; string error = 2; }
-message GetMaintenanceRequest     { string id = 1; }
-message RetryMaintenanceRequest   { string id = 1; }
-
-// One-time bootstrap.
-message ClusterInitRequest         { optional int32 only_node_id = 1; }
-message ClusterInitStandbyResult   { int32 node_id = 1; string hostname = 2; bool ok = 3; string message = 4; }
-message ClusterInitResponse        { bool ok = 1; string message = 2; string repl_user = 3; repeated ClusterInitStandbyResult standbys = 4; }
-```
+- **pgpool/PostgreSQL hooks**, via `pg_agentc`: `Failover`,
+  `FollowPrimary`, `RecoveryFirstStage`, `RemoteStart`, `Escalation`,
+  `RestoreWal`. Workflows in §5.
+- **Operator commands**, via `pg_agentctl`: `ClusterInit`,
+  `ClusterStatus`, `ClusterRecover`, `ClusterHandoff`,
+  `GetPgpoolBackends`, the `*Maintenance` trio, the `*InflightOp` quartet,
+  `AllowAsync`, `SetPause`. Surface in §13.
+- **Status**: `GetStatus`, `GetNodeConfig`, delegated to `NodeInfo` (§4).
 
 ### 3.2 `PgAgentPeer` — mTLS TCP, port 9701
 
-Clients are other agents. Mutual TLS, cert from `[tls]`, SAN must be in the
-pool allowlist (see §7).
+`proto/pgagent_peer.proto`. Clients are other agents. Mutual TLS, cert
+from `[tls]`, SAN must be in the pool allowlist (§7).
 
-```proto
-service PgAgentPeer {
-  rpc Start            (StartRequest)            returns (OpResult);
-  rpc Stop             (StopRequest)             returns (OpResult);
-  rpc Reload           (ReloadRequest)           returns (OpResult);
-  rpc ReloadPgpool     (ReloadPgpoolRequest)     returns (OpResult);
-  rpc Promote          (PromoteRequest)          returns (OpResult);
-  rpc CreateSlot       (CreateSlotRequest)       returns (OpResult);
-  rpc DropSlot         (DropSlotRequest)         returns (OpResult);
-  rpc ConfigureStandby (ConfigureStandbyRequest) returns (OpResult);
-  rpc Basebackup       (BasebackupRequest)       returns (stream OpProgress);
-  rpc Rewind           (RewindRequest)           returns (stream OpProgress);
-  rpc FetchWal         (FetchWalRequest)         returns (stream WalChunk);
-  rpc RemoveVip        (RemoveVipRequest)        returns (OpResult);   // codes::Unimplemented
-  rpc GetStatus        (GetStatusRequest)        returns (NodeStatus);
-  rpc GetNodeConfig    (NodeConfigRequest)       returns (NodeConfigResponse);
-}
+**This service carries work, never authority.** `Start`, `Stop`,
+`StartPgpool`, `AttachNode`, `Promote`, `CreateSlot`, `DropSlot`,
+`ConfigureStandby`, `Basebackup`, `Rewind`, `FetchWal`, plus the two
+status RPCs. Each does one thing locally on the receiver at the
+requester's instruction. Handler behaviour in §5.8.
 
-message CreateSlotRequest        { string slot_name = 1; }       // min_len 1
-message DropSlotRequest          { string slot_name = 1; }       // min_len 1
-message ConfigureStandbyRequest  { string primary_host = 1; int32 primary_port = 2; string repl_user = 3; string slot_name = 4; }
-message BasebackupRequest        { string primary_host = 1; int32 primary_port = 2; string repl_user = 3; string slot_name = 4; }
-message RewindRequest            { string primary_host = 1; int32 primary_port = 2; string repl_user = 3; }
-message FetchWalRequest          { string wal_file = 1; }        // ^([0-9A-F]{24}|[0-9A-F]{8}\.history)$
-message WalChunk                 { bytes data = 1; }             // chunk size: 1 MiB
-message RemoveVipRequest         { string address = 1; string device = 2; }
-```
+The distinction is load-bearing: the original defect was that a work RPC
+(`Failover`) *was* the role decision. Role assignment lives in §3.3 and
+nowhere else.
 
-### 3.3 Validation
+### 3.3 `PgAgentRaft` — mTLS TCP, port 9701, separate connection
 
-The Go code installs a `protovalidate` interceptor on both servers (unary +
-stream first-message). The only constraints actually used are:
+`proto/pgagent_raft.proto`. The consensus plane: openraft's
+`AppendEntries` / `Vote` / `InstallSnapshot`, plus `Propose` and
+`ReadState` for forwarding a lease write or a linearizable read to
+whichever node currently leads Raft.
 
-- `string.min_len = 1` on slot names, hostnames, replication user, intent ids,
-  dest paths.
-- `int32.gt = 0` on PostgreSQL ports.
-- A pattern on `wal_file`: `^([0-9A-F]{24}|[0-9A-F]{8}\.history)$`.
+Three properties that must hold (docs/promotion-authority.md §5):
 
-If a Rust protovalidate crate is awkward, validate by hand in the handlers
-and return `tonic::Status::invalid_argument(...)`. The constraints must be
-checked **before** any handler logic runs.
+- **Same listener, same certs, same SAN allowlist** as `PgAgentPeer`, so
+  the mTLS gate guarding the peer plane's mutating RPCs guards promotion
+  authority unchanged. An unauthenticated consensus port is an
+  unauthenticated promotion authority; `validate-env` refuses to start
+  without mTLS for this reason.
+- **A separate connection** from the work plane. `AppendEntries`
+  heartbeats are small, frequent and latency-critical; `Basebackup`
+  streams gigabytes. Sharing an HTTP/2 connection lets a saturated
+  basebackup starve heartbeats at the TCP layer and trigger a spurious
+  election during a recovery.
+- **Forwarding is one hop, never two.** The leader-side handlers refuse
+  rather than re-forward; a chain makes latency unbounded in exactly the
+  churny conditions where the `retry_timeout` budget is tightest.
 
-### 3.4 Status codes used
+Frames are opaque serialized openraft types rather than protobuf-mirrored
+fields, so `grpcurl` sees a blob and debugging goes through agent logs
+and openraft metrics. This is a deliberate trade — mirroring would
+re-declare a large slice of openraft's internals every upgrade to buy
+interop that cannot arise, since both ends are the same binary at the
+same version.
+
+### 3.4 Validation
+
+Validated by hand in the handlers, **before any handler logic runs**,
+returning `tonic::Status::invalid_argument(...)`:
+
+- non-empty slot names, hostnames, replication user, intent ids, dest
+  paths;
+- PostgreSQL ports > 0;
+- `wal_file` matching `^([0-9A-F]{24}|[0-9A-F]{8}\.history)$`.
+
+The value-shape regexes every input is matched against are in §5.11.
+
+### 3.5 Status codes used
 
 | gRPC code              | When |
 |------------------------|------|
 | `InvalidArgument`      | validation failure; `dest_path` outside `PGDATA`; `wal_file` rejected by filename whitelist |
 | `FailedPrecondition`   | `Basebackup` called while PostgreSQL is running |
-| `NotFound`             | `FetchWal` for a WAL segment that is absent in the peer's archive; `GetMaintenance` / `RetryMaintenance` for missing id |
-| `Unimplemented`        | `RemoveVip` |
+| `NotFound`             | `FetchWal` for a WAL segment that is absent in the peer's archive; `GetMaintenance` / `RetryMaintenance` / `GetInflightOp` for a missing id |
 | `Internal`             | everything else that fails inside a handler |
 
 Hook RPCs (`PgAgentLocal.Failover`, etc.) usually return `OpResult { ok=false, message=... }` rather than a gRPC error when the failure is operationally normal (`FollowPrimary` skipping a stopped target, `Failover` with no candidates, `RestoreWal` not finding a segment). Reserve gRPC errors for unrecoverable / system-level failures.
@@ -300,64 +190,60 @@ Hook RPCs (`PgAgentLocal.Failover`, etc.) usually return `OpResult { ok=false, m
 
 ## 4. Dependency-injection seams
 
-All external collaborators are pulled out behind traits so unit tests can
-fake them and the daemon can be exercised end-to-end in multi-node
-functional tests without touching real PostgreSQL or systemd. Translate the
-following Go interfaces to Rust traits, every method `async fn` returning
-`Result<…, AgentError>`:
+Every external collaborator sits behind a trait so no handler calls
+PostgreSQL, systemd, PCP, a `pg_*` binary, or a peer unmediated. Unit
+tests swap in-process fakes; the composition root
+(`pg-agentd/src/main.rs`) is the only place concrete types appear.
+
+Method lists below are indicative, not exhaustive — the trait definitions
+are authoritative. What matters here is which collaborator each seam
+owns, because that boundary is a design decision rather than an
+implementation detail.
 
 | Trait              | Real impl                          | Surface |
 |--------------------|------------------------------------|---------|
 | `LocalDb`          | tokio-postgres pool to local Unix socket | `promote()`, `checkpoint()`, `create_slot(name)`, `drop_slot(name)`, `is_in_recovery()`, `replication_lag()` → `ReplicationLag { bytes, state }`, `setting(name)`, `extension_exists(name)`, `role_exists(name)`, `create_replication_role(name)` |
 | `PeerRegistry`     | mTLS gRPC pool (`PeerPool`)        | `client(node) -> PeerClient`, `close()` |
 | `StandbyOps`       | subprocess + filesystem            | `basebackup(opts, progress_cb)`, `rewind(opts, progress_cb)`, `write_recovery_conf(opts)` |
-| `Pcp`              | `pcp_attach_node` / `pcp_node_info` subprocess | `attach_node(id)`, `node_info_all() -> Vec<NodeInfo>`, `node_count() -> int` (legacy / preflight only — `/healthz` uses `node_info_all`) |
-| `Systemd`          | zbus to `systemd1`                 | `start_postgres()`, `stop_postgres()`, `status_postgres()`, `status_pgpool()`, `reload_or_restart_postgres()`, `reload_or_restart_pgpool()` |
+| `Pcp`              | `pcp_attach_node` / `pcp_detach_node` / `pcp_node_info` subprocess | `attach_node(id)`, `detach_node(id)`, `node_info_all() -> Vec<NodeInfo>`, `node_count() -> int` (preflight only — `/healthz` uses `node_info_all`) |
+| `Systemd`          | zbus to `systemd1`                 | start / stop / status / reload-or-restart for the configured PostgreSQL and pgpool units, each waiting on `JobRemoved` for real job completion rather than trusting the call to return |
 | `ReplayMarkerStore` | JSON files under `<state_dir>/replay/` | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
 | `MaintenanceStore` | one JSON file per intent under `<state_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
 | `InflightOpStore` | one JSON file per op under `<state_dir>/inflight_ops/` | `begin(payload, phase, exclusive)`, `update_phase`, `complete`, `abandon`, `find(op, key)`, `get(id)`, `list(statuses…)`, `sweep(now)`. Also the **slot-ownership authority**: `owner_of_node` / `owner_of_slot` gate every destructive slot path (§5.1 step 3, `PgAgentPeer.DropSlot`, the maintenance worker) |
-| `ConsensusStore`   | in-memory only for now (openraft-backed at the promotion-authority cutover) | `read_state() -> ClusterState` (linearizable; `Err` = unknown, never vacant), `try_takeover(candidate, expected)` (lease CAS, terms are fencing tokens), `release(holder, term)`, `set_paused(…)`, `set_switchover(…)` — see docs/promotion-authority.md §5 |
+| `ConsensusStore`   | `RaftConsensusStore` over the openraft handle; `InMemoryConsensusStore` with fault injection for tests | `read_state() -> ClusterState` (linearizable; **`Err` = unknown, never vacant**), `try_takeover(candidate, expected)` (lease CAS, terms are fencing tokens), `release(holder, term)`, `set_paused(…)`, `set_switchover(…)` — see docs/promotion-authority.md §5 |
 
 A `NodeInfo` trait (`get_status`, `get_node_config`) is satisfied by
 `Agent` itself; `LocalServer` and `PeerServer` both delegate `GetStatus` /
 `GetNodeConfig` to it so there is one canonical implementation.
 
-### 4.1 LocalDb queries (verbatim)
+The `ConsensusStore` seam earns its keep twice: it let the HA loop be
+written and fault-tested against a deterministic in-memory store before
+openraft existed in the tree, and it keeps partition cases as ordinary
+unit tests rather than a lab exercise.
 
-```sql
--- promote
-SELECT pg_promote();
+### 4.1 The local database connection
 
--- checkpoint
-CHECKPOINT;
-
--- create slot (treat SQLSTATE 42710 as success → idempotent)
-SELECT pg_create_physical_replication_slot($1);
-
--- drop slot
-SELECT pg_drop_replication_slot($1);
-
--- recovery / lag
-SELECT pg_is_in_recovery();
-SELECT coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(),
-                                pg_last_wal_replay_lsn()), 0);
-SELECT coalesce(status, '') FROM pg_stat_wal_receiver LIMIT 1;  -- empty when no receiver
-
--- preflight helpers
-SELECT current_setting($1, true);
-SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname=$1);
-SELECT EXISTS (SELECT 1 FROM pg_roles  WHERE rolname=$1);
-
--- replication role (treat 42710 as success)
-CREATE ROLE "<name>" WITH LOGIN REPLICATION;  -- name validated against the same regex used for repl_user
-```
-
-The local pool connects as `postgres` via Unix socket (peer auth):
+The local pool connects as `postgres` over the Unix socket (peer auth):
 
 ```
 host=<socket_dir> port=<pg_port> user=postgres dbname=postgres
 ```
+
+Two conventions hold across every `LocalDb` method, and callers depend on
+both:
+
+- **SQLSTATE 42710 (`duplicate_object`) is success.** `create_slot` and
+  `create_replication_role` are idempotent so a re-run of any
+  orchestration is safe. (The cost of that choice is in TODO.md: a
+  pre-existing slot keeps its stale `restart_lsn`.)
+- **Identifiers reaching SQL are regex-validated first** (§5.11), never
+  escaped-and-hoped.
+
+The queries themselves live in `pgman::localdb`, with the role-awareness
+that matters — a standby's flush position and timeline come from
+different sources than a primary's, and getting that wrong has twice
+produced a silent selection defect (findings 4 and 24).
 
 ---
 
@@ -430,8 +316,8 @@ The slot name is always `node{id}` (e.g. `node2`).
 
 ### 5.2 `FollowPrimary(detached, new_primary, …)`
 
-> **Not wired into pgpool post-cutover**: `follow_primary_command` is
-> empty in the canonical contract (§5.15 / hook-contract §5.4 — a
+> **Not wired into pgpool**: `follow_primary_command` is
+> empty in the canonical contract (§5.15 / hook-contract §2 — a
 > non-empty value makes pgpool degenerate healthy standbys), and the
 > executor's follow path replaces this flow for lease-driven role
 > changes. The RPC and handler remain for `pcp_promote_node`-style
@@ -446,8 +332,8 @@ When invoked, the behavior is: per-down-non-primary in a forked child
 3. `peers[detached].GetStatus()`. If `!is_running` → return ok with "skipping",
    mark replay done. The node is presumed down for a deliberate reason.
 4. `peers[detached].Stop()`.
-5. Local `Checkpoint` (see notes §2: makes the slot consistent with the WAL
-   stream a basebackup would start from).
+5. Local `Checkpoint` — makes the slot consistent with the WAL stream a
+   basebackup would start from.
 6. Local `CreateSlot(detached.slot_name)` (slot is created on the **new
    primary**, i.e. local node).
 7. Try `peers[detached].Rewind(new_primary)`. Drain progress stream until
@@ -505,25 +391,28 @@ Invoked by `pgpool_recovery` on the primary.
 
 1. `db.is_in_recovery()`. If true → refuse with `ok=false, message="local node is not the primary (in recovery)"`.
 2. Resolve target. `peers[target].Start()`.
-3. Discards pgpool's positional `$2` (the primary's PGDATA) — see notes §11.
+3. Discards pgpool's positional `$2` (the primary's PGDATA): every
+   operational path comes from `config.toml`, never from hook argv
+   (§8.6).
 
 ### 5.5 `Escalation()` / `DeEscalation()`
 
-Both map to the same RPC (`Escalation`). No-op: HAProxy replaces VIP
-management. Returning ok keeps watchdog happy.
+Both map to the same RPC (`Escalation`), which is a no-op — HAProxy
+replaces VIP management.
 
-Retired under the agent-led contract: `use_watchdog = off` means the
-`wd_*` hooks never fire, and `gen-pgpool` does not emit them (the
-legacy hook block that carried them is deleted). The RPC and the
-`pg_agentc` dispatch arm are vestigial — kept only because removing a
-proto RPC is a wire-compat decision (see TODO).
+**Vestigial.** `use_watchdog = off` means the `wd_*` hooks never fire and
+`gen-pgpool` does not emit them, so nothing invokes this path in a
+supported deployment. The RPC, the hookspec constants and the `pg_agentc`
+dispatch arm survive only because removing a proto RPC is a wire-compat
+decision rather than code hygiene (TODO.md).
 
 ### 5.6 `RestoreWal(wal_file, dest_path)`
 
 Invoked by PostgreSQL on a standby via
 `restore_command = 'pg_agentc restore-wal %f %p'`. `dest_path` is
-**authoritative** — it is the local backend telling the agent where to drop
-the segment (see notes §6).
+**authoritative** — unlike every other hook field it comes from the local
+PostgreSQL backend rather than from pgpool, so it is the backend telling
+the agent where to drop the segment (§17 invariant 9).
 
 1. Validate `wal_file` against the regex above.
 2. For each non-local pool entry, in order:
@@ -584,17 +473,15 @@ no password.
 |---------------------|--------|
 | `Start`             | `systemd.StartUnit($pg_service, "replace")` |
 | `Stop`              | `systemd.StopUnit($pg_service, "replace")` |
-| `Reload`            | `systemd.ReloadOrRestartUnit($pg_service, "replace")` |
-| `ReloadPgpool`      | `systemd.ReloadOrRestartUnit($pgpool_service, "replace")` |
+| `StartPgpool`       | `systemd.StartUnit($pgpool_service, "replace")`. Idempotent. Used by `cluster recover` to bring pgpool back on a freshly re-cloned target — and only *after* the target's PostgreSQL start succeeded, because a pgpool with a dead local backend health-checks it down and fires `failover_command` at the node just rebuilt. |
 | `Promote`           | `SELECT pg_promote()` |
 | `CreateSlot`        | `pg_create_physical_replication_slot(name)`, SQLSTATE 42710 ok |
 | `AttachNode`        | Attach a backend on the RECEIVER's local pgpool (hook-contract §3: attach is per-instance — `cluster recover` fans this out to every member). Finding-16 semantics server-side: attach only a backend this map holds down; when the request's `primary_node_id` backend is down here too, attach it first (a standby attach into a primary-less map blocks in `find_primary_node_repeatedly`). pcp failure → `ok=false`, not a gRPC error — the caller's fan-out is best-effort per instance. |
 | `DropSlot`          | **Ownership guard first:** if `inflight_ops::owner_of_slot_observing` reports an op owns this slot (`InProgress`, or `Done`, undischarged, within the `CROSS_OP_GRACE` backstop — an active slot discharges the op instead, §5.1 step 4), return `ok=true` with a "retained" message and do nothing. `ok=true` rather than an error is deliberate — the caller's cleanup is genuinely obsolete, and an error keeps a maintenance intent retrying against a slot now in legitimate use. Otherwise `pg_drop_replication_slot(name)`. The guard lives here because callers are plural and some are stale (a queued `drop_slot_cleanup` on another node retries with backoff), and only the slot's host knows whether it is spoken for. |
 | `ConfigureStandby`  | validate (`primary_host` regex, port>0, repl_user regex, slot regex). Write `$PGDATA/myrecovery.conf` (template — see §5.10) and create empty `$PGDATA/standby.signal`. Both files mode `0640`. |
 | `Basebackup`        | refuse if PostgreSQL is running (`FailedPrecondition`). Clear `$PGDATA` contents. Exec `<pg_install_prefix>/bin/pg_basebackup --pgdata <data> --dbname '<conninfo>' --wal-method=stream --checkpoint=fast --no-password [--slot <name>] [--progress]`. Scan stderr line-by-line (split on `\r` *or* `\n`), forward `done/total kB` lines as `OpProgress { phase="streaming", bytes_done=done*1024, bytes_total=total*1024 }`, log other lines, capture last ~4 KiB into the error tail if the subprocess exits non-zero. Final `OpProgress { phase="done" }`. |
-| `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pg_install_prefix>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (notes §3). Final `OpProgress { phase="done" }`. |
+| `Rewind`            | clear `$PGDATA/pg_replslot/*` before. Exec `<pg_install_prefix>/bin/pg_rewind --target-pgdata <data> --source-server '<conninfo with dbname=postgres>' --no-password --progress`. Same scanner. After success, clear `$PGDATA/pg_replslot/*` again (§17 invariant 5). Final `OpProgress { phase="done" }`. |
 | `FetchWal`          | validate filename. Open `<archive_dir>/<wal_file>` (after `filepath.Localize`-equivalent rejection of `..`/absolute paths). Stream 1 MiB chunks. `NotFound` if absent. Chunks are read into a `BytesMut` and shipped as `bytes::Bytes` (`WalChunk.data` carries the prost `bytes` override) so neither side copies a chunk out of its transport buffer. The service negotiates **zstd** — a 16 MiB segment compresses well, and one closed early by `archive_timeout` is mostly zero padding; zstd rather than gzip because tonic hardcodes gzip to level 6, slow enough to bottleneck a LAN. Compression is per-service in tonic, so the small peer RPCs ride along. |
-| `RemoveVip`         | always `Unimplemented`. |
 | `GetStatus` / `GetNodeConfig` | delegate to `NodeInfo`. |
 
 ### 5.9 `GetStatus` implementation
@@ -738,7 +625,7 @@ the cleanup goes here.
 
 The design accommodates additional intent types but adding one is a
 **deliberate choice**, not a default. Plausible future candidates
-(`pcp_attach_node` retry, `peer Start` retry, `ReloadPgpool` retry) stay
+(`pcp_attach_node` retry, `peer Start` retry, `StartPgpool` retry) stay
 "bubble up as error" until a real operational need surfaces. Resist the
 temptation to start enqueueing every possible failure mode.
 
@@ -786,26 +673,19 @@ runtime "unsupported op" branch.
 The same worker also calls `replay_marker_store.sweep(now)` on every
 tick — one timer, two janitor jobs.
 
-**Deliberately *not* present** (vs. the Go version): the silent
-migration of `rewind_restore_replslot` / `rewind_delete_quarantine_slots`
-intents. Those op strings were leftovers from a removed feature in the
-Go implementation; there is no installed base for pg-agent-rs, so an
-intent file with an unknown op surfaces as an error rather than being
-quietly retired.
+**An intent file with an unknown op is an error**, never quietly
+retired. There is no installed base to migrate, so a payload the worker
+cannot match is a bug in this build rather than a leftover from an older
+one.
 
 ### 5.14 Best-effort cleanup contexts
 
 When a hook RPC is being cancelled (deadline, peer reset), cleanup work
 must still complete. Use a detached, time-bounded context:
 
-```rust
-// Go: bestEffortCleanupContext(parent) →
-//      context.WithTimeout(context.WithoutCancel(parent), 30s)
-// Rust: tokio::time::timeout(Duration::from_secs(30), async {…})
-//       inside a tokio::spawn that does NOT inherit the parent cancellation.
-```
-
-30s budget is enough for one local `DropSlot` and one maintenance append.
+`tokio::time::timeout(30s, …)` inside a `tokio::spawn` that does **not**
+inherit the parent cancellation. 30 s is enough for one local `DropSlot`
+and one maintenance append.
 
 ---
 
@@ -823,9 +703,21 @@ its lease within `retry_timeout` decides to demote. A dead holder is
 watched for `leader_ttl` before any candidate proposes a CAS takeover.
 Candidate selection is STRICT flush-max (docs/quorum-commit.md §4):
 any reachable peer with more flushed WAL outranks, byte-for-byte, and
-node id breaks exact ties only — `max_lag_on_failover_bytes` is
-accepted in config but vestigial. Terms are fencing tokens, minted
-monotonically; the lease is seeded by `ClusterInit` at bootstrap.
+node id breaks exact ties only. There is no lag-tolerance knob: the
+former `max_lag_on_failover_bytes` band was both an acknowledged-write
+hole under quorum commit and finding 15's wedge cause, so it is not a
+config field. Terms are fencing tokens, minted monotonically; the lease
+is seeded by `ClusterInit` at bootstrap, and a candidacy that is still
+receiving WAL **freezes first** — detaching from the deposed primary so
+positions stop moving — because a moving stream has no stable order
+(finding 23).
+
+A candidate that cannot see the holder consults the cluster before
+deposing it: every node reports how long ago it last observed each peer
+*serving as primary* (`NodeStatus.peer_primary_seen_age_ms`), and a
+candidate stands down while any reachable member has watched that holder
+serve within `leader_ttl`. Self-clearing — a genuinely dead holder ages
+out of every witness's map within one ttl.
 
 **Execution layer** (`roleexec` module): every decision is handed to
 the executor after logging.
@@ -850,8 +742,9 @@ the executor after logging.
   its own instance after promotion, and `auto_failback off` makes that
   permanent; in a pgpool-routed deployment self-attach is part of what
   "promote" means. Probe failures are debug-level (pgpool legitimately
-  down is routine); the cross-instance attach fan-out stays an open
-  TODO.
+  down is routine). The cross-instance fan-out — converging the *other*
+  instances' maps after a promotion — is still open (TODO.md); today
+  only `cluster recover` fans out, via the `AttachNode` peer RPC.
 - A demote decision → **fence**: stop local PostgreSQL. Never gated on
   journaling. A node running as primary while another holds the lease
   is fenced the same way.
@@ -867,15 +760,19 @@ the executor after logging.
   rejoining (rewind/reclone) is `cluster recover` — operator-driven,
   never automatic.
 
-**pgpool's place after the cutover** (the §6 contract of
+Cluster-wide, `cluster pause` suspends the execution layer on every
+member: the loop keeps observing and logging but stops acting — no
+takeover, no fence, no re-point. It is replicated through consensus, so
+it survives agent restarts, and it does **not** protect a primary that
+dies while paused; nothing promotes in its place until `cluster resume`.
+
+**pgpool's place** (the §6 contract of
 [docs/promotion-authority.md](docs/promotion-authority.md)): watchdog
 off, `failover_command` a notify-only poke, `follow_primary_command`
 empty, `detach_false_primary` on, `auto_failback` off. pgpool remains
 the router and learns the primary through `sr_check`; it commands
-nothing. `pg_agentctl gen-pgpool` emits this contract and
-`check-hooks` verifies it, including the decision-critical settings.
-This is the only contract; the pre-cutover (pgpool-led) block and its
-`--legacy` flags are deleted.
+nothing. `pg_agentctl gen-pgpool` emits this contract and `check-hooks`
+verifies it, including the decision-critical settings.
 
 ## 6. Hook contract (positional args / format tokens)
 
@@ -893,7 +790,7 @@ command lines `pg_agentc` can parse, and their token order:
 
 ```
 failover_command           = 'pg_agentc failover       %d %h %p %D %m %H %M %P %r %R %N %S'
-follow_primary_command     = ''   # MUST stay empty (hook-contract §5.4)
+follow_primary_command     = ''   # MUST stay empty (hook-contract §2)
 ```
 
 (`pg_agentc follow_primary %d %h %p %D %m %H %M %P %r %R %N %S` remains
@@ -909,7 +806,7 @@ Token meaning (pgpool tokens, *not* postgres tokens):
 | `%M`          | old main id |
 | `%P %N %S`    | old primary id / host / port |
 
-`%m / %H` carry different semantics across the two hooks (notes §9): in
+`%m / %H` carry different semantics across the two hooks: in
 `failover_command` they are the smallest-id surviving node ("new main"); in
 `follow_primary_command` they explicitly mean "new primary". Agent code
 should verify primary status with `pg_is_in_recovery()` rather than trust
@@ -924,7 +821,7 @@ layout. The operator has no `pgpool.conf` knob for the order.
 recovery_1st_stage : $1=primary_pgdata $2=standby_host $3=standby_pgdata
                      $4=primary_port   $5=standby_id   $6=standby_port
                      $7=primary_host
-pgpool_remote_start: $1=standby_host   $2=primary_pgdata   (see notes §11)
+pgpool_remote_start: $1=standby_host   $2=primary_pgdata   (discarded)
 ```
 
 Both are installed as symlinks under `$PGDATA/recovery_1st_stage` and
@@ -1000,10 +897,9 @@ The `pg_agentd.service` unit ships `ExecReload=/bin/kill -HUP $MAINPID`, so
 ### 7.5 `/healthz` does not use TLS
 
 The healthz listener is **plain HTTP** — `CertReloader` has nothing to
-do with it. See §9.2 for the reasoning. Mentioned here because earlier
-revisions of this SPEC and the Go version did wire the cert reloader to
-healthz; new readers who reach for that pattern should know we
-deliberately don't.
+do with it. See §9.2 for the reasoning. Mentioned here because it is a
+natural thing to reach for, and the answer is that we deliberately don't:
+`CertReloader` exists solely for the peer/consensus port (9701).
 
 ---
 
@@ -1066,7 +962,34 @@ hostname = "server3"
 # enabled = true
 # listen  = "0.0.0.0"
 # port    = 9702
+
+[raft]
+# Timing only — there is no switch here (§5.15). Defaults satisfy both
+# invariants in §8.3; change them only with a measured reason.
+# loop_wait_secs      = 10
+# retry_timeout_secs  = 10
+# leader_ttl_secs     = 30
+# election_timeout_ms = 5000
+
+[startup]
+# How many peers must answer the phantom-primary check before a
+# primary-shaped node is allowed to come up. Default 1. Set to 0 only
+# on a cluster where the quorum gate cannot be met by construction
+# (the acceptance harness does this at bootstrap, when no peer has a
+# database yet).
+# phantom_check_required_peers = 1
+
+[supervisor]
+# The agent ensures pgpool2.service is running, once after the
+# phantom-primary verdict resolves and continuously thereafter on a
+# rate-limited cadence. Disable if pgpool's lifecycle is managed
+# externally. Default true.
+# pgpool = true
 ```
+
+The `.deb`/`.rpm` ship an annotated sample at
+`/usr/share/pg_agent/config.toml.sample` listing every field the daemon
+reads; it is the operator-facing companion to this section.
 
 ### 8.2 Defaults (apply when omitted)
 
@@ -1092,7 +1015,23 @@ pcp.pgpool_service    = pgpool2.service
 healthz.enabled       = true
 healthz.listen        = 0.0.0.0
 healthz.port          = 9702
+
+raft.loop_wait_secs          = 10
+raft.retry_timeout_secs      = 10
+raft.leader_ttl_secs         = 30
+raft.election_timeout_ms     = 5000
+
+startup.phantom_check_required_peers = 1
+supervisor.pgpool                    = true
 ```
+
+Every PostgreSQL/pgpool path default above is Debian's. On the RHEL
+family an operator sets five fields explicitly (`pg_install_prefix`,
+`data_dir`, `service`, `user_home`, `pcp.pgpool_service`) and everything
+else works — the `rocky9-pg16` matrix cell runs the full suite that way.
+Auto-detecting them is on the roadmap. `node_id_file` is **not** on that
+list: the agent probes both families' spellings of pgpool's own node-id
+file (§8.4), because it is pgpool's file rather than a field anyone sets.
 
 ### 8.3 Validation
 
@@ -1116,9 +1055,13 @@ In priority order, first hit wins:
 
 1. `node_id` field at the root of `config.toml`.
 2. `node_id_file` field — file containing the integer.
-3. `/etc/pgpool2/pgpool_node_id` if present — pgpool's own node-id file.
-   Sharing this file between pg_agent and pgpool means one Ansible step
-   writes one file both tools read; the two can never drift.
+3. pgpool's own node-id file, probed at **both** family spellings in
+   order: `/etc/pgpool2/pgpool_node_id` (Debian) then
+   `/etc/pgpool-II/pgpool_node_id` (RHEL). Sharing this file between
+   pg_agent and pgpool means one Ansible step writes one file both tools
+   read; the two can never drift. Probing only one spelling was finding
+   28 — invisible when it fires, because source 4 quietly answers
+   correctly on any host named like its pool entry.
 4. Hostname fallback: `os::hostname()` matched against `[[pool]].hostname`.
 
 Sources 1 and 2 are errors if they point at an id that isn't in the pool.
@@ -1175,7 +1118,6 @@ for local smoke tests).
 | `PG_AGENTD_TLS_KEY`       | `tls.key` |
 | `PG_AGENTD_CONFIG`        | path to `config.toml` (read by the systemd unit, not the binary) |
 | `PG_AGENTC_TIMEOUT`       | hook client per-RPC timeout (default 30 min) |
-| `PG_AGENTCTL_TIMEOUT`     | operator CLI per-RPC timeout (default 5 min) |
 
 ---
 
@@ -1271,13 +1213,26 @@ Net: no `[tls]` interaction with the healthz listener at all.
       { "id": 2, "hostname": "server3", "role": "standby", "status": "down",    "replication_state": "none"      }
     ]
   },
-  "replication": { "lag_bytes": 0, "wal_receiver_state": "" }
+  "replication": { "lag_bytes": 0, "wal_receiver_state": "" },
+  "sync_commit": "armed",
+  "follow_wedged": false
 }
 ```
 
 - `role` is one of `"primary"`, `"replica"`, `"unknown"`.
   Serialised from a typed `HealthRole` enum — no stringly-typed
   constants in code.
+- `sync_commit` is `"armed"` / `"disarmed"` / `"blocked"` / `"n/a"`
+  (docs/quorum-commit.md §5), primaries only. `"armed"` means
+  acknowledged commits are on ≥ 2 nodes. `"disarmed"` means they are
+  single-copy promises — bootstrap before the first standby attaches, or
+  the operator's `allow-async` hatch. **`"blocked"` means commits are
+  currently hanging** for want of a standby, and is a page.
+- `follow_wedged` is the executor's tripwire: a follow it confirmed has
+  not reached `streaming` past the grace window, so redundancy is
+  degraded until the node is rebuilt. Structurally unreachable in the
+  designed flows since candidacy went strict flush-max — if it ever
+  trips, that is a new finding.
 - `pgpool.backends` is a per-backend array, one element per
   `[[pool]]` entry, with the pgpool-side view of each backend. Fields
   are projected from `pcp_node_info -a`'s 11-field output (a curated
@@ -1294,41 +1249,12 @@ Net: no `[tls]` interaction with the healthz listener at all.
   diagnostics — which avoids leaking PostgreSQL error contents (schema
   names, role names, file paths) over an unauthenticated endpoint.
 
-### 9.5 Snapshot struct shape
-
-The struct mirrors the JSON body (nested, not flat):
-
-```rust
-struct HealthSnapshot {
-    timestamp: DateTime<Utc>,
-    role: HealthRole,
-    postgres: PostgresProbe,        // reachable, in_recovery
-    pgpool: PgpoolProbe,            // reachable, backends: Vec<BackendStatus>
-    replication: ReplicationProbe,  // lag_bytes, wal_receiver_state
-}
-
-struct PgpoolProbe {
-    reachable: bool,
-    /// Per-backend snapshot from `pcp_node_info -a`. Empty when
-    /// `reachable == false`.
-    backends: Vec<BackendStatus>,
-}
-
-struct BackendStatus {
-    id: i32,
-    hostname: String,
-    role: String,              // "primary" | "standby" | "main" | "replica" | "unknown"
-    status: String,            // "up" | "waiting" | "down"
-    replication_state: String, // "streaming" | "catchup" | "none" | ""
-}
-```
-
 The full 11-field `NodeInfo` returned by `Pcp::node_info_all()` is
-available to other consumers (preflight, the future `/metrics`
-endpoint, `pg_agentctl cluster status`); the snapshot body carries
-only the projected subset above. Avoids the `postgres_*` / `pgpool_*`
-prefix soup the Go version carried; lets `#[serde(rename_all =
-"snake_case")]` handle the wire shape automatically.
+available to other consumers (preflight, `pg_agentctl cluster status`, a
+future `/metrics` endpoint); the body carries only the projected subset
+above. `HealthSnapshot` mirrors this shape — nested rather than flat, so
+`#[serde(rename_all = "snake_case")]` handles the wire form and there is
+no `postgres_*` / `pgpool_*` prefix soup to keep in sync by hand.
 
 ---
 
@@ -1371,11 +1297,21 @@ Created/repaired by `pg_agentd` at startup. Rules:
 ├── node_id                          # optional — see §8.4
 ├── maintenance/
 │   └── <intent-id>.json             # one per intent, atomic temp+rename
-└── replay/
-    └── <op>_<sha256>.json           # idempotency markers (see §5.12)
+├── replay/
+│   └── <op>_<sha256>.json           # idempotency markers (see §5.12)
+├── inflight_ops/
+│   └── <op-id>.json                 # phased orchestration journal
+└── raft/
+    └── raft.redb                    # consensus log + state machine
 
 $PGDATA/                             # no agent files — left to PostgreSQL
 ```
+
+`raft/` is the only one that is not disposable-by-design at the file
+level — and even it is recoverable from peers: stop the agent, delete the
+directory, restart, let Raft re-replicate. That is what makes the storage
+engine a low-stakes choice, and the acceptance suite executes the
+procedure rather than trusting it.
 
 `<state_dir>` defaults to `<postgres.user_home>/pg_agent` and is created with
 mode `0700` by the daemon at startup.
@@ -1426,11 +1362,26 @@ WantedBy=multi-user.target
 
 ### 10.5 polkit rule
 
-Installed at `/usr/share/polkit-1/rules.d/50-pg-agent.rules`. Grants the
-`postgres` user `org.freedesktop.systemd1.manage-units` for any
-`postgresql@*.service` and `pgpool2.service`, verbs:
+`/etc/polkit-1/rules.d/50-pg-agent.rules`, mode `0644 root:root`. Grants
+the `postgres` user `org.freedesktop.systemd1.manage-units` for the
+PostgreSQL and pgpool units, verbs:
 `start`/`stop`/`reload`/`restart`/`reload-or-restart`/`try-restart`/
 `reload-or-try-restart`. No `sudo`, no shell exec.
+
+**Ansible ships this file; the package does not**, and `validate-env`
+does not check it (§14). A missing or non-matching rule surfaces as peer
+operations failing with
+`org.freedesktop.DBus.Error.InteractiveAuthorizationRequired` — polkit's
+fallback is to ask a human, which no daemon can answer.
+
+**Match unit patterns, not literal names.** A rule pinned to
+`postgresql@17-main.service` covers no other version, and one naming only
+`pgpool2.service` covers neither RHEL's `pgpool-II.service` nor a
+source-built `pgpool.service`. Both were real defects (findings 27, 28).
+The rule must accept `/^postgresql@\d+-main\.service$/` (Debian's
+per-cluster template), `/^postgresql-\d+\.service$/` (RHEL's per-version
+unit), `postgresql.service`, and all three pgpool spellings.
+`testing/docker/50-pg-agent.rules` is the reference content.
 
 ### 10.6 Binary placement & permissions
 
@@ -1483,12 +1434,13 @@ must not be running on this node (refused by `PeerServer::Basebackup` →
   --progress
 ```
 
-Pre + post: `rm -rf $PGDATA/pg_replslot/*` (notes §3).
+Pre + post: `rm -rf $PGDATA/pg_replslot/*` (§17 invariant 5).
 
 ### 11.3 `pcp_*` PCP impl
 
 ```
-pcp_attach_node -h localhost -p <pcp_port> -U <pcp_user> -n <id> -w
+pcp_attach_node -h localhost -p <pcp_port> -U <pcp_user> -w -n <id>
+pcp_detach_node -h localhost -p <pcp_port> -U <pcp_user> -w -n <id>
 pcp_node_info   -h localhost -p <pcp_port> -U <pcp_user> -w -a
 pcp_node_count  -h localhost -p <pcp_port> -U <pcp_user> -w
 ```
@@ -1502,8 +1454,11 @@ line per backend, 11 space-separated fields per `pcp-node-info.html`
 (hostname, port, status code, weight, status name, actual status,
 role, actual role, replication delay, replication state, sync state)
 followed by a `last_status_change` timestamp the agent currently
-discards. This is what `/healthz` consumes (see §9) and what
-`pg_agentctl cluster status` will use.
+discards. This is what `/healthz` consumes (§9), and what the executor's
+self-attach probe reads to decide whether the local pgpool has degenerated
+this node's own backend (§5.15). `pg_agentctl cluster status` does not use
+it — that fans `GetStatus` out over the peer mesh instead, so it reports
+what the *agents* see rather than what one pgpool's map says.
 
 `pcp_node_count` returns the count of backends defined in `pgpool.conf`
 (not the count currently up — per upstream docs). Kept in the `Pcp`
@@ -1531,185 +1486,118 @@ and sends a final `OpProgress { phase = "done" }` on success.
 ## 12. Daemon lifecycle
 
 1. Parse CLI flags (`--config`, `--socket`, `--dev`, `--version`).
-2. Load config (or fallback to `DefaultConfig` with a warning).
-3. Apply env overrides; apply CLI overrides; apply `--dev` rules.
-4. Create `<state_dir>` and `<state_dir>/maintenance` (mode `0700`).
-5. Compose runtime: `Topology`, `ServeSettings`, `PostgresRuntime`.
-6. Build `CertReloader` if TLS configured; fail fast if not and remote
-   peers are present and `--dev` is not set.
-7. Spawn a SIGHUP handler task that calls `CertReloader::reload()`.
-8. Open `LocalDb` pool to local PostgreSQL.
-9. Build `PeerTransport` (CA pool, SAN allowlist), then `PeerPool`.
-10. Build `StandbyOps`, `PcpCli`, `Systemd`, `ReplayMarkerStore`, `WalStore`,
-    `MaintenanceStore`.
-11. Construct `Agent` with all deps.
-12. Repair `$PGDATA` hook symlinks (fail fast on conflicts).
-13. `Agent::serve(ctx)`:
-    a. Bind Unix socket synchronously (chmod 0600, remove stale).
-    b. Bind TCP peer addr synchronously.
-    c. Bind `/healthz` TCP listener synchronously (plain HTTP, port 9702).
-    d. Run **one synchronous probe** to seed the healthz snapshot so
-       the listener is fresh-and-true from the very first request.
-    e. Spawn the `LocalServer`, `PeerServer`, `MaintenanceWorker`, and
-       healthz serve loops on their respective bound listeners (the
-       background snapshot loop also starts here, ticking at 1 s).
-    f. `sd_notify::ready()` — only after every listener is bound AND
-       the initial snapshot is in place. See SPEC §9.3 and the
-       `sdnotify` module docs for the race this ordering prevents.
-    g. Wait for SIGINT/SIGTERM. On shutdown: `sd_notify::stopping()`,
-       gracefully stop both gRPC servers, shut down healthz with a 5 s
-       grace window.
+2. Load config (or fall back to defaults with a warning); apply env
+   overrides, CLI overrides, `--dev` rules.
+3. Create `<state_dir>` and its `maintenance/`, `replay/`,
+   `inflight_ops/` subdirectories (mode `0700`).
+4. Build `CertReloader` if TLS is configured; fail fast if it is not,
+   remote peers are present, and `--dev` is not set. Spawn the SIGHUP
+   handler that reloads it.
+5. Open the `LocalDb` pool; build `PeerTransport` (CA pool, SAN
+   allowlist) and `PeerPool`; build `StandbyOps`, `PcpCli`, `Systemd`
+   and the three file-backed stores.
+6. Build the Raft runtime over `<state_dir>/raft/` and compose
+   `HaWiring` — the consensus store, the HA loop and the executor as one
+   value, so neither "consensus without executors" nor "executors
+   without consensus" is a state that can be spelled.
+7. Repair `$PGDATA` hook symlinks (fail fast on conflicts).
+8. `Agent::serve`:
+   a. Bind the Unix socket (chmod 0600, remove stale), the TCP peer
+      listener, and the plain-HTTP healthz listener — all synchronously.
+   b. Run **one synchronous probe** to seed the healthz snapshot.
+   c. Spawn `LocalServer`, `PeerServer` (carrying `PgAgentRaft` on the
+      same listener), `MaintenanceWorker`, the healthz serve + snapshot
+      loops, and — if enabled — the pgpool supervisor.
+   d. `sd_notify::ready()`, only after every listener is bound and the
+      initial snapshot is in place (§9.3).
+   e. **Phantom-primary check**, after the subsystems are up so peers
+      can answer: if any peer reports a higher timeline, or asserts
+      primary on this node's own timeline, stop local PostgreSQL rather
+      than serve on a timeline the cluster has moved past. Unverifiable
+      evidence stops it too — conservatively, and tunable via
+      `[startup] phantom_check_required_peers`.
+   f. **Cold-start reconciliation**, synchronously and *before* the HA
+      loop spawns, so a primary coming up through crash recovery never
+      races the loop's fence. Standby-shaped `$PGDATA` (has
+      `standby.signal`) starts unconditionally — divergence lands in the
+      follow-wedge tripwire, never in a serving primary. Primary-shaped
+      `$PGDATA` starts only on a quorum-fresh lease read naming this
+      node; a deposed ex-holder reads `holder != self` and stays down.
+      Uninitialized `$PGDATA` is never touched. Without this, an
+      established cluster never returns from a full-site power blip:
+      PostgreSQL is agent-managed, the demote policy ignores `Down`
+      instances, and a holder whose PostgreSQL is down can only tick
+      `WouldDemote` (finding 21). The quorum poll is bounded at 10 s
+      because the unit ships `TimeoutStartSec=30s`.
+   g. Spawn the HA loop and executor.
+   h. Wait for SIGINT/SIGTERM. On shutdown: `sd_notify::stopping()`,
+      gracefully stop the gRPC servers, shut down healthz with a 5 s
+      grace window.
 
 ---
 
 ## 13. Operator CLI (`pg_agentctl`)
 
-`pg_agentctl <subcommand> [flags]`.
+**`--help` is the authoritative surface** — flags, defaults and exact
+spellings live in the clap definitions and are not restated here. This is
+what each command is *for*, and which ones can hurt you.
 
-| Subcommand                                         | Behaviour |
-|----------------------------------------------------|-----------|
-| `print-hooks`                                      | Emit canonical `pgpool.conf` and `postgresql.conf` hook lines. |
-| `check-hooks <pgpool.conf>`                        | Parse the given file (`key = 'value'` lines, single-quote stripping, `#` comment trimming). For every entry in the canonical list: missing/wrong → `ERR`, exact match → `OK`. Exit 0 iff all rows are `OK`. |
-| `gen-pgpool [--write <path>] [--config <path>]`    | Call `GetPgpoolBackends` on the local daemon, which fans out `GetNodeConfig` to every pool member via its PeerPool. Render `backend_hostname{i} / backend_port{i} / backend_data_directory{i} / backend_flag{i} = ALLOW_TO_FAILOVER` plus the canonical hook block. Stdout by default; `--write` does atomic temp+rename. Refuses to render if any node is unreachable — better a clear error than a silently-mis-sized pool. |
-| `maintenance list [--status pending|done|abandoned]` | Tabular dump of `ListMaintenance`. Surfaces `Skipped` files to stderr. |
-| `maintenance show <id>`                            | `GetMaintenance(id)`; pretty-print fields and JSON payload. |
-| `maintenance retry <id>`                           | `RetryMaintenance(id)`. Refuses non-pending intents. |
-| `cluster init [--only-node <id>] [--config <path>]` | `ClusterInit({only_node_id})`. Long deadline — overridable via `PG_AGENTCTL_TIMEOUT`. |
-| `cluster status [--config <path>]`                 | Call `ClusterStatus` on the local daemon, which fans out `GetStatus` to every pool member via its PeerPool. Render the response as a topology table: id, hostname, role (primary/standby), PG state, pgpool state, lag bytes, replication state. Also serves as the mesh-level mTLS reachability check that `validate-env` doesn't cover. Exit 0 iff every node responded successfully. |
-| `help` / `version`                                 | as usual |
+| Command | Purpose |
+|---|---|
+| `print-hooks` | Emit the canonical `pgpool.conf` + `postgresql.conf` hook lines (§6). |
+| `check-hooks <pgpool.conf>` | Verify a deployed conf against that canonical list, including the decision-critical settings (`use_watchdog`, `detach_false_primary`, `auto_failback`, `failover_on_backend_error`). Exit 0 iff every row is `OK`. |
+| `gen-pgpool` | Render the backend block from live cluster values plus the canonical hook block. `--write` is atomic temp+rename. **Refuses to render if any node is unreachable** — better a clear error than a silently mis-sized pool. |
+| `cluster init` | One-time bootstrap (§5.7): replication role, slots, basebackup each standby, seed the lease, form Raft membership. Run **on the chosen primary**; refused in recovery. Idempotent. |
+| `cluster status` | Fan out `GetStatus`; render a topology table. Also the mesh-level mTLS reachability check `validate-env` deliberately does not cover. Exit 0 iff every node answered. |
+| `cluster recover --target <id>` | Reclone a broken standby **from** the local primary. The supported repair for a fenced ex-primary or a wedged follow. `--stop-target-pg` stops the target's PostgreSQL first; without it, a target still running PostgreSQL is refused rather than dying eight layers deeper. |
+| `cluster handoff --target <id>` | Planned role swap: promote the target, demote the local primary to follow it. Refuses on lag above one WAL segment unless `--allow-lag`. **Destructive on failure** — see the Ctrl-C caveat in TODO.md. |
+| `cluster pause --reason <why>` / `cluster resume` | Suspend automatic role decisions cluster-wide for planned work. Replicated through consensus, so it survives agent restarts and applies on every member. Does **not** stop PostgreSQL or protect a primary that dies while paused: nothing will promote in its place until you resume. `--reason` is required — the next person to find a cluster that is not failing over needs to know it was deliberate. |
+| `cluster allow-async --confirm` | **Emergency only.** Disarm quorum commit on the current primary so commits stop waiting for a standby ack (§5.15). Journaled, shouted in `/healthz`, and re-armed automatically at the next standby attach. |
+| `maintenance list \| show \| retry` | The durable cleanup-retry queue (§5.13). |
+| `ops list \| show \| resume \| abandon` | The in-flight orchestration journal. `resume` verifies the cluster still matches the recorded phase and refuses on divergence; `abandon` clears an unrecoverable op out of the way. |
 
-**Every** `pg_agentctl` subcommand routes through the local daemon
-over the Unix socket. The daemon owns the `PeerPool`, the cert
-material, and any fan-out; the CLI never imports `PeerPool` /
-`CertReloader` / TLS material. `cluster init`, `cluster status`, and
-`gen-pgpool` each map to a single daemon RPC; the daemon does the
-peer dialing on the CLI's behalf. Operators can run the CLI from a
-workstation that has socket access (via SSH) without any TLS
-material on disk.
+**Every** subcommand routes through the local daemon over the Unix
+socket. The daemon owns the `PeerPool`, the cert material, and any
+fan-out; the CLI never imports `PeerPool`, `CertReloader` or TLS
+material. Operators can therefore run it from a workstation with socket
+access over SSH, with no TLS material on disk.
 
-### 13.1 Ansible integration
+### 13.1 What the CLI guarantees to automation
 
-Cluster deployment is expected to be driven by Ansible. The agent's job is
-to **give Ansible good seams where they help and stay out of the way
-otherwise**. Concretely:
+Cluster deployment is driven by Ansible ([BOOTSTRAP.md](BOOTSTRAP.md) is
+the playbook-shaped walkthrough, including who owns which file and the
+HAProxy constraints). The agent's job is to give Ansible good seams and
+otherwise stay out of the way. Four properties are contract, not
+convention:
 
-**What Ansible owns** (the agent never does these — duplicating them would
-fight the deployment tooling):
-
-- Installing the `.deb` / binaries themselves.
-- Writing `/etc/pg_agent/config.toml`, `/etc/default/pg_agentd`,
-  `/etc/polkit-1/rules.d/50-pg-agent.rules`, TLS cert material.
-- Enabling / starting `pg_agentd.service` and `pgpool2.service`. The
-  package explicitly does **not** auto-enable (SPEC §10.4).
-- Writing `pgpool.conf`, `postgresql.conf`, `pg_hba.conf`, `pool_passwd`,
-  `.pgpass`, `.pcppass`, the `pgpool_node_id` file.
-- `CREATE EXTENSION pgpool_recovery` and replication-role bootstrap (or
-  delegate the role part to `pg_agentctl cluster init` — operator's call).
-
-**What the agent exposes that Ansible plays well with:**
-
-- **Stable exit codes** across every `pg_agentctl` subcommand:
-  - `0` — success / clean / no action needed
-  - `1` — work to do, hard failure, or any check returned `ERR`
-  - `2` — usage / argument error
-  This lets Ansible `register:` + `failed_when:` cleanly.
-
-- **`--json` everywhere** that produces output an operator would parse.
-  Stable schemas:
-
-  ```
-  pg_agentctl --json print-hooks       # for the `template` module
-  pg_agentctl --json maintenance list
-  pg_agentctl --json cluster status
-  pg_agentd   validate-env --json      # localhost env validation (§14)
-  ```
-
-- **No interactive prompts, ever.** Destructive commands take `--force`
-  rather than reading from stdin.
-
+- **Stable exit codes** on every subcommand: `0` success / clean / no
+  action needed, `1` work to do or hard failure or any check `ERR`, `2`
+  usage error. This is what makes `register:` + `failed_when:` honest.
+- **`--json` wherever output would otherwise be parsed** — `print-hooks`,
+  `maintenance list`, `cluster status`, and `pg_agentd validate-env`.
+  Stable schemas.
+- **No interactive prompts, ever.** Destructive commands take an explicit
+  flag (`--confirm`, `--stop-target-pg`, `--allow-lag`) rather than
+  reading stdin.
 - **Idempotent by default.** Re-running `cluster init`, `maintenance
-  retry`, or a future `cluster pause` against an already-correct state is
-  a no-op, not an error. This makes `changed_when:` honest.
+  retry`, or `cluster pause` against an already-correct state is a no-op,
+  not an error — which is what makes `changed_when:` meaningful.
 
-- **Atomic file writes** for everything operator-facing
-  (`gen-pgpool --write`, the daemon's symlink repair). Partial writes
-  never appear under target paths.
+Plus **atomic file writes** for anything operator-facing (`gen-pgpool
+--write`, the daemon's symlink repair), and **SIGHUP reload rather than
+restart** for cert rotation, so `service: state=reloaded` Just Works.
 
-- **SIGHUP reload, not restart**, for cert rotation. The systemd unit's
-  `ExecReload=/bin/kill -HUP $MAINPID` makes the Ansible
-  `ansible.builtin.service: state=reloaded` idiom Just Work.
+`pg_agentd validate-env` is the universal post-deploy assertion: one call
+per host, structured per-check so a playbook can remediate conditionally.
+The systemd unit wires it as `ExecStartPre=` too — Ansible's explicit
+task is the early-warning gate, the unit's is the safety net. Mind §14's
+list of what it does *not* cover.
 
-- **`pg_agentd validate-env` is the universal post-deploy assertion.**
-  Running it as a task after every config change gives Ansible a
-  single-call "is this node ready?" probe. The JSON output is structured
-  per-check so playbooks can conditionally remediate (e.g. install the
-  polkit rule iff that check is `ERR`). The systemd unit also wires it
-  as `ExecStartPre=`, so the daemon refuses to start with a broken
-  environment — Ansible's explicit task is the early-warning gate, the
-  unit's `ExecStartPre=` is the safety net.
-
-**Recommended playbook shape:**
-
-```yaml
-- name: pg-agent validate-env
-  ansible.builtin.command: pg_agentd validate-env --json
-  register: validate_env
-  changed_when: false
-  failed_when: (validate_env.stdout | from_json).has_errors
-
-- name: render pgpool include from live cluster
-  ansible.builtin.command: pg_agentctl gen-pgpool --write /etc/pgpool2/pg_agent.conf
-  register: gen
-  changed_when: "'wrote' in gen.stderr"
-  notify: reload pgpool
-```
-
-**Anti-patterns the agent should never adopt** (because they make
-Ansible's life harder):
-
-- Reading state from environment variables that aren't documented.
-- Writing to paths outside `<state_dir>` / `$PGDATA` / `/run/pg_agentd/`
-  unless explicitly told to (e.g. `gen-pgpool --write <path>`).
-- Bundling its own service-management of pgpool / postgres beyond the
-  D-Bus calls already specified.
-- Auto-creating directories Ansible owns (`/etc/pg_agent/`,
-  `/etc/pgpool2/`).
-
-**HAProxy configuration gotchas** (deployment-time, not agent-time —
-included here so the playbook author has the matching context):
-
-- **Do NOT enable PROXY protocol** (`send-proxy`, `send-proxy-v2`) on the
-  HAProxy backend that fronts pgpool. Pgpool-II does not understand
-  PROXY protocol headers (verified against pgpool 4.6 docs — no
-  `proxy_protocol` config, no PROXY header parsing); PostgreSQL itself
-  also doesn't support it natively as of PG 17. Enabling PROXY on the
-  HAProxy side would prepend bytes pgpool reads as garbage during the
-  startup phase, dropping every client connection.
-- Client identity is consequently lost at the first proxy hop. Postgres
-  and pgpool both see the previous hop's IP. The intended pattern is
-  `pg_hba.conf` rules using `samenet` for the `pgpool` / `postgres` /
-  `repl` users (which the preflight check verifies in §14); real
-  client IP visibility for audit / debugging lives in HAProxy's access
-  log, correlated with pgpool / postgres logs via timestamps.
-- HAProxy's backend health-check on pgpool should be `option pgsql-check
-  user pgpool` (a real wire-protocol probe). Don't use the agent's
-  `/healthz` for routing — pgpool is the role-aware routing layer in
-  this architecture (see §1.1 and §9.1).
-- **Do NOT terminate TLS at HAProxy** (no `ssl verify required` /
-  `ca-file` / `sni` on the backend `server` line). Pgpool terminates
-  TLS for the client itself (postgres-protocol SSL upgrade): stacking
-  haproxy↔pgpool TLS on top means the client's TLS-upgrade
-  `ClientHello` arrives inside the haproxy-managed TLS tunnel as
-  encrypted application data, pgpool reads it as garbage protocol,
-  and drops the connection. Symptom is `server closed the connection
-  unexpectedly` from the client with **nothing** useful in either
-  pgpool's or haproxy's log and a green health check the whole time
-  — there's no thread for the operator to pull on. The correct
-  posture is `mode tcp` + a plain `server` line; certificate
-  verification happens at the client↔pgpool layer end-to-end through
-  the L4 tunnel.
-
----
+Things the agent deliberately never does, because they would fight the
+deployment tooling: read undocumented environment variables, write
+outside `<state_dir>` / `$PGDATA` / `/run/pg_agentd/` unless told to,
+manage pgpool or PostgreSQL beyond the D-Bus calls specified here, or
+auto-create directories Ansible owns (`/etc/pg_agent/`, `/etc/pgpool2/`).
 
 ## 14. Environment validation (`pg_agentd validate-env`)
 
@@ -1736,49 +1624,74 @@ reaching each other?".
 
 Filesystem (always):
 
-- **TLS material** — if `[tls]` unset and only loopback peers exist → WARN.
-  If set: each of `ca_cert`/`cert`/`key` exists, is a regular file, has
-  mode that postgres can read; cert parses; cert has SANs covering every
-  non-local pool hostname; expiry > now + 30 d.
-- **polkit rule** — `/usr/share/polkit-1/rules.d/50-pg-agent.rules` exists
-  and is readable.
-- **pgpool_node_id** — `/etc/pgpool2/pgpool_node_id` exists and matches
-  the agent's resolved local node id.
-- **.pcppass** — `/var/lib/postgresql/.pcppass` mode `0600`, contains a line
-  `localhost:<pcp_port>:<pcp_user>:*`.
-- **.pgpass** — contains entries for `repl` and `postgres` users on the
-  configured port.
-- **pcp.conf** — `/etc/pgpool2/pcp.conf` exists and contains `pgpool` user
-  with an md5 hash.
-- **pool_passwd** — `/etc/pgpool2/pool_passwd` contains entries for
-  `pgpool` and `postgres`.
-- **Recovery tools** — `<pg_install_prefix>/bin/pg_basebackup` and
-  `<pg_install_prefix>/bin/pg_rewind` exist and are executable.
+- **`tls material`** — if `[tls]` is unset and only loopback peers exist
+  → WARN. If set: each of `ca_cert`/`cert`/`key` exists, is a regular
+  file, is readable by postgres; the cert parses; its SANs cover every
+  non-local pool hostname; expiry is more than 30 d away.
+- **`pgpool_node_id`** — pgpool's node-id file (either family spelling,
+  §8.4) exists and matches the agent's resolved local node id.
+- **`postgres user_home` / `.pcppass` / `.postgresql`** — the postgres
+  home resolves, `.pcppass` is present and mode `0600` (absent → WARN,
+  `pcp_attach_node` would prompt), libpq's cert directory exists.
+- **`pg_basebackup` / `pg_rewind`** — present and executable under
+  `pg_install_prefix`.
+- **`recovery conf include`** — the effective `postgresql.conf` (walked
+  the way PostgreSQL walks it: `include`, `include_if_exists`,
+  `include_dir`) has an include that **resolves to**
+  `$PGDATA/myrecovery.conf`. Asserting the include merely *names* that
+  file is not enough: PostgreSQL resolves a relative include against the
+  directory of the referencing file, so on the Debian layout
+  `include_if_exists = 'myrecovery.conf'` points into `/etc` at a file
+  nothing ever writes — it parses, PostgreSQL starts clean, and the
+  standby silently never streams. ERR when absent, ERR when it resolves
+  elsewhere (both paths named), WARN for a plain `include` (PostgreSQL
+  refuses to start when the file is absent, which is a primary's normal
+  state).
+- **`postgres unit: restart policy`** — the *effective* `Restart=` for
+  the configured unit (via `systemctl show`, so a drop-in counts) must be
+  `no`; anything else is ERR, with the drop-in path in the message.
+  `LoadState` is read alongside it because `systemctl show` answers for a
+  nonexistent unit by printing defaults — and the default is
+  `Restart=no`, so without that a typo'd unit name would report a clean
+  bill of health.
+- **`raft: …`** — five refusals rather than warnings, because each one's
+  failure mode only becomes visible during an outage: a pool smaller than
+  three, an unresolved local node id, no mTLS (the consensus plane shares
+  the peer listener, so this would expose lease takeover to anyone who
+  can reach the port), an unwritable state dir (a vote that cannot be
+  persisted is a vote that can be cast twice after a crash), and a
+  leftover obsolete `[raft] enabled` key.
 
-DB-backed (skipped with a WARN if `--skip-db` or DB unreachable):
+DB-backed (skipped with a WARN row if the DB is unreachable):
 
-- **Settings**: `wal_log_hints = on`, `hot_standby = on`,
-  `max_replication_slots ≥ pool size`, `max_wal_senders ≥ pool size`.
-- **TLS / pg_hba**: if `[postgres.replication]` is configured, verify
-  `listen_addresses` includes non-loopback, `ssl=on`, server certs exist,
-  and the SSL CA on the primary trusts the configured replication client
-  cert; verify `pg_hba.conf` has `hostssl replication <repl_user> … cert
-  clientcert=verify-full` (or equivalent).
-- **Extension**: `CREATE EXTENSION pgpool_recovery` is in place in the
-  `postgres` database.
-- **Roles**: `repl`, `pgpool`, `postgres` exist; `pgpool` has `pg_monitor`.
-- **pg_hba.conf**: `scram-sha-256` or `md5` for the required (database,
-  user) tuples from `samenet`.
+- **`setting: …`** — `wal_level ≥ replica`, `hot_standby = on`,
+  `max_replication_slots` and `max_wal_senders` ≥ pool size + 2, and
+  `wal_keep_size` ≥ 512 MB (WARN). The agent does not manage
+  `wal_keep_size` — it is static deployment config, unlike
+  `synchronous_standby_names` — but it is the only thing covering WAL
+  written *before* a slot exists at promotion, so the check says plainly
+  when that gap is left open (finding 22).
+- **`extension: pgpool_recovery`** — installed in the `postgres` database.
+- **`role: …`** — the replication role and `pgpool` exist.
+
+**What it deliberately does not check**, because operators reasonably
+assume otherwise: the polkit rule, `pcp.conf`, `pool_passwd`, and
+`pg_hba.conf`. Each of those fails later and less informatively, and
+covering them is open work — until then Ansible should assert them
+directly. See BOOTSTRAP.md Phase 1.7.
 
 Report format:
 
 ```
-OK    tls material: ca_cert
-WARN  tls material: expires in 21d
-ERR   pgpool_node_id: file says 0, config says 1
+OK    tls material            ca_cert
+WARN  tls material            expires in 21d
+ERR   pgpool_node_id          file says 0, config says 1
 …
 validate-env: 1 error(s), 1 warning(s) — FAIL
 ```
+
+`--json` emits `{"checks": [{name, status, detail}…], "has_errors":
+bool}`. The shape is stable; `has_errors` is what Ansible gates on.
 
 ---
 
@@ -1811,23 +1724,32 @@ Tiny on purpose.
 
 ## 16. Testing
 
-Functional multi-node tests should work the same way they do today:
+Two layers, and the split is deliberate.
 
-- Three loopback IPs (`127.0.0.0/8`), one daemon per IP, exercised end-to-end.
-- A `faked-agentd` test helper binary linked against cross-process fakes:
-  same `Agent` wiring as `pg_agentd`, but `LocalDb` / `Systemd` /
-  `StandbyOps` etc. swapped for HTTP-observable fakes that expose
-  `GET/DELETE /<service>/calls`, `POST /<service>/errors`,
-  `PUT /<service>/state`. Tests poll those endpoints to assert peers were
-  called.
-- Env toggles like `FAKED_AGENTD_REAL_PEERS=1` and `FAKED_AGENTD_REAL_FS=1`
-  control which collaborators stay real.
-- Linux-only by design (the loopback-range trick).
+**Unit tests** use in-process fakes — one struct per trait (§4) with
+call-log vectors and configurable `Err` fields, in the same file as the
+trait. No mocking framework. This is where decision logic, parsers and
+state machines are pinned, including the consensus store's fault
+injection.
 
-Unit tests use in-process fakes (one struct per trait with call-log
-vectors and configurable `Err` fields). Keep the in-process and
-cross-process fakes in separate crates so a Rust test can't accidentally
-pull in the HTTP machinery for a pure unit test.
+**Acceptance tests** boot the real artifacts: the packaged `.deb`/`.rpm`,
+the packaged unit with its `ExecStartPre`, the polkit rule, real mTLS,
+real PostgreSQL replication, on three systemd containers. See
+[testing/README.md](testing/README.md).
+
+The load-bearing property of the acceptance layer is that it asserts on
+**event order**, not on sampled state: scenario windows are cursors into
+one merged event log, "did X happen" awaits that log, and absence claims
+cover windows bounded by awaited events rather than instants. A whole
+class of defect — and of vacuous pass — is only visible that way.
+
+There is no middle layer of process-level fakes, and deliberately so:
+every bug the acceptance suite has found lived in the interaction with a
+real dependency (systemd's job semantics, libpq's include resolution,
+pgpool's backend map, a partitioned peer's TCP behaviour), which a fake
+would have modelled away. See [testing/FINDINGS.md](testing/FINDINGS.md)
+— finding 4 states the general case: no unit test can catch that class,
+because the stubs don't run SQL.
 
 ---
 
@@ -1850,7 +1772,12 @@ cluster:
 5. **`pg_rewind` clears `$PGDATA/pg_replslot/*` before *and* after.** Before:
    stale slot dirs from this node's pre-rewind role. After: slot dirs
    pg_rewind copied from the source's role would crash recovery.
-6. **`pcp_attach_node` is `FollowPrimary`-only.** Not RecoveryFirstStage.
+6. **`RecoveryFirstStage` never calls `pcp_attach_node`.** pgpool drives
+   re-attachment after its own stage 2, and attaching underneath it
+   races that. Other paths legitimately attach — `FollowPrimary`,
+   `cluster recover`'s fan-out, and the executor's self-attach (§5.15) —
+   but each attaches on an instance it owns, and with the watchdog off
+   an attach reaches exactly the one instance it was sent to.
 7. **`RemoteStart` asserts the local node is the primary.** Pgpool's
    `pgpool_recovery` extension is supposed to call it on the primary; if
    we're a standby, refuse.
@@ -1884,16 +1811,20 @@ cluster:
 
 ---
 
-## 18. Out of scope (for v1 of the port)
+## 18. Out of scope
 
-- VIP management (`RemoveVip`, `if_up_cmd`, etc.) — HAProxy makes it
-  unnecessary; the proto entry stays for forward compatibility.
-- SRV-based pool discovery (notes §14) — `[[pool]]` stays the source of
-  truth; SRV is a future enhancement.
-- A pure-Rust replacement for `pg_basebackup` / `pg_rewind` — subprocess for
-  now.
-- A pure-Rust PCP protocol client — subprocess `pcp_attach_node` /
-  `pcp_node_count` for now (the protocol is simple TCP text and could be
-  ported later).
-- A separate-middleware topology (pgpool not co-located with PostgreSQL).
-- `if_up_cmd` / `if_down_cmd` / `arping_cmd` — all replaced by HAProxy.
+- **VIP management** (`if_up_cmd`, `if_down_cmd`, `arping_cmd`,
+  `delegate_IP`) — HAProxy is the entry point. Supporting a
+  watchdog-managed VIP instead is on the roadmap, and would mean turning
+  the watchdog back on, which reintroduces a second thing with opinions
+  about failover.
+- **A separate-middleware topology** — pgpool is assumed co-located with
+  PostgreSQL on every backend. The agent reaches its local pgpool via PCP
+  on `localhost` and manages the unit via systemd.
+- **SRV-based pool discovery** — `[[pool]]` is the source of truth.
+- **Pure-Rust replacements for `pg_basebackup` / `pg_rewind` / PCP** —
+  subprocess for now. PCP is simple TCP text and could be ported; the
+  data-path tools are a larger bet (roadmap).
+- **Non-systemd init systems** — the agent drives PostgreSQL through
+  systemd over D-Bus, waiting on `JobRemoved` for genuine job completion.
+  See TODO.md for what a second `ServiceManager` impl would cost.

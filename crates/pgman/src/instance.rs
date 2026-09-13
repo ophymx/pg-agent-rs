@@ -5,7 +5,7 @@
 //! — and leaves "drive this instance to a role" to be composed at every
 //! call site, with the ordering invariants enforced by convention. This
 //! module is where that composition gets a single owner, shaped by the
-//! HA loop's step-7 executors (docs/promotion-authority.md §10): each
+//! HA loop's executors (docs/promotion-authority.md §5): each
 //! method is the execution of one decision family.
 //!
 //! Three long-standing gaps close structurally here:

@@ -16,7 +16,7 @@
 //! - **Maintenance queue** — `ListMaintenance`, `GetMaintenance`,
 //!   `RetryMaintenance`.
 //!
-//! Every RPC validates its inputs against SPEC §3.3's regex set
+//! Every RPC validates its inputs against SPEC §3.4's regex set
 //! before touching the local DB or the peer pool.
 
 use crate::agent::NodeInfo;
@@ -2216,7 +2216,7 @@ impl PgAgentLocal for LocalServer {
     /// "Not primary" is returned as `OpResult { ok=false, message=… }`
     /// rather than `Err(Status::failed_precondition)` because pgpool
     /// inspects the boolean — surfacing as a non-error is the correct
-    /// contract per SPEC §3.6.
+    /// contract per SPEC §3.5.
     async fn remote_start(
         &self,
         req: Request<RemoteStartRequest>,

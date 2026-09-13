@@ -1,4 +1,4 @@
-//! The HA loop's executors (promotion-authority §10, step 7).
+//! The HA loop's executors (promotion-authority §5, "The HA loop").
 //!
 //! [`RoleExecutor`] consumes [`HaDecision`]s and drives the local
 //! PostgreSQL instance toward what the lease says. The split matters:

@@ -53,7 +53,7 @@
 //! `InteractiveAuthorizationRequired` — a prompt no daemon can answer
 //! (testing/README.md finding 27).
 //!
-//! The rule itself is installed by Ansible (see SPEC §13.1 — pg_agent
+//! The rule itself is installed by Ansible (see SPEC §10.5 — pg_agent
 //! owns no /etc files); testing/docker/50-pg-agent.rules is the
 //! reference copy the acceptance suite deploys.
 

@@ -1,400 +1,203 @@
 # pg-agent-rs — ROADMAP
 
-Companion to [SPEC.md](SPEC.md). The SPEC describes **what we're building
-first**; this document describes **where we're going after that**.
+Where we're going. [SPEC.md](SPEC.md) describes what exists.
 
-The bar is: be a more pleasant HA layer to operate than Patroni, on top of
-the pgpool-II substrate we're stuck with. The path is three tiers — close
-Patroni's parity gap, build the observability + ergonomics moat, then push
-into territory no one else has covered yet.
+The bar is: be a more pleasant HA layer to operate than Patroni, on top
+of the pgpool-II substrate we're stuck with.
 
-Each item is tagged with a rough effort estimate (**S** = days,
-**M** = weeks, **L** = month-scale) and a "why now" so the ordering is
-arguable rather than dogmatic.
+Items are tagged with a rough effort estimate (**S** = days, **M** =
+weeks, **L** = month-scale) and a "why now" so the ordering is arguable
+rather than dogmatic. Open engineering defects live in
+[TODO.md](TODO.md); this is the feature roadmap.
 
 ---
 
-## v1 — Baseline (SPEC.md scope, recap)
+## Next — Patroni parity
 
-The starting line. Everything listed here is already specified; this
-section exists so the rest of the roadmap has a clear "from" to its "to".
+Table-stakes features anyone coming from Patroni will miss.
 
-- 1:1 replacement of the five pgpool shell hooks via a typed RPC surface.
-- Persistent mTLS peer mesh, hot cert reload via SIGHUP.
-- Local Unix-socket RPC for `pg_agentc` (filesystem permission == auth).
-- Durable maintenance queue for failed slot cleanups (file-backed, atomic
-  writes, capped retries with exponential backoff).
-- Hook idempotency via on-disk replay markers, swept on a cadence.
-- `pg_agentd validate-env` — **localhost-only** checks (TLS, polkit,
-  `.pcppass`, PostgreSQL tuning, roles, extensions, `pg_hba.conf` — every
-  silent-failure mode we know about that lives on this node). Wired
-  as `ExecStartPre=` so the daemon refuses to start with a broken env;
-  Ansible runs it explicitly as a deploy gate. The `nginx -t` shape.
-- `pg_agentctl cluster status` — fan-out `GetStatus`, render a topology
-  table. Also serves as the mesh-level reachability check that used to
-  live in preflight.
-- `/healthz` plain-HTTP listener with snapshot-based readiness for HAProxy.
-- `pg_agentctl cluster init` one-shot bootstrap from a chosen primary.
-- Strict input validation (regex on every value reaching libpq / subprocess
-  / SQL identifier).
-
-What this gets you: a cluster that operates correctly without bash, ssh, or
-hand-rolled hook scripts. What it does **not** get you: any operator-facing
-ergonomics beyond `pg_agentc status`, `pg_agentctl cluster status`, and
-`pg_agentctl maintenance list`.
-
----
-
-## v1.x — Patroni parity (close the operator UX gap)
-
-These are the table-stakes features anyone coming from Patroni will
-immediately miss. Tackling them early prevents "this is great, but I can't
-schedule a switchover" from blocking adoption.
-
-### Cluster control plane
-
-- **`pg_agentctl cluster pause [--reason …]` / `cluster resume`** *(M)* —
-  maintenance mode. A boolean in shared cluster state (see "Shared state"
-  below) that every agent honors: `Failover`, `FollowPrimary`, and the
-  maintenance worker all short-circuit while paused, with a clear reason
-  surfaced in `cluster status`. *Why now:* without this, every kernel
-  upgrade or major DDL is a fight with the cluster.
+- **Role-aware `/healthz` + the HAProxy split** *(S)* — `/primary` and
+  `/replica` endpoints backed by the lease. Blocked for a long time
+  because nothing authoritatively knew the role; the lease supplies it
+  now. *Why now:* it is the last piece of the promotion-authority work
+  and the cheapest item on this list. See SPEC §9.1 for why the current
+  single-endpoint contract is what it is.
 
 - **`pg_agentctl cluster switchover --to <id> [--at <RFC3339>]`** *(M)* —
-  planned promotion, separate from emergency failover. Drains the HAProxy
-  backend for the current primary (see Drain hook below), waits for the
-  candidate's lag to fall under a threshold, calls a (new) `PgAgentPeer.Demote`
-  on the old primary, `Promote` on the new one, updates pgpool via PCP.
-  *Why now:* operations need a planned, reversible-up-to-the-cutover path —
-  emergency failover is a different code path with different invariants.
+  planned promotion, separate from emergency failover and from
+  `cluster handoff` (which is immediate and operator-blocking). The
+  replicated state already carries a `switchover` field; what is missing
+  is the operator verb and the executor's scheduled path. *Why now:*
+  operations need a planned, reversible-up-to-the-cutover path.
 
 - **`pg_agentctl cluster attach <id>`** *(S)* — wrap `pcp_attach_node`
-  with the pgpool-reload and gen-pgpool refresh so "add a new
-  standby to a running cluster" is one command end-to-end. Today
-  the flow is `cluster init --only-node-id <id>` → manual
-  `pcp_attach_node` → manual `gen-pgpool --write` + pgpool reload;
-  `cluster attach` collapses the trailing two manual steps.
-  *Why now:* the only remaining manual step in the add-standby
-  workflow; pure ergonomics, no new state.
+  with the pgpool reload and `gen-pgpool` refresh so "add a new standby
+  to a running cluster" is one command. Today the flow ends in a manual
+  `pcp_attach_node` plus a manual `gen-pgpool --write` and reload. *Why
+  now:* the only remaining manual steps in the add-standby workflow;
+  pure ergonomics, no new state.
 
 - **Per-node tags in `config.toml`** *(S)* — surface and respect
   `nofailover = true`, `noloadbalance = true`, `clonefrom = true`.
-  Failover skips nofailover nodes when picking a candidate (returning to
-  the `%m = -1` sentinel if none qualify); `gen-pgpool` emits the right
-  `backend_flag` for noloadbalance.
-  *Why now:* universal Patroni feature; users have muscle memory for it.
+  Candidacy skips `nofailover` nodes; `gen-pgpool` emits the right
+  `backend_flag` for `noloadbalance`. *Why now:* universal Patroni
+  feature; users have muscle memory for it.
 
-### Recovery and reconciliation
+- **Phantom-primary detection is startup-only** *(M)* — a returning node
+  is checked against peer timelines before it comes up, but a node that
+  drifts into a wrong role while running is caught only by the executor's
+  fence. Extending the timeline comparison into the steady-state loop
+  would close the gap the fence covers by side effect rather than by
+  design. *Why now:* it is the one reconciliation path that still relies
+  on a restart to run.
 
-The flow that takes a broken or stale standby back to a healthy
-streaming state. Today this is mostly pgpool-driven and assumes the
-operator's environment is intact at the moment they need it most.
-
-- **`pg_agentctl cluster recover --target <id>`** *(S)* — first-class
-  reclone command. Dials the local daemon, which (on the current
-  primary) drives the same `recovery_1st_stage` orchestration pgpool
-  would have via `pcp_recovery_node`. Operator never has to debug
-  `~postgres/.pcppass` mid-incident — the daemon owns the PCP creds
-  and the typed RPC already exists (`PgAgentLocal.RecoveryFirstStage`).
-  Fails loudly with "run this on `<primary hostname>`" when the local
-  daemon isn't the primary. *Why now:* today the only operator lever
-  is `pcp_recovery_node`, which means recovery is gated on PCP-auth
-  config being intact — exactly when it's most likely to be a yak.
-
-- **Phantom-primary detection at startup** *(M)* — before opening
-  `/healthz` ready or announcing to pgpool, the agent queries peers
-  for their timeline. If any peer reports a higher timeline than the
-  local one, the agent refuses to come up as primary — either stops
-  PG and surfaces a degraded state, or auto-demotes via the standard
-  `follow_primary` flow. Bootstrap subtlety: handle "no peers
-  reachable at startup" without deadlocking (timeout + conservative
-  default — refuse to assert primary role unless at least one peer
-  agrees). *Why now:* a primary that was offline through a failover
-  and then came back has no reconciliation path that verifies "am I
-  still the primary?" — postgres just resumes whatever role its data
-  dir was in. Today the only signal the cluster has the wrong shape
-  is the operator running `cluster status` and noticing.
-
-- **`restore_wal` follows the current primary** *(S)* — today
-  `crates/pg-agent-core/src/walstore.rs` fetches archive WAL from
-  whichever peer the configuration named at startup. After a
-  promotion the *new* primary is the source of truth; the old one
-  may be offline or stale. The fetch should consult live cluster
-  state (peer pool / pgpool view), not a static peer ref. *Why now:*
-  any standby trying to catch up across a promotion will hammer the
-  old primary until the operator restarts it or rewrites config.
-
-### Shared cluster state (the foundation switchover and pause need)
-
-Patroni gets free shared state from the DCS. We chose to avoid that
-dependency, so we need a lightweight equivalent:
-
-> **Scope limit — role assignment is out of scope for this item.** The
-> LWW scheme below is not linearizable; two partitioned nodes can both
-> believe they won and reconcile only *after* both have been primary.
-> That is acceptable for a `paused` flag and fatal for "who is primary."
->
-> **Superseded in fact.** The embedded Raft
-> ([docs/promotion-authority.md](docs/promotion-authority.md) §5)
-> shipped and now serializes role assignment (the lease, terms as
-> fencing tokens) — the part the LWW scheme below could never do. What
-> remains of THIS item is only the small shared document (`paused`
-> flag, scheduled switchover) as additional state on the existing raft
-> state machine; the gossip/LWW design below is dead and kept for the
-> record.
-
-- **Cluster-state RPC + gossip** *(M)* — extend `PgAgentPeer` with
-  `GetClusterState` / `ProposeClusterState(version, payload)`. State is a
-  small JSON document (paused flag, scheduled switchover, current
-  generation), versioned with a monotonic clock + writer node id. On any
-  mutation, the writer fans out `ProposeClusterState` to every peer; an
-  agent only accepts a proposal whose version > local version. On startup
-  / SIGHUP an agent reconciles by pulling from every peer and taking the
-  highest-version document. *Why now:* this is the substrate every
-  subsequent v1.x item needs.
-
-  Conflict resolution is intentionally "last-writer-wins with humans in
-  the loop" — operator commands are infrequent and the gen counter makes
-  the divergence visible in `cluster status`. Not as principled as Raft;
-  far simpler than running etcd.
-
-### Observability and ergonomics
-
-- **Structured JSON logging by default** *(S)* — `tracing-subscriber` with
-  a JSON layer, configurable via `--log-format=json|text`. Includes
-  `trace_id` (per-hook-RPC) so cross-node correlation works in Loki /
-  OpenSearch without parsing slog. *Why now:* tiny change, immediate gain.
-
-- **In-memory event ring buffer + `pg_agentctl events`** *(S)* — last N
-  hook firings + state transitions, exposed over the local socket. `events
-  --cluster` fans out and merges by timestamp. *Why now:* post-mortem
-  today means tailing journalctl on three boxes; this collapses it to one
-  command, no persistence cost.
-
-- **`cluster status` warns on multi-timeline primaries** *(S)* — when
-  the fan-out shows two nodes reporting role `primary` and they
-  disagree on timeline (one TL1, one TL2), print a `WARN: stale
-  primary on node <id> (TL<n>, current cluster is TL<m>)` line under
-  the table. Cheaper than the startup-detection item in "Recovery and
-  reconciliation" above and gives the operator a fast signal even
-  before that lands. *Why now:* diagnosing this state by hand means
-  per-node `pg_controldata` + `pg_waldump` comparison; `cluster
-  status` already fans out `GetStatus` and has everything it needs
-  to flag the divergence automatically.
-
-- **REST surface on the `/healthz` listener** *(M)* — extend to `/cluster`
-  (current state), `/events?since=…`, `/config` (active runtime config),
-  read-only. Same TLS, optional bearer token for write endpoints in a
-  future iteration. *Why now:* every monitoring stack speaks HTTP; gRPC
-  client lib in dashboards is friction.
+- **`restore_wal` follows the current primary** *(S)* — `walstore.rs`
+  fetches archive WAL from whichever peers the configuration named at
+  startup. After a promotion the *new* primary is the source of truth;
+  the old one may be offline or stale. The fetch should consult live
+  cluster state rather than a static peer list. *Why now:* any standby
+  catching up across a promotion hammers the old primary first.
 
 ---
 
-## v2 — Differentiation moats (where Patroni stops, we keep going)
+## Then — observability and ergonomics
 
-These are the features that make pg-agent-rs the better choice rather than
-a different choice.
+- **Structured JSON logging** *(S)* — `--log-format=json|text`, with a
+  `trace_id` per hook RPC so cross-node correlation works in Loki /
+  OpenSearch. *Why now:* tiny change, immediate gain.
 
-### First-class observability
+- **In-memory event ring + `pg_agentctl events`** *(S)* — last N hook
+  firings and state transitions over the local socket; `events --cluster`
+  fans out and merges by timestamp. *Why now:* post-mortem today means
+  tailing journalctl on three boxes.
 
-- **Prometheus / OpenMetrics endpoint on `/healthz`** *(S–M)* — per-node
-  lag bytes, replication slot LSN gap, hook latency histograms, maintenance
-  queue depth by status, cert days-to-expiry, peer connection age,
-  basebackup / rewind in-progress bytes. Lift directly from the
-  existing healthsnap + maintenance + certreload surfaces. *Why now:*
-  Patroni offloads this to a third-party exporter that lags upstream; we
-  ship it natively and it never drifts.
+- **`cluster status` warns on multi-timeline primaries** *(S)* — when the
+  fan-out shows two nodes reporting `primary` on different timelines,
+  print a `WARN: stale primary on node <id>` line. *Why now:* `cluster
+  status` already fans out `GetStatus` and has everything it needs.
 
-- **Append-only on-disk event log** *(M)* — promote the in-memory ring
-  (v1.x) to a durable log under `<state_dir>/events/`. Daily rotation,
-  configurable retention. `pg_agentctl events --since 1h --cluster`
-  reconstructs the global timeline. Closest analog: `kubectl events`;
-  no HA tool currently does this well. *Why now:* this is the "what
-  happened to my cluster last night" feature operators repeatedly ask
-  Patroni for.
+- **Prometheus / OpenMetrics endpoint** *(S–M)* — per-node lag, slot LSN
+  gap, hook latency histograms, maintenance queue depth, cert
+  days-to-expiry, peer connection age, basebackup bytes in flight. Lift
+  from the existing healthsnap / maintenance / certreload surfaces. *Why
+  now:* Patroni offloads this to a third-party exporter that lags
+  upstream; shipping it natively means it never drifts.
 
-- **`pg_agentctl top` — TUI dashboard** *(M–L)* — ratatui-backed live view.
-  Topology, lag, slot states, event tail, paused/switchover banners,
-  cert expiry warnings. `patronictl list` is tabular; the gap is real
-  and the lift is contained. *Why now:* this is the demo-day feature that
-  changes "yet another HA tool" into "oh, *that's* nice".
+- **Append-only on-disk event log** *(M)* — promote the ring buffer to a
+  durable log under `<state_dir>/events/` with rotation and retention.
+  Closest analog is `kubectl events`. *Why now:* "what happened to my
+  cluster last night" is the feature operators repeatedly ask Patroni
+  for.
 
-### Operational safety
+- **REST surface on the healthz listener** *(M)* — `/cluster`,
+  `/events?since=…`, `/config`, read-only. Plain HTTP like the rest of
+  that listener (SPEC §9.2); operators who need TLS front it with a
+  reverse proxy. *Why now:* every monitoring stack speaks HTTP.
+
+- **`pg_agentctl top`** *(M–L)* — ratatui live view: topology, lag, slot
+  states, event tail, paused/switchover banners, cert expiry.
+  `patronictl list` is tabular; the gap is real and the lift contained.
+
+---
+
+## Operational safety
+
+- **Distro profiles** *(S)* — a `distro = "debian" | "rhel"` knob, or
+  auto-detection from `/etc/os-release`, selecting defaults for
+  `pg_install_prefix`, `user_home`, `data_dir`, `service`, and
+  `pcp.pgpool_service`. Operator overrides still win per field. **RHEL
+  already works** — the `rocky9-pg16` matrix cell installs the `.rpm` and
+  runs the full suite green — so this is about deleting a five-field
+  chore, not about portability. The discipline that made RHEL cheap, and
+  which these defaults must not break: no Debian path outside the
+  `DEFAULT_*` consts, and no `postgresql@*-main` instance naming assumed
+  in subprocess args.
+
+- **A BOOTSTRAP distro matrix appendix** *(S)* — the path-pair
+  differences between supported distros plus the "this is what Ansible
+  writes differently per OS family" inventory snippet. The table exists
+  in three places (testing/README.md, `Dockerfile.rhel`,
+  `cluster::Facts`); BOOTSTRAP is where an operator would look for it.
 
 - **Fence hook (`stonith_command`)** *(M)* — before any promotion,
   optionally invoke an operator-supplied command (PDU API, hypervisor
   STOP, IPMI power-off) to verify the old primary is dead. Patroni's
-  `/dev/watchdog` works only for self-fencing; STONITH covers the case
-  where the primary is alive but partitioned. Default off; on by config.
-  *Why now:* split-brain insurance — the one failure mode no amount of
-  good design eliminates.
-
-- **Audit log of admin actions** *(M)* — every mutation initiated via
-  `pg_agentctl` is timestamped, signed by the issuing cert's CN, and
-  appended to a tamper-evident chain under `<state_dir>/audit/`.
-  `pg_agentctl audit verify` walks the chain. *Why now:* compliance-grade
-  for regulated environments; trivial to add early, costly to retrofit.
+  `/dev/watchdog` covers only self-fencing; STONITH covers the primary
+  that is alive but partitioned. Default off. *Why now:* split-brain
+  insurance for the one failure mode no amount of good design eliminates.
 
 - **HAProxy drain integration** *(S)* — `pg_agentctl cluster drain <id>`
-  marks a backend as `MAINT` in HAProxy's runtime API (or via a configurable
-  drain hook) so connections drift off before maintenance. Used internally
-  by switchover. *Why now:* the missing piece between "I planned a switch"
-  and "no clients saw an error".
+  marks a backend `MAINT` via HAProxy's runtime API so connections drift
+  off before maintenance; used internally by switchover. *Why now:* the
+  missing piece between "I planned a switch" and "no clients saw an
+  error".
+
+- **Audit log of admin actions** *(M)* — every `pg_agentctl` mutation
+  timestamped, attributed to the issuing cert's CN, appended to a
+  tamper-evident chain under `<state_dir>/audit/`. *Why now:* trivial to
+  add early, costly to retrofit.
 
 ---
 
-## Exploratory — bigger bets
+## Exploratory
 
-Speculative, but worth keeping in view because the design choices we make
-in v1.x and v2 should not foreclose them.
+Speculative, kept in view because current design choices should not
+foreclose them.
 
 - **Config drift detection** — periodic SHA-256 of pgpool.conf,
-  postgresql.conf, pg_hba.conf, pool_passwd, .pcppass per node; fan out
-  via a new `Peer.ConfigDigest` RPC and surface mismatches in
-  `cluster status`. Catches "someone hand-edited node3 last Tuesday"
-  before it bites during the next failover. Extends naturally from the
-  `gen-pgpool` machinery.
+  postgresql.conf, pg_hba.conf, pool_passwd per node, fanned out via a
+  `Peer.ConfigDigest` RPC and surfaced in `cluster status`. Catches
+  "someone hand-edited node3 last Tuesday" before the next failover does.
 
-- **Backup rotation orchestration** — track which standby took the last
-  `pg_basebackup` and rotate so the primary isn't always loaded. Pair
-  with WAL archive integrity sweep: enumerate each peer's archive_dir
-  via a `Peer.ListWal` RPC, identify holes, surface to operators
-  before they bite during a recovery.
+- **WAL archive integrity sweep** — enumerate each peer's `archive_dir`
+  via a `Peer.ListWal` RPC, identify holes, surface them before they bite
+  during a recovery. Pairs with rotating which standby takes the next
+  `pg_basebackup` so the primary isn't always the source.
 
-- **DR / standby cluster mode** — a second cluster following the first via
-  cascading replication. Requires extending topology to express "this
-  pool is a follower of pool X"; the wire format already supports
-  cross-pool addressing if we wanted it. Patroni has standby clusters;
-  this is the bar.
+- **DR / standby cluster mode** — a second cluster following the first
+  via cascading replication. Requires topology to express "this pool
+  follows pool X". Patroni has standby clusters; that's the bar.
 
 - **Pluggable backup providers** — pgbackrest / wal-g / barman as
-  first-class alternatives to `pg_basebackup` for cluster_init and
-  recovery_1st_stage. The current `StandbyOps` trait already abstracts
-  basebackup; the lift is mostly adding adapters and a config knob.
+  first-class alternatives to `pg_basebackup`. `StandbyOps` already
+  abstracts the seam; the lift is adapters and a config knob.
 
-- **Pure-Rust `pg_basebackup` replacement** over a temporary HTTPS
-  listener using the same mTLS material (the SPEC already reserves this
-  in §17/§18 as future work). Eliminates the last external subprocess
-  dependency for the data path and enables progress/cancel semantics the
-  CLI tools don't expose.
+- **Pure-Rust `pg_basebackup` replacement** over a temporary listener
+  using the same mTLS material. Eliminates the last external subprocess
+  on the data path and enables progress/cancel semantics the CLI tools
+  don't expose.
 
-- **A web UI** that consumes the v1.x REST surface + v2 metrics. Out of
-  scope to build in-tree, but the REST surface should be designed
-  assuming someone will eventually ship one.
+- **VIP failover via pgpool watchdog `delegate_IP`** — for deployments
+  that would rather lean on pgpool's watchdog VIP than provision HAProxy.
+  Needs `Escalation`/`DeEscalation` wired to `ip addr add`/`del` plus a
+  gratuitous-ARP burst, a `[watchdog]` config block, a `CAP_NET_ADMIN`
+  preflight, and VIP ownership in `cluster status`. Not now because
+  HAProxy is the supported entry point and watchdog leader election is a
+  separate failure surface to debug — and because turning the watchdog
+  back on reintroduces a second thing with opinions about failover.
 
-- **Distro-agnostic deployment** — today's defaults bake in the Debian
-  package layout (`/usr/lib/postgresql/17`, `/var/lib/postgresql`,
-  `postgresql@17-main.service`, `pgpool2.service`,
-  `/etc/pgpool2/pgpool_node_id`). RHEL/Rocky/Alma puts the same files
-  in different places (`/usr/pgsql-17`, `/var/lib/pgsql`,
-  `postgresql-17.service`, `pgpool-II.service`,
-  `/etc/pgpool-II/pgpool_node_id`). Today: an operator on a non-Debian
-  distro overrides every path field in `config.toml` — feasible but
-  error-prone, and BOOTSTRAP.md reads as Debian-only.
-  **Status: RHEL WORKS — what is left is not having to spell it out.**
-  The `rocky9-pg16` matrix cell installs the `.rpm` on Rocky 9 and runs
-  the full acceptance suite green, so this is no longer a portability
-  question. An operator on RHEL sets five path fields in `config.toml`
-  and everything works; the remaining items are about deleting that
-  chore.
+- **Not locked to systemd** — the agent drives PostgreSQL through systemd
+  over D-Bus with a polkit rule, waiting on `JobRemoved` for job
+  completion. A second `ServiceManager` impl would buy OpenRC, Gentoo,
+  Devuan and Alpine at once. See TODO.md for the scoping; the hard part
+  is rebuilding job-completion semantics on a weaker primitive, and the
+  honest fix there would strengthen the systemd path too.
 
-  Work done:
-  - ~~**`.rpm` packaging**~~ — shipped, via `cargo-generate-rpm`, from
-    the same static musl binary and the same scriptlets as the `.deb`.
-  - ~~**CI matrix on a RHEL-flavoured container**~~ — shipped, and it
-    immediately earned its keep: finding 28 (the agent probed pgpool's
-    node-id file only at `/etc/pgpool2`, silently falling back to the
-    hostname match on RHEL) plus a polkit rule that did not match
-    `pgpool-II.service`.
-
-  Work to do:
-  1. **Distro profiles** — ship a `distro = "debian" | "rhel"` knob (or
-     auto-detect from `/etc/os-release`) that selects a default set
-     for `pg_install_prefix`, `user_home`, `data_dir`, `service`,
-     `pcp.pgpool_service`. Operator overrides still win per-field. Now
-     a convenience rather than a blocker — and there is a cell to keep
-     it honest. (`DEFAULT_PGPOOL_NODE_ID_FILES` no longer belongs on
-     this list: it probes both families' paths already, because it is
-     pgpool's file rather than a field anyone sets.)
-  2. **`ensure_hook_symlinks` discovery** — currently looks for
-     `pg_agentc` as a sibling of `pg_agentd`. Confirmed the same on
-     RHEL (`/usr/bin` for both, since our own package places them), so
-     this is codification rather than a fix.
-  3. **BOOTSTRAP "distro matrix"** appendix listing the path-pair
-     differences between supported distros, plus a "this is what
-     Ansible writes differently per OS family" inventory snippet. The
-     table now exists in three places (testing/README.md,
-     Dockerfile.rhel, `cluster::Facts`); BOOTSTRAP is where an
-     operator would look for it.
-
-  The discipline that made this cheap, kept because the remaining
-  items depend on it: no Debian path outside the `DEFAULT_*` consts,
-  and no `postgresql@*-main` instance naming assumed in subprocess
-  args. Every RHEL surprise turned out to be somewhere that rule had
-  been broken — a hardcoded `/etc/pgpool2` (finding 28) and a literal
-  unit name in the polkit rule (finding 27). Nothing in the decision
-  logic needed touching.
-
-- **VIP failover via pgpool watchdog `delegate_IP`** — support
-  deployments that put pgpool's watchdog VIP in front of the cluster
-  instead of HAProxy. v1 assumes HAProxy is the L4 entry point and
-  treats `Escalation` / `DeEscalation` as no-ops (SPEC §5.5, §18); to
-  serve operators who'd rather lean on pgpool's built-in watchdog
-  (no separate LB to provision, simpler topology on a small cluster),
-  those two hooks need to actually do something.
-  Work to do:
-  1. **Wire `Escalation` / `DeEscalation`** to bring up / tear down
-     the configured `delegate_IP` on the local interface
-     (`ip addr add` / `ip addr del` + a gratuitous-ARP burst). Today
-     both RPCs return ok with no side effect.
-  2. **Config** — `[watchdog] delegate_ip = "10.0.0.42/24"` +
-     `interface = "eth0"`, opt-in. When unset, behaviour matches v1
-     (no-op, HAProxy-fronted deployment).
-  3. **Preflight** — assert `CAP_NET_ADMIN` on the daemon (or
-     `setcap cap_net_admin+ep` on the binary), the configured
-     interface exists, and the address isn't already bound to a
-     different host.
-  4. **`cluster status`** — show which node currently holds the VIP
-     (sourced from `ip addr show`) and flag divergence from the
-     watchdog's view of leadership as a hard ERR.
-  5. **SPEC update** — promote §5.5 / §18 from "no-op, reserved" to
-     a documented mode toggle; revise §3 topology table to show the
-     VIP row when configured.
-
-  Not v1 because HAProxy is the supported entry point today and
-  watchdog leader election is a separate failure surface to debug.
-  Keeping the RPC names (`Escalation` / `DeEscalation`) intact in v1
-  ensures the wire format doesn't need to change to land this later.
+- **A web UI** consuming the REST surface and metrics. Out of scope to
+  build in-tree, but the REST surface should be designed assuming someone
+  eventually ships one.
 
 ---
 
 ## Non-goals (explicit)
 
-To keep this list honest, the following are **not** on the roadmap, even
-as speculation:
-
-- Replacing pgpool itself. If we ever wanted to escape pgpool, we'd switch
+- **Replacing pgpool itself.** If we wanted to escape pgpool we'd switch
   to Patroni + PgBouncer + HAProxy, not reinvent the routing/pooling
-  layer. The whole point of pg-agent-rs is to make pgpool tolerable.
-- Multi-region active-active. Out of scope for the substrate (pgpool is
-  not designed for this; PostgreSQL streaming replication is not designed
-  for this).
-- A DCS dependency. The lightweight gossip approach in v1.x is a deliberate
-  choice; if it stops working we redesign rather than bolt on etcd.
-- Connection pooling. pgpool already does this; doing it again is a different
-  product.
-
----
-
-## Ordering principle
-
-Within each tier, ship the items that **unblock other items** first:
-
-- v1.x shared cluster state unlocks pause + switchover + tags.
-- v1.x event ring buffer is the in-memory prototype of the v2 on-disk log.
-- v1.x REST surface is the substrate for v2 metrics and the eventual web UI.
-- v2 audit log is cheap if added during the REST surface build; expensive
-  to retrofit.
-
-The cheapest immediate win is `cluster status` — one fan-out of an
-existing RPC. Start there.
+  layer. The whole point is to make pgpool tolerable.
+- **Multi-region active-active.** Neither pgpool nor PostgreSQL streaming
+  replication is designed for it.
+- **An external DCS dependency.** Consensus is embedded
+  ([docs/promotion-authority.md](docs/promotion-authority.md) §5); if
+  that stops working we redesign rather than bolt on etcd.
+- **Connection pooling.** pgpool already does this; doing it again is a
+  different product.

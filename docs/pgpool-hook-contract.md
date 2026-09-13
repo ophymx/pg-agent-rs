@@ -1,26 +1,19 @@
 # pgpool hooks under agent-led failover
 
-**Status:** implemented — §4's block is the canonical contract
-(`pg_agentctl gen-pgpool` emits it, `check-hooks` verifies it; the
-pre-cutover block and its `--legacy` flag are deleted along with the
-pgpool-led promote path), and the one open choice in it is resolved:
-`failover_command` is kept as a notify-only poke, with the handler
-always answering "advisory" on primary-down (SPEC §5.1).
-Researched against the
-[pgpool-II 4.6 documentation](https://www.pgpool.net/docs/46/en/html/index.html)
-(the version SPEC §"PROXY protocol" is already verified against),
-2026-08; quotes verified against a local mirror of the 4.6 docs
-(`~/src/pgpool-4.6-docs`).
+§4's block is the canonical contract: `pg_agentctl gen-pgpool` emits it
+and `check-hooks` verifies it. Researched against the
+[pgpool-II 4.6 documentation](https://www.pgpool.net/docs/46/en/html/index.html),
+2026-08.
 
-The question this answers: **when `use_watchdog = off`, which hooks does
+The question this answers: **with `use_watchdog = off`, which hooks does
 pgpool actually fire, what do they mean, and what must the agent do about
-each?** Plus one finding §6 had not priced: backend-status
-synchronization between pgpool instances is a watchdog feature, and
-losing it creates a new fan-out obligation for the agent.
+each?** Plus one cost the promotion-authority design had not priced:
+backend-status synchronization between pgpool instances is a watchdog
+feature, and losing it creates a fan-out obligation for the agent.
 
 ---
 
-## 1. What fires the hooks today (watchdog on, quorum-only)
+## 1. What watchdog was providing
 
 Per [pgpool 4.6 §"Watchdog"](https://www.pgpool.net/docs/46/en/html/tutorial-watchdog-intro.html):
 
@@ -34,7 +27,7 @@ and:
 > notifies the information to other Pgpool-II nodes and synchronizes
 > them."
 
-So today, three properties come bundled with `use_watchdog = on`:
+Three properties come bundled with `use_watchdog = on`:
 
 1. **Single execution** — `failover_command` / `follow_primary_command` /
    `failback_command` run once cluster-wide, on the watchdog leader.
@@ -58,13 +51,10 @@ Trigger conditions are from
 [pgpool 4.6 §"Failover and Failback"](https://www.pgpool.net/docs/46/en/html/runtime-config-failover.html)
 and
 [§"Online Recovery"](https://www.pgpool.net/docs/46/en/html/runtime-online-recovery.html).
-"Today" = current SPEC behavior; "Target" = under agent-led failover
-with `use_watchdog = off`.
-
-| Hook | Fired by (pgpool 4.6) | With watchdog off | Target meaning for the agent |
+| Hook | Fired by (pgpool 4.6) | With watchdog off | What the agent does |
 |---|---|---|---|
 | `failover_command` | Backend degeneration, from any of: health-check failure exhausting retries; backend connection error (`failover_on_backend_error`, default on); backend shutdown codes 57P01/57P02 (`failover_on_backend_shutdown`); `pcp_detach_node`; a `detach_false_primary` detach; `pcp_promote_node --switchover`. | **Fires once per pgpool instance** — no leader, no single-execution guarantee, no quorum gate. Each instance computes `%m` (lowest alive node id) from its own local view, so N invocations may carry **different arguments**. | **Advisory wake-up only.** Never an order. The HA loop may use it to run an immediate tick instead of waiting for `loop_wait`, improving detection latency. All arguments (`%m`, `%d`, …) are hints; the lease CAS is the sole authority. Duplicate/conflicting invocations are expected and harmless by design. |
-| `follow_primary_command` | After a failover in which the *primary* was degenerated (not for standby failovers), once per remaining non-primary backend; also on `pcp_promote_node`. Streaming-replication mode only. **Side effect when non-empty:** after a primary failover, pgpool first *"degenerates all nodes except the new primary"*, then runs the command per degenerated node — i.e. configuring this hook at all makes pgpool detach every healthy standby as part of primary failover. | Fires per instance × per standby — the multiplication of the previous row. Each instance also performs its own mass-degeneration. | **Remove (set empty), don't make it notify-only.** Leaving it empty skips the mass-degeneration of healthy standbys, which under agent-led failover is pure damage: the agent reconfigures standbys on lease change and would then have to re-attach everything pgpool detached. This tilts promotion-authority's "notify-only vs. removed" question decisively for this hook (the question stays open for `failover_command` only). |
+| `follow_primary_command` | After a failover in which the *primary* was degenerated (not for standby failovers), once per remaining non-primary backend; also on `pcp_promote_node`. Streaming-replication mode only. **Side effect when non-empty:** after a primary failover, pgpool first *"degenerates all nodes except the new primary"*, then runs the command per degenerated node — i.e. configuring this hook at all makes pgpool detach every healthy standby as part of primary failover. | Fires per instance × per standby — the multiplication of the previous row. Each instance also performs its own mass-degeneration. | **Remove (set empty), don't make it notify-only.** Leaving it empty skips the mass-degeneration of healthy standbys, which under agent-led failover is pure damage: the agent reconfigures standbys on lease change and would then have to re-attach everything pgpool detached. Removed rather than notify-only, unlike `failover_command`. |
 | `failback_command` | A backend node gets attached (`pcp_attach_node`, `auto_failback`). | Fires per instance, only on the instance where the attach happened (no sync — see §3). | **Not wired today, stays unwired.** The agent initiates attaches itself and needs no callback. Listed for completeness. |
 | `wd_escalation_command` | Watchdog leader acquisition (before VIP-up, but fires even with no VIP). | **Never fires.** Watchdog-only. | Delete. Already a no-op in SPEC §5.5; the RPC can be retired with the watchdog. |
 | `wd_de_escalation_command` | Watchdog leader resignation (shutdown, network blackout, lost quorum). | **Never fires.** | Delete, as above. |
@@ -140,12 +130,11 @@ None of this is an argument against dropping watchdog — routing-state
 divergence is self-limiting (worst case: queries error against a down
 backend, promotion-authority §6's "routing state" concern) where role
 divergence is fatal. But it converts an implicit pgpool guarantee into
-explicit agent work, and it belongs in the implementation estimate for
-the cutover step.
+explicit agent work.
 
 ---
 
-## 4. Intended pgpool configuration (expanded from promotion-authority §6)
+## 4. The pgpool configuration (expanded from promotion-authority §6)
 
 ```
 # --- consensus/coordination: none. The agent mesh owns role. ---
@@ -153,9 +142,9 @@ use_watchdog               = off      # escalation/de-escalation hooks retire wi
 
 # --- hooks: advisory pokes at most ---
 failover_command           = 'pg_agentc failover %d %h %p %D %m %H %M %P %r %R %N %S'
-                                      # KEEP (notify-only): wakes the HA loop for
-                                      # detection latency; args documented advisory.
-                                      # Alternative: remove entirely — open question.
+                                      # Notify-only: wakes the HA loop for
+                                      # detection latency; every argument is
+                                      # advisory and the handler promotes nothing.
 follow_primary_command     = ''       # agent reacts to lease change instead.
                                       # MUST be empty, not notify-only: non-empty
                                       # makes pgpool degenerate every healthy
@@ -177,10 +166,14 @@ recovery_1st_stage_command = 'recovery_1st_stage'   # still exec'd via extension
                                       # pcp_recovery_node (see §3)
 ```
 
-The one live choice in that block is `failover_command`: keep as a
+`failover_command` was the one live choice in that block — keep it as a
 notify-only poke (buys detection latency, costs a forever-documented
-"these args are advisory" contract) or remove (HA loop polls at
-`loop_wait`). That is promotion-authority open question 4, unchanged.
+"these args are advisory" contract) or remove it and let the HA loop poll
+at `loop_wait`. **Resolved as notify-only.** The handler answers
+"advisory" on primary-down and promotes nothing (SPEC §5.1), the
+non-authoritative contract is documented in the canonical block itself,
+and the acceptance suite exercises the full shape: hook fires, handler
+declines, lease promotes, `sr_check` discovers.
 
 ---
 
@@ -189,10 +182,10 @@ notify-only poke (buys detection latency, costs a forever-documented
 Measured on the dockerized 3-node acceptance cluster
 ([testing/README.md](../testing/README.md)), pgpool-II 4.6 with
 `use_watchdog = off`, this config, and real PostgreSQL 17 replication.
-Items 1–2 are **confirmed**; 3–5 remain open.
+Items 1–2 are **confirmed**; 3–5 remain unmeasured.
 
-1. **Per-instance firing count — CONFIRMED** (promotion-authority open
-   question 7). Stopping the primary's PostgreSQL produced **exactly
+1. **Per-instance firing count — CONFIRMED.** Stopping the primary's
+   PostgreSQL produced **exactly
    one `failover_command` invocation per pgpool instance, three across
    the cluster**, all within the same second, all carrying *identical*
    arguments (`%d = 0`, `%m = 1`, `%P = 0`). So without watchdog the
@@ -210,11 +203,12 @@ Items 1–2 are **confirmed**; 3–5 remain open.
    that and a double promotion. That is precisely the gap the lease
    CAS closes.
 
-   Today's outcome without a lease: **exactly one primary, no split
-   brain** — three agents each received the same hint, the first
-   promoted, the rest short-circuited on `get_status` reporting the
-   target already primary. Idempotence carried it. Worth having as the
-   pre-consensus baseline.
+   Measured before the lease existed, as the pre-consensus baseline:
+   **exactly one primary, no split brain** — three agents each received
+   the same hint, the first promoted, the rest short-circuited on
+   `get_status` reporting the target already primary. Idempotence carried
+   it, which is precisely the guarantee that does not survive an
+   asymmetric partition.
 
 2. **Attach/detach propagation — CONFIRMED ABSENT, and asymmetric as
    predicted (§3).** `pcp_detach_node -n 2` on db0's instance marked
