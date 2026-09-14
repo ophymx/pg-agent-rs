@@ -53,7 +53,7 @@ message NodeStatus {
   // and under quorum commit the acknowledged-write guarantee attaches
   // to flushed WAL, so candidate selection compares this field, not
   // current_wal_lsn (replay misclassifies a flush-complete standby as
-  // lagging — testing/README.md finding 19). 0 = unknown.
+  // lagging — testing/FINDINGS.md finding 19). 0 = unknown.
   uint64 last_flush_lsn          = 12;
   // How long ago (milliseconds) this node last observed each pool
   // member RUNNING AS A PRIMARY, keyed by node id. Recorded by the HA

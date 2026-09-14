@@ -44,7 +44,7 @@ export VERSION
 # Not a preference — a correctness fix. A dynamically-linked build
 # carries the build host's glibc floor and the package declares none,
 # so it installs on an older distro and dies at exec with
-# `GLIBC_2.39 not found` (testing/README.md finding 26). Debian 12 and
+# `GLIBC_2.39 not found` (testing/FINDINGS.md finding 26). Debian 12 and
 # RHEL 9 are both below a Debian 13 builder's floor, which rules out
 # the .rpm target entirely. Static musl removes the floor rather than
 # documenting it: one artifact verified running on Debian 12, Ubuntu

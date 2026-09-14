@@ -2,7 +2,7 @@
 #
 # The artifacts are the point. `scripts/build-pkgs.sh` produces a
 # statically-linked musl `.deb` and `.rpm` — one binary that installs on
-# Debian 12, Ubuntu 24.04, Rocky 9 and Alpine alike (testing/README.md
+# Debian 12, Ubuntu 24.04, Rocky 9 and Alpine alike (testing/FINDINGS.md
 # finding 26 is what a dynamic build cost) — and this workflow does
 # nothing to that build but run it somewhere reproducible and hang the
 # results off the tag.
@@ -129,7 +129,7 @@ jobs:
           echo "$desc"
           case "$desc" in
             *"dynamically linked"*)
-              echo "::error::pg_agentd is dynamically linked — the glibc floor is back (testing/README.md finding 26)" >&2
+              echo "::error::pg_agentd is dynamically linked — the glibc floor is back (testing/FINDINGS.md finding 26)" >&2
               exit 1
               ;;
             *static*) ;;

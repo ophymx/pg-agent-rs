@@ -251,7 +251,7 @@ fi
 # `validate-env` refuses to start the daemon without it. Provisioning
 # writes it here for the same reason Ansible does there, which is why
 # the two stayed identical rather than the fixture keeping a private
-# workaround. See testing/README.md finding 29.
+# workaround. See testing/FINDINGS.md finding 29.
 install -d "/etc/systemd/system/${PG_UNIT}.service.d"
 cat > "/etc/systemd/system/${PG_UNIT}.service.d/10-agent-managed.conf" <<'EOF'
 # pg-agent-acceptance: PostgreSQL's lifecycle belongs to the agent.
