@@ -11,7 +11,7 @@
 //! restart.
 //!
 //! Channels are cached by node id, but only for [`MAX_CONNECTION_AGE`]
-//! (12 h, see SPEC §7.3). Past that, the next `client()` call dials
+//! (12 h). Past that, the next `client()` call dials
 //! fresh — which forces a new TLS handshake and so picks up any
 //! SIGHUP-rotated client cert. Without this cap, a long-lived channel
 //! could outlive a cert rotation indefinitely.
@@ -156,11 +156,11 @@ pub trait PeerClient: Send + Sync {
 // PeerPool — production PeerRegistry
 // ---------------------------------------------------------------------------
 
-/// Outbound channel age cap (SPEC §7.3). A SIGHUP-rotated client cert
-/// reaches every peer connection within this window, *without* tearing
-/// down healthy in-flight channels. The cap is 12 h; the 5-minute grace
-/// in the Go version isn't ported — checked-on-access semantics make a
-/// soft grace meaningless.
+/// Outbound channel age cap. A SIGHUP-rotated client cert reaches every
+/// peer connection within this window, *without* tearing down healthy
+/// in-flight channels. Age is checked on access rather than by a reaper,
+/// which is why there is no grace period: a soft grace would only matter
+/// to a background sweep that does not exist.
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Default per-dial connect deadline. Wide enough for healthy LANs with

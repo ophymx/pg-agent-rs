@@ -1,5 +1,6 @@
 //! `config.toml` schema, defaults, and projections (`ServeSettings`,
-//! `NodePool`, `PostgresRuntime`). See SPEC §8.
+//! `NodePool`, `PostgresRuntime`). This module is the schema; the
+//! `DEFAULT_*` constants below are the defaults of record.
 //!
 //! Load flow:
 //!
@@ -12,9 +13,9 @@
 //!    unique ids/hostnames, replication sslmode in libpq's set, local node
 //!    resolved).
 //!
-//! Optional after `load`: [`Config::apply_env_overrides`] (called by the
-//! daemon between file-load and CLI-flag application — see SPEC §8.7 for
-//! the precedence order).
+//! Optional after `load`: [`Config::apply_env_overrides`], called by the
+//! daemon between file-load and CLI-flag application. Precedence is
+//! lowest-to-highest: **config file → environment → CLI flags**.
 
 use crate::errors::AgentError;
 use pg_agent_proto::pgagentpb as pb;

@@ -9,9 +9,12 @@
 //! authoritative side already succeeded); the cleanup is deferred here.
 //!
 //! The design accommodates additional intent types but adding one is a
-//! **deliberate choice**, not a default. See SPEC §5.13.
+//! **deliberate choice**, not a default. Plausible candidates
+//! (`pcp_attach_node` retry, peer `Start` retry) stay as bubble-up
+//! errors until a real operational need surfaces; resist the temptation
+//! to enqueue every possible failure mode.
 //!
-//! # Typed payload (vs. Go's raw JSON)
+//! # Typed payload
 //!
 //! The payload is a Rust enum with `#[serde(tag = "op")]`. Adding a new
 //! variant forces the worker's `match` to handle it (compile error
@@ -71,7 +74,7 @@ impl MaintenanceStatus {
 /// `match` can't miss a case.
 ///
 /// **New variants are a deliberate choice.** Most "I tried something
-/// and it failed" cases should stay as bubble-up errors. See SPEC §5.13.
+/// and it failed" cases should stay as bubble-up errors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum MaintenancePayload {
@@ -198,9 +201,9 @@ impl FileMaintenanceStore {
 
     fn make_id(&self, payload: &MaintenancePayload, now: DateTime<Utc>) -> String {
         // `<unix_nano>-<op>-<seq>` — seq disambiguates within the same
-        // nanosecond (rare but possible during sweep storms). Matches
-        // the Go id shape; operators can scan-sort this lexicographically
-        // and get oldest-first.
+        // nanosecond (rare but possible during sweep storms). Leading
+        // timestamp so operators can scan-sort lexicographically and get
+        // oldest-first.
         let nanos = now.timestamp_nanos_opt().unwrap_or(0);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         format!("{nanos}-{}-{seq}", payload.op_name())

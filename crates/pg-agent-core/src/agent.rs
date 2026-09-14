@@ -1,6 +1,6 @@
 //! `Agent` — the long-running runtime. Owns the shared deps and the
 //! background subsystems (LocalServer + PeerServer + MaintenanceWorker +
-//! `/healthz` listener). See SPEC §12.
+//! `/healthz` listener).
 //!
 //! # Lifecycle (race-critical)
 //!
@@ -166,7 +166,8 @@ impl Options {
 /// [`Agent::serve`] requires this as an argument — so by the time we reach
 /// the `sd_notify(READY=1)` call inside `serve`, every listener's fd is
 /// already in the kernel. The bind-before-notify invariant becomes
-/// structural rather than discipline (see SPEC §12 + [`crate::sdnotify`]).
+/// structural rather than discipline (see [`crate::sdnotify`] for the
+/// race this closes).
 pub struct Listeners {
     pub unix: UnixListener,
     pub peer: TcpListener,
@@ -384,8 +385,7 @@ impl Agent {
             });
         }
 
-        // Phantom-primary detection (SPEC §...; ROADMAP recovery and
-        // reconciliation). Runs AFTER subsystems spawn so peers can
+        // Phantom-primary detection. Runs AFTER subsystems spawn so peers can
         // answer our outbound GetStatus via the now-bound local
         // PeerServer if they're booting concurrently, and BEFORE
         // sd_notify(READY) so systemd's "started" signal aligns with
@@ -1029,7 +1029,9 @@ impl NodeInfo for Agent {
     /// `is_ready` is the conjunction of "every contributing probe
     /// succeeded": both service statuses + `is_in_recovery` + replication
     /// lag. A node where any probe failed is degraded, not ready, even if
-    /// the visible facts (e.g. service running) look fine. See SPEC §5.9.
+    /// the visible facts (e.g. service running) look fine — an
+    /// unreachable systemd makes "stopped" and "unknown" indistinguishable,
+    /// and a standby that cannot report lag has not proven it is caught up.
     async fn get_status(&self) -> anyhow::Result<pb::NodeStatus> {
         let (
             pg_status_res,

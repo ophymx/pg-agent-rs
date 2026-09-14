@@ -13,7 +13,10 @@
 //! - [`FixedArg`] — positional arguments hard-coded in pgpool's C source.
 //!   The operator has no knob in pgpool.conf for these.
 //!
-//! See SPEC.md §6 for the full hook contract.
+//! The `%m`/`%H` tokens mean different things in different hooks —
+//! "new main" (smallest surviving node id) in `failover_command`, "new
+//! primary" in `follow_primary_command` — so agent code verifies role
+//! with `pg_is_in_recovery()` rather than trusting the token.
 
 use std::collections::HashMap;
 use thiserror::Error;

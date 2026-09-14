@@ -1,10 +1,22 @@
-//! Hook-idempotency markers. **Scope (narrowed from the Go version): only
-//! `FollowPrimary` and `RecoveryFirstStage` carry markers.** Both flows
-//! run `pg_basebackup`, which wipes `$PGDATA` before streaming the
-//! primary's data — re-running a fully-completed flow would clobber the
-//! healthy standby's data dir. `Failover` was dropped from the protected
-//! set because its operations are naturally near-idempotent (see SPEC
-//! §5.12 for the full reasoning).
+//! Hook-idempotency markers. **Scope: `FollowPrimary` and `Failover`'s
+//! standby-down branch.**
+//!
+//! `FollowPrimary` is the one that needs protecting: it runs
+//! `pg_basebackup` conditionally, which wipes `$PGDATA` before streaming,
+//! so re-running a completed flow would clobber a healthy standby's data
+//! directory. The marker makes the second invocation a fast no-op.
+//! `Failover`'s standby-down branch carries one so a re-fired hook skips
+//! as "already processed"; its primary-down branch is a stateless
+//! advisory that answers BEFORE the marker check and never writes one —
+//! a stale marker of the same key shape must not mask it.
+//!
+//! `RecoveryFirstStage` is deliberately NOT here. It moved to the
+//! `inflight_ops` journal, which gives the same post-completion dedup
+//! plus two things a binary marker cannot: rejection of *concurrent*
+//! duplicates, and visibility of an in-flight orchestration to
+//! `Failover`'s cross-op consult — without which stopping a recovery
+//! target made pgpool fire a hook that dropped the slot the recovery had
+//! just created.
 //!
 //! # Storage
 //!

@@ -4,8 +4,9 @@
 //!   `archive_dir` for the peer-side `FetchWal` handler to stream.
 //! - [`WalStore::write_restore`] receives bytes streamed from a peer and
 //!   writes them atomically into `$PGDATA` at the path PostgreSQL's
-//!   `restore_command` supplied. The caller-supplied path is authoritative
-//!   (SPEC §17 invariant 9) but MUST resolve inside `pg_data_dir`.
+//!   `restore_command` supplied. That path is authoritative — unlike
+//!   every other hook field it comes from the local PostgreSQL backend
+//!   rather than from pgpool — but it MUST resolve inside `pg_data_dir`.
 //!
 //! # Security model
 //!

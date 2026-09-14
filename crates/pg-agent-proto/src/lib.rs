@@ -8,8 +8,9 @@
 //!   consensus plane, on the same mTLS listener as `PgAgentPeer` but dialed
 //!   over its own client channel.
 //!
-//! See [`../../SPEC.md`](../../SPEC.md) §3 for the full surface, including
-//! the field-level validation rules each handler must apply.
+//! The `.proto` files under `proto/` are the contract — message fields,
+//! comments and all. Handlers validate field values themselves before any
+//! handler logic runs; there is no interceptor doing it for them.
 
 #![allow(clippy::all)]
 #![allow(missing_docs)]

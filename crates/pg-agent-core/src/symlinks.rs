@@ -4,7 +4,7 @@
 //! `$PGDATA/recovery_1st_stage` and `$PGDATA/pgpool_remote_start` as
 //! subprocesses of the primary's PostgreSQL backend. Both names must
 //! exist as symlinks pointing at `pg_agentc` for the hook surface to
-//! work; see SPEC §10.2.
+//! work.
 //!
 //! Two call sites need this logic:
 //!
@@ -20,8 +20,7 @@
 //!    paths. `StandbyExec::basebackup` (trait method on
 //!    [`crate::pgstandby::StandbyOps`]) calls [`ensure_hook_symlinks`]
 //!    at the tail of its success path so the repair window is "during
-//!    the same handler that did the wipe." See SPEC §17 invariant on
-//!    hook symlinks.
+//!    the same handler that did the wipe" — no orchestrator can forget.
 //!
 //! `pg_rewind` does NOT wipe `$PGDATA` (it modifies in place), so the
 //! existing symlinks survive a rewind. Only basebackup needs the

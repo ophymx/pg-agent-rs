@@ -1,4 +1,5 @@
-//! Thin wrapper around `sd_notify(3)`. See SPEC §10.4 and §12.
+//! Thin wrapper around `sd_notify(3)`. The unit is `Type=notify`, so
+//! systemd holds the service "activating" until [`ready`] fires.
 //!
 //! # Race-safety invariant (caller contract)
 //!
@@ -17,12 +18,11 @@
 //!
 //! # Why this is called out
 //!
-//! Code review of the Go implementation surfaced this exact bug. The
-//! original `Serve()` spawned goroutines that *would* bind the listeners
-//! and then *immediately* called `SdNotify(READY)` without waiting. On a
-//! cold-boot a slow scheduler could deliver READY before the goroutine
-//! actually reached its `Listen()` call. The fix is the same on either
-//! runtime: do the bind synchronously, *then* notify, *then* spawn the
+//! The tempting shape — spawn the tasks that *will* bind the listeners,
+//! then notify — is a race, not a style choice: on a cold boot a slow
+//! scheduler delivers READY before a spawned task reaches its `bind()`,
+//! and pgpool starts against a socket that does not exist yet. The rule
+//! is: bind synchronously, *then* notify, *then* spawn the
 //! accept loop on the bound listener.
 //!
 //! # Dev-mode no-op

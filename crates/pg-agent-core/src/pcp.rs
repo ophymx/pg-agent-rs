@@ -2,7 +2,8 @@
 //! `pcp_detach_node`, `pcp_node_info`, and `pcp_node_count` (all shipped
 //! by the `pgpool2` distro package); `-w` disables the password prompt so
 //! auth flows through `~/.pcppass` (mode 0600, owned by the postgres
-//! user, provisioned by Ansible — see SPEC §10.5 and §13.1).
+//! user, provisioned by Ansible). The agent never reads or handles the
+//! PCP password itself.
 //!
 //! # Hot path: `pcp_node_info -a`
 //!

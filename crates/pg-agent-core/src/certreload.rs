@@ -1,4 +1,7 @@
-//! Hot-reloadable mTLS material backed by an [`ArcSwap`]. See SPEC §7.4.
+//! Hot-reloadable mTLS material backed by an [`ArcSwap`]. `[tls]` paths
+//! are the only hot-reloadable config there is; everything else needs a
+//! restart. The unit ships `ExecReload=/bin/kill -HUP $MAINPID`, so
+//! `systemctl reload pg_agentd` is the operator interface.
 //!
 //! [`CertReloader::new`] loads `ca_cert`, `cert`, and `key` from disk and
 //! parses them into a [`CertBundle`] — a [`rustls::sign::CertifiedKey`]
@@ -8,9 +11,9 @@
 //! SIGHUP calls [`CertReloader::reload`] which re-reads all three files
 //! and `ArcSwap`s a fresh bundle into place. **Existing TLS connections
 //! are not torn down** — only subsequent handshakes pick up the new
-//! material. Combined with the `MaxConnectionAge` keepalive on peer gRPC
-//! channels (SPEC §7.3), a rotated cert hits every long-lived channel
-//! within ~12 h.
+//! material. Combined with the `MaxConnectionAge` cap on peer gRPC
+//! channels, a rotated cert hits every long-lived channel within ~12 h
+//! without tearing down healthy connections.
 //!
 //! On a reload error the previous bundle is preserved (the broken files
 //! don't get installed); the error bubbles to the SIGHUP handler, which

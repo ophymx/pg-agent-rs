@@ -1,4 +1,13 @@
-//! pg_agentctl — operator CLI. See SPEC §13.
+//! pg_agentctl — operator CLI. The clap definitions below are the
+//! authoritative surface; keep their doc comments good, because they are
+//! what `--help` prints and what operators actually read.
+//!
+//! Four properties are contract, not convention, because automation
+//! depends on them: stable exit codes (0 clean / 1 work-to-do or failure
+//! / 2 usage), `--json` wherever output would otherwise be parsed, no
+//! interactive prompts ever (destructive commands take an explicit flag),
+//! and idempotence — re-running a command against an already-correct
+//! state is a no-op rather than an error.
 //!
 //! Designed to be friendly to Ansible:
 //!   - Every subcommand has a stable exit code (0 = success, 1 = work to do
@@ -391,7 +400,7 @@ async fn cluster_status(
 
     // Thin dialer: the daemon owns the fan-out, the PeerPool, the cert
     // material. The CLI doesn't need TLS material on disk — just the
-    // socket. See SPEC §13.
+    // socket.
     let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
     let mut client = client::dial_local(&socket).await?;
     let resp = client
@@ -1044,7 +1053,7 @@ async fn maintenance(
                 .map_err(|s| rpc_failed("ListMaintenance", s))?
                 .into_inner();
 
-            // SPEC §13: skipped files go to stderr.
+            // Skipped files go to stderr so stdout stays parseable.
             for s in &resp.skipped {
                 eprintln!("warning: skipped {}: {}", s.path, s.error);
             }
@@ -1339,9 +1348,8 @@ fn print_intent_human(i: &pg_agent_proto::pgagentpb::MaintenanceIntent) {
 
 /// Parse `pgpool.conf` enough to extract single-quoted directive values.
 ///
-/// Matches lines of the form `key = 'value'`, ignoring `#` comments
-/// (the SPEC §13 contract). Last-write-wins on duplicate keys, matching
-/// pgpool's own resolution.
+/// Matches lines of the form `key = 'value'`, ignoring `#` comments.
+/// Last-write-wins on duplicate keys, matching pgpool's own resolution.
 fn parse_pgpool_conf(text: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for raw in text.lines() {

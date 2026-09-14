@@ -29,7 +29,7 @@
 //! # Replslot cleanup
 //!
 //! `pg_rewind` clears `$PGDATA/pg_replslot/*` **both before and after**
-//! its run (SPEC §17 invariant 5). Before: stale slot dirs from this
+//! its run. Before: stale slot dirs from this
 //! node's pre-rewind role would otherwise survive (rewind copies only
 //! changed blocks). After: rewind may have copied slot dirs from the
 //! source's role that would crash PG recovery if left in place.
@@ -239,7 +239,10 @@ pub trait StandbyOps: Send + Sync {
         progress: Option<ProgressCb>,
     ) -> anyhow::Result<()>;
 
-    /// Clears `pg_replslot/*` before *and* after (see SPEC §17 invariant 5).
+    /// Clears `pg_replslot/*` before *and* after — before, stale slot
+    /// dirs from this node's pre-rewind role survive the block-level
+    /// copy; after, dirs rewind copied from the source's role would
+    /// crash PostgreSQL recovery.
     /// Does NOT touch symlinks — rewind modifies pgdata in place, and
     /// symlinks (being outside `pg_replslot/`) survive untouched.
     async fn rewind(&self, opts: RewindOpts, progress: Option<ProgressCb>) -> anyhow::Result<()>;
@@ -809,7 +812,7 @@ fn render_recovery_conf(
         anyhow::bail!("slot_name contains invalid characters");
     }
     // application_name = the slot name = this node's one identity
-    // (`node{id}`, SPEC §5.1). It is what the primary's
+    // (`node{id}`). It is what the primary's
     // `synchronous_standby_names = ANY 1 (...)` will match walsenders
     // by (docs/quorum-commit.md §6) — without it, quorum commit has
     // nothing to name. Already validated by the slot-name regex above.

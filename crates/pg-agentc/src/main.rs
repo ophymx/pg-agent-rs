@@ -1,4 +1,6 @@
-//! pg_agentc — pgpool-II hook client for pg_agent. See SPEC §15.
+//! pg_agentc — pgpool-II hook client for pg_agent. Tiny on purpose: it
+//! carries no config and resolves no nodes, so if it can reach the
+//! socket, it works. Adding state here is a design regression.
 //!
 //! Behaviour:
 //!
@@ -346,9 +348,9 @@ async fn handle_escalation(
     hook_name: &str,
     timeout: Duration,
 ) -> Result<ExitCode> {
-    // Same RPC for escalation and de_escalation; both are no-ops in the
-    // HAProxy deployment (SPEC §5.5). The hook_name is only used for the
-    // error/info message.
+    // Same RPC for escalation and de_escalation; both are no-ops —
+    // HAProxy replaces VIP management, and with the watchdog off these
+    // hooks never fire at all. The hook_name only shapes the message.
     let resp = with_deadline(timeout, client.escalation(pb::EscalationRequest {})).await?;
     finish(hook_name, resp)
 }

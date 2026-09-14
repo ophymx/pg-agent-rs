@@ -1,5 +1,4 @@
-//! `/healthz` plain-HTTP listener. See SPEC §9 for the design rationale
-//! (one endpoint, status code is the contract, no TLS).
+//! `/healthz` plain-HTTP listener.
 //!
 //! # One endpoint, status code is the contract
 //!
@@ -16,8 +15,11 @@
 //! The JSON body carries operational state for operators
 //! (`role`, per-backend list, replication lag, snapshot age) but it is
 //! **not part of the status-code contract**. Error strings from failed
-//! probes go to `tracing::warn` instead of the body — see SPEC §9.2 for
-//! why this is plain HTTP rather than HTTPS.
+//! probes go to `tracing::warn` instead of the body, which is what makes
+//! plain HTTP defensible here: the body then carries no schema, role or
+//! path leakage, so TLS would encrypt "lag is 0, role is primary" at the
+//! cost of CA-trust gymnastics in every monitoring tool. Operators who
+//! need it front this with a reverse proxy.
 //!
 //! # Hot path
 //!
@@ -34,7 +36,8 @@
 //! 2. `HealthSnapshotter::new(db, pcp)`.
 //! 3. `snapshotter.probe_once().await` — initial sync probe so the
 //!    very first request after `sd_notify::ready()` sees a real
-//!    snapshot, not 503 (SPEC §9.3, §12).
+//!    snapshot, not 503. Without it there is a ~1 s window in which
+//!    HAProxy marks a just-started node down.
 //! 4. Spawn `snapshotter.run(shutdown)` for the ticking loop.
 //! 5. Spawn `serve_healthz(listener, snapshotter, STALE_AFTER, shutdown)`.
 //! 6. `sd_notify::ready()`.
@@ -58,7 +61,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
-// Tuning constants (rationale in SPEC §9.3)
+// Tuning constants
 // ---------------------------------------------------------------------------
 
 /// Snapshot probe cadence. Must be shorter than HAProxy's `fastinter 2s`
@@ -935,7 +938,9 @@ mod tests {
         let (_status, body) = compute_health(Some(healthy_snapshot()), STALE_AFTER, Utc::now());
         let json: serde_json::Value = serde_json::to_value(&body).unwrap();
 
-        // Top-level fields per SPEC §9.4.
+        // This body is consumed by operators and monitoring, so the
+        // field names are a wire contract: renaming one is a breaking
+        // change even though nothing in this repo would fail to compile.
         assert_eq!(json["ready"], true);
         assert_eq!(json["role"], "primary");
         assert!(json["snapshot_age_ms"].is_i64());

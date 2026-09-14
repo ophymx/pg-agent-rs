@@ -3,7 +3,7 @@
 // `tonic::include_proto!("pgagentpb")`.
 //
 // Field-level validation (buf.validate) is NOT pulled in here on purpose —
-// see SPEC §3.4. Validation is performed by hand in the Rust handlers so the
+// Validation is performed by hand in the Rust handlers so the
 // proto files stay portable and we don't take a heavy dep for one regex and
 // one min_len.
 

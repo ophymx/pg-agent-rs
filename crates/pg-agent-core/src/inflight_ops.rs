@@ -123,8 +123,9 @@ pub enum InflightPayload {
     /// Long-term, the existing `FollowPrimary` RPC should converge on
     /// this same driver: orchestration shouldn't care who pulled the
     /// trigger, only that the right peers get the right instructions
-    /// and the end state is correct. See ROADMAP item
-    /// "follow_primary unification".
+    /// and the end state is correct. Three implementations share this
+    /// end state today — this driver, the `FollowPrimary` RPC handler,
+    /// and the executor's light-follow path.
     FollowPrimary {
         /// The standby being rebased.
         detached_node_id: i32,
@@ -1228,8 +1229,8 @@ impl InflightOpStore for InMemoryInflightOpStore {
 // Ownership queries
 // ---------------------------------------------------------------------------
 
-/// Node id encoded in a replication-slot name. Slots are `node{id}`
-/// (SPEC §5.1); anything else has no owning node.
+/// Node id encoded in a replication-slot name. Slots are always
+/// `node{id}`; anything else has no owning node.
 pub fn node_id_from_slot(slot_name: &str) -> Option<i32> {
     slot_name.strip_prefix("node")?.parse().ok()
 }

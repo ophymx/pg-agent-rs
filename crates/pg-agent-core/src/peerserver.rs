@@ -22,8 +22,8 @@
 //! The **root store** (used to validate the inbound peer's cert chain)
 //! is snapshotted from [`crate::certreload::CertBundle::roots`] at
 //! `serve()` time. CA rotation is treated as "rare enough to restart
-//! the daemon for" — see SPEC §7.4. Server-cert rotation is the hot
-//! path; CA rotation is a planned event.
+//! the daemon for". Server-cert rotation is the hot path; CA rotation is
+//! a planned event.
 
 use crate::agent::NodeInfo;
 use crate::certreload::{extract_sans, CertReloader, ReloadingServerCertResolver};
@@ -266,7 +266,7 @@ impl PeerServer {
     /// [`crate::localserver::CROSS_OP_GRACE`] is only the backstop for
     /// a node that never comes up).
     ///
-    /// Slots are named `node{id}` (SPEC §5.1), which is the link
+    /// Slots are always named `node{id}`, which is the link
     /// between a slot and the op that owns the node it belongs to. An
     /// unparseable name means no owner: the guard exists to protect
     /// known orchestrations, not to block anything unfamiliar.

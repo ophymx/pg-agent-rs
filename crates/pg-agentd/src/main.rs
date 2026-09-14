@@ -1,4 +1,4 @@
-//! pg_agentd — coordinator daemon. See SPEC §12 for the lifecycle.
+//! pg_agentd — coordinator daemon.
 //!
 //! Two modes:
 //!
@@ -12,7 +12,7 @@
 //!   [`Listeners::bind`]).
 //!
 //! - **`pg_agentd validate-env`** — run the localhost preflight checks
-//!   (see SPEC §14) and exit. No listeners bound, no signal handlers,
+//!   ([`pg_agent_core::preflight`]) and exit. No listeners, no handlers,
 //!   no daemon. Intended for `ExecStartPre=` and Ansible deploy gates,
 //!   like `nginx -t`.
 
@@ -68,7 +68,7 @@ enum Cmd {
     /// Run the coordinator daemon (default when no subcommand given).
     Serve,
 
-    /// Validate the localhost environment (SPEC §14): TLS material,
+    /// Validate the localhost environment: TLS material,
     /// pgpool_node_id consistency, libpq home defaults, recovery tools,
     /// PostgreSQL tuning, roles, extension. Exits 0 if every check
     /// passes with no ERRs. Designed for systemd `ExecStartPre=` and
@@ -261,9 +261,10 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
     let pg_agentc_bin = find_pg_agentc().map_err(|e| anyhow::anyhow!("locate pg_agentc: {e}"))?;
     info!(path = %pg_agentc_bin.display(), "pg_agentc located");
 
-    // Daemon-startup hook-symlink repair (SPEC §10.2 + §17). pgpool may
-    // exec these any time after pg_agentd.service activates, so the
-    // symlinks must exist before listeners come up.
+    // Daemon-startup hook-symlink repair. pgpool may exec these any time
+    // after pg_agentd.service activates, so the symlinks must exist
+    // before listeners come up. Refuses rather than clobbers if a
+    // foreign symlink or a regular file is in the way.
     ensure_hook_symlinks(&postgres.data_dir, &pg_agentc_bin)
         .map_err(|e| anyhow::anyhow!("hook symlink setup: {e}"))?;
 
@@ -416,7 +417,7 @@ fn install_shutdown_handler(shutdown: CancellationToken) -> anyhow::Result<()> {
 
 /// SIGHUP → [`CertReloader::reload`]. Each SIGHUP atomically swaps the
 /// active cert bundle; new connections pick up the new material, in-flight
-/// ones drain on the old. Per SPEC §7 the reload window is bounded by the
+/// ones drain on the old. The reload window is bounded by the
 /// 12 h peer-connection age cap, so a SIGHUP propagates everywhere within
 /// ~12 h without us tearing down healthy channels.
 fn install_sighup_reload(reloader: Arc<CertReloader>) {

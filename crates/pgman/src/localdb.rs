@@ -18,7 +18,11 @@
 //! [`crate::pgstandby::PgReplicationConfig`] for sslmode + libpq's default
 //! does **not** flow through this pool.
 //!
-//! See SPEC §4.1 for the verbatim SQL each method runs.
+//! Two conventions hold across every method here. SQLSTATE 42710
+//! (`duplicate_object`) is treated as success, so `create_slot` and
+//! `create_replication_role` are idempotent and any orchestration is
+//! safe to re-run. And every identifier that reaches SQL is regex-
+//! validated by the caller first rather than escaped-and-hoped.
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config as PoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -435,7 +439,7 @@ impl LocalDb for PgLocalDb {
 
         // pg_stat_wal_receiver may have zero rows if the receiver isn't
         // connected — return the lag value with state="" rather than
-        // erroring, matching the Go impl.
+        // erroring: no receiver is a state, not a failure.
         let state_row = conn
             .query_opt(
                 "SELECT coalesce(status, '') FROM pg_stat_wal_receiver LIMIT 1",
@@ -451,7 +455,7 @@ impl LocalDb for PgLocalDb {
     async fn setting(&self, name: &str) -> anyhow::Result<String> {
         let conn = self.get_conn().await?;
         // current_setting(name, missing_ok=true) returns NULL when absent;
-        // accept NULL and turn into the empty string, matching the Go impl.
+        // accept NULL and turn it into the empty string.
         let row = conn
             .query_one("SELECT current_setting($1, true)", &[&name])
             .await

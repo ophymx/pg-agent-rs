@@ -16,8 +16,11 @@
 //! - **Maintenance queue** — `ListMaintenance`, `GetMaintenance`,
 //!   `RetryMaintenance`.
 //!
-//! Every RPC validates its inputs against SPEC §3.4's regex set
-//! before touching the local DB or the peer pool.
+//! Every RPC validates its inputs against the shared regex set
+//! (hostname, repl user, slot name, WAL filename) BEFORE touching the
+//! local DB or the peer pool. A hostname containing a space would
+//! otherwise inject a second `key=value` into a libpq conninfo and
+//! redirect a basebackup at an attacker's host.
 
 use crate::agent::NodeInfo;
 use crate::config::{NodeConfig, NodePool, PostgresRuntime};
@@ -138,7 +141,7 @@ pub(crate) const REC_PHASE_STANDBY_CONFIGURED: &str = "standby_configured";
 
 /// How long a completed recovery suppresses an identical re-run.
 /// Preserves the semantics of the 24 h replay marker this ladder
-/// replaces (SPEC §5.12): pgpool may re-fire `recovery_1st_stage`
+/// replaces: pgpool may re-fire `recovery_1st_stage`
 /// after a partial success, and a second destructive reclone is not
 /// what it is asking for. `bypass_replay_marker` on the request
 /// overrides it, which is how `cluster recover` re-runs deliberately.
@@ -365,7 +368,8 @@ impl PgAgentLocal for LocalServer {
             .old_primary
             .ok_or_else(|| Status::invalid_argument("failover: old_primary is required"))?;
 
-        // SPEC §8: -1 is pgpool's "no candidates" sentinel.
+        // -1 is pgpool's "no candidates alive" sentinel. Nothing safe to
+        // do with it, so log and decline — never panic, never guess.
         if new_main_ref.id == -1 {
             warn!("failover: no standby candidates available (new_main.id == -1)");
             return Ok(Response::new(OpResult {
@@ -599,7 +603,9 @@ impl PgAgentLocal for LocalServer {
             ))
         })?;
 
-        // SPEC §10: skip a deliberately-stopped detached node.
+        // Skip a deliberately-stopped detached node: if it is not
+        // running, someone stopped it on purpose and rebuilding it here
+        // would fight them.
         let status = peer.get_status().await.map_err(|e| {
             internal(anyhow::anyhow!(
                 "follow_primary: get_status {}: {e}",
@@ -621,9 +627,9 @@ impl PgAgentLocal for LocalServer {
             ))
         })?;
 
-        // SPEC §2: checkpoint before slot creation so the slot's
-        // restart_lsn is at the current WAL position, not whatever was
-        // there when the primary was promoted.
+        // Checkpoint before slot creation so the slot's restart_lsn is
+        // at the current WAL position, not whatever was there when the
+        // primary was promoted.
         self.db
             .checkpoint()
             .await
@@ -711,7 +717,6 @@ impl PgAgentLocal for LocalServer {
             return Err(internal(err));
         }
 
-        // SPEC §5: pcp_attach_node is FollowPrimary-only.
         // From this point the slot is in use by the standby — don't drop
         // on attach failure; only pgpool's view is wrong, slot is correct.
         if let Err(e) = self.pcp.attach_node(detached.id).await {
@@ -870,7 +875,7 @@ impl PgAgentLocal for LocalServer {
             }};
         }
 
-        // SPEC §2: checkpoint then create_slot so the slot's restart_lsn
+        // Checkpoint then create_slot so the slot's restart_lsn
         // sits at the current WAL position. Without this, basebackup
         // could start from an older checkpoint and the slot would
         // immediately need WAL we no longer keep.
@@ -964,7 +969,7 @@ impl PgAgentLocal for LocalServer {
             warn!(id = %op_id, ?e, "recovery_1st_stage: journal phase update failed");
         }
 
-        // SPEC §5: do NOT call pcp_attach_node here — pgpool drives
+        // Do NOT call pcp_attach_node here — pgpool drives
         // re-attachment after 2nd stage completes (which is triggered
         // by pgpool itself via pgpool_remote_start, not us).
         self.inflight
@@ -1064,7 +1069,8 @@ impl PgAgentLocal for LocalServer {
     /// Each per-standby failure path drops the slot we just created
     /// (consistent with FollowPrimary/RecoveryFirstStage); if the drop
     /// itself fails, a `DropSlotCleanup` maintenance intent is queued.
-    /// SPEC §5.7 spells out the cleanup rule.
+    /// A slot that survives a half-completed flow pins WAL on the
+    /// primary indefinitely, which costs the operator real disk.
     ///
     /// Does NOT call `pcp_attach_node` — pgpool isn't running yet
     /// during initial bootstrap. Adding-to-a-running-cluster is the
@@ -1075,7 +1081,8 @@ impl PgAgentLocal for LocalServer {
     ) -> Result<Response<ClusterInitResponse>, Status> {
         let req = req.into_inner();
 
-        // SPEC §5.7 invariant: must run on the primary.
+        // Must run on the primary — defensive, since cluster_init is
+        // dispatched at the node the operator ran the CLI on.
         let in_recovery =
             self.db.is_in_recovery().await.map_err(|e| {
                 internal(anyhow::anyhow!("cluster_init: check primary status: {e}"))
@@ -2215,7 +2222,8 @@ impl PgAgentLocal for LocalServer {
     /// "Not primary" is returned as `OpResult { ok=false, message=… }`
     /// rather than `Err(Status::failed_precondition)` because pgpool
     /// inspects the boolean — surfacing as a non-error is the correct
-    /// contract per SPEC §3.5.
+    /// contract: gRPC errors are reserved for unrecoverable failures,
+    /// and "you asked the wrong node" is operationally normal.
     async fn remote_start(
         &self,
         req: Request<RemoteStartRequest>,
@@ -2230,7 +2238,7 @@ impl PgAgentLocal for LocalServer {
             .map_err(|e| Status::invalid_argument(format!("remote_start: target: {e}")))?;
         info!(target = %target.hostname, "remote_start");
 
-        // SPEC §7: defense in depth — pgpool_remote_start is only ever
+        // Defense in depth — pgpool_remote_start is only ever
         // exec'd by `pgpool_recovery` on the primary. If we're in
         // recovery, something upstream is off.
         let in_recovery =
@@ -2439,7 +2447,7 @@ impl LocalServer {
     /// Write the replay marker then return an `Ok(OpResult)` with the
     /// given message. Failure to write the marker surfaces as Internal —
     /// without it pgpool may re-fire the whole hook on a retry, undoing
-    /// what we just did. See SPEC §17.
+    /// what we just did.
     async fn write_replay_marker_then_ok(
         &self,
         op: &str,
@@ -2460,7 +2468,7 @@ impl LocalServer {
     /// per-standby outcomes). On any failure between `create_slot` and
     /// `start`, the slot is dropped via the shared
     /// `cleanup_slot_after_failure` helper — failed cleanups queue a
-    /// `DropSlotCleanup` maintenance intent. SPEC §5.7.
+    /// `DropSlotCleanup` maintenance intent.
     async fn init_standby(
         &self,
         standby: &NodeConfig,
@@ -5026,7 +5034,7 @@ mod tests {
         );
     }
 
-    // ----- failover preconditions (defense in depth, TODO.md / §3) ----------
+    // ----- failover preconditions (defense in depth, not the fix) -----------
 
     #[tokio::test]
     async fn failover_skips_slot_drop_while_a_recovery_owns_the_node() {

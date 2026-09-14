@@ -1,9 +1,13 @@
-//! Runtime-prerequisite checks. Each is independent and idempotent;
-//! failures are reported, not raised. Designed to be invoked from
-//! `pg_agentctl preflight` and from Ansible (parseable output,
-//! deterministic exit code).
+//! Runtime-prerequisite checks behind `pg_agentd validate-env`. Each is
+//! independent and idempotent; failures are reported, not raised.
 //!
-//! **Scope: localhost only.** Two buckets per SPEC §14:
+//! It lives on the DAEMON binary rather than `pg_agentctl` because the
+//! daemon is the authority on what a valid environment is — same loader,
+//! same projections, no chance of the validator drifting from the
+//! consumer. The unit wires it as `ExecStartPre=`, so a node with a
+//! broken environment refuses to start instead of half-running.
+//!
+//! **Scope: localhost only.** Two buckets:
 //!
 //! 1. **Filesystem** — TLS material, pgpool_node_id, libpq home defaults
 //!    (`.pcppass`, `.postgresql/`), recovery tools. Always run.
@@ -867,16 +871,17 @@ async fn db_roles(db: &Arc<dyn LocalDb>, cfg: &Config, r: &mut PreflightReport) 
 
 /// The drop-in that fixes a resurrecting unit. Same filename the
 /// acceptance suite writes (`testing/docker/provision.sh`) and the same
-/// one BOOTSTRAP §1.1 hands the operator, so a node, a fixture and a
-/// playbook all name the same file.
+/// one the deployment docs hand the operator, so a node, a fixture and a
+/// playbook all name the same file. The check prints this path, which is
+/// the whole point: an ERR the operator cannot act on is just noise.
 const RESTART_DROPIN: &str = "10-agent-managed.conf";
 
 /// Is systemd allowed to restart PostgreSQL behind the agent's back?
 ///
 /// PGDG's `postgresql-<ver>.service` ships `Restart=on-failure`
 /// **active**; Debian's `postgresql@.service` ships the same line
-/// commented out. Nothing in BOOTSTRAP closes that: `systemctl disable`
-/// stops boot-time autostart, not `Restart=`.
+/// commented out. Disabling the unit does not close it either:
+/// `systemctl disable` stops boot-time autostart, not `Restart=`.
 ///
 /// **The hazard is not the agent's own fence.** systemd never restarts
 /// a unit it stopped by an explicit stop job, so `ensure_stopped` is
@@ -1196,8 +1201,10 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_include_ok_when_pgdata_conf_names_it() {
-        // RHEL shape: postgresql.conf lives inside PGDATA, so the
-        // relative spelling BOOTSTRAP prescribes resolves correctly.
+        // RHEL shape: postgresql.conf lives inside PGDATA, so even the
+        // relative spelling resolves correctly. This is exactly why the
+        // check must resolve the include rather than pattern-match it —
+        // the same line is right here and wrong on Debian.
         let tmp = TempDir::new().unwrap();
         let (cfg, data_dir, _conf_dir) = make_include_cfg(&tmp);
         fs::write(
@@ -1263,9 +1270,9 @@ mod tests {
 
     #[test]
     fn recovery_include_ok_on_the_real_debian_shape() {
-        // What the acceptance images actually provision, and what
-        // BOOTSTRAP now prescribes: config outside PGDATA, the line in
-        // a conf.d drop-in, path spelled absolutely. The walk has to
+        // What the acceptance images provision and what operators are
+        // told to write: config outside PGDATA, the line in a conf.d
+        // drop-in, path spelled absolutely. The walk has to
         // cross both hops — include_dir, then the drop-in — and accept
         // the absolute target.
         let tmp = TempDir::new().unwrap();

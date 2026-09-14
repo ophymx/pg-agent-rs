@@ -1,11 +1,11 @@
 //! systemd service management via D-Bus (no `sudo`, polkit-authorised for
-//! the `postgres` user). See SPEC §11.
+//! the `postgres` user).
 //!
 //! # Gotcha #1 — the SYSTEM bus, not the session bus
 //!
 //! [`DbusSystemd::new`] connects to the **system** bus
-//! ([`zbus::Connection::system`]). The polkit rule we ship
-//! (`/usr/share/polkit-1/rules.d/50-pg-agent.rules`) only protects actions
+//! ([`zbus::Connection::system`]). The polkit rule
+//! (`/etc/polkit-1/rules.d/50-pg-agent.rules`) only protects actions
 //! issued on the system bus; talking to the session bus would silently
 //! bypass polkit entirely AND fail to actually manage system units, with a
 //! confusing "unit not found" or "permission denied" error rather than a
@@ -22,10 +22,9 @@
 //! Internally `DbusSystemd::run_unit_op` subscribes to the JobRemoved
 //! stream **before** issuing the call, so a fast-completing job (e.g. a unit
 //! that was already active and the new job was `skipped`) can't escape
-//! the wait window. The previous Go implementation followed the same
-//! ordering, but missing the subscribe-first ordering would manifest as
-//! "job sometimes never completes" intermittent test failures — exactly
-//! the kind of race that's easy to introduce by accident.
+//! the wait window. Getting that ordering backwards manifests as "the
+//! job sometimes never completes" — an intermittent failure that is easy
+//! to introduce by accident and miserable to diagnose.
 //!
 //! # Gotcha #3 — Subscribe()
 //!
@@ -53,9 +52,9 @@
 //! `InteractiveAuthorizationRequired` — a prompt no daemon can answer
 //! (testing/FINDINGS.md finding 27).
 //!
-//! The rule itself is installed by Ansible (see SPEC §10.5 — pg_agent
-//! owns no /etc files); testing/docker/50-pg-agent.rules is the
-//! reference copy the acceptance suite deploys.
+//! The rule is installed by Ansible, not by our package — pg_agent owns
+//! no files under /etc. `testing/docker/50-pg-agent.rules` is the
+//! reference copy the acceptance suite deploys, and the one to copy from.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -265,7 +264,7 @@ impl DbusSystemd {
             .map_err(|e| anyhow::anyhow!("systemd: status {unit}: {e}"))?;
         // ListUnitsByNames returns the requested units in order, or omits
         // ones systemd doesn't know about. Empty → "not loaded" → treat as
-        // not running (matches the Go impl).
+        // not running.
         match statuses.into_iter().next() {
             None => Ok(false),
             Some(s) => Ok(is_active_state_running(&s.active_state)),
@@ -353,7 +352,7 @@ impl Systemd for DbusSystemd {
 // ---------------------------------------------------------------------------
 
 /// systemd's `ActiveState` values that we treat as "the unit is up and
-/// processing requests" — matches the Go impl. Any other value (including
+/// processing requests". Any other value (including
 /// `inactive`/`deactivating`/`failed` and the rare `maintenance`) is
 /// treated as "not running" so the agent can surface a clear "stopped"
 /// rather than "unknown" to operators.

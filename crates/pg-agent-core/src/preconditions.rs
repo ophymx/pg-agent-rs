@@ -44,9 +44,9 @@ pub const PRECONDITION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A cluster-state-changing action about to be taken, described with
 /// enough context to check it against live cluster state. Handlers add
-/// variants as they adopt the validator (TODO.md: failover today;
-/// follow_primary / recover / handoff preflights are candidates to
-/// converge here).
+/// variants as they adopt the validator — failover today;
+/// `follow_primary`, `cluster_recover` and `cluster_handoff` still carry
+/// their own ad-hoc preflights and are the candidates to converge here.
 pub enum ClusterIntent<'a> {
     /// Reactive failover, standby-down branch: drop `detached`'s
     /// replication slot because the standby is presumed dead. Wrong

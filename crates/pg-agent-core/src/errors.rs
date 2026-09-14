@@ -1,7 +1,8 @@
 //! Typed errors for pg-agent-core.
 //!
-//! Mirrors the named errors used in the Go agent so log-grep recipes ported
-//! from the Go version still find them. New error variants belong here, not
+//! Error *names* are an operator interface: they end up in the journal,
+//! and runbooks grep for them. Renaming one is a breaking change even
+//! though nothing fails to compile. New variants belong here rather than
 //! buried inside individual modules.
 
 use std::path::PathBuf;

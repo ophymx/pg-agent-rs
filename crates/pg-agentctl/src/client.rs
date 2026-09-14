@@ -3,9 +3,14 @@
 //! Every `pg_agentctl` subcommand that talks to a running `pg_agentd`
 //! dials it via the Unix socket at `unix_socket` from config (or
 //! `--socket` override). No mTLS — the socket is mode `0600
-//! postgres:postgres` and filesystem permissions ARE the access control
-//! (SPEC §10.1). Symmetric with how `pg_agentc` already reaches the
-//! daemon, just exposed as a small helper instead of duplicated.
+//! postgres:postgres` and filesystem permissions ARE the access control.
+//! Symmetric with how `pg_agentc` already reaches the daemon, just
+//! exposed as a small helper instead of duplicated.
+//!
+//! This is why the CLI needs no TLS material on disk: the daemon owns
+//! the peer pool and the certs, and does any fan-out on the CLI's
+//! behalf. An operator can drive a cluster over SSH with nothing but
+//! socket access.
 //!
 //! See [`crate::config_loader::resolve_socket_path`] for how the path
 //! falls through CLI flag → config → default.
