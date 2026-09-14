@@ -144,13 +144,12 @@ pub trait PeerClient: Send + Sync {
     /// to promote the chosen new main after the primary goes down.
     async fn promote(&self) -> anyhow::Result<()>;
 
-    // The `Reload`, `ReloadPgpool` and `RemoveVip` peer RPCs used to be
-    // listed here as deliberately-unimplemented client methods. They
-    // are gone from the proto entirely now: every config reload in this
-    // design is local to the node whose config changed, and HAProxy
-    // fronts the cluster so there is no VIP to manage. A reserved RPC
-    // with a server handler and no caller is a surface that has to be
-    // maintained, tested, and reasoned about while doing nothing.
+    // There is deliberately no `Reload`, `ReloadPgpool` or `RemoveVip`
+    // here, and none in the proto: every config reload in this design is
+    // local to the node whose config changed, and HAProxy fronts the
+    // cluster so there is no VIP to manage. A reserved RPC with a server
+    // handler and no caller is a surface that has to be maintained,
+    // tested and reasoned about while doing nothing.
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +612,7 @@ impl PeerClient for PeerChannel {
         // Client-side bound on establishing the stream (the same
         // partition trap as PRECONDITION_TIMEOUT and the consensus
         // plane's LEADER_RPC_TIMEOUT — third occurrence of the class,
-        // found by acceptance E2): without it, a black-holed peer holds
+        // finding 14): without it, a black-holed peer holds
         // this call to the 300 s channel ceiling, and this call sits on
         // the promotion-critical path via restore_command. Bounds the
         // setup only; the data stream, once flowing, is governed by the

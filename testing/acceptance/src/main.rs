@@ -3,9 +3,8 @@
 //! THE MODEL UNDER TEST IS LEASE-DRIVEN ROLES. Every failure/recovery
 //! scenario runs under the raft consensus lease — the only shape the
 //! daemon has, since a node either joins consensus or refuses to start
-//! — with pgpool present strictly as the router it is post-cutover.
-//! The pgpool-led promote path is deleted from the codebase, not
-//! merely untested.
+//! — with pgpool present strictly as a router. It commands nothing:
+//! there is no pgpool-led promote path in the codebase to test.
 //!
 //! Usage (via testing/acceptance.sh, which builds and execs this):
 //!   testing/acceptance.sh              # build, up, run, down

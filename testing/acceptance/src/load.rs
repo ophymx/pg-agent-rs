@@ -1,4 +1,4 @@
-//! Continuous write load: the ledger writer (gap item 4). Upgrades
+//! Continuous write load: the ledger writer. Upgrades
 //! the suite's data-survival claim from "one at-rest sentinel
 //! survived" to "EVERY acknowledged row survived" — the actual
 //! quorum-commit invariant — and lets the deposed primary's

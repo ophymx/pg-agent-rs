@@ -219,8 +219,8 @@ pub struct PeerServer {
     pcp: Arc<dyn crate::pcp::Pcp>,
     /// The consensus plane, served on this same listener when Raft is
     /// running (promotion-authority §5, "Transport"): same port, same
-    /// certs, same SAN allowlist. `None` until the node has a Raft
-    /// instance, which is every deployment before cutover.
+    /// certs, same SAN allowlist. `None` only where no Raft instance is
+    /// wired — the peer-server unit tests, never a running daemon.
     raft: Option<PgAgentRaftServer<RaftGrpcService>>,
 }
 
@@ -1039,7 +1039,6 @@ mod tests {
         start_calls: AtomicUsize,
         stop_calls: AtomicUsize,
         reload_pg_calls: AtomicUsize,
-        reload_pgpool_calls: AtomicUsize,
         fail: AtomicBool,
     }
 

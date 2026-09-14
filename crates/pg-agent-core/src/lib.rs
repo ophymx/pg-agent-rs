@@ -7,11 +7,10 @@
 //! without linking the gRPC server bits.
 //!
 //! See [`../../SPEC.md`](../../SPEC.md) for the architecture and
-//! [`../../ROADMAP.md`](../../ROADMAP.md) for the v1.x / v2 / exploratory
-//! features that should not be foreclosed by current design choices.
+//! [`../../ROADMAP.md`](../../ROADMAP.md) for the planned features that
+//! current design choices should not foreclose.
 
 #![forbid(unsafe_code)]
-#![allow(dead_code)] // scaffolding — modules are stubs
 
 pub mod agent;
 pub mod certreload;

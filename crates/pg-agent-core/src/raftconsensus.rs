@@ -1,5 +1,5 @@
 //! [`ConsensusStore`] over a running Raft
-//! (docs/promotion-authority.md §5, sequencing step 6).
+//! (docs/promotion-authority.md §5).
 //!
 //! This is the swap the whole seam exists for: the HA loop's contract
 //! does not change, and neither does the loop. What changes is that
@@ -330,10 +330,10 @@ impl RaftRuntime {
         // Don't return into a leaderless gap. `initialize()` commits the
         // membership and only then does the first election run; a caller
         // that immediately proposes (ClusterInit seeds the lease on the
-        // next line) loses that race with "no leader known" — the
-        // greenfield acceptance suite hit exactly this on its first run,
-        // where the same code had won the race in every staged-migration
-        // run before it. Bounded: elections are sub-second here, and a
+        // next line) loses that race with "no leader known". The race is
+        // timing-dependent, so it stays lost or won quietly for long
+        // stretches — which is why the wait is explicit rather than
+        // left to luck. Bounded: elections are sub-second here, and a
         // cluster that cannot elect within this window has a problem the
         // caller should hear about from its own next step.
         let deadline = tokio::time::Instant::now() + LEADER_WAIT_AFTER_BOOTSTRAP;

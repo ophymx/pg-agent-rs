@@ -1,5 +1,5 @@
 //! openraft storage for the consensus state machine
-//! (docs/promotion-authority.md §5, sequencing step 6).
+//! (docs/promotion-authority.md §5).
 //!
 //! Two halves of openraft's `storage-v2` split, both backed by one redb
 //! file under `<state_dir>/raft/`:

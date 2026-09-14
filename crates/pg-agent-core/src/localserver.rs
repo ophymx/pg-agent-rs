@@ -71,8 +71,9 @@ const RESTORE_WAL_PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 /// long. PostgreSQL invokes `restore_command` once per file, back to
 /// back — at promotion, several times in a row — and without a
 /// cooldown each invocation re-pays the full timeout for the same
-/// partitioned peer. Acceptance E2 measured the cost: a promotion
-/// stalled ~40 s re-probing an isolated node, wide enough for a rival
+/// partitioned peer. The acceptance suite measured the cost (finding
+/// 14): a promotion stalled ~40 s re-probing an isolated node, wide
+/// enough for a rival
 /// to depose the winner and promote a second primary. The cooldown is
 /// process-local and short: a peer that recovers is retried within
 /// seconds, and a false skip only means the segment comes from another
@@ -374,13 +375,12 @@ impl PgAgentLocal for LocalServer {
         }
 
         // The primary-down announcement is ALWAYS advisory: pgpool's
-        // failure report is a hint, never an order, and the pgpool-led
-        // promote path is gone — the lease decides who is primary
-        // (promotion-authority §6; the legacy mode was removed
-        // wholesale once greenfield deployment made it dead code).
-        // Answered before the replay-marker check because the advisory
-        // is stateless. Only standby-down slot hygiene below is real
-        // work, and it keeps its guards.
+        // failure report is a hint, never an order. The lease decides
+        // who is primary (promotion-authority §6), and this handler
+        // promotes nothing. Answered before the replay-marker check
+        // because the advisory is stateless — a stale marker of the
+        // same key shape must not mask it. Only standby-down slot
+        // hygiene below is real work, and it keeps its guards.
         if detached_ref.id == old_primary_ref.id {
             info!(
                 detached = %detached_ref.hostname,
@@ -1634,8 +1634,7 @@ impl PgAgentLocal for LocalServer {
         // target.last_wal_replay_lsn`. NodeStatus.current_wal_lsn
         // already returns `pg_current_wal_lsn()` when populated from
         // a primary and `pg_last_wal_replay_lsn()` when populated
-        // from a standby (added in 0.4.0 for the split-brain LEAD
-        // marker) — so we already have both halves on the wire.
+        // from a standby — so we already have both halves on the wire.
         if !req.allow_lag {
             let local_lsn = self.db.current_wal_lsn().await.map_err(|e| {
                 internal(anyhow::anyhow!(
@@ -4055,8 +4054,8 @@ mod tests {
         is_in_recovery: AtomicBool,
         replication_lag_bytes: AtomicI64,
         /// Peer's `current_wal_lsn` (on a standby = `pg_last_wal_replay_lsn()`).
-        /// Used by the handoff lag check after 0.6.1; tests set this
-        /// to a non-zero value to bypass the "cannot measure lag" guard.
+        /// Used by the handoff lag check; tests set this to a non-zero
+        /// value to bypass the "cannot measure lag" guard.
         current_wal_lsn: std::sync::atomic::AtomicU64,
         /// Peer's live timeline. Defaults to 0 (= unknown).
         timeline_id: std::sync::atomic::AtomicI32,
@@ -4982,11 +4981,11 @@ mod tests {
             .unwrap());
     }
 
-    /// A replay marker from a legacy-mode failover (same key — pgpool
-    /// re-announces the same detached/new_main/old_primary shape) must
-    /// not mask the advisory: run 8's E3 hit exactly this, with S9's
-    /// marker answering "already processed" where the cutover contract
-    /// should have said "advisory".
+    /// A stale replay marker carrying the same
+    /// detached/new_main/old_primary key — pgpool re-announces that
+    /// shape freely — must not mask the advisory. Observed live: the
+    /// marker answered "already processed" where the contract requires
+    /// "advisory".
     #[tokio::test]
     async fn failover_advisory_wins_over_a_stale_legacy_replay_marker() {
         let (s, _db, peers, _maint, _wal, replay, _pcp, _sd, _standby, _inflight) = make_server();
@@ -6697,9 +6696,9 @@ mod tests {
     /// RESTORE_WAL_PEER_COOLDOWN. PostgreSQL calls restore_command once
     /// per file back to back — at promotion, several times in a row —
     /// and without the cooldown every invocation re-pays the full
-    /// per-peer timeout for the same partitioned peer. Acceptance E2
-    /// measured that as a ~40 s promotion stall, wide enough for a
-    /// rival to depose the winner (finding 14).
+    /// per-peer timeout for the same partitioned peer. Measured as a
+    /// ~40 s promotion stall, wide enough for a rival to depose the
+    /// winner (finding 14).
     #[tokio::test]
     async fn restore_wal_cools_down_a_failed_peer_across_invocations() {
         let (s, _db, peers, _maint, _wal) = make_server_3();

@@ -200,8 +200,8 @@ impl LocalDb for PgLocalDb {
         let conn = self.get_conn().await?;
         // wait := false — fire the signal and return. The default
         // (wait = true) blocks server-side for up to 60 s, which put
-        // the wait outside any caller's deadline: the acceptance
-        // suite's E2 watched a promotion stall 40 s inside this call
+        // the wait outside any caller's deadline: the acceptance suite
+        // watched a promotion stall 40 s inside this call (finding 14)
         // (recovery-end blocked on restore_command against a
         // partitioned peer) while promote_and_wait's deadline sat
         // powerless around it. The caller owns the wait; this call

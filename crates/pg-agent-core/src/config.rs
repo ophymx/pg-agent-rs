@@ -393,10 +393,10 @@ pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaftConfig {
     /// **Obsolete, and parsed only so it can be refused.** `enabled`
-    /// selected whether the node joined consensus at all, back when
-    /// pgpool's `failover_command` was the other way to decide who is
-    /// primary. That path is gone (there is no second authority to fall
-    /// back to), so the knob has exactly one honest setting left.
+    /// selected whether the node joined consensus at all. The lease is
+    /// the only promotion authority there is, so a node that does not
+    /// join it cannot learn it has been deposed — the knob has exactly
+    /// one honest setting left.
     ///
     /// It survives as a field because deleting it outright would let
     /// serde IGNORE a leftover `enabled = false`, and a config line
@@ -417,8 +417,9 @@ pub struct RaftConfig {
     pub leader_ttl_secs: Option<u64>,
     /// Raft election timeout upper bound. Milliseconds because it is a
     /// protocol-level knob; the default is deliberately long so an
-    /// Ansible rolling agent restart does not cascade into elections
-    /// (open question 3 — needs a measured answer on the live cluster).
+    /// Ansible rolling agent restart does not cascade into elections.
+    /// The acceptance suite measures that restart window against
+    /// `leader_ttl` on every run rather than assuming the margin.
     #[serde(default)]
     pub election_timeout_ms: Option<u64>,
     // Deliberately absent: `max_lag_on_failover_bytes` and `shadow`.
@@ -433,15 +434,11 @@ pub struct RaftConfig {
     // an operator can tune that changes nothing is a lie the config
     // file tells.
     //
-    // `shadow` ran the loop with no executors — the staged-migration
-    // scaffolding (promotion-authority steps 5-6) whose S/R/E
-    // acceptance suites were deleted at the greenfield cutover. Under
-    // the shipped design it selected a cluster where the loop narrates
-    // and nothing manages PostgreSQL, which is not a deployment anyone
-    // wants; it went with the migration it existed for. The daemon now
-    // builds the loop, the executor and the raft runtime as one unit
-    // (`agent::HaWiring`), so "consensus without executors" is not a
-    // state that can be spelled.
+    // `shadow` ran the loop with no executors: a cluster where the loop
+    // narrates and nothing manages PostgreSQL, which is not a
+    // deployment anyone wants. The daemon builds the loop, the executor
+    // and the raft runtime as one unit (`agent::HaWiring`), so
+    // "consensus without executors" is not a state that can be spelled.
 }
 
 pub const DEFAULT_RAFT_LOOP_WAIT_SECS: u64 = 10;

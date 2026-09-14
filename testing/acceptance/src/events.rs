@@ -392,7 +392,7 @@ const RESTART_POLL: Duration = Duration::from_secs(3);
 /// node — the agent is nearly silent by design in steady state, so
 /// "no lines for ten minutes" is also what healthy looks like.
 ///
-/// Measured, on the Rocky cell (testing/README.md finding 30): db0's
+/// Measured, on the Rocky cell (testing/FINDINGS.md finding 30): db0's
 /// agent tail died once during G10's PID-1 kill, respawned, reported
 /// itself healthy — and then delivered 2052 of the 3901 lines db0
 /// wrote. Every failure in that run came after G10, all but two were

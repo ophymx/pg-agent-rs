@@ -1,5 +1,4 @@
-//! The consensus-store seam (docs/promotion-authority.md §5, sequencing
-//! step 4).
+//! The consensus-store seam (docs/promotion-authority.md §5).
 //!
 //! [`ConsensusStore`] is the HA loop's entire view of the replicated
 //! state machine: the lease, the pause flag, a scheduled switchover,

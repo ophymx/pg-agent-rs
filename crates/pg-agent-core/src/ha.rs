@@ -14,15 +14,12 @@
 //! [`crate::roleexec::RoleExecutor`], which the daemon always attaches
 //! ([`HaLoop::with_executor`]).
 //!
-//! That split is a testing seam, not a mode. It used to be one: a loop
-//! with no executor was "shadow mode", the staged migration's way of
-//! watching decisions against a live pgpool-led cluster without letting
-//! them act. There is no pgpool-led cluster to shadow any more — the
-//! lease is the only promotion authority — so an executor-less loop
-//! would be a daemon that watches a cluster nobody is running. The
-//! daemon builds the loop, its executor and the store as one value
-//! (`agent::HaWiring`); only this module's own unit tests construct a
-//! loop without one, to assert the decision and not its consequences.
+//! That split is a testing seam, not a mode. An executor-less loop
+//! would be a daemon that watches a cluster nobody is running, so it is
+//! not a state the daemon can be configured into: it builds the loop,
+//! its executor and the store as one value (`agent::HaWiring`). Only
+//! this module's own unit tests construct a loop without an executor,
+//! to assert the decision and not its consequences.
 //!
 //! # How the decisions are judged
 //!
@@ -31,11 +28,11 @@
 //! whether the announced-dead node was actually dead, whether exactly
 //! one node became promotable — in the dockerized acceptance suite
 //! (`testing/`), where those facts are manufactured rather than
-//! inferred. Diffing against pgpool's live behavior was the design
-//! doc's original plan and is explicitly abandoned: pgpool's decisions
-//! are the defect this loop exists to replace (promotion-authority
-//! §2.1, §2.2), so in the cases that matter agreement would be the bad
-//! outcome, not the good one.
+//! inferred. Diffing this stream against pgpool's own decisions would
+//! be the wrong oracle: pgpool's decisions are the defect this loop
+//! exists to replace (promotion-authority §2.1, §2.2), so in exactly
+//! the cases that justify the loop, agreement would be the alarming
+//! reading.
 //!
 //! # Decision rules carried over from the design doc
 //!
@@ -173,7 +170,7 @@ struct TickState {
     /// `(holder, since)` — the clock is keyed to the holder it watched.
     /// A lease that changes hands must NOT inherit the previous
     /// holder's unhealthy time: the ttl is each holder's protection
-    /// window, and the acceptance suite's R4 caught a rival deposing a
+    /// window, and the acceptance suite caught a rival deposing a
     /// 7-second-old lease because its clock had been running against
     /// the *previous* holder (finding 13).
     holder_unhealthy_since: Option<(i32, Instant)>,
@@ -304,8 +301,8 @@ impl HaLoop {
 
         // The read is bounded by the loop's own retry budget, whatever
         // the store behind the trait does. The raft-backed store learned
-        // this the hard way in the acceptance suite's R4: a forwarded
-        // read to a just-isolated leader blocked one tick for 34 s — the
+        // this the hard way (finding 12): a forwarded read to a
+        // just-isolated leader blocked one tick for 34 s — the
         // entire partition window — where "evidence we cannot get within
         // the budget is evidence we do not get" would have produced a
         // StoreUnknown tick and kept the loop's clock running. The store
@@ -556,7 +553,7 @@ impl HaLoop {
         // there is: when a holder's PostgreSQL dies its agent keeps
         // answering GetStatus perfectly, so every witness truthfully
         // reported "I reached it 1s ago" and no standby would ever
-        // take the lease (caught by G3 on the first run).
+        // take the lease. G3 is the regression.
         //
         // Self-clearing by construction: a genuinely dead holder makes
         // every witness's age grow past the ttl within one ttl, so the
@@ -1755,10 +1752,10 @@ mod tests {
     /// The unhealthy clock is each holder's, not the lease's. Watching
     /// a dead holder past ttl earns candidacy against THAT holder; if
     /// someone else wins the race, the new holder gets a fresh ttl —
-    /// the clock must not carry over. Regression for acceptance
-    /// finding 13: a rival deposed a 7-second-old lease during the R4
-    /// partition because its clock had been running against the
-    /// previous holder, voiding exactly the hysteresis window a fresh
+    /// the clock must not carry over. Regression for finding 13: a
+    /// rival deposed a 7-second-old lease during a partition because
+    /// its clock had been running against the previous holder, voiding
+    /// exactly the hysteresis window a fresh
     /// winner needs to finish its (asynchronous) promotion.
     #[tokio::test]
     async fn a_new_holder_does_not_inherit_its_predecessors_unhealthy_clock() {

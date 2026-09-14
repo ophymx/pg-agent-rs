@@ -127,8 +127,8 @@ impl Pg {
 
     /// Standbys streaming from `primary`, excluding pg_basebackup's WAL
     /// stream — an in-flight rebuild masquerades as a caught-up standby
-    /// otherwise (bash suite run 11 declared a repair done while the
-    /// basebackup was still copying).
+    /// otherwise — a repair reads as done while the basebackup is still
+    /// copying.
     pub async fn streaming_count(&self, primary: &'static str) -> Option<i64> {
         self.scalar(
             primary,

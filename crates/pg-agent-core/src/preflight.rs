@@ -36,7 +36,7 @@ const WAL_KEEP_SIZE_FLOOR_MB: i64 = 512;
 /// only if the effective `postgresql.conf` includes it, and nothing in
 /// the write path can tell the difference: `ConfigureStandby` reports
 /// success, the standby starts, and it simply never streams — no
-/// `primary_conninfo`, no error (testing/README.md finding 6). That is
+/// `primary_conninfo`, no error (testing/FINDINGS.md finding 6). That is
 /// the class of silent localhost misconfiguration `validate-env` exists
 /// to catch, so the missing include is an ERR.
 const RECOVERY_CONF_FILE: &str = "myrecovery.conf";
@@ -891,7 +891,7 @@ const RESTART_DROPIN: &str = "10-agent-managed.conf";
 /// prevent.
 ///
 /// Found by the acceptance suite rather than by reading unit files
-/// (testing/README.md finding 29): G9 SIGKILLs the primary's postmaster
+/// (testing/FINDINGS.md finding 29): G9 SIGKILLs the primary's postmaster
 /// and waits for the lease to depose it. On Rocky systemd returned the
 /// primary inside a second, nothing was ever deposed, and the thirteen
 /// scenarios that followed ran against a cluster no assertion expected.

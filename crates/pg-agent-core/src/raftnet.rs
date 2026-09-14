@@ -85,8 +85,8 @@ pub const RAFT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Client-side deadline on leader-forwarded RPCs (`Propose`,
 /// `ReadState`).
 ///
-/// This exists because of a bug the acceptance suite's R4 scenario
-/// caught on the first real partition: the HA tick forwarded its read
+/// This exists because of a bug the acceptance suite caught on the
+/// first real partition (finding 12): the HA tick forwarded its read
 /// to the raft leader that had just been isolated, over a cached
 /// channel whose only bound was the 30 s channel ceiling — so one tick
 /// blocked 34 s while a 1 s re-election had already moved leadership.
@@ -816,7 +816,7 @@ mod tests {
     /// network partition against an established channel, where there is
     /// no RST and no server to honour a header deadline — must fail at
     /// the client-side deadline, not the 30 s channel ceiling. This is
-    /// the regression test for the R4 finding: one HA tick blocked 34 s
+    /// the regression test for finding 12: one HA tick blocked 34 s
     /// on a forwarded read to a just-isolated leader, consuming the
     /// whole partition window.
     #[tokio::test]

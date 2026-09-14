@@ -112,13 +112,11 @@ pub struct Options {
 /// Consensus, the executor, and the loop's timing — as one value,
 /// because they are one thing.
 ///
-/// They used to be three independent `Option`s, which spelled four
-/// states the daemon could be in and only one it should ever have been
-/// in. The other three were the staged migration's: a loop reading a
-/// process-local store authoritative for nothing, a loop that narrated
-/// decisions with no executor to act on them (shadow mode), consensus
-/// running under no loop at all. Each was reachable by a config file,
-/// and none of them is a cluster anyone wants to be paged for.
+/// Three independent `Option`s would spell four states and only one of
+/// them is a cluster anyone wants to be paged for. The others: a loop
+/// reading a store authoritative for nothing, a loop that narrates
+/// decisions with no executor to act on them, consensus running under
+/// no loop at all.
 ///
 /// Binding them together makes those states unrepresentable rather than
 /// merely discouraged: there is no lease without something to act on

@@ -51,7 +51,7 @@
 //! cosmetic: a rule that names one version or one family does not fail
 //! loudly, it falls through to polkit's default and returns
 //! `InteractiveAuthorizationRequired` — a prompt no daemon can answer
-//! (testing/README.md finding 27).
+//! (testing/FINDINGS.md finding 27).
 //!
 //! The rule itself is installed by Ansible (see SPEC §10.5 — pg_agent
 //! owns no /etc files); testing/docker/50-pg-agent.rules is the

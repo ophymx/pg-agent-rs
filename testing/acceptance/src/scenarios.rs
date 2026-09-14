@@ -2045,7 +2045,7 @@ async fn leader_ttl_secs(node: &str) -> u64 {
 /// node, and `docker cp` writes into the image layer UNDERNEATH that
 /// mount. The copy reports success, the file is invisible to everything
 /// running in the container, and the install fails with "cannot access
-/// archive" — which is how this landed on the first run.
+/// archive".
 fn staged_package() -> (&'static str, &'static str) {
     match cluster::facts().family.as_str() {
         "rhel" => (

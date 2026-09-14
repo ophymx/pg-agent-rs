@@ -340,8 +340,8 @@ pub struct PgpoolHookEntry {
 }
 
 /// Build every directive in the canonical `pgpool.conf` hook block —
-/// the **agent-led contract** (docs/pgpool-hook-contract.md §4, the
-/// promotion-authority cutover). Values are derived from the schema
+/// the **agent-led contract** (docs/pgpool-hook-contract.md §4). Values
+/// are derived from the schema
 /// definitions so token order is always consistent with what
 /// `HookSchema::parse` expects.
 ///
@@ -351,13 +351,11 @@ pub struct PgpoolHookEntry {
 ///   under lease-driven roles logs the announcement and promotes
 ///   nothing — the HA loop decides — but the poke buys detection
 ///   latency over waiting for the next `loop_wait` tick. Its arguments
-///   are advisory forever; that trade is deliberate (promotion-authority
-///   open question 4, resolved at cutover).
+///   are advisory forever, and that trade is deliberate.
 /// - `follow_primary_command` is **empty, not notify-only**: a
 ///   non-empty value makes pgpool degenerate every healthy standby
-///   after a primary failover (hook-contract §2, measured in
-///   acceptance S12). The agent re-points standbys off the lease
-///   instead.
+///   after a primary failover (hook-contract §2). The agent re-points
+///   standbys off the lease instead.
 ///
 /// The `wd_*` escalation hooks are gone with the watchdog.
 ///

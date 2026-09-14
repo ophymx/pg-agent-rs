@@ -244,7 +244,7 @@ pub async fn power_blip() {
     let _ = host(&["docker", "start", "pga-db0", "pga-db1", "pga-db2"]).await;
 }
 
-// --- partial / asymmetric partitions (gap item 6) -----------------------
+// --- partial / asymmetric partitions -------------------------------------
 //
 // `network_disconnect` severs a node completely — both planes, both
 // directions, the shape every earlier scenario used. Real failures are

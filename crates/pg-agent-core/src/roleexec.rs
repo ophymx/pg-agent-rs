@@ -47,7 +47,7 @@
 //! (`cluster recover`) is the operator's call. The executor never
 //! performs a destructive rebuild.
 //!
-//! # pgpool self-attach (testing/README.md finding 16)
+//! # pgpool self-attach (testing/FINDINGS.md finding 16)
 //!
 //! In a pgpool-routed deployment, part of what "primary" means is that
 //! the local pgpool routes to it. `failover_on_backend_error` can
