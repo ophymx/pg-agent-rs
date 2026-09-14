@@ -37,9 +37,8 @@ allow = [
 #                      taken. (It arrives via getrandom's UEFI support and
 #                      is never compiled for any target we ship, but the
 #                      policy should not depend on that staying true.)
-#   MPL-2.0            not in the graph. saltator's is, via ruma; ours is
-#                      not, and a new one should be a decision rather than
-#                      a surprise.
+#   MPL-2.0            not in the graph, and a new one should be a
+#                      decision rather than a surprise.
 #   OpenSSL            not in the graph — the TLS stack is rustls over ring
 #                      — and would want a conscious decision, since it also
 #                      means native code beyond ring's and therefore a

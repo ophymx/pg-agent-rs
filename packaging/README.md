@@ -11,7 +11,7 @@ Packages are built from **statically linked musl binaries**. That is
 the point, not a detail: a dynamically linked build inherits the build
 host's glibc floor, and neither packager can invent a floor the binary
 does not declare — which is how a package came to install on Debian 12
-and then die at exec (testing/README.md finding 26). Both packagers run
+and then die at exec (testing/FINDINGS.md finding 26). Both packagers run
 with `--no-build` so they package what `scripts/build-pkgs.sh` produced
 rather than triggering a second, host-native build.
 

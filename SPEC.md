@@ -193,7 +193,7 @@ Hook RPCs (`PgAgentLocal.Failover`, etc.) usually return `OpResult { ok=false, m
 Every external collaborator sits behind a trait so no handler calls
 PostgreSQL, systemd, PCP, a `pg_*` binary, or a peer unmediated. Unit
 tests swap in-process fakes; the composition root
-(`pg-agentd/src/main.rs`) is the only place concrete types appear.
+(`crates/pg-agentd/src/main.rs`) is the only place concrete types appear.
 
 Method lists below are indicative, not exhaustive — the trait definitions
 are authoritative. What matters here is which collaborator each seam
@@ -1755,9 +1755,8 @@ because the stubs don't run SQL.
 
 ## 17. Invariants (must preserve)
 
-The Rust port has freedom to refactor everything **except** these. They are
-the load-bearing decisions that make this system safe to drop into a live
-cluster:
+Refactor anything **except** these. They are the load-bearing decisions
+that make this system safe to drop into a live cluster:
 
 1. **Drop-slot failures are not RPC errors.** The hook RPC returns ok and
    the failed cleanup goes through the maintenance queue. Surfacing the

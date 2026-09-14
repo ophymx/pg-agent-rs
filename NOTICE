@@ -94,10 +94,10 @@ the only native code in this build.** Everything else is pure Rust.
 That is what makes `x86_64-unknown-linux-musl` tractable, and the static
 musl binary is in turn what lets one `.deb` and one `.rpm` install on
 Debian 12, Ubuntu 24.04, Rocky 9 and Alpine alike (see
-`scripts/build-pkgs.sh` and testing/README.md finding 26). A dependency
-that vendors a C++ library — RocksDB and its five compression backends are
-the canonical example, and are why saltator cannot do this — would take
-that away, and would also add a body of license terms that `cargo deny`
+`scripts/build-pkgs.sh` and testing/FINDINGS.md finding 26). A dependency
+that vendors a C++ library — RocksDB and its five compression backends
+being the canonical example — would take that away, and would also add a
+body of license terms that `cargo deny`
 structurally cannot see, since it reads crate manifests and not vendored
 sources.
 

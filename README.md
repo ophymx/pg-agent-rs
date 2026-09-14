@@ -1,18 +1,41 @@
 # pg-agent-rs
 
-Rust port of `pg_agent` — the daemon that replaces pgpool-II's shell-script
-hooks (`failover.sh`, `follow_primary.sh`, `recovery_1st_stage`,
-`pgpool_remote_start`, `escalation.sh`) and the SSH-based remote execution
-they depend on.
+A high-availability agent for PostgreSQL clusters fronted by pgpool-II.
 
-It also owns the promotion decision, on a quorum-backed lease in a Raft
-log the agents replicate among themselves — no external DCS.
+It replaces pgpool's shell-script hooks (`failover.sh`,
+`follow_primary.sh`, `recovery_1st_stage`, `pgpool_remote_start`,
+`escalation.sh`) and the SSH-based remote execution they depend on with a
+typed RPC surface over an mTLS mesh.
+
+More importantly, it owns the promotion decision. pgpool's watchdog is a
+failure detector, not a consensus protocol — it can answer "can I reach
+X?" but not "is X primary?", and treating the first answer as the second
+is how split-brain happens. Here the decision is a compare-and-swap on a
+lease in a Raft log the agents replicate among themselves, so there is no
+external DCS to operate.
 
 - **What this is and why:** [SPEC.md](SPEC.md)
 - **How an operator deploys it:** [BOOTSTRAP.md](BOOTSTRAP.md)
 - **Where this is going:** [ROADMAP.md](ROADMAP.md)
 - **Why promotion works this way:** [docs/promotion-authority.md](docs/promotion-authority.md)
   and [docs/quorum-commit.md](docs/quorum-commit.md)
+
+## What it assumes
+
+Worth checking before reading further — these are structural, not
+configurable:
+
+- **pgpool-II co-located with PostgreSQL** on every backend node. A
+  separate-middleware topology is out of scope.
+- **At least three nodes.** Consensus is not optional and a two-node Raft
+  cluster tolerates zero failures, so `validate-env` refuses a smaller
+  pool rather than letting that be discovered during an outage.
+- **systemd**, reached over D-Bus with a polkit rule. PostgreSQL's
+  lifecycle belongs to the agent, not to `Restart=`.
+- **HAProxy** (or equivalent) as the L4 entry point. VIP management is
+  deliberately absent.
+- Debian- or RHEL-family layouts. Both are exercised in CI; other distros
+  need five path fields set explicitly.
 
 ## Binaries
 
@@ -54,11 +77,33 @@ Needs nothing but a Rust toolchain: the proto crate's build.rs uses the
 `protoc` vendored by `protoc-bin-vendored`, so there is no system package
 to install first.
 
+## Testing
+
+Unit tests run under `cargo test`. The claims that matter — that a
+partitioned primary fences itself, that exactly one node is ever
+promoted, that acknowledged writes survive every induced failure — are
+asserted by a dockerized three-node acceptance suite that boots the real
+packages, the real systemd units and real streaming replication, and
+manufactures the failures:
+
+```
+testing/acceptance.sh        # baseline cell
+testing/matrix.sh            # every OS / PostgreSQL cell
+```
+
+See [testing/README.md](testing/README.md). Discoveries it has made are
+logged in [testing/FINDINGS.md](testing/FINDINGS.md), and much of the
+design is easier to understand from those than from the specification.
+
 ## Status
 
-v1 feature-complete: every SPEC §5 workflow shipped, every `pg_agentctl`
-subcommand wired, packaging produces `.deb` + `.rpm`. See
-[ROADMAP.md](ROADMAP.md) for what comes next.
+Feature-complete and exercised end to end: every workflow shipped, every
+`pg_agentctl` subcommand wired, packaging produces `.deb` + `.rpm`, and
+the acceptance suite passes across Debian 12/13, Ubuntu 24.04 and Rocky 9
+on PostgreSQL 15–17. It has not been through wide production use beyond
+the cluster it was built for — read [ROADMAP.md](ROADMAP.md) for what is
+missing and [TODO.md](TODO.md) for known open defects before you rely on
+it.
 
 ## License
 

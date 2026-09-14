@@ -856,8 +856,8 @@ fn progress_cb(tx: tokio::sync::mpsc::Sender<Result<OpProgress, Status>>) -> Pro
 /// subprocess actually ran. The orchestrator on the other end of the
 /// stream already sees the error in its tonic response, but the worker
 /// side would otherwise have no breadcrumb at all — and the worker is
-/// where the operator is most likely to look first. See
-/// docs/incidents/2026-06-10-post-maintenance.md §1.
+/// where the operator looks first, because the worker is the node whose
+/// data directory is being rebuilt.
 fn spawn_progress_stream<F, Fut>(
     op_label: &'static str,
     intermediate_phase: &'static str,

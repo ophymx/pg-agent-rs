@@ -37,8 +37,7 @@ tonic-build = { version = "0.12" }
 # system protoc installed, EVERY crate in the workspace failed to compile
 # at pg-agent-proto's build script, and the fix was an apt line in CI plus
 # a `require protoc` guard in precommit-check.sh to make the error legible.
-# Neither is needed now; both are gone. saltator has always done it this
-# way.
+# Neither is needed now; both are gone.
 #
 # The vendored binary runs on the BUILD host, so it is unrelated to the
 # musl target — but it does assume the build host is a platform
@@ -118,8 +117,7 @@ sd-notify = { version = "0.4" }
 tempfile  = { version = "3" }
 rcgen     = { version = "0.13" }
 
-# Debug info, not debug *builds* — the same split chapbook and saltator
-# carry, for the same reason: DWARF is the majority of a debug tree's
+# Debug info, not debug *builds*: DWARF is the majority of a debug tree's
 # bytes and it is rewritten to disk on every relink. `testing/acceptance`
 # is a workspace member, so every acceptance target is another binary
 # paying for it.
