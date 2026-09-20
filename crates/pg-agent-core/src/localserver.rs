@@ -84,6 +84,15 @@ const RESTORE_WAL_PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 /// peer or the primary.
 const RESTORE_WAL_PEER_COOLDOWN: Duration = Duration::from_secs(10);
 
+/// Ceiling on a timeline history file buffered for screening.
+///
+/// Real ones are a line per timeline — the file that broke a cluster
+/// was 170 bytes. The cap is not tuning, it is the refusal to let a
+/// peer decide how much memory this node spends: history files are the
+/// one restore path that reads content into memory before writing it,
+/// so it is the one path where that decision exists at all.
+const MAX_HISTORY_FILE_BYTES: u64 = 1 << 20;
+
 // ---------------------------------------------------------------------------
 // Handoff phase ladder
 // ---------------------------------------------------------------------------
@@ -3073,6 +3082,113 @@ impl LocalServer {
     /// `RESTORE_WAL_PER_PEER_TIMEOUT`; timeouts and connect failures are
     /// logged and folded into `TryNext` so a single bad peer doesn't
     /// abort the loop.
+    /// Read a fetched history file and decide whether this node may
+    /// follow the timeline it describes.
+    ///
+    /// The fan-out treats every peer as interchangeable, which is
+    /// right for WAL segments — a segment is named by timeline and
+    /// LSN, so whoever answers first hands over identical bytes — and
+    /// wrong for history files. A history file is how PostgreSQL
+    /// *chooses* a timeline, so serving one from a peer on a divergent
+    /// branch does not fail to help, it actively breaks the asker:
+    /// PostgreSQL adopts the recovery target and then refuses to start
+    /// against it.
+    ///
+    /// That is what happened. A standby on timeline 4 at `0/1D000028`,
+    /// whose upstream was a healthy timeline-4 primary it could have
+    /// caught up to, asked the pool for `00000005.history`. A third
+    /// node that had promoted onto timeline 5 — forking at
+    /// `0/1B0001E0`, before the standby's WAL ended — answered, and
+    /// the standby died on every start with "requested timeline 5 is
+    /// not a child of this server's history".
+    ///
+    /// The refusal mirrors PostgreSQL's own test, so declining here
+    /// prevents exactly the FATAL that would otherwise follow, and
+    /// nothing more: a peer on a timeline this node CAN follow is
+    /// served normally.
+    ///
+    /// `TryNext` rather than a hard failure — another peer may hold a
+    /// history file for a timeline that is reachable. If none is, the
+    /// caller's NotFound is what `restore_command` wants anyway, and
+    /// PostgreSQL stays on its current timeline and keeps streaming
+    /// from its configured upstream. Which, in the case above, was all
+    /// it ever needed to do.
+    async fn screen_history_file(
+        &self,
+        node: &NodeConfig,
+        wal_file: &str,
+        mut reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+    ) -> Result<Vec<u8>, FetchOutcome> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut bytes = Vec::new();
+        // Buffered rather than streamed because the content has to be
+        // judged before it is committed. Capped because "how big is a
+        // file a peer sends me" is not this node's decision to leave
+        // open; real history files are a line per timeline.
+        if let Err(e) = (&mut reader)
+            .take(MAX_HISTORY_FILE_BYTES)
+            .read_to_end(&mut bytes)
+            .await
+        {
+            warn!(?e, peer = %node.hostname, %wal_file, "restore_wal: reading history file failed");
+            return Err(FetchOutcome::TryNext);
+        }
+        if bytes.len() as u64 == MAX_HISTORY_FILE_BYTES {
+            warn!(
+                peer = %node.hostname, %wal_file, cap = MAX_HISTORY_FILE_BYTES,
+                "restore_wal: history file exceeds the cap; refusing it"
+            );
+            return Err(FetchOutcome::TryNext);
+        }
+
+        let Some(requested) = pgman::timeline::timeline_of(wal_file) else {
+            // Unparseable name: nothing to judge against, and the
+            // write path is confined to pgdata regardless.
+            return Ok(bytes);
+        };
+        let local = self
+            .standby
+            .control_point()
+            .await
+            .inspect_err(|e| {
+                warn!(
+                    ?e,
+                    "restore_wal: control point unreadable; serving history unscreened"
+                )
+            })
+            .unwrap_or(pgman::timeline::ControlPoint::UNKNOWN);
+        let history = pgman::timeline::parse_history(&String::from_utf8_lossy(&bytes));
+
+        match pgman::timeline::reachable(local, requested, &history) {
+            pgman::timeline::Reachable::Yes | pgman::timeline::Reachable::Unknown => Ok(bytes),
+            pgman::timeline::Reachable::Diverged { forked_at } => {
+                warn!(
+                    peer = %node.hostname,
+                    %wal_file,
+                    local_tl = local.timeline_id,
+                    local_checkpoint = %pgman::timeline::format_lsn(local.checkpoint_lsn),
+                    forked_at = %pgman::timeline::format_lsn(forked_at),
+                    "restore_wal: refusing history for a timeline this node diverged from — \
+                     it forked before our WAL ends, so following it would fork the cluster \
+                     (PostgreSQL would refuse to start). Staying on the current timeline; \
+                     rebuild from the node that owns that timeline if you want to join it"
+                );
+                Err(FetchOutcome::TryNext)
+            }
+            pgman::timeline::Reachable::NotADescendant => {
+                warn!(
+                    peer = %node.hostname,
+                    %wal_file,
+                    local_tl = local.timeline_id,
+                    "restore_wal: refusing history for a timeline that does not descend \
+                     from ours — a different lineage, not a branch of this one"
+                );
+                Err(FetchOutcome::TryNext)
+            }
+        }
+    }
+
     async fn try_fetch_wal_from_peer(
         &self,
         node: &NodeConfig,
@@ -3102,6 +3218,19 @@ impl LocalServer {
                     return FetchOutcome::TryNext;
                 }
             };
+            // A history file decides which timeline PostgreSQL follows,
+            // so it gets read before it is believed. See
+            // `screen_history_file` — segments skip this entirely.
+            let reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
+                if pgman::timeline::is_history_file(wal_file) {
+                    match self.screen_history_file(node, wal_file, reader).await {
+                        Ok(bytes) => Box::new(std::io::Cursor::new(bytes)),
+                        Err(outcome) => return outcome,
+                    }
+                } else {
+                    reader
+                };
+
             match self.wal.write_restore(Path::new(dest_path), reader).await {
                 Ok(()) => FetchOutcome::Fetched,
                 Err(pgman::walstore::WalStoreError::DestOutsidePgData) => FetchOutcome::Fatal(
@@ -4549,10 +4678,27 @@ mod tests {
         basebackup_calls: AtomicUsize,
         basebackup_fails: AtomicBool,
         write_recovery_conf_calls: AtomicUsize,
+        /// What this node's control file says. `UNKNOWN` by default,
+        /// which is the "cannot judge" path — so tests that do not
+        /// care about timelines keep their old behaviour.
+        control_point: StdMutex<pgman::timeline::ControlPoint>,
+    }
+
+    impl StubStandby {
+        fn at(&self, timeline_id: i32, lsn: &str) {
+            *self.control_point.lock().unwrap() = pgman::timeline::ControlPoint {
+                timeline_id,
+                checkpoint_lsn: pgman::timeline::parse_lsn(lsn).unwrap(),
+            };
+        }
     }
 
     #[async_trait]
     impl StandbyOps for StubStandby {
+        async fn control_point(&self) -> anyhow::Result<pgman::timeline::ControlPoint> {
+            Ok(*self.control_point.lock().unwrap())
+        }
+
         async fn rewind(
             &self,
             _: RewindOpts,
@@ -6945,6 +7091,138 @@ mod tests {
         let written = wal.written.lock().unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].1, content);
+    }
+
+    // ----- history files are screened, segments are not -------------------
+    //
+    // The bug these pin down stranded a standby for three months. It
+    // sat on timeline 4 at 0/1D000028 with a perfectly good timeline-4
+    // primary configured as its upstream, asked the pool for
+    // 00000005.history, and a third node that had forked onto timeline
+    // 5 at 0/1B0001E0 — before the standby's WAL ended — answered.
+    // PostgreSQL believed the file, set its recovery target to 5, and
+    // refused to start on every attempt.
+
+    /// The history file that actually did it.
+    const TL5_HISTORY: &[u8] = b"1\t0/A0000A0\tno recovery target specified\n\
+2\t0/100000A0\tno recovery target specified\n\
+3\t0/14000238\tno recovery target specified\n\
+4\t0/1B0001E0\tno recovery target specified\n";
+
+    fn history_req(wal_file: &str) -> RestoreWalRequest {
+        RestoreWalRequest {
+            wal_file: wal_file.into(),
+            dest_path: "/var/lib/postgresql/17/main/pg_wal/RECOVERYHISTORY".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_wal_refuses_history_for_a_timeline_we_diverged_from() {
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, standby, _inflight) = make_server();
+        standby.at(4, "0/1D000028");
+        peers
+            .default_client
+            .stage_wal("00000005.history", TL5_HISTORY.to_vec());
+
+        let err = s
+            .restore_wal(Request::new(history_req("00000005.history")))
+            .await
+            .expect_err("a divergent history must not be restored");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // The point is not the error code, it is that the file never
+        // reached $PGDATA. A history file on disk is what PostgreSQL
+        // reads to pick its recovery target.
+        assert!(
+            wal.written.lock().unwrap().is_empty(),
+            "a divergent history file reached the data directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_wal_serves_history_for_a_timeline_we_can_follow() {
+        // The guarantee that must survive the fix: a standby whose WAL
+        // ends BEFORE the fork can follow timeline 5 cleanly, and
+        // withholding the file would strand it for no reason.
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, standby, _inflight) = make_server();
+        standby.at(4, "0/1A000000");
+        peers
+            .default_client
+            .stage_wal("00000005.history", TL5_HISTORY.to_vec());
+
+        let resp = s
+            .restore_wal(Request::new(history_req("00000005.history")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(wal.written.lock().unwrap()[0].1, TL5_HISTORY);
+    }
+
+    #[tokio::test]
+    async fn restore_wal_serves_our_own_timelines_history() {
+        // A node already on timeline 5 reads 00000005.history during
+        // ordinary startup. Its own timeline is absent from that file,
+        // so a naive descendant test would refuse it and break
+        // recovery on a node that had done nothing wrong.
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, standby, _inflight) = make_server();
+        standby.at(5, "0/25000028");
+        peers
+            .default_client
+            .stage_wal("00000005.history", TL5_HISTORY.to_vec());
+
+        let resp = s
+            .restore_wal(Request::new(history_req("00000005.history")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(wal.written.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_wal_does_not_screen_segments() {
+        // Segments are named by timeline AND LSN, so whoever answers
+        // hands over identical bytes — there is nothing to adjudicate,
+        // and screening them would add a control-file read to the hot
+        // replay path for no benefit. A node diverged from timeline 5
+        // still gets timeline-5 segments if it asks.
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, standby, _inflight) = make_server();
+        standby.at(4, "0/1D000028");
+        peers
+            .default_client
+            .stage_wal("000000050000000000000024", b"SEGMENT".to_vec());
+
+        let resp = s
+            .restore_wal(Request::new(RestoreWalRequest {
+                wal_file: "000000050000000000000024".into(),
+                dest_path: "/var/lib/postgresql/17/main/pg_wal/RECOVERYXLOG".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(wal.written.lock().unwrap()[0].1, b"SEGMENT");
+    }
+
+    #[tokio::test]
+    async fn restore_wal_serves_history_unscreened_when_the_control_file_is_unreadable() {
+        // Default StubStandby reports UNKNOWN. The check exists to
+        // catch a PROVABLE divergence; withholding WAL because the
+        // agent could not read its own control file would strand a
+        // standby that might well be able to follow.
+        let (s, _db, peers, _maint, wal, _replay, _pcp, _sd, _standby, _inflight) = make_server();
+        peers
+            .default_client
+            .stage_wal("00000005.history", TL5_HISTORY.to_vec());
+
+        let resp = s
+            .restore_wal(Request::new(history_req("00000005.history")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(wal.written.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

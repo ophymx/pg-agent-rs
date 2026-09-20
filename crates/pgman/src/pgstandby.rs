@@ -257,20 +257,28 @@ pub trait StandbyOps: Send + Sync {
     /// rewrites the file.
     async fn detach_recovery_conf(&self) -> anyhow::Result<()>;
 
-    /// This node's timeline as recorded in `$PGDATA/global/pg_control`,
-    /// readable with PostgreSQL stopped. `0` means unknown.
+    /// What `$PGDATA/global/pg_control` records — timeline and latest
+    /// checkpoint — readable with PostgreSQL stopped.
     ///
     /// Belongs with the other data-directory operations for the reason
     /// they are grouped at all: it reads `$PGDATA` directly instead of
     /// asking a running server. That is the whole point — a node whose
-    /// PostgreSQL is down still *has* a timeline, and callers comparing
-    /// timelines across the pool need it exactly when the live probe
-    /// cannot answer.
+    /// PostgreSQL is down still *has* a timeline and a checkpoint, and
+    /// callers comparing lineage across the pool need both exactly
+    /// when the live probe cannot answer.
     ///
     /// Defaults to unknown so test doubles need not implement it;
     /// [`StandbyExec`] overrides it.
+    async fn control_point(&self) -> anyhow::Result<crate::timeline::ControlPoint> {
+        Ok(crate::timeline::ControlPoint::UNKNOWN)
+    }
+
+    /// Just the timeline from [`control_point`](Self::control_point).
+    /// `0` means unknown. Provided, not implemented — the control file
+    /// is one read, and splitting it would cost two subprocesses for
+    /// callers that want both fields.
     async fn control_timeline(&self) -> anyhow::Result<i32> {
-        Ok(0)
+        Ok(self.control_point().await?.timeline_id)
     }
 }
 
@@ -334,21 +342,33 @@ impl StandbyExec {
     }
 }
 
-/// Pull `Latest checkpoint's TimeLineID` out of `pg_controldata` output.
+/// Pull the timeline and latest checkpoint location out of
+/// `pg_controldata` output.
 ///
 /// Parsed rather than read from `global/pg_control` directly because the
 /// control file is a versioned binary struct; `pg_controldata` is the
 /// supported reader and ships in the same directory as the other
 /// binaries this module already depends on.
 ///
-/// Returns `None` when the field is absent — a different PostgreSQL
-/// major, a localized build, or a truncated read. Unknown, never a
-/// guess: callers compare this across nodes, and a fabricated timeline
-/// would be worse than no answer.
-fn parse_control_timeline(out: &str) -> Option<i32> {
-    out.lines()
-        .find_map(|line| line.strip_prefix("Latest checkpoint's TimeLineID:"))
-        .and_then(|v| v.trim().parse::<i32>().ok())
+/// Each field falls back to `0` (unknown) independently when absent or
+/// unparseable — a different PostgreSQL major, a localized build, a
+/// truncated read. Unknown, never a guess: callers compare these
+/// across nodes and against switchpoints, and a fabricated value would
+/// be worse than no answer.
+fn parse_control_point(out: &str) -> crate::timeline::ControlPoint {
+    let field = |label: &str| {
+        out.lines()
+            .find_map(|line| line.strip_prefix(label))
+            .map(str::trim)
+    };
+    crate::timeline::ControlPoint {
+        timeline_id: field("Latest checkpoint's TimeLineID:")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0),
+        checkpoint_lsn: field("Latest checkpoint location:")
+            .and_then(crate::timeline::parse_lsn)
+            .unwrap_or(0),
+    }
 }
 
 #[async_trait]
@@ -515,7 +535,7 @@ impl StandbyOps for StandbyExec {
         Ok(())
     }
 
-    async fn control_timeline(&self) -> anyhow::Result<i32> {
+    async fn control_point(&self) -> anyhow::Result<crate::timeline::ControlPoint> {
         let bin = self.controldata_bin();
         let out = Command::new(&bin)
             .arg("-D")
@@ -530,16 +550,16 @@ impl StandbyOps for StandbyExec {
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|e| anyhow::anyhow!("control_timeline: spawn {}: {e}", bin.display()))?;
+            .map_err(|e| anyhow::anyhow!("control_point: spawn {}: {e}", bin.display()))?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
-                "control_timeline: {} exited {}; stderr: {}",
+                "control_point: {} exited {}; stderr: {}",
                 bin.display(),
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        Ok(parse_control_timeline(&String::from_utf8_lossy(&out.stdout)).unwrap_or(0))
+        Ok(parse_control_point(&String::from_utf8_lossy(&out.stdout)))
     }
 }
 
@@ -1338,10 +1358,11 @@ mod tests {
 
 #[cfg(test)]
 mod controldata_tests {
-    use super::parse_control_timeline;
+    use super::parse_control_point;
+    use crate::timeline::ControlPoint;
 
     /// Real `pg_controldata` output, trimmed to the neighbourhood of
-    /// the field. The two adjacent `TimeLineID` lines are the reason
+    /// the fields. The two adjacent `TimeLineID` lines are the reason
     /// this parses a prefix rather than searching for a substring.
     const SAMPLE: &str = "\
 Database cluster state:               shut down
@@ -1353,8 +1374,11 @@ Latest checkpoint's full_page_writes: on
 ";
 
     #[test]
-    fn reads_the_checkpoint_timeline() {
-        assert_eq!(parse_control_timeline(SAMPLE), Some(5));
+    fn reads_the_checkpoint_timeline_and_location() {
+        let cp = parse_control_point(SAMPLE);
+        assert_eq!(cp.timeline_id, 5);
+        assert_eq!(cp.checkpoint_lsn, 0x2500_0028);
+        assert!(cp.is_known());
     }
 
     #[test]
@@ -1362,22 +1386,41 @@ Latest checkpoint's full_page_writes: on
         // PrevTimeLineID differs after a promotion; picking it up
         // would report the timeline this node LEFT.
         let promoted = SAMPLE.replace("PrevTimeLineID:   5", "PrevTimeLineID:   4");
-        assert_eq!(parse_control_timeline(&promoted), Some(5));
+        assert_eq!(parse_control_point(&promoted).timeline_id, 5);
+    }
+
+    #[test]
+    fn redo_location_does_not_win() {
+        // "Latest checkpoint's REDO location" sits adjacent to the
+        // field we want and differs from it on a busy server; the
+        // prefix match must not slide onto it.
+        let busy = SAMPLE.replace(
+            "REDO location:    0/25000028",
+            "REDO location:    0/24000000",
+        );
+        assert_eq!(parse_control_point(&busy).checkpoint_lsn, 0x2500_0028);
     }
 
     #[test]
     fn unknown_rather_than_a_guess() {
         // A different major version, a localized build, or a truncated
-        // read must not produce a timeline — callers compare these
-        // across nodes and would act on a fabricated one.
+        // read must not produce a value — callers compare these across
+        // nodes and against switchpoints, and would act on a
+        // fabricated one.
         assert_eq!(
-            parse_control_timeline("Database cluster state: shut down\n"),
-            None
+            parse_control_point("Database cluster state: shut down\n"),
+            ControlPoint::UNKNOWN
         );
-        assert_eq!(parse_control_timeline(""), None);
-        assert_eq!(
-            parse_control_timeline("Latest checkpoint's TimeLineID:       not-a-number\n"),
-            None
+        assert_eq!(parse_control_point(""), ControlPoint::UNKNOWN);
+        let garbled = parse_control_point(
+            "Latest checkpoint's TimeLineID:       not-a-number\n\
+             Latest checkpoint location:           not-an-lsn\n",
         );
+        assert_eq!(garbled, ControlPoint::UNKNOWN);
+        // Each field falls back independently: a readable timeline
+        // beside an unreadable location is still not comparable.
+        let half = parse_control_point("Latest checkpoint's TimeLineID:       5\n");
+        assert_eq!(half.timeline_id, 5);
+        assert!(!half.is_known(), "half a control point cannot be compared");
     }
 }

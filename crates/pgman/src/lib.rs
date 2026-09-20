@@ -19,6 +19,10 @@
 //!   `standby.signal`.
 //! - [`walstore`] — the local WAL archive: serving segments out,
 //!   restoring segments in (with pgdata-confinement checks).
+//! - [`timeline`] — this instance's control point and the timeline
+//!   history around it: which timelines it could follow, and which
+//!   would fork it. Pure functions over what `$PGDATA` records, so the
+//!   rule is readable and testable apart from the fetching.
 //! - [`process`] — the seam for starting/stopping the instance's
 //!   server process. Trait only: the systemd implementation lives with
 //!   the agent, and a non-systemd deployment (pg_ctl, container
@@ -51,4 +55,5 @@ pub mod instance;
 pub mod localdb;
 pub mod pgstandby;
 pub mod process;
+pub mod timeline;
 pub mod walstore;
