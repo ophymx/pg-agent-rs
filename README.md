@@ -34,8 +34,10 @@ configurable:
   lifecycle belongs to the agent, not to `Restart=`.
 - **HAProxy** (or equivalent) as the L4 entry point. VIP management is
   deliberately absent.
-- Debian- or RHEL-family layouts. Both are exercised in CI; other distros
-  need five path fields set explicitly.
+- Debian- or RHEL-family layouts. Both are covered by the acceptance
+  matrix — run before each release, not in CI, which cannot host it (see
+  [Testing](#testing)); other distros need five path fields set
+  explicitly.
 
 ## Binaries
 
@@ -43,7 +45,7 @@ configurable:
 |----------------|------|
 | `pg_agentd`    | Coordinator daemon. `serve` (default) runs the gRPC + healthz listeners; `validate-env` is the `nginx -t` equivalent — wired as `ExecStartPre=`. |
 | `pg_agentc`    | One-shot pgpool hook client. Marshals positional argv into a single Unix-socket RPC, then exits. |
-| `pg_agentctl`  | Operator CLI: hook config (`print-hooks`, `check-hooks`, `gen-pgpool`), cluster operations (`cluster init/status/recover/handoff/pause/resume/allow-async`), and the two journals (`maintenance`, `ops`). Every subcommand routes through the local daemon over the Unix socket — no TLS material needed on the operator's host. Run `--help` for the current surface. |
+| `pg_agentctl`  | Operator CLI: hook config (`print-hooks`, `check-hooks`, `gen-pgpool`), cluster operations (`cluster init/status/recover/handoff/start-primary/pause/resume/allow-async`), and the two journals (`maintenance`, `ops`). Every subcommand routes through the local daemon over the Unix socket — no TLS material needed on the operator's host. Run `--help` for the current surface. |
 
 ## Layout
 
@@ -94,6 +96,13 @@ testing/matrix.sh            # every OS / PostgreSQL cell
 See [testing/README.md](testing/README.md). Discoveries it has made are
 logged in [testing/FINDINGS.md](testing/FINDINGS.md), and much of the
 design is easier to understand from those than from the specification.
+
+CI runs the unit tests, `clippy -D warnings`, rustfmt and the licence
+gate on every push. It does **not** run the acceptance suite: that needs
+privileged containers running systemd as PID 1 with `cgroup: host`, and
+one scenario SIGKILLs PID 1 to force a container restart — none of which
+a hosted runner will do. The matrix is run before a release, and its
+result is what the [Status](#status) section below is reporting.
 
 ## Status
 
