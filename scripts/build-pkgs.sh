@@ -61,6 +61,31 @@ export VERSION
 # discover peers through DNS.
 TARGET="${TARGET:-x86_64-unknown-linux-musl}"
 export TARGET
+
+# Package architecture, derived from the target rather than assumed.
+#
+# The two formats spell the same machine differently — Debian says
+# amd64/arm64 where RPM says x86_64/aarch64 — and BOTH names have to be
+# right for reasons beyond the filename: the architecture recorded
+# INSIDE the package is what apt and dnf use to refuse a package built
+# for another machine. A mislabelled arm64 build would install happily
+# on x86_64 and die at exec, which is finding 26's failure mode wearing
+# a different hat.
+#
+# Unknown targets stop here. Guessing an architecture name is exactly
+# the kind of helpfulness that produces a package claiming to be
+# something it is not.
+case "$TARGET" in
+    x86_64-unknown-linux-musl)  DEB_ARCH=amd64; RPM_ARCH=x86_64 ;;
+    aarch64-unknown-linux-musl) DEB_ARCH=arm64; RPM_ARCH=aarch64 ;;
+    *)
+        echo "error: no package-architecture mapping for TARGET=$TARGET" >&2
+        echo "       add one to scripts/build-pkgs.sh rather than letting the" >&2
+        echo "       packagers guess" >&2
+        exit 2
+        ;;
+esac
+
 echo "==> cargo build --release --target ${TARGET}"
 cargo build --release --target "$TARGET"
 
@@ -79,19 +104,28 @@ echo "==> staged $(file -b dist/staging/pg_agentd | cut -d, -f1-2)"
 
 build_deb() {
     need cargo-deb
-    out="dist/pg-agent-rs_${VERSION}_amd64.deb"
+    out="dist/pg-agent-rs_${VERSION}_${DEB_ARCH}.deb"
     # --no-build: the static musl build above IS the artifact. Letting
     # cargo-deb rebuild would produce a host-native dynamic binary —
     # finding 26 walking straight back in.
+    #
+    # --target is NOT a build instruction here (--no-build already
+    # settled that); it is how cargo-deb learns which architecture to
+    # stamp on the package. The assets are fixed paths under
+    # dist/staging, so it changes nothing else.
     echo "==> cargo deb → ${out}"
-    cargo deb --no-build --no-strip -p pg-agentd --output "$out"
+    cargo deb --no-build --no-strip --target "$TARGET" -p pg-agentd --output "$out"
 }
 
 build_rpm() {
     need cargo-generate-rpm
-    out="dist/pg-agent-rs-${VERSION}-1.x86_64.rpm"
+    out="dist/pg-agent-rs-${VERSION}-1.${RPM_ARCH}.rpm"
+    # -a rather than --target: --target would send it looking for
+    # artifacts under a target subdirectory, and the binaries it
+    # packages are staged at a fixed path. Only the recorded
+    # architecture needs to change.
     echo "==> cargo generate-rpm → ${out}"
-    cargo generate-rpm -p crates/pg-agentd --output "$out"
+    cargo generate-rpm -a "$RPM_ARCH" -p crates/pg-agentd --output "$out"
 }
 
 case "${1:-all}" in

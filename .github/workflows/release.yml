@@ -13,6 +13,23 @@
 # hosted runner will do. The suite stays a thing you run before you tag.
 # What this gate catches is a tag cut from a commit that does not build,
 # does not lint, or does not pass its unit tests.
+#
+# NO CARGO BUILD CACHE HERE, AND THAT IS THE POINT.
+#
+# `ci.yml` caches aggressively, because it runs on every push and a
+# stale artifact there costs nothing this job will not catch. This job
+# is the one that must be honest: it compiles 371 crates from nothing,
+# on a runner with no protoc and no toolchain but the pinned one, and
+# that clean room is a check in its own right. `protoc-bin-vendored`
+# means a fresh checkout needs only a Rust toolchain — a promise that
+# only holds while something actually tests it, and a warm `target/`
+# would let pg-agent-proto's build script not re-run at all.
+#
+# The cost is minutes on a workflow that fires a few times a month.
+# The thing bought is that the artifacts attached to a tag were built
+# the way a stranger cloning the repo would build them. Do not add
+# `rust-cache` here to make a release faster; make `ci.yml` faster
+# instead, and let this one stay slow and literal.
 name: release
 
 on:
@@ -24,8 +41,33 @@ permissions:
   contents: write # create the release and upload assets
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  # One job per architecture, each on a runner of that architecture.
+  #
+  # Cross-compiling would need a cross C toolchain (ring contributes C
+  # and assembly), and would leave the static-linkage assertion below
+  # inspecting a binary no machine in the job could execute. Building
+  # natively keeps the artifact and the check that guards it on the
+  # same machine the package claims to be for.
+  #
+  # `ubuntu-24.04-arm` is a GitHub-hosted arm64 runner: free on public
+  # repositories, and included with Team and Enterprise Cloud on
+  # private ones. If arm64 runners are unavailable to this repository
+  # this job fails to start, and the fix is either the plan or a
+  # cross-build with cargo-zigbuild — not dropping the arch back to a
+  # mislabelled x86_64 package.
+  build:
+    strategy:
+      # Ship both architectures or ship neither. A half-populated
+      # release is worse than a late one: `apt` on the missing arch
+      # silently keeps the older version.
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -73,7 +115,12 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-deb
             ~/.cargo/bin/cargo-generate-rpm
-          key: packagers-${{ runner.os }}-deb-3.7.0-rpm-0.21.0
+          # runner.arch is load-bearing now that this job is a matrix:
+          # both entries report runner.os == Linux, so without it the
+          # x86_64 and arm64 legs would share one key and whichever
+          # cached first would hand the other machine binaries it
+          # cannot execute.
+          key: packagers-${{ runner.os }}-${{ runner.arch }}-deb-3.7.0-rpm-0.21.0
 
       - name: Install packaging tools
         if: steps.cache-packagers.outputs.cache-hit != 'true'
@@ -108,10 +155,17 @@ jobs:
 
       # Same script the maintainer runs locally, same checks. A release
       # cut from a red commit is worse than no release.
+      #
+      # Run on BOTH matrix legs rather than once. It is the only place
+      # the test suite executes on arm64 at all, and shipping an arm64
+      # package whose tests have only ever run on x86_64 is the kind of
+      # gap that surfaces as a field report.
       - name: precommit-check
         run: ./scripts/precommit-check.sh
 
       - name: Build packages
+        env:
+          TARGET: ${{ matrix.target }}
         run: ./scripts/build-pkgs.sh
 
       # Static linkage is the property the whole distro matrix rests
@@ -139,11 +193,92 @@ jobs:
               ;;
           esac
 
+      # The machine the binary is FOR, checked against the machine the
+      # package SAYS it is for.
+      #
+      # Architecture is metadata in three places — the ELF header, the
+      # filename, and the field apt/dnf actually read — and a matrix is
+      # exactly the shape that gets them out of step. The failure is
+      # quiet and late: a package labelled amd64 holding an arm64
+      # binary installs without complaint and dies at exec, which is
+      # finding 26's failure mode reached by a different route.
+      - name: Assert the package architecture matches the binary
+        run: |
+          set -eu
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)  elf="x86-64";  deb_arch="amd64"; rpm_arch="x86_64" ;;
+            aarch64-unknown-linux-musl) elf="aarch64"; deb_arch="arm64"; rpm_arch="aarch64" ;;
+            *) echo "::error::no assertion mapping for ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+
+          desc="$(file -b dist/staging/pg_agentd)"
+          echo "binary: $desc"
+          case "$desc" in
+            *"$elf"*) ;;
+            *) echo "::error::pg_agentd is not $elf — built for the wrong machine: $desc" >&2; exit 1 ;;
+          esac
+
+          # dpkg-deb reads the control field, not the filename, which is
+          # the whole point of asking it rather than globbing.
+          got="$(dpkg-deb -f dist/pg-agent-rs_*_"${deb_arch}".deb Architecture)"
+          echo "deb Architecture: $got"
+          [ "$got" = "$deb_arch" ] || {
+            echo "::error::deb says Architecture=$got, expected $deb_arch" >&2; exit 1; }
+
+          # No rpm tooling on the runner; the filename is what dnf
+          # resolves against and cargo-generate-rpm writes the same
+          # value into the header it was given via -a.
+          ls -1 dist/pg-agent-rs-*-1."${rpm_arch}".rpm >/dev/null || {
+            echo "::error::no .rpm for ${rpm_arch}" >&2; exit 1; }
+
+      # Hand the packages to the publish job rather than releasing from
+      # here: a matrix leg that published would race its sibling to
+      # create the same release, and the loser's artifacts would be the
+      # ones missing.
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+  # One release, created once, after every architecture has built and
+  # passed its assertions.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      # Cheap insurance against a matrix that silently shrinks: if
+      # somebody drops a leg, or `if-no-files-found` is relaxed, this
+      # is what stops a release going out with half its architectures.
+      - name: Expect one package per format per architecture
+        run: |
+          set -eu
+          ls -l dist/
+          for f in \
+            dist/pg-agent-rs_*_amd64.deb \
+            dist/pg-agent-rs_*_arm64.deb \
+            dist/pg-agent-rs-*.x86_64.rpm \
+            dist/pg-agent-rs-*.aarch64.rpm
+          do
+            [ -f "$f" ] || { echo "::error::missing artifact: $f" >&2; exit 1; }
+          done
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          ls -l dist/
           gh release create "${GITHUB_REF_NAME}" \
             dist/*.deb dist/*.rpm \
             --title "${GITHUB_REF_NAME}" \

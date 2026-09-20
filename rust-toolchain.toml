@@ -17,6 +17,16 @@
 [toolchain]
 channel    = "1.98.0"
 components = ["rustfmt", "clippy"]
-# The release build target. Declared here so a fresh checkout — and a
-# CI runner — has it without a separate `rustup target add`.
-targets    = ["x86_64-unknown-linux-musl"]
+# The release build targets. Declared here so a fresh checkout — and a
+# CI runner — has them without a separate `rustup target add`.
+#
+# Releases ship both architectures. Each is built on its own native
+# runner rather than cross-compiled: ring contributes C and assembly,
+# so a cross build wants a cross C toolchain, and the thing being
+# shipped is a STATIC binary whose whole promise is that it runs
+# anywhere — a promise better kept by building it on the machine it
+# targets and asserting the result there.
+targets    = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]

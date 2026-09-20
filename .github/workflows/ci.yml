@@ -1,0 +1,89 @@
+# Run the maintainer's own checks on every push and pull request.
+#
+# Until this existed, `release.yml` was the only workflow in the repo —
+# so every check in `precommit-check.sh` ran for the first time in CI
+# when a tag was already pushed. That is precisely the failure the
+# toolchain pin was added for: v0.8.0 went out red because a compiler
+# three versions ahead of the developer's turned a green local run into
+# a red release, with the tag immutable by then. A pin stops the
+# compiler drifting; it does not move the feedback earlier. This does.
+#
+# It runs `scripts/precommit-check.sh` rather than restating its steps,
+# for the reason release.yml gives for doing the same: the moment CI
+# keeps its own list of checks, the list drifts from the one the
+# maintainer actually runs, and the drift is discovered by a release.
+#
+# NOT a substitute for the acceptance suite, which needs privileged
+# containers running systemd as PID 1 — see release.yml. Nor for the
+# release job's uncached build; see the note on caching there.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# Minimum viable: this job reads the code and reports. It creates
+# nothing, so it needs no write scope — unlike release.yml, which
+# publishes.
+permissions:
+  contents: read
+
+# A branch that is pushed three times in a minute should not compile
+# three times. The tail run is the one anybody reads; cancel the ones
+# it superseded and give the minutes back.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No version pinned here on purpose — rust-toolchain.toml does
+      # it, including the components and the musl target, so the runner
+      # compiles with exactly what a developer does. `rustup show`
+      # installs that toolchain and fails loudly if it cannot, rather
+      # than letting the first `cargo` invocation do it silently
+      # halfway through a step that is about something else.
+      #
+      # musl-tools is deliberately absent: musl only needs its linker
+      # when something actually links for it, and this job builds for
+      # the host. release.yml installs it because it builds the
+      # artifacts.
+      - name: Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup show
+          rustc --version
+          cargo --version
+
+      # The cache belongs HERE and not on the release job, and the
+      # asymmetry is deliberate rather than an oversight — see the
+      # comment in release.yml.
+      #
+      # This job runs on every push, so the cache is warm nearly always
+      # and pays for itself immediately: 371 crates in the lockfile,
+      # and clippy plus test plus doc across the workspace is the bulk
+      # of the wall clock. A false green from a stale artifact is also
+      # cheap here, because the release job rebuilds everything from
+      # nothing before any artifact ships.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # The license set is gated at the tag, where NOTICE is about to
+      # ship. Gating it here too is what makes a widening dependency a
+      # pull-request comment rather than a discovery made while cutting
+      # a release.
+      - name: Licenses (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+      # fmt, clippy -D warnings, the unit tests, and cargo doc with
+      # warnings denied. No `--quick`: `cargo doc` is the slow check
+      # and skipping it is a convenience for a developer mid-loop, not
+      # something a gate should inherit.
+      - name: precommit-check
+        run: ./scripts/precommit-check.sh
