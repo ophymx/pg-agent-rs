@@ -366,17 +366,35 @@ ordinary unit tests instead of a lab exercise.
   asserts that a node with no quorum errors rather than reporting a
   vacant lease — §3's hole would otherwise walk back in as an
   `unwrap_or_default`.
-- **Membership is formed by `ClusterInit`**, not at daemon startup and
-  not implicitly at first election. It is already the operator-driven
-  "this is the cluster" moment; bootstrapping at startup would have every
-  node racing to declare a membership, and bootstrapping on first
-  election would make the member set depend on who booted first. It is
-  idempotent and never fatal to `ClusterInit` — replication has already
-  been configured by that point, and failing the command over a
-  consensus-bootstrap problem would send the operator back to re-run
-  destructive work that already succeeded. A *restarting* node
-  deliberately does not bootstrap, or a restart could redefine who the
-  members are.
+- **Membership is formed at daemon startup**, from the configured
+  `[[pool]]`, and also by `ClusterInit`. It was `ClusterInit` alone
+  until v0.9.0, on the reasoning that forming the pool is the
+  operator-driven "this is the cluster" moment and that daemons racing
+  to declare one would be a hazard. Both halves were wrong, and a real
+  cluster died of it.
+
+  There is no race to lose: membership is a config file, so every node
+  computes a byte-identical set and concurrent `initialize` calls
+  cannot disagree about what the cluster *is* — only about which
+  proposal commits, which Raft already settles. Startup staggers by
+  pool position anyway, to spend no election on it.
+
+  And gating it on `ClusterInit` made it unreachable for any cluster
+  that already existed. `ClusterInit` basebackups every standby, so it
+  is not a command run against a live deployment; an existing cluster
+  upgraded into the Raft releases therefore came up with an empty
+  store, no voters, and no leader electable *ever*. Cold start then
+  reads the lease as unreadable and leaves PostgreSQL down on every
+  primary-shaped node — permanently, with no operator exit documented
+  anywhere. A consensus layer whose bootstrap can only be reached by a
+  destructive command has no bootstrap on the path that matters.
+
+  It remains idempotent and never fatal — to startup or to
+  `ClusterInit`. A node that cannot form the pool is no worse off for
+  having tried, and failing `ClusterInit` over it would send the
+  operator back to re-run destructive work that already succeeded. A
+  node that recovers membership from its own log does not re-form it,
+  or a restart could redefine who the members are.
 - **The election window is derived, not configured.** `[raft]` carries
   one upper bound and the daemon randomizes half-to-full, because a
   single value has every node time out together and split the vote.
