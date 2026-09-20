@@ -201,6 +201,41 @@ message ClusterStatusResponse {
   // that is not failing over needs to be told which of those it is,
   // and "" for both would hide exactly the case worth seeing.
   string                      pause_status  = 3;
+  // Consensus as this daemon sees it. Absent only when the daemon runs
+  // without an HA subsystem at all (unit tests).
+  optional ConsensusStatus    consensus     = 4;
+}
+
+// The lease, and the machinery that holds it.
+//
+// The lease decides promotion — it is the authority this whole design
+// is built around — and for several releases no operator surface
+// rendered it at all. Diagnosing a stuck cluster meant grepping the
+// journal for `TookOver`.
+message ConsensusStatus {
+  // False means the Raft pool has no voters: no leader can ever be
+  // elected, every lease read fails, and cold start will refuse to run
+  // PostgreSQL on every primary-shaped node. Distinct from "no leader
+  // at this instant", which resolves itself in an election.
+  bool           membership_formed = 1;
+  // Node id Raft currently believes leads. Absent during an election.
+  // NOT the PostgreSQL primary — the two are unrelated by design.
+  optional int32 raft_leader       = 2;
+  // Why the lease could not be read. Non-empty means the lease is
+  // UNKNOWN, which is not the same as vacant: `lease` absent with an
+  // empty `error` is a genuinely unheld lease. Conflating the two is
+  // the hole the consensus module's "Err means unknown" rule exists to
+  // close, and rendering must not reintroduce it.
+  string         error             = 3;
+  optional Lease lease             = 4;
+}
+
+message Lease {
+  int32  holder = 1;
+  // Fencing token — strictly monotonic across holder changes.
+  uint64 term   = 2;
+  // RFC 3339 instant the holder acquired it.
+  string since  = 3;
 }
 
 message ClusterRecoverRequest {
@@ -215,6 +250,20 @@ message ClusterRecoverRequest {
   // is running`). The CLI surface is `--stop-target-pg` on
   // `pg_agentctl cluster recover`.
   bool stop_target_pg = 2;
+}
+
+message ClusterStartPrimaryRequest {
+  // Skip the pre-start timeline check. Without it the daemon refuses
+  // when any peer reports a STRICTLY HIGHER timeline than the local
+  // control file — that peer was promoted past this node, and starting
+  // here would resurrect a stale primary and fork the cluster. The
+  // check reads peers' timelines whether or not their PostgreSQL is
+  // running, so "everything is down" is not an excuse to skip it.
+  //
+  // The escape hatch exists because a peer can be wrong about itself
+  // in ways only an operator can adjudicate; it is not for getting
+  // past a refusal you have not read.
+  bool force = 1;
 }
 
 message ClusterHandoffRequest {
@@ -280,6 +329,14 @@ service PgAgentLocal {
   // target. Refuses if the target lag exceeds 16 MiB unless `allow_lag`
   // is set.
   rpc ClusterHandoff    (ClusterHandoffRequest)    returns (OpResult);
+  // Start the local PostgreSQL as the cluster's primary and claim the
+  // lease. The bootstrap case cold start deliberately refuses: a
+  // primary-shaped pgdata with a vacant lease stays down, because
+  // candidacy needs a running standby's flush position and not a cold
+  // ex-primary's assertion. That is the right automatic behaviour and
+  // the wrong place to leave an operator, who until now had to reach
+  // for systemctl and then wait for the HA loop to notice.
+  rpc ClusterStartPrimary (ClusterStartPrimaryRequest) returns (OpResult);
   rpc GetPgpoolBackends (GetPgpoolBackendsRequest) returns (GetPgpoolBackendsResponse);
 
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);

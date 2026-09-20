@@ -16,6 +16,19 @@
 //!   - Idempotent by default. Re-running a successful command is a no-op.
 //!   - No interactive prompts. `--yes` is implied; destructive commands
 //!     require an explicit `--force` flag.
+//!
+//! # Short flags
+//!
+//! Navigational options carry a short alias (`-j`, `-s`, `-c`, `-t`,
+//! `-n`, `-w`, `-r`) because they are typed constantly, often mid-
+//! incident.
+//!
+//! The opt-ins that authorise damage do NOT: `--force`, `--confirm`,
+//! `--allow-lag`, `--stop-target-pg`. Spelling those out is part of
+//! what they mean — each one is the operator asserting they have
+//! understood a specific refusal, and a two-character version invites
+//! reaching for it before reading the message. Same reason there are no
+//! prompts: the deliberation happens at the keyboard, once.
 
 mod client;
 mod config_loader;
@@ -31,14 +44,14 @@ use std::process::ExitCode;
 struct Cli {
     /// Emit machine-readable JSON instead of human-readable text where the
     /// subcommand supports it.
-    #[arg(long, global = true)]
+    #[arg(short, long, global = true)]
     json: bool,
 
     /// Override the Unix socket path. Precedence: this flag → config
     /// `unix_socket` → /run/pg_agentd/pg_agentd.sock. Only relevant
     /// for subcommands that dial the local daemon (cluster init,
     /// maintenance, …).
-    #[arg(long, global = true)]
+    #[arg(short, long, global = true)]
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -55,9 +68,9 @@ enum Cmd {
 
     /// Generate a pgpool include with live backend values from each peer.
     GenPgpool {
-        #[arg(long)]
+        #[arg(short, long)]
         write: Option<std::path::PathBuf>,
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
 
@@ -103,7 +116,7 @@ enum OpsCmd {
     /// in `last_error` for later incident review.
     Abandon {
         id: String,
-        #[arg(long, default_value = "")]
+        #[arg(short, long, default_value = "")]
         reason: String,
     },
 }
@@ -125,16 +138,16 @@ enum MaintenanceCmd {
 enum ClusterCmd {
     /// One-time bootstrap from this primary.
     Init {
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         only_node: Option<i32>,
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
     /// Fan-out GetStatus to every pool member; render a topology table.
     /// Also serves as the mesh-level mTLS reachability check that
     /// `pg_agentd validate-env` doesn't cover.
     Status {
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
     /// Reclone a target standby from this primary. Same orchestration
@@ -144,7 +157,7 @@ enum ClusterCmd {
     /// the local node is in recovery.
     Recover {
         /// Pool id of the standby to reclone.
-        #[arg(long)]
+        #[arg(short, long)]
         target: i32,
         /// Stop PostgreSQL on the target via the peer agent before
         /// running basebackup. Without this flag, a target that still
@@ -155,7 +168,34 @@ enum ClusterCmd {
         /// safe to discard (which is the entire point of recloning it).
         #[arg(long)]
         stop_target_pg: bool,
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
+    /// Start this node's PostgreSQL as the cluster's primary and claim
+    /// the lease. The bootstrap case the agent deliberately will not
+    /// automate: a primary-shaped data directory with a vacant lease
+    /// stays down on its own, because candidacy is meant to run off a
+    /// live standby's flush position rather than a cold ex-primary's
+    /// word about itself.
+    ///
+    /// Run it on the node you have decided is the primary — after a
+    /// full-site outage, or after `cluster status` shows every node
+    /// down with no lease holder.
+    ///
+    /// Refuses, rather than forking the cluster, when: the data
+    /// directory is standby-shaped; another node holds the lease; a
+    /// peer reports a higher timeline (it was promoted past this one);
+    /// or consensus cannot be read, since an unknown lease is not a
+    /// vacant one.
+    StartPrimary {
+        /// Override the timeline refusal — start even though a peer
+        /// reports a higher timeline. That peer was promoted past this
+        /// node; starting here resurrects a stale primary and forks
+        /// the cluster. For an operator who has adjudicated the
+        /// conflict, not for getting past a message unread.
+        #[arg(long)]
+        force: bool,
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
     /// Planned primary handoff. Run from the current primary. Promotes
@@ -167,7 +207,7 @@ enum ClusterCmd {
     /// unless `--allow-lag` is set.
     Handoff {
         /// Pool id of the standby to promote.
-        #[arg(long)]
+        #[arg(short, long)]
         target: i32,
         /// Override the lag pre-check. Without this, the daemon refuses
         /// to promote a target whose replication lag exceeds one WAL
@@ -176,7 +216,7 @@ enum ClusterCmd {
         /// LSN.
         #[arg(long)]
         allow_lag: bool,
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
     /// EMERGENCY: disarm quorum commit on the current primary
@@ -191,7 +231,7 @@ enum ClusterCmd {
         /// single-copy promises until a standby attaches.
         #[arg(long)]
         confirm: bool,
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
     /// Suspend AUTOMATIC role decisions cluster-wide for planned work.
@@ -208,14 +248,14 @@ enum ClusterCmd {
         /// Why — recorded in consensus and shown by `cluster status`.
         /// Required: the next person to find a cluster that is not
         /// failing over needs to know whether that was deliberate.
-        #[arg(long)]
+        #[arg(short, long)]
         reason: String,
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
     /// Resume automatic role decisions after `cluster pause`.
     Resume {
-        #[arg(long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
 }
@@ -266,6 +306,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
                     cli.json,
                 )
                 .await
+            }
+            ClusterCmd::StartPrimary { force, config } => {
+                cluster_start_primary(config, force, cli.socket.as_deref(), cli.json).await
             }
             ClusterCmd::Handoff {
                 target,
@@ -415,14 +458,18 @@ async fn cluster_status(
         let payload = serde_json::json!({
             "all_reachable": resp.all_reachable,
             "pause_status": resp.pause_status,
+            "consensus": resp.consensus.as_ref().map(consensus_to_json),
             "nodes": rows.iter().map(status_row_to_json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        // Above the table, not below it: a paused cluster explains
-        // everything else on the screen.
+        // Above the table, not below it: a paused cluster and a broken
+        // consensus each explain everything else on the screen.
         if !resp.pause_status.is_empty() {
             println!("maintenance mode: {}", resp.pause_status);
+        }
+        if let Some(c) = &resp.consensus {
+            print_consensus(c, &mut std::io::stdout())?;
         }
         print_status_table(&rows, &mut std::io::stdout())?;
     }
@@ -438,6 +485,45 @@ async fn cluster_status(
 /// `recovery_1st_stage` against the named pool member. The daemon is
 /// the only side that needs PCP credentials / mTLS material; the CLI
 /// is a thin dialer. Same shape as `cluster init` / `cluster status`.
+/// `cluster start-primary` — a thin dialer. Every judgement (data
+/// directory shape, lease ownership, peer timelines) lives daemon-side,
+/// because only the daemon can read the control file and reach the
+/// peers; the CLI's job is to relay the refusal verbatim.
+async fn cluster_start_primary(
+    config_path: PathBuf,
+    force: bool,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::ClusterStartPrimaryRequest;
+
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .cluster_start_primary(ClusterStartPrimaryRequest { force })
+        .await
+        .map_err(|s| rpc_failed("ClusterStartPrimary", s))?
+        .into_inner();
+
+    if json {
+        let payload = serde_json::json!({
+            "ok":      resp.ok,
+            "message": resp.message,
+            "force":   force,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if resp.ok {
+        println!("OK: {}", resp.message);
+    } else {
+        eprintln!("cluster start-primary: {}", resp.message);
+    }
+    Ok(if resp.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
 async fn cluster_recover(
     config_path: PathBuf,
     target: i32,
@@ -649,12 +735,29 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         })
         .collect();
     let show_lsn = !primaries.is_empty();
-    // Identify the lead primary by (timeline_id, current_wal_lsn) lex
-    // order, but only when 2+ primaries are present (a single primary
-    // is unambiguous; no marker needed). Primaries with both fields=0
-    // can't be compared — fall back to no marker rather than marking
-    // an arbitrary winner.
-    let lead_id: Option<i32> = if primaries.len() >= 2 {
+    // Timelines are shown whenever anyone reports one. Stopped nodes
+    // now answer from their control file, so this column survives the
+    // case it matters most in — a site where nothing is running and
+    // the only question is which data directory is furthest ahead.
+    let show_tl = rows
+        .iter()
+        .any(|r| matches!(&r.result, Ok(s) if s.timeline_id > 0));
+
+    // Who leads, and on what evidence.
+    //
+    // Two distinct situations, and the old code only handled the first:
+    //
+    // - **2+ primaries RUNNING** — split brain in progress. Rank by
+    //   (timeline, LSN); the loser gets recovered to the winner.
+    // - **no primary running at all** — a full-site outage, which is
+    //   exactly when an operator needs to be told which node to start
+    //   and exactly when the old gate produced no marker, no LSN
+    //   column and no timelines. Rank on what a stopped node can still
+    //   report: its timeline. Mark only a UNIQUE maximum — equal
+    //   timelines cannot be separated without LSNs we do not have from
+    //   a stopped node, and marking an arbitrary one of them would be
+    //   worse than marking none.
+    let lead: Option<(i32, LeadBasis)> = if primaries.len() >= 2 {
         primaries
             .iter()
             .filter_map(|r| {
@@ -667,10 +770,30 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
                 })
             })
             .max_by_key(|(tl, lsn, _)| (*tl, *lsn))
-            .map(|(_, _, id)| id)
+            .map(|(_, _, id)| (id, LeadBasis::RunningPrimaries))
+    } else if primaries.is_empty() {
+        let known: Vec<(i32, i32)> = rows
+            .iter()
+            .filter_map(|r| {
+                r.result
+                    .as_ref()
+                    .ok()
+                    .filter(|s| s.timeline_id > 0)
+                    .map(|s| (s.timeline_id, r.id))
+            })
+            .collect();
+        let top = known.iter().map(|(tl, _)| *tl).max();
+        match top {
+            Some(top) if known.iter().filter(|(tl, _)| *tl == top).count() == 1 => known
+                .iter()
+                .find(|(tl, _)| *tl == top)
+                .map(|(_, id)| (*id, LeadBasis::ColdTimelines)),
+            _ => None,
+        }
     } else {
         None
     };
+    let lead_id = lead.map(|(id, _)| id);
 
     let mut headers: Vec<&str> = vec![
         "ID",
@@ -682,6 +805,9 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         "LAG",
         "REPL_STATE",
     ];
+    if show_tl {
+        headers.push("TL");
+    }
     if show_lsn {
         headers.push("LSN");
     }
@@ -695,6 +821,13 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         // Annotate the lead's ROLE cell with `*`.
         if Some(r.id) == lead_id {
             row[2] = format!("{}*", row[2]);
+        }
+        if show_tl {
+            row.push(match &r.result {
+                Ok(s) if s.timeline_id > 0 => s.timeline_id.to_string(),
+                Ok(_) => "-".into(),
+                Err(_) => "—".into(),
+            });
         }
         if show_lsn {
             row.push(match &r.result {
@@ -753,14 +886,37 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
             writeln!(w, "  {} {}: {}", r.id, r.hostname, err)?;
         }
     }
-    if lead_id.is_some() {
-        writeln!(w)?;
-        writeln!(
-            w,
-            "* lead primary by (timeline, LSN) — recover other primaries to this one"
-        )?;
+    match lead.map(|(_, basis)| basis) {
+        Some(LeadBasis::RunningPrimaries) => {
+            writeln!(w)?;
+            writeln!(
+                w,
+                "* lead primary by (timeline, LSN) — recover other primaries to this one"
+            )?;
+        }
+        Some(LeadBasis::ColdTimelines) => {
+            writeln!(w)?;
+            writeln!(
+                w,
+                "* furthest-ahead data directory by timeline (nothing is running) — \
+                 `cluster start-primary` there, then recover the others to it"
+            )?;
+        }
+        None => {}
     }
     Ok(())
+}
+
+/// What the `*` marker is asserting, which differs enough between the
+/// two cases that one footnote cannot serve both: one says "you have
+/// two primaries, keep this one", the other says "you have none, start
+/// this one".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeadBasis {
+    /// Two or more primaries are serving; ranked by (timeline, LSN).
+    RunningPrimaries,
+    /// Nothing is serving; ranked by control-file timeline alone.
+    ColdTimelines,
 }
 
 /// Render a 64-bit `pg_lsn` as PostgreSQL's canonical `XXXXXXXX/XXXXXXXX`
@@ -864,6 +1020,74 @@ fn format_lag_bytes(n: i64) -> String {
     }
 }
 
+/// Canonical `pg_lsn` text for a non-zero LSN, JSON `null` for the
+/// unknown/zero sentinel — so a consumer cannot mistake "0/0" for a
+/// real position at the very start of WAL.
+fn lsn_or_null(lsn: u64) -> serde_json::Value {
+    if lsn == 0 {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(format_lsn(lsn))
+    }
+}
+
+fn consensus_to_json(c: &pg_agent_proto::pgagentpb::ConsensusStatus) -> serde_json::Value {
+    serde_json::json!({
+        "membership_formed": c.membership_formed,
+        "raft_leader":       c.raft_leader,
+        // Non-empty means the lease below is UNKNOWN, not vacant.
+        "error":             c.error,
+        "lease": c.lease.as_ref().map(|l| serde_json::json!({
+            "holder": l.holder,
+            "term":   l.term,
+            "since":  l.since,
+        })),
+    })
+}
+
+/// The consensus header above the topology table.
+///
+/// The lease decides promotion, and for several releases no operator
+/// surface printed it: diagnosing a stuck cluster meant grepping the
+/// journal for `TookOver`. Three lines, and the middle one is the
+/// answer to "why is nothing failing over".
+fn print_consensus(
+    c: &pg_agent_proto::pgagentpb::ConsensusStatus,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if !c.membership_formed {
+        writeln!(
+            w,
+            "consensus: MEMBERSHIP NOT FORMED — this pool has no voters, so no leader can \
+             be elected and no lease can be read or granted. Restart pg_agentd to form it \
+             from the configured [[pool]]."
+        )?;
+        writeln!(w)?;
+        return Ok(());
+    }
+    let leader = match c.raft_leader {
+        Some(id) => format!("node {id}"),
+        // Not an error on its own — elections are sub-second — but it
+        // is the reason a read taken at this instant may have failed.
+        None => "none (election in flight)".into(),
+    };
+    // Vacant and unknown are different states and must never render
+    // alike: one invites `cluster start-primary`, the other means the
+    // cluster cannot currently tell you anything.
+    let lease = if !c.error.is_empty() {
+        format!("UNKNOWN — {}", c.error)
+    } else {
+        match &c.lease {
+            Some(l) => format!("node {} (term {}, since {})", l.holder, l.term, l.since),
+            None => "vacant (no node holds it)".into(),
+        }
+    };
+    writeln!(w, "consensus: raft leader {leader}")?;
+    writeln!(w, "lease:     {lease}")?;
+    writeln!(w)?;
+    Ok(())
+}
+
 fn status_row_to_json(r: &StatusRow) -> serde_json::Value {
     match &r.result {
         Ok(s) => serde_json::json!({
@@ -881,6 +1105,26 @@ fn status_row_to_json(r: &StatusRow) -> serde_json::Value {
                 "is_postgres_status_ok":       s.is_postgres_status_ok,
                 "is_pgpool_running":           s.is_pgpool_running,
                 "is_pgpool_status_ok":         s.is_pgpool_status_ok,
+                // The fields the table renders (and the ones it
+                // doesn't) all belong here. Omitting them made the
+                // machine-readable output the WEAKER of the two, which
+                // is backwards — and left automation unable to see the
+                // timeline, the one field that decides which node is
+                // the real primary in a split brain.
+                //
+                // 0 means unknown in every one of these; callers must
+                // skip cross-node comparison for a node reporting 0
+                // rather than treating it as "timeline zero".
+                "timeline_id":                 s.timeline_id,
+                "current_wal_lsn":             s.current_wal_lsn,
+                "current_wal_lsn_hex":         lsn_or_null(s.current_wal_lsn),
+                "last_flush_lsn":              s.last_flush_lsn,
+                "last_flush_lsn_hex":          lsn_or_null(s.last_flush_lsn),
+                // Per-peer "when did you last see node N SERVING as a
+                // primary", in ms. The second opinion candidacy runs
+                // on; an operator diagnosing a refused failover needs
+                // the same evidence the loop had.
+                "peer_primary_seen_age_ms":    s.peer_primary_seen_age_ms,
             },
         }),
         Err(e) => serde_json::json!({
@@ -1800,6 +2044,193 @@ quoted_with_spaces = '  spaces inside  '
         // Single primary → no LEAD marker.
         assert!(!s.contains("lead primary"), "unexpected lead footer: {s}");
         assert!(!s.contains("primary*"), "unexpected lead asterisk: {s}");
+    }
+
+    // ----- cold-site triage ----------------------------------------------
+    //
+    // The case the old gate rendered as a wall of "unknown": every node
+    // down, which is when an operator most needs to be told which data
+    // directory is furthest ahead.
+
+    /// A node whose PostgreSQL is confirmed stopped but which still
+    /// reports a timeline from its control file.
+    fn ns_down(timeline_id: i32) -> pg_agent_proto::pgagentpb::NodeStatus {
+        pg_agent_proto::pgagentpb::NodeStatus {
+            is_postgres_running: false,
+            is_running: false,
+            is_pgpool_running: false,
+            is_ready: false,
+            ..ns_with(false, false, false, 0, "", timeline_id, 0)
+        }
+    }
+
+    #[test]
+    fn cold_site_names_the_furthest_ahead_node() {
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns_down(4)),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns_down(4)),
+            },
+            StatusRow {
+                id: 2,
+                hostname: "pg2".into(),
+                result: Ok(ns_down(5)),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("TL"),
+            "timeline column missing on a cold site: {s}"
+        );
+        assert!(
+            s.contains("unknown*"),
+            "furthest-ahead node not marked: {s}"
+        );
+        assert!(
+            s.contains("cluster start-primary"),
+            "footer must name the command that acts on the marker: {s}"
+        );
+        // The split-brain footer is about keeping one of two SERVING
+        // primaries; saying that here would be wrong advice.
+        assert!(
+            !s.contains("lead primary by"),
+            "wrong footer for a cold site: {s}"
+        );
+    }
+
+    #[test]
+    fn cold_site_refuses_to_pick_between_equal_timelines() {
+        // Without LSNs — which a stopped node cannot report — equal
+        // timelines are genuinely unrankable. Marking an arbitrary one
+        // would be worse than marking none.
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns_down(4)),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns_down(4)),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("TL"), "timeline column still belongs here: {s}");
+        assert!(!s.contains('*'), "must not guess a winner: {s}");
+    }
+
+    #[test]
+    fn running_split_brain_keeps_its_own_footer() {
+        // The pre-existing behaviour, unchanged: two SERVING primaries
+        // rank by (timeline, LSN) and the advice is to recover the
+        // loser, not to start anything.
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "pg0".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 4, 0x100)),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "pg1".into(),
+                result: Ok(ns_with(false, true, true, 0, "", 5, 0x50)),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("lead primary by (timeline, LSN)"), "{s}");
+        assert!(
+            !s.contains("start-primary"),
+            "wrong footer for a live split brain: {s}"
+        );
+        // Higher timeline wins despite the lower LSN.
+        let pg1_line = s.lines().find(|l| l.contains("pg1")).unwrap();
+        assert!(pg1_line.contains("primary*"), "TL must outrank LSN: {s}");
+    }
+
+    // ----- consensus header ----------------------------------------------
+
+    fn consensus(
+        formed: bool,
+        leader: Option<i32>,
+        error: &str,
+        lease: Option<(i32, u64)>,
+    ) -> pg_agent_proto::pgagentpb::ConsensusStatus {
+        pg_agent_proto::pgagentpb::ConsensusStatus {
+            membership_formed: formed,
+            raft_leader: leader,
+            error: error.into(),
+            lease: lease.map(|(holder, term)| pg_agent_proto::pgagentpb::Lease {
+                holder,
+                term,
+                since: "2026-09-20T00:36:22Z".into(),
+            }),
+        }
+    }
+
+    fn consensus_text(c: &pg_agent_proto::pgagentpb::ConsensusStatus) -> String {
+        let mut buf = Vec::new();
+        print_consensus(c, &mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn lease_holder_is_visible() {
+        let s = consensus_text(&consensus(true, Some(0), "", Some((2, 7))));
+        assert!(s.contains("raft leader node 0"), "{s}");
+        assert!(s.contains("node 2"), "lease holder must be named: {s}");
+        assert!(s.contains("term 7"), "fencing token must be shown: {s}");
+    }
+
+    #[test]
+    fn a_vacant_lease_and_an_unknown_one_do_not_look_alike() {
+        // The whole "Err means unknown" rule, at the render layer: one
+        // of these invites `cluster start-primary`, the other means the
+        // cluster cannot currently tell you anything.
+        let vacant = consensus_text(&consensus(true, Some(1), "", None));
+        assert!(vacant.contains("vacant"), "{vacant}");
+        assert!(!vacant.to_lowercase().contains("unknown"), "{vacant}");
+
+        let unknown = consensus_text(&consensus(
+            true,
+            None,
+            "consensus read failed: no quorum",
+            None,
+        ));
+        assert!(unknown.contains("UNKNOWN"), "{unknown}");
+        assert!(!unknown.contains("vacant"), "{unknown}");
+        assert!(
+            unknown.contains("no quorum"),
+            "the cause belongs on screen: {unknown}"
+        );
+    }
+
+    #[test]
+    fn an_unformed_pool_says_so_and_says_what_to_do() {
+        // The failure that cost a cluster every PostgreSQL. It must not
+        // render as an ordinary missing leader.
+        let s = consensus_text(&consensus(false, None, "no leader known", None));
+        assert!(s.contains("MEMBERSHIP NOT FORMED"), "{s}");
+        assert!(
+            s.contains("restart pg_agentd") || s.contains("Restart pg_agentd"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("election in flight"),
+            "that is the OTHER diagnosis: {s}"
+        );
     }
 
     #[test]

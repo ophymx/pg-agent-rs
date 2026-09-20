@@ -46,11 +46,11 @@ use tracing::{error, info, warn};
 #[command(name = "pg_agentd", version, about, long_about = None)]
 struct Cli {
     /// Path to config.toml (default: /etc/pg_agent/config.toml).
-    #[arg(long, env = "PG_AGENTD_CONFIG", global = true)]
+    #[arg(short, long, env = "PG_AGENTD_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Override unix_socket path from config. (Only honoured by `serve`.)
-    #[arg(long, env = "PG_AGENTD_SOCKET", global = true)]
+    #[arg(short, long, env = "PG_AGENTD_SOCKET", global = true)]
     socket: Option<PathBuf>,
 
     /// Development mode: allow plaintext peer connections to non-loopback
@@ -78,7 +78,7 @@ enum Cmd {
     /// `pg_agentctl cluster status`, not here.
     ValidateEnv {
         /// Emit machine-readable JSON instead of the human report.
-        #[arg(long)]
+        #[arg(short, long)]
         json: bool,
 
         /// Skip the local-DB checks (use during pre-bootstrap when PG

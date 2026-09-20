@@ -40,11 +40,12 @@ use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
     AbandonInflightOpRequest, AllowAsyncRequest, ClusterHandoffRequest, ClusterInitRequest,
-    ClusterInitResponse, ClusterInitStandbyResult, ClusterRecoverRequest, ClusterStatusEntry,
-    ClusterStatusRequest, ClusterStatusResponse, EscalationRequest, FailoverRequest,
-    FollowPrimaryRequest, GetInflightOpRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
+    ClusterInitResponse, ClusterInitStandbyResult, ClusterRecoverRequest,
+    ClusterStartPrimaryRequest, ClusterStatusEntry, ClusterStatusRequest, ClusterStatusResponse,
+    ConsensusStatus, EscalationRequest, FailoverRequest, FollowPrimaryRequest,
+    GetInflightOpRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
     GetPgpoolBackendsResponse, GetStatusRequest, InflightOp as ProtoInflightOp,
-    ListInflightOpsRequest, ListInflightOpsResponse, ListMaintenanceRequest,
+    Lease as ProtoLease, ListInflightOpsRequest, ListInflightOpsResponse, ListMaintenanceRequest,
     ListMaintenanceResponse, MaintenanceIntent as ProtoIntent, NodeConfigRequest,
     NodeConfigResponse, NodeRef, NodeStatus, OpResult, PgpoolBackendEntry, RecoveryRequest,
     RemoteStartRequest, RestoreWalRequest, ResumeInflightOpRequest, RetryMaintenanceRequest,
@@ -2123,19 +2124,37 @@ impl PgAgentLocal for LocalServer {
         // cluster that is not failing over because it is PAUSED and one
         // that is not failing over because it cannot reach quorum are
         // different emergencies.
-        let pause_status = match &self.raft {
-            None => String::new(),
+        //
+        // One read serves both the pause line and the consensus block:
+        // they are two views of the same `ClusterState`, and reading it
+        // twice would let them disagree on a cluster mid-election.
+        let (pause_status, consensus) = match &self.raft {
+            None => (String::new(), None),
             Some(rt) => {
-                match tokio::time::timeout(PAUSE_READ_BUDGET, rt.store.read_state()).await {
-                    Ok(Ok(state)) => match state.paused {
-                        Some(p) => format!(
-                            "PAUSED: {} (set by {} at {})",
-                            p.reason,
-                            p.set_by,
-                            p.at.to_rfc3339()
-                        ),
-                        None => String::new(),
-                    },
+                let read = tokio::time::timeout(PAUSE_READ_BUDGET, rt.store.read_state()).await;
+                // Membership and leadership come from local metrics, not
+                // from the read — they are exactly what an operator needs
+                // when the read is what failed.
+                let membership_formed = rt.raft.is_initialized().await.unwrap_or(false);
+                let raft_leader = rt.raft.metrics().borrow().current_leader;
+                let (pause, lease, error) = match read {
+                    Ok(Ok(state)) => {
+                        let pause = match state.paused {
+                            Some(p) => format!(
+                                "PAUSED: {} (set by {} at {})",
+                                p.reason,
+                                p.set_by,
+                                p.at.to_rfc3339()
+                            ),
+                            None => String::new(),
+                        };
+                        let lease = state.lease.map(|l| ProtoLease {
+                            holder: l.holder,
+                            term: l.term,
+                            since: l.since.to_rfc3339(),
+                        });
+                        (pause, lease, String::new())
+                    }
                     // Distinguish "no leader right now" from "this pool
                     // was never formed". They read identically at the
                     // store ("no leader known") and have opposite
@@ -2145,22 +2164,41 @@ impl PgAgentLocal for LocalServer {
                     // every primary-shaped node. An operator staring at
                     // a dead cluster should not have to read the source
                     // to tell which one they have.
-                    Ok(Err(e)) => {
-                        if rt.raft.is_initialized().await.unwrap_or(true) {
-                            format!("unknown (consensus read failed: {e})")
-                        } else {
-                            format!(
-                                "unknown (raft membership NOT FORMED on this node — the pool \
-                                 has no voters, so no leader can ever be elected; restart \
-                                 pg_agentd to form it from the configured [[pool]]) \
-                                 [read failed: {e}]"
-                            )
-                        }
-                    }
-                    Err(_) => format!(
-                        "unknown (consensus read did not answer within {PAUSE_READ_BUDGET:?})"
+                    Ok(Err(e)) if !membership_formed => (
+                        String::new(),
+                        None,
+                        format!(
+                            "raft membership NOT FORMED on this node — the pool has no \
+                             voters, so no leader can ever be elected; restart pg_agentd \
+                             to form it from the configured [[pool]] (read failed: {e})"
+                        ),
                     ),
-                }
+                    Ok(Err(e)) => (String::new(), None, format!("consensus read failed: {e}")),
+                    Err(_) => (
+                        String::new(),
+                        None,
+                        format!("consensus read did not answer within {PAUSE_READ_BUDGET:?}"),
+                    ),
+                };
+                // The pause line keeps carrying its own "unknown"
+                // wording: it is read by operators and scripts that
+                // predate the consensus block, and silently turning a
+                // failed read into "not paused" is the one thing it
+                // must never do.
+                let pause_status = if error.is_empty() {
+                    pause
+                } else {
+                    format!("unknown ({error})")
+                };
+                (
+                    pause_status,
+                    Some(ConsensusStatus {
+                        membership_formed,
+                        raft_leader: raft_leader.map(|id| id as i32),
+                        error,
+                        lease,
+                    }),
+                )
             }
         };
 
@@ -2168,7 +2206,212 @@ impl PgAgentLocal for LocalServer {
             all_reachable,
             nodes: entries,
             pause_status,
+            consensus,
         }))
+    }
+
+    /// `pg_agentctl cluster start-primary` — start the local
+    /// PostgreSQL as the cluster's primary and claim the lease.
+    ///
+    /// This is the bootstrap case cold start deliberately refuses. A
+    /// primary-shaped pgdata with a vacant lease stays down there,
+    /// because candidacy is meant to run off a live standby's flush
+    /// position rather than a cold ex-primary's assertion about itself
+    /// — correct as an automatic policy, and the wrong place to strand
+    /// an operator, who until now had to reach for `systemctl` and
+    /// then wait for the HA loop to notice what they had done.
+    ///
+    /// The refusals are the point of the command; the start is the
+    /// easy part:
+    /// - **standby-shaped pgdata** — starting it would not make a
+    ///   primary, it would make a standby chasing whatever
+    ///   `myrecovery.conf` last said. `cluster recover` is that path.
+    /// - **lease held by another node** — that node is the primary;
+    ///   rebuild this one from it rather than forking.
+    /// - **a peer on a higher timeline** — it was promoted past us
+    ///   while we were away. Starting here resurrects a stale primary,
+    ///   which is the single worst outcome available. `force` exists
+    ///   for the case an operator has adjudicated, not to walk past a
+    ///   refusal unread.
+    /// - **consensus unreadable** — an unknown lease is not a vacant
+    ///   one, and claiming against it is the split-brain door.
+    async fn cluster_start_primary(
+        &self,
+        req: Request<ClusterStartPrimaryRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        let force = req.into_inner().force;
+        let refuse = |m: String| {
+            Ok(Response::new(OpResult {
+                ok: false,
+                message: m,
+            }))
+        };
+
+        let local = self
+            .node_pool
+            .local_node()
+            .map_err(|e| internal(anyhow::anyhow!("start_primary: resolve local node: {e}")))?;
+
+        if self.pg.data_dir.join("standby.signal").exists() {
+            return refuse(
+                "start_primary: pgdata is standby-shaped (standby.signal present) — \
+                 starting it would produce a standby, not a primary; use `cluster \
+                 recover --target` from the intended primary"
+                    .into(),
+            );
+        }
+        if !self.pg.data_dir.join("PG_VERSION").exists() {
+            return refuse(format!(
+                "start_primary: {} is not an initialised data directory",
+                self.pg.data_dir.display()
+            ));
+        }
+
+        let rt = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| internal(anyhow::anyhow!("start_primary: no consensus subsystem")))?;
+        // Read BEFORE starting. A lease held elsewhere means this node
+        // must not come up at all, and finding that out after the start
+        // would mean stopping it again.
+        let state = rt.store.read_state().await.map_err(|e| {
+            Status::failed_precondition(format!(
+                "start_primary: consensus unreadable ({e}) — an unknown lease is not a \
+                 vacant one; resolve consensus first (`cluster status` reports whether \
+                 membership is formed)"
+            ))
+        })?;
+        // Already ours is the re-run case: a half-finished start, or an
+        // operator confirming. Note it and skip the CAS later — a
+        // re-claim would mint a new term for no reason, and the term is
+        // a fencing token, so bumping it invalidates whatever is
+        // carrying the old one. "Re-running a successful command is a
+        // no-op" is a contract this crate makes.
+        let mut already_held: Option<u64> = None;
+        if let Some(l) = &state.lease {
+            if l.holder != local.id {
+                return refuse(format!(
+                    "start_primary: node {} already holds the lease (term {}) — it is the \
+                     primary; rebuild this node from it with `cluster recover --target {}` \
+                     run there",
+                    l.holder, l.term, local.id
+                ));
+            }
+            already_held = Some(l.term);
+        }
+
+        // Timeline safety. The local answer comes from the control file
+        // because PostgreSQL is down by assumption; peers answer from
+        // theirs too when stopped, so "the whole site is down" no
+        // longer means "no evidence available".
+        let local_tl = self.standby.control_timeline().await.unwrap_or(0);
+        let remotes: Vec<NodeConfig> = self
+            .node_pool
+            .members
+            .iter()
+            .filter(|n| !self.node_pool.is_local(n))
+            .cloned()
+            .collect();
+        let mut ahead: Vec<String> = Vec::new();
+        for view in crate::cluster_view::collect_statuses(
+            self.peers.clone(),
+            &remotes,
+            crate::cluster_view::STATUS_FANOUT_BUDGET,
+            self.peer_seen.as_deref(),
+        )
+        .await
+        {
+            if let Ok(s) = view.status {
+                if s.timeline_id > 0 && local_tl > 0 && s.timeline_id > local_tl {
+                    ahead.push(format!("{}@TL{}", view.node.hostname, s.timeline_id));
+                }
+            }
+        }
+        if !ahead.is_empty() && !force {
+            return refuse(format!(
+                "start_primary: local timeline is {local_tl} but {} reports a higher one \
+                 — this node was promoted past and its writes would fork the cluster. \
+                 Recover it from that node instead, or pass --force if you have \
+                 adjudicated otherwise",
+                ahead.join(", ")
+            ));
+        }
+        if local_tl == 0 {
+            warn!("start_primary: local timeline unreadable; peer comparison skipped");
+        }
+
+        info!(
+            node = local.id,
+            timeline = local_tl,
+            force,
+            "start_primary: starting PostgreSQL"
+        );
+        self.sd
+            .start_postgres()
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("start_primary: start postgres: {e}")))?;
+
+        // Confirm what we actually started. A pgdata with no
+        // standby.signal that nonetheless comes up in recovery (a
+        // `recovery.signal`, a restore in progress) must not be handed
+        // the lease.
+        match self.db.is_in_recovery().await {
+            Ok(false) => {}
+            Ok(true) => {
+                return refuse(
+                    "start_primary: PostgreSQL started but is IN RECOVERY — not claiming \
+                     the lease for a node that is not serving writes"
+                        .into(),
+                )
+            }
+            Err(e) => {
+                return refuse(format!(
+                    "start_primary: PostgreSQL started but its role could not be \
+                     confirmed ({e}); lease NOT claimed — re-run once it answers"
+                ))
+            }
+        }
+
+        // Claim. Losing the CAS means a rival moved between our read
+        // and here; report it rather than retrying into a fight.
+        if let Some(term) = already_held {
+            info!(
+                term,
+                "start_primary: lease already held; not re-minting a term"
+            );
+            return Ok(Response::new(OpResult {
+                ok: true,
+                message: format!(
+                    "start_primary: node {} is primary on TL{local_tl}; already holds the \
+                     lease (term {term})",
+                    local.id
+                ),
+            }));
+        }
+        match rt.store.try_takeover(local.id, None).await {
+            Ok(crate::consensus::TakeoverOutcome::Won { lease }) => {
+                info!(term = lease.term, "start_primary: lease claimed");
+                Ok(Response::new(OpResult {
+                    ok: true,
+                    message: format!(
+                        "start_primary: node {} is primary on TL{local_tl}; lease claimed \
+                         (term {})",
+                        local.id, lease.term
+                    ),
+                }))
+            }
+            Ok(crate::consensus::TakeoverOutcome::Lost { current }) => refuse(format!(
+                "start_primary: PostgreSQL is running, but the lease was taken \
+                 concurrently{} — check `cluster status` before doing anything else",
+                current
+                    .map(|l| format!(" by node {} (term {})", l.holder, l.term))
+                    .unwrap_or_default()
+            )),
+            Err(e) => refuse(format!(
+                "start_primary: PostgreSQL is running but the lease claim failed ({e}); \
+                 the HA loop will claim it once consensus recovers"
+            )),
+        }
     }
 
     /// Backend data for rendering pgpool.conf's per-backend block
@@ -5368,6 +5611,74 @@ mod tests {
             standby,
             inflight,
         )
+    }
+
+    // ----- cluster start-primary ------------------------------------------
+    //
+    // The guards, which are the command. Both of these fire before
+    // consensus is consulted, so they are exactly what a confused
+    // operator hits first — and both refuse rather than starting
+    // something that would not be a primary.
+
+    /// A server whose `$PGDATA` is a real directory the test controls.
+    fn server_with_pgdata(dir: &std::path::Path) -> LocalServer {
+        LocalServer::new(
+            Arc::new(FakeNodeInfo),
+            Arc::new(StubDb::default()),
+            Arc::new(StubPeers::default()),
+            Arc::new(StubMaint::default()),
+            Arc::new(StubWal::default()),
+            Arc::new(StubReplay::default()),
+            Arc::new(StubInflight::default()),
+            Arc::new(StubPcp::default()),
+            Arc::new(StubSd::default()),
+            Arc::new(StubStandby::default()),
+            make_pool(),
+            PostgresRuntime {
+                port: 5432,
+                data_dir: dir.to_path_buf(),
+                repl_user: "repl".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn start_primary_refuses_standby_shaped_pgdata() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("PG_VERSION"), "17").unwrap();
+        std::fs::write(tmp.path().join("standby.signal"), "").unwrap();
+
+        let resp = server_with_pgdata(tmp.path())
+            .cluster_start_primary(Request::new(ClusterStartPrimaryRequest { force: false }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.ok);
+        assert!(resp.message.contains("standby-shaped"), "{}", resp.message);
+        // Naming the command that IS the right path matters more than
+        // naming the one that isn't.
+        assert!(resp.message.contains("cluster recover"), "{}", resp.message);
+    }
+
+    #[tokio::test]
+    async fn start_primary_refuses_an_uninitialised_data_directory() {
+        // A wiped pgdata mid-reclone looks exactly like this. Starting
+        // PostgreSQL against it would fail anyway; refusing here says
+        // why.
+        let tmp = tempfile::tempdir().unwrap();
+        let resp = server_with_pgdata(tmp.path())
+            .cluster_start_primary(Request::new(ClusterStartPrimaryRequest { force: false }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.ok);
+        assert!(
+            resp.message.contains("not an initialised data directory"),
+            "{}",
+            resp.message
+        );
     }
 
     #[tokio::test]
