@@ -256,6 +256,22 @@ pub trait StandbyOps: Send + Sync {
     /// (still a standby, just detached); the next follow/recover
     /// rewrites the file.
     async fn detach_recovery_conf(&self) -> anyhow::Result<()>;
+
+    /// This node's timeline as recorded in `$PGDATA/global/pg_control`,
+    /// readable with PostgreSQL stopped. `0` means unknown.
+    ///
+    /// Belongs with the other data-directory operations for the reason
+    /// they are grouped at all: it reads `$PGDATA` directly instead of
+    /// asking a running server. That is the whole point — a node whose
+    /// PostgreSQL is down still *has* a timeline, and callers comparing
+    /// timelines across the pool need it exactly when the live probe
+    /// cannot answer.
+    ///
+    /// Defaults to unknown so test doubles need not implement it;
+    /// [`StandbyExec`] overrides it.
+    async fn control_timeline(&self) -> anyhow::Result<i32> {
+        Ok(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +328,27 @@ impl StandbyExec {
     fn rewind_bin(&self) -> PathBuf {
         self.pg_install_prefix.join("bin").join("pg_rewind")
     }
+
+    fn controldata_bin(&self) -> PathBuf {
+        self.pg_install_prefix.join("bin").join("pg_controldata")
+    }
+}
+
+/// Pull `Latest checkpoint's TimeLineID` out of `pg_controldata` output.
+///
+/// Parsed rather than read from `global/pg_control` directly because the
+/// control file is a versioned binary struct; `pg_controldata` is the
+/// supported reader and ships in the same directory as the other
+/// binaries this module already depends on.
+///
+/// Returns `None` when the field is absent — a different PostgreSQL
+/// major, a localized build, or a truncated read. Unknown, never a
+/// guess: callers compare this across nodes, and a fabricated timeline
+/// would be worse than no answer.
+fn parse_control_timeline(out: &str) -> Option<i32> {
+    out.lines()
+        .find_map(|line| line.strip_prefix("Latest checkpoint's TimeLineID:"))
+        .and_then(|v| v.trim().parse::<i32>().ok())
 }
 
 #[async_trait]
@@ -476,6 +513,33 @@ impl StandbyOps for StandbyExec {
         .map_err(|e| anyhow::anyhow!("detach_recovery_conf: write myrecovery.conf: {e}"))?;
         info!(datadir = %self.pg_data_dir.display(), "detach_recovery_conf: completed");
         Ok(())
+    }
+
+    async fn control_timeline(&self) -> anyhow::Result<i32> {
+        let bin = self.controldata_bin();
+        let out = Command::new(&bin)
+            .arg("-D")
+            .arg(&self.pg_data_dir)
+            // pg_controldata localizes its field labels. Pin the locale
+            // so the parse above matches on any host.
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("control_timeline: spawn {}: {e}", bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "control_timeline: {} exited {}; stderr: {}",
+                bin.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(parse_control_timeline(&String::from_utf8_lossy(&out.stdout)).unwrap_or(0))
     }
 }
 
@@ -1269,5 +1333,51 @@ mod tests {
                 .unwrap_or_else(|e| panic!("symlink {name} missing: {e}"));
             assert_eq!(target, hook_bin);
         }
+    }
+}
+
+#[cfg(test)]
+mod controldata_tests {
+    use super::parse_control_timeline;
+
+    /// Real `pg_controldata` output, trimmed to the neighbourhood of
+    /// the field. The two adjacent `TimeLineID` lines are the reason
+    /// this parses a prefix rather than searching for a substring.
+    const SAMPLE: &str = "\
+Database cluster state:               shut down
+Latest checkpoint location:           0/25000028
+Latest checkpoint's REDO location:    0/25000028
+Latest checkpoint's TimeLineID:       5
+Latest checkpoint's PrevTimeLineID:   5
+Latest checkpoint's full_page_writes: on
+";
+
+    #[test]
+    fn reads_the_checkpoint_timeline() {
+        assert_eq!(parse_control_timeline(SAMPLE), Some(5));
+    }
+
+    #[test]
+    fn prev_timeline_does_not_win() {
+        // PrevTimeLineID differs after a promotion; picking it up
+        // would report the timeline this node LEFT.
+        let promoted = SAMPLE.replace("PrevTimeLineID:   5", "PrevTimeLineID:   4");
+        assert_eq!(parse_control_timeline(&promoted), Some(5));
+    }
+
+    #[test]
+    fn unknown_rather_than_a_guess() {
+        // A different major version, a localized build, or a truncated
+        // read must not produce a timeline — callers compare these
+        // across nodes and would act on a fabricated one.
+        assert_eq!(
+            parse_control_timeline("Database cluster state: shut down\n"),
+            None
+        );
+        assert_eq!(parse_control_timeline(""), None);
+        assert_eq!(
+            parse_control_timeline("Latest checkpoint's TimeLineID:       not-a-number\n"),
+            None
+        );
     }
 }

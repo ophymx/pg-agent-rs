@@ -218,7 +218,85 @@ const LEADER_WAIT_AFTER_BOOTSTRAP: Duration = Duration::from_secs(10);
 /// for a spurious election in database availability.
 const HEARTBEAT_DIVISOR: u64 = 5;
 
+/// Per-node-position delay before [`RaftRuntime::ensure_membership`]
+/// attempts to form the pool.
+///
+/// Every node would otherwise call `initialize` in the same instant
+/// with the same member set. That is survivable — the set is identical
+/// by construction, so whichever proposal wins yields the same cluster
+/// — but it costs a needless election round. Staggering by pool
+/// position makes the lowest-id reachable node the usual bootstrapper
+/// while leaving every other node able to do the job if that one is
+/// down, which is the property a fixed "node 0 bootstraps" rule would
+/// lose.
+const MEMBERSHIP_BOOTSTRAP_STAGGER: Duration = Duration::from_secs(3);
+
 impl RaftRuntime {
+    /// Form the pool if nobody has yet — called unconditionally at
+    /// daemon startup.
+    ///
+    /// # Why this is automatic
+    ///
+    /// Membership used to be seeded only by `ClusterInit`, on the
+    /// theory that forming the pool is the operator's "this is the
+    /// cluster" moment and that daemons racing to declare one would be
+    /// a hazard. Both halves turned out to be wrong, and a real
+    /// cluster died of it:
+    ///
+    /// - There is no race to lose. Membership is `[[pool]]` from the
+    ///   config file — every node computes a byte-identical set, so
+    ///   concurrent `initialize` calls cannot disagree about what the
+    ///   cluster is. The only thing at stake is which proposal commits.
+    /// - Tying it to `ClusterInit` made it unreachable for any cluster
+    ///   that already existed. `ClusterInit` basebackups every standby,
+    ///   so it is not a command an operator runs on a live deployment;
+    ///   an existing cluster upgraded into the Raft releases therefore
+    ///   came up with an empty store, no voters, and no way to ever
+    ///   elect a leader. Cold start then reads "store unreadable" and
+    ///   leaves PostgreSQL down on every primary-shaped node —
+    ///   permanently, with no operator exit documented anywhere.
+    ///
+    /// Idempotent and cheap on the overwhelmingly common path: a node
+    /// that recovers membership from its own log returns on the first
+    /// line without waiting or proposing.
+    pub async fn ensure_membership(&self) {
+        if self.raft.is_initialized().await.unwrap_or(false) {
+            return;
+        }
+        // Pool position, not node id: ids need not be contiguous, and
+        // what matters is only that the nodes pick distinct delays.
+        let position = self
+            .members
+            .keys()
+            .position(|id| *id == self.local_id)
+            .unwrap_or(0) as u32;
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_BOOTSTRAP_STAGGER * position;
+        while tokio::time::Instant::now() < deadline {
+            // A peer ahead of us in the stagger forms the pool and
+            // replicates the membership entry here; that lands as
+            // `is_initialized`, and this node has nothing left to do.
+            if self.raft.is_initialized().await.unwrap_or(false) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        match self.bootstrap_membership().await {
+            Ok(outcome) => info!(
+                members = self.members.len(),
+                outcome = %outcome.describe(),
+                "raft: membership ensured at startup"
+            ),
+            // Not fatal to startup. A node that cannot form the pool is
+            // no worse off than before it tried, and the next restart
+            // (or a peer that can reach a quorum) will do it.
+            Err(e) => tracing::warn!(
+                err = %e,
+                "raft: could not form membership at startup; consensus stays \
+                 unavailable until a node can — `pg_agentctl cluster status` \
+                 reports this"
+            ),
+        }
+    }
     /// Open the store, start Raft, and build the [`ConsensusStore`].
     ///
     /// Does not bootstrap membership — see
@@ -716,6 +794,67 @@ mod tests {
             rt.bootstrap_membership().await.unwrap(),
             MembershipBootstrap::AlreadyFormed,
             "re-running ClusterInit must not be an error"
+        );
+    }
+
+    /// The fix for a cluster that died of an empty store. Membership
+    /// used to be reachable only through `ClusterInit`, which
+    /// basebackups every standby — so an existing deployment upgraded
+    /// into the Raft releases came up with no voters, could never
+    /// elect a leader, and left cold start refusing to run PostgreSQL
+    /// on every primary-shaped node. Startup now forms the pool on its
+    /// own.
+    #[tokio::test]
+    async fn startup_forms_the_pool_without_an_operator() {
+        let dir = TempDir::new().unwrap();
+        let rt = RaftRuntime::start(
+            dir.path(),
+            &pool(1, 0),
+            9701,
+            None,
+            &crate::config::RaftConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !rt.raft.is_initialized().await.unwrap(),
+            "precondition: a virgin store has no membership"
+        );
+        rt.ensure_membership().await;
+        assert!(rt.raft.is_initialized().await.unwrap());
+        assert!(
+            rt.raft.metrics().borrow().current_leader.is_some(),
+            "forming the pool must leave it electable, not merely configured"
+        );
+    }
+
+    /// The common path by far: a daemon restart on an established
+    /// cluster. It must cost nothing and must not redefine the pool —
+    /// so `ensure_membership` returns on the already-initialized check
+    /// without ever reaching its stagger or its proposal.
+    #[tokio::test]
+    async fn startup_on_a_formed_pool_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let cfg = crate::config::RaftConfig::default();
+        let members = {
+            let rt = RaftRuntime::start(dir.path(), &pool(1, 0), 9701, None, &cfg)
+                .await
+                .unwrap();
+            rt.ensure_membership().await;
+            let m = rt.raft.metrics().borrow().membership_config.clone();
+            rt.raft.shutdown().await.unwrap();
+            m
+        };
+
+        let rt = RaftRuntime::start(dir.path(), &pool(1, 0), 9701, None, &cfg)
+            .await
+            .unwrap();
+        rt.ensure_membership().await;
+        assert_eq!(
+            rt.raft.metrics().borrow().membership_config.membership(),
+            members.membership(),
+            "a restart must recover the pool it had, not declare a new one"
         );
     }
 

@@ -41,7 +41,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // NodeInfo
@@ -385,6 +385,16 @@ impl Agent {
             });
         }
 
+        // Form the Raft pool if this is the first daemon generation to
+        // carry consensus. Runs AFTER the peer server binds (membership
+        // replication is peer RPC) and BEFORE cold-start reconciliation,
+        // which cannot read the store until a leader exists. See
+        // `RaftRuntime::ensure_membership` for why this is automatic
+        // rather than an operator command.
+        if let Some(wiring) = &self.opts.ha {
+            wiring.raft.ensure_membership().await;
+        }
+
         // Phantom-primary detection. Runs AFTER subsystems spawn so peers can
         // answer our outbound GetStatus via the now-bound local
         // PeerServer if they're booting concurrently, and BEFORE
@@ -672,12 +682,23 @@ const COLD_START_QUORUM_BUDGET: Duration = Duration::from_secs(10);
 /// peers with a known timeline (`timeline_id > 0`) make it into the
 /// observation list — unreachable peers and pre-feature peers are
 /// counted via the quorum gate, not by being represented here.
+///
+/// A known timeline no longer implies a running PostgreSQL: peers
+/// answer from their control file when stopped. `asserting_primary`
+/// carries that distinction, because the two verdicts need different
+/// things from it — being stale is a property of the DATA (true of a
+/// stopped node), while split brain is a property of who is SERVING.
 #[derive(Debug, Clone)]
 pub struct PeerObservation {
     pub id: i32,
     pub hostname: String,
     pub timeline_id: i32,
     pub is_in_recovery: bool,
+    /// Peer's PostgreSQL is confirmed up and out of recovery — it
+    /// claims the primary role right now. False whenever its PostgreSQL
+    /// is down or its systemd probe failed, so an unknown never reads
+    /// as a rival.
+    pub asserting_primary: bool,
 }
 
 /// Result of `verify_primary_at_startup`. Pure data — the
@@ -957,11 +978,15 @@ impl Agent {
                     hostname: view.node.hostname.clone(),
                     timeline_id: status.timeline_id,
                     is_in_recovery: status.is_in_recovery,
+                    asserting_primary: status.is_postgres_status_ok
+                        && status.is_postgres_running
+                        && !status.is_in_recovery,
                 }),
                 Ok(_) => {
                     // Peer responded but timeline is 0 — pre-feature peer
-                    // or its own timeline probe failed. Counts as "did
-                    // not respond with evidence" for the quorum gate.
+                    // or neither its live probe nor its control file
+                    // could answer. Counts as "did not respond with
+                    // evidence" for the quorum gate.
                     warn!(
                         peer = %view.node.hostname,
                         "phantom-primary check: peer reported timeline_id=0; no evidence"
@@ -984,8 +1009,15 @@ impl Agent {
         let mut split_peers: Vec<PeerObservation> = Vec::new();
         for obs in &observations {
             if obs.timeline_id > local_tl {
+                // Stale-ness is a fact about data, so a STOPPED peer on
+                // a higher timeline convicts us just as firmly as a
+                // running one: it was promoted past us while we were
+                // away, and our writes are the ones that fork.
                 phantom_peers.push(obs.clone());
-            } else if obs.timeline_id == local_tl && !obs.is_in_recovery {
+            } else if obs.timeline_id == local_tl && obs.asserting_primary {
+                // Split brain, by contrast, is a fact about who is
+                // SERVING — a stopped peer sharing our timeline is our
+                // own history, not a rival.
                 split_peers.push(obs.clone());
             }
         }
@@ -1071,9 +1103,34 @@ impl NodeInfo for Agent {
         // they're informational metrics, and a transient hiccup
         // shouldn't flap readiness. Consumers treat 0 as "unknown" and
         // skip the cross-node comparison for that node.
-        let timeline = timeline_res
+        let mut timeline = timeline_res
             .inspect_err(|e| warn!(?e, "get_status: timeline_id query failed"))
             .unwrap_or(0);
+        // A stopped PostgreSQL cannot be asked its timeline, but
+        // `$PGDATA` still records one — so fall back to the control
+        // file rather than reporting "unknown" to the pool.
+        //
+        // What this is worth: peers compare timelines to decide whether
+        // a node is a stale primary, and answering 0 made a node that
+        // was merely DOWN indistinguishable from one whose timeline
+        // could not be established. During a rolling restart that turns
+        // every already-restarted peer into a blind spot, and the last
+        // node to restart finds no evidence at all and stops its own
+        // healthy PostgreSQL — each conservative stop blinding the next
+        // node in line until the whole pool is down. On-disk evidence
+        // breaks that chain without weakening the check: a peer with a
+        // HIGHER on-disk timeline still convicts us of being stale,
+        // running or not.
+        if timeline == 0 {
+            match self.deps.standby.control_timeline().await {
+                Ok(tl) if tl > 0 => {
+                    debug!(timeline = tl, "get_status: timeline from control file");
+                    timeline = tl;
+                }
+                Ok(_) => {}
+                Err(e) => warn!(?e, "get_status: control-file timeline unavailable"),
+            }
+        }
         let wal_lsn = wal_lsn_res
             .inspect_err(|e| warn!(?e, "get_status: current_wal_lsn query failed"))
             .unwrap_or(0);
@@ -1385,6 +1442,26 @@ mod tests {
     /// Build a NodeStatus for fan-out canned responses.
     fn ns(timeline_id: i32, is_in_recovery: bool) -> pb::NodeStatus {
         ns_with_lsn(timeline_id, is_in_recovery, 0)
+    }
+
+    /// A peer whose PostgreSQL is confirmed DOWN but which still
+    /// answers with the timeline from its control file — what a node
+    /// mid-rolling-restart looks like to the rest of the pool.
+    fn ns_stopped(timeline_id: i32) -> pb::NodeStatus {
+        pb::NodeStatus {
+            is_running: false,
+            is_postgres_running: false,
+            // The systemd probe SUCCEEDED and said "not running" —
+            // that is the whole difference between "down" and
+            // "unknown".
+            is_postgres_status_ok: true,
+            is_ready: false,
+            // Nothing to be in recovery with; the live probe failed
+            // and this defaults false, which is exactly the trap
+            // `asserting_primary` exists to close.
+            is_in_recovery: false,
+            ..ns(timeline_id, false)
+        }
     }
 
     fn ns_with_lsn(timeline_id: i32, is_in_recovery: bool, current_wal_lsn: u64) -> pb::NodeStatus {
@@ -2399,6 +2476,87 @@ mod tests {
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].timeline_id, 8);
                 assert_eq!(peers[0].hostname, "peer1");
+            }
+            other => panic!("expected Phantom, got {other:?}"),
+        }
+    }
+
+    // ----- a stopped peer is evidence, not a blind spot ----------------
+    //
+    // The regression these three pin down cost a three-node cluster its
+    // entire PostgreSQL fleet. A rolling agent upgrade restarted the
+    // nodes one at a time; each restarted node reported timeline 0
+    // while its PostgreSQL was down, so the next node up found "0/1
+    // peers answered with a known timeline", returned Unverifiable, and
+    // conservatively stopped its own healthy primary — blinding the
+    // node after it in turn, until nothing was left running.
+
+    #[tokio::test]
+    async fn stopped_peer_on_lower_timeline_confirms_us() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 5,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // Peer is down, but its control file still says TL4 — positive
+        // evidence that it is behind us, not an absence of evidence.
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns_stopped(4))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(matches!(v, PrimaryVerdict::Confirmed), "got {v:?}");
+        assert_eq!(
+            sd.stop_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the last running primary must not stop itself over a peer it can see is down"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_peer_on_our_timeline_is_not_split_brain() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 7,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // Same timeline, PostgreSQL down: our own history, not a rival.
+        // `is_in_recovery` defaults to false for a stopped node, so the
+        // old `!is_in_recovery` test would have convicted it.
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns_stopped(7))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        let v = agent.verify_primary_at_startup().await;
+        assert!(matches!(v, PrimaryVerdict::Confirmed), "got {v:?}");
+        assert_eq!(sd.stop_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_peer_on_higher_timeline_still_convicts_us() {
+        let db = Arc::new(StubDb {
+            in_recovery: false,
+            timeline: 4,
+            ..Default::default()
+        });
+        let sd = Arc::new(StubSd {
+            pg_running: true,
+            ..Default::default()
+        });
+        // The guarantee that must NOT be traded away for the above:
+        // being stale is a property of the data, so a peer promoted
+        // past us convicts us whether or not it is serving.
+        let peers = Arc::new(StubPeers::with_responses(vec![(1, ns_stopped(5))]));
+        let agent = make_agent_with_one_peer(db, sd.clone(), peers);
+        match agent.verify_primary_at_startup().await {
+            PrimaryVerdict::Phantom { local_tl, peers } => {
+                assert_eq!(local_tl, 4);
+                assert_eq!(peers[0].timeline_id, 5);
+                assert!(!peers[0].asserting_primary);
             }
             other => panic!("expected Phantom, got {other:?}"),
         }

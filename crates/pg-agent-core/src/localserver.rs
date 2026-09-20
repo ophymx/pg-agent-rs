@@ -2136,7 +2136,27 @@ impl PgAgentLocal for LocalServer {
                         ),
                         None => String::new(),
                     },
-                    Ok(Err(e)) => format!("unknown (consensus read failed: {e})"),
+                    // Distinguish "no leader right now" from "this pool
+                    // was never formed". They read identically at the
+                    // store ("no leader known") and have opposite
+                    // prognoses: the first resolves itself in an
+                    // election, the second never resolves at all and
+                    // leaves cold start refusing to run PostgreSQL on
+                    // every primary-shaped node. An operator staring at
+                    // a dead cluster should not have to read the source
+                    // to tell which one they have.
+                    Ok(Err(e)) => {
+                        if rt.raft.is_initialized().await.unwrap_or(true) {
+                            format!("unknown (consensus read failed: {e})")
+                        } else {
+                            format!(
+                                "unknown (raft membership NOT FORMED on this node — the pool \
+                                 has no voters, so no leader can ever be elected; restart \
+                                 pg_agentd to form it from the configured [[pool]]) \
+                                 [read failed: {e}]"
+                            )
+                        }
+                    }
                     Err(_) => format!(
                         "unknown (consensus read did not answer within {PAUSE_READ_BUDGET:?})"
                     ),
