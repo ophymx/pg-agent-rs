@@ -93,12 +93,13 @@ linked build (finding 26).
 ## Scenarios
 
 - **G0** — greenfield boot: all nodes come up through the validate-env
-  gate. Pre-membership the loop ticks `StoreUnknown` — no quorum, no
-  action.
-- **G1/G1b** — `cluster init` does replication + raft membership + lease
-  seeding in one operator command (idempotent on re-run); executors
-  converge the standbys; pgpool comes up in the agent-led contract and
-  `/healthz` reports ready.
+  gate, the pool forms itself from `[[pool]]` with no operator command,
+  and raft elects. No executor acts before membership exists.
+- **G1/G1b** — `cluster init` does replication + lease seeding in one
+  operator command, and finds membership already formed by startup
+  (idempotent either way — it still forms the pool if it genuinely got
+  there first); executors converge the standbys; pgpool comes up in the
+  agent-led contract and `/healthz` reports ready.
 - **G2** — `check-hooks` passes clean on the deployed conf: the canonical
   `gen-pgpool` block IS what's deployed, no overrides.
 - **G2b** — pgpool stays a router: a detach neither propagates between

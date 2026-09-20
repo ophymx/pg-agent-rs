@@ -195,8 +195,22 @@ async fn g0(cx: &mut Ctx) {
     // Consensus is not configurable: every daemon joins it or fails to
     // start. validate-env (the systemd ExecStartPre gate) runs the raft
     // prerequisite checks on every start; the daemons coming up IS that
-    // assertion. Before ClusterInit there is no membership and hence no
-    // quorum: the loop must tick StoreUnknown — never vacant, never act.
+    // assertion.
+    //
+    // This scenario used to await a `StoreUnknown` tick here, on the
+    // premise that membership did not exist until `ClusterInit` and the
+    // loop therefore had a pre-membership window to be careful in.
+    // v0.9.0 removed the window: a daemon forms the pool from its own
+    // `[[pool]]` at startup. That premise had also cost a live cluster
+    // every one of its PostgreSQL instances — gating membership on a
+    // command that basebackups every standby left an upgraded cluster
+    // with no voters and no reachable bootstrap at all — so what this
+    // asserts now is the guarantee that replaced it: the pool forms
+    // unattended, before any operator command.
+    //
+    // The "never acts on an unformed pool" half is kept below. It is
+    // the half that was always load-bearing, and it survives the
+    // window it used to be observed in.
     for n in NODES {
         cx.wait_until(
             60,
@@ -230,12 +244,28 @@ async fn g0(cx: &mut Ctx) {
         )
         .await;
     }
+    // Any node, not db0: the stagger makes the lowest pool position the
+    // usual bootstrapper, but "usual" is not an invariant worth
+    // encoding — whichever node gets there first is a correct outcome,
+    // and pinning the assertion to one of them would make container
+    // start order a test failure.
     cx.await_event(
-        30,
-        "pre-membership: loop reports store unknown (not vacant, no action)",
+        60,
+        "membership forms at startup, with no operator command",
         Cursor(0),
-        |ev| agent(ev, "db0", "StoreUnknown"),
+        |ev| agent_any(ev, "raft: membership ensured at startup"),
     )
+    .await;
+    // The pool is not merely configured, it elected — the property
+    // cold start depends on, and the one whose absence left a real
+    // cluster unable to ever read its own lease.
+    //
+    // One event, not one per node: exactly one node becomes leader and
+    // openraft logs nothing at INFO for the followers, so a per-node
+    // assertion would be asserting something that cannot be true.
+    cx.await_event(60, "raft elected a leader", Cursor(0), |ev| {
+        agent_any(ev, "become leader")
+    })
     .await;
     cx.check_absent(
         "no executor action before membership exists",
@@ -257,13 +287,35 @@ async fn g1(cx: &mut Ctx) {
         "cluster init: standbys initialised",
         init1.contains("cluster_init complete"),
     );
+    // Either wording is a pass, and which one appears is itself the
+    // point. Since v0.9.0 the daemons form the pool at startup, so on a
+    // greenfield cluster whose agents are already up — G0 just watched
+    // them come up — `cluster init` arrives to find membership done and
+    // says "already formed". It still says "initialized" if it genuinely
+    // got there first, which is the ordering this suite does not
+    // legislate. What must not happen is init FAILING over a pool that
+    // someone else formed: idempotence is the contract, and the second
+    // init below asserts the same thing from the other direction.
     cx.check(
-        "raft membership formed by init",
-        init1.contains("raft membership initialized (3 nodes)"),
+        "raft membership present after init (formed by it, or already by startup)",
+        init1.contains("raft membership initialized (3 nodes)")
+            || init1.contains("raft membership already formed"),
     );
+    // Same story as membership above, one layer up. Now that the pool
+    // forms at startup, raft elects before `cluster init` is typed, and
+    // the HA loop reaches the vacant lease first: db0 is the only node
+    // observably running as a primary, which is precisely the case the
+    // vacant branch claims for itself. So init finds the lease already
+    // held rather than seeding it — by the node it would have seeded it
+    // for, at the term it would have minted.
+    //
+    // Both wordings pass because which of the two got there first is a
+    // race this suite has no business legislating. The OUTCOME is
+    // asserted right below ("db0 retains the lease"), and that is the
+    // claim that was ever worth making.
     cx.check(
-        "lease seeded for the bootstrap primary",
-        init1.contains("lease seeded"),
+        "bootstrap primary holds the lease after init (seeded by it, or claimed by the loop)",
+        init1.contains("lease seeded") || init1.contains("lease already held"),
     );
     if cx.failures.iter().any(|f| f.contains("cluster init")) {
         cx.note(&format!("init output: {}", init1.trim()));
