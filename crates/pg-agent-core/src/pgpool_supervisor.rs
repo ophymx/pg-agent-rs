@@ -32,6 +32,21 @@
 //!    is reset on the NEXT tick that confirms `active`; on failure the
 //!    counter increments.
 //!
+//! # Running is not the same as current
+//!
+//! pgpool reads its TLS material once, at start. A renewer that
+//! rewrites `ssl_cert` leaves a running pgpool serving the old
+//! certificate until something restarts it — in the field, for two
+//! weeks past its expiry, with every health check green. So the
+//! supervisor also owns "pgpool is running with the certificate on
+//! disk": every `TLS_PROBE_INTERVAL` while pgpool is active it compares
+//! the served certificate with the file (`crate::pgpool_tls`), publishes
+//! the result for `/healthz`, and when the file is a different
+//! certificate with a later expiry, restarts pgpool — once per distinct
+//! file, so a bad file cannot drive a restart loop. Configurable off
+//! (`[supervisor] restart_pgpool_on_stale_tls = false`): the report and
+//! the warning stay, the restart does not.
+//!
 //! # Why not `reload_or_restart_pgpool`?
 //!
 //! `ReloadOrRestartUnit` on an **active** unit reloads it — kicking
@@ -39,7 +54,9 @@
 //! running"; reloading a working pgpool is the opposite of that. The
 //! status-then-start pattern keeps the no-op path truly no-op.
 
+use crate::pgpool_tls::{self, PgpoolTlsSpec, PgpoolTlsStatus};
 use crate::systemd::Systemd;
+use arc_swap::ArcSwapOption;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,6 +84,40 @@ pub const MIN_ATTEMPT_GAP: Duration = Duration::from_secs(30);
 /// real failure to the operator instead of fighting it forever.
 pub const MAX_CONSECUTIVE_FAILURES: usize = 10;
 
+/// How often the served certificate is compared with the file. A
+/// renewal landing a minute late is nothing; the probe is a TLS
+/// handshake against loopback plus a file read.
+pub const TLS_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Budget for one served-certificate probe.
+pub const TLS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The served-certificate probe, injectable so the watch's decisions
+/// can be tested without a TLS server.
+type TlsProbe = Arc<
+    dyn Fn(
+            PgpoolTlsSpec,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PgpoolTlsStatus> + Send>>
+        + Send
+        + Sync,
+>;
+
+struct TlsWatch {
+    spec: PgpoolTlsSpec,
+    probe: TlsProbe,
+    /// Latest comparison, read by the healthz snapshotter.
+    status: Arc<ArcSwapOption<PgpoolTlsStatus>>,
+    restart: bool,
+    interval: Duration,
+    last_probe: Mutex<Option<Instant>>,
+    /// Fingerprint of the on-disk certificate the last restart was
+    /// issued for. One restart per file: if pgpool still serves
+    /// something else afterwards, that is a pgpool problem to report,
+    /// not to retry.
+    restarted_for: Mutex<Option<String>>,
+    restart_count: AtomicUsize,
+}
+
 /// The supervisor itself. Owned by `Agent::serve`; lives on the
 /// JoinSet of background tasks.
 pub struct PgpoolSupervisor {
@@ -76,6 +127,10 @@ pub struct PgpoolSupervisor {
     max_consecutive_failures: usize,
     last_attempt: Mutex<Option<Instant>>,
     consecutive_failures: AtomicUsize,
+    /// Served-certificate watch: where to look, where to publish, and
+    /// whether to act. `None` when pgpool.conf has `ssl = off` or could
+    /// not be read.
+    tls: Option<TlsWatch>,
     /// Cumulative count of `start_pgpool` calls the supervisor has
     /// issued. Exposed for tests; not on a public API.
     pub(crate) started_count: AtomicUsize,
@@ -86,6 +141,53 @@ impl PgpoolSupervisor {
     /// and [`MAX_CONSECUTIVE_FAILURES`] constants.
     pub fn new(sd: Arc<dyn Systemd>) -> Self {
         Self::with_params(sd, TICK, MIN_ATTEMPT_GAP, MAX_CONSECUTIVE_FAILURES)
+    }
+
+    /// Watch the served certificate against `spec.cert_path`, publishing
+    /// into `status` and restarting pgpool on a stale one when
+    /// `restart` is set.
+    pub fn with_tls_watch(
+        mut self,
+        spec: PgpoolTlsSpec,
+        status: Arc<ArcSwapOption<PgpoolTlsStatus>>,
+        restart: bool,
+    ) -> Self {
+        self.tls = Some(TlsWatch {
+            spec,
+            probe: Arc::new(|spec| {
+                Box::pin(async move { pgpool_tls::probe(&spec, TLS_PROBE_TIMEOUT).await })
+            }),
+            status,
+            restart,
+            interval: TLS_PROBE_INTERVAL,
+            last_probe: Mutex::new(None),
+            restarted_for: Mutex::new(None),
+            restart_count: AtomicUsize::new(0),
+        });
+        self
+    }
+
+    /// Test knob: replace the served-certificate probe.
+    pub fn with_tls_probe(mut self, probe: TlsProbe) -> Self {
+        if let Some(w) = &mut self.tls {
+            w.probe = probe;
+        }
+        self
+    }
+
+    /// Test knob: probe cadence for the TLS watch.
+    pub fn with_tls_probe_interval(mut self, interval: Duration) -> Self {
+        if let Some(w) = &mut self.tls {
+            w.interval = interval;
+        }
+        self
+    }
+
+    /// Restarts issued by the TLS watch. Exposed for tests.
+    pub fn tls_restart_count(&self) -> usize {
+        self.tls
+            .as_ref()
+            .map_or(0, |w| w.restart_count.load(Ordering::SeqCst))
     }
 
     /// Test constructor — lets tests run a fast loop without
@@ -104,6 +206,7 @@ impl PgpoolSupervisor {
             max_consecutive_failures,
             last_attempt: Mutex::new(None),
             consecutive_failures: AtomicUsize::new(0),
+            tls: None,
             started_count: AtomicUsize::new(0),
         }
     }
@@ -166,6 +269,7 @@ impl PgpoolSupervisor {
             // Confirmed up; reset the failure counter so a future death
             // gets a fresh cap window to retry against.
             self.consecutive_failures.store(0, Ordering::SeqCst);
+            self.tls_tick().await;
             return;
         }
 
@@ -196,6 +300,76 @@ impl PgpoolSupervisor {
         // 4. Attempt.
         info!("pgpool_supervisor: pgpool inactive, attempting start");
         self.attempt_start().await;
+    }
+
+    /// The served-certificate half of the tick (module docs, "Running
+    /// is not the same as current"). Rate-limited to the watch's
+    /// interval; a no-op without a watch.
+    async fn tls_tick(&self) {
+        let Some(w) = &self.tls else {
+            return;
+        };
+        {
+            let mut last = w.last_probe.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < w.interval) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let status = (w.probe)(w.spec.clone()).await;
+        let previous = w.status.load_full();
+        if let Some(e) = &status.error {
+            // Same debug-level posture as the healthz probes: pgpool
+            // with SSL off or mid-restart is not a page.
+            debug!(err = %e, "pgpool_supervisor: tls probe incomplete");
+        }
+        if status.stale {
+            let disk = status.on_disk.as_ref().expect("stale implies on_disk");
+            let served = status.served.as_ref().expect("stale implies served");
+            let already = w
+                .restarted_for
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|fp| fp == disk.fingerprint);
+            if !w.restart {
+                if !previous.as_ref().is_some_and(|p| p.stale) {
+                    warn!(
+                        served_not_after = %served.not_after,
+                        disk_not_after = %disk.not_after,
+                        "pgpool_supervisor: pgpool serves an older certificate than {} holds — \
+                         renewed on disk, not loaded. Restart pgpool to load it \
+                         (restart_pgpool_on_stale_tls is off)",
+                        w.spec.cert_path.display()
+                    );
+                }
+            } else if already {
+                warn!(
+                    served_not_after = %served.not_after,
+                    disk_not_after = %disk.not_after,
+                    "pgpool_supervisor: pgpool still serves the old certificate after a \
+                     restart for {}; not restarting again — check pgpool's ssl_* paths",
+                    w.spec.cert_path.display()
+                );
+            } else {
+                warn!(
+                    served_not_after = %served.not_after,
+                    disk_not_after = %disk.not_after,
+                    "pgpool_supervisor: pgpool serves an older certificate than {} holds; \
+                     restarting pgpool to load the renewed one",
+                    w.spec.cert_path.display()
+                );
+                *w.restarted_for.lock().unwrap() = Some(disk.fingerprint.clone());
+                w.restart_count.fetch_add(1, Ordering::SeqCst);
+                match self.sd.restart_pgpool().await {
+                    Ok(()) => info!("pgpool_supervisor: restart_pgpool succeeded"),
+                    Err(e) => error!(?e, "pgpool_supervisor: restart_pgpool failed"),
+                }
+            }
+        } else if previous.as_ref().is_some_and(|p| p.stale) {
+            info!("pgpool_supervisor: pgpool serves the certificate on disk again");
+        }
+        w.status.store(Some(Arc::new(status)));
     }
 
     async fn attempt_start(&self) {
@@ -433,6 +607,158 @@ mod tests {
             0,
             "active tick must reset failure counter"
         );
+    }
+
+    // ----- served-certificate watch ------------------------------------------
+
+    /// Stub whose `restart_pgpool` is counted.
+    #[derive(Default)]
+    struct RestartSd {
+        restarts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Systemd for RestartSd {
+        async fn start_postgres(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop_postgres(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start_pgpool(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn status_postgres(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn status_pgpool(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn reload_or_restart_postgres(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn restart_pgpool(&self) -> anyhow::Result<()> {
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn facts(fp: &str, year: i32) -> crate::pgpool_tls::CertFacts {
+        use chrono::TimeZone as _;
+        crate::pgpool_tls::CertFacts {
+            fingerprint: fp.into(),
+            not_after: chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap(),
+        }
+    }
+
+    fn scripted(status: PgpoolTlsStatus) -> TlsProbe {
+        Arc::new(move |_| {
+            let s = status.clone();
+            Box::pin(async move { s })
+        })
+    }
+
+    fn spec() -> PgpoolTlsSpec {
+        PgpoolTlsSpec {
+            addr: "127.0.0.1:9999".parse().unwrap(),
+            cert_path: "/etc/pgpool2/server.crt".into(),
+        }
+    }
+
+    fn stale_status() -> PgpoolTlsStatus {
+        PgpoolTlsStatus {
+            served: Some(facts("old", 2026)),
+            on_disk: Some(facts("new", 2027)),
+            stale: true,
+            served_matches_disk: false,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_certificate_restarts_pgpool_once_per_file() {
+        let sd = Arc::new(RestartSd::default());
+        let shared = Arc::new(ArcSwapOption::from(None));
+        let sup = PgpoolSupervisor::new(sd.clone())
+            .with_tls_watch(spec(), shared.clone(), true)
+            .with_tls_probe(scripted(stale_status()))
+            .with_tls_probe_interval(Duration::ZERO);
+        sup.tick_once().await;
+        assert_eq!(sd.restarts.load(Ordering::SeqCst), 1);
+        assert!(shared.load_full().unwrap().stale, "published for /healthz");
+        // Still stale on the next probe (pgpool did not pick it up):
+        // reported, not restarted again.
+        sup.tick_once().await;
+        sup.tick_once().await;
+        assert_eq!(sd.restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(sup.tls_restart_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_newer_file_after_a_restart_is_a_new_restart() {
+        let sd = Arc::new(RestartSd::default());
+        let shared = Arc::new(ArcSwapOption::from(None));
+        let mut sup = PgpoolSupervisor::new(sd.clone())
+            .with_tls_watch(spec(), shared.clone(), true)
+            .with_tls_probe(scripted(stale_status()))
+            .with_tls_probe_interval(Duration::ZERO);
+        sup.tick_once().await;
+        let mut again = stale_status();
+        again.on_disk = Some(facts("newer-still", 2028));
+        sup = sup.with_tls_probe(scripted(again));
+        sup.tick_once().await;
+        assert_eq!(sd.restarts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn restart_off_reports_without_restarting() {
+        let sd = Arc::new(RestartSd::default());
+        let shared = Arc::new(ArcSwapOption::from(None));
+        let sup = PgpoolSupervisor::new(sd.clone())
+            .with_tls_watch(spec(), shared.clone(), false)
+            .with_tls_probe(scripted(stale_status()))
+            .with_tls_probe_interval(Duration::ZERO);
+        sup.tick_once().await;
+        assert_eq!(sd.restarts.load(Ordering::SeqCst), 0);
+        assert!(shared.load_full().unwrap().stale);
+    }
+
+    #[tokio::test]
+    async fn matching_certificate_never_restarts() {
+        let sd = Arc::new(RestartSd::default());
+        let shared = Arc::new(ArcSwapOption::from(None));
+        let sup = PgpoolSupervisor::new(sd.clone())
+            .with_tls_watch(spec(), shared.clone(), true)
+            .with_tls_probe(scripted(PgpoolTlsStatus {
+                served: Some(facts("same", 2027)),
+                on_disk: Some(facts("same", 2027)),
+                stale: false,
+                served_matches_disk: true,
+                error: None,
+            }))
+            .with_tls_probe_interval(Duration::ZERO);
+        sup.tick_once().await;
+        assert_eq!(sd.restarts.load(Ordering::SeqCst), 0);
+        assert!(shared.load_full().unwrap().served_matches_disk);
+    }
+
+    #[tokio::test]
+    async fn tls_probe_is_rate_limited() {
+        let sd = Arc::new(RestartSd::default());
+        let shared = Arc::new(ArcSwapOption::from(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let probe: TlsProbe = Arc::new(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { PgpoolTlsStatus::default() })
+        });
+        let sup = PgpoolSupervisor::new(sd)
+            .with_tls_watch(spec(), shared, true)
+            .with_tls_probe(probe)
+            .with_tls_probe_interval(Duration::from_secs(3600));
+        sup.tick_once().await;
+        sup.tick_once().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

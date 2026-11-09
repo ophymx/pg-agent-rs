@@ -206,7 +206,7 @@ implementation detail.
 | `PeerRegistry`     | mTLS gRPC pool (`PeerPool`)        | `client(node) -> PeerClient`, `close()` |
 | `StandbyOps`       | subprocess + filesystem            | `basebackup(opts, progress_cb)`, `rewind(opts, progress_cb)`, `write_recovery_conf(opts)` |
 | `Pcp`              | `pcp_attach_node` / `pcp_detach_node` / `pcp_node_info` subprocess | `attach_node(id)`, `detach_node(id)`, `node_info_all() -> Vec<NodeInfo>`, `node_count() -> int` (preflight only — `/healthz` uses `node_info_all`) |
-| `Systemd`          | zbus to `systemd1`                 | start / stop / status / reload-or-restart for the configured PostgreSQL and pgpool units, each waiting on `JobRemoved` for real job completion rather than trusting the call to return |
+| `Systemd`          | zbus to `systemd1`                 | start / stop / status / reload-or-restart for the configured PostgreSQL and pgpool units, plus `restart_pgpool` (the only way pgpool loads renewed TLS material), each waiting on `JobRemoved` for real job completion rather than trusting the call to return |
 | `ReplayMarkerStore` | JSON files under `<state_dir>/replay/` | `has(op, key)`, `mark_done(op, key)`, `sweep(now)` |
 | `WalStore`         | filesystem (archive dir + PGDATA)  | `open_archive(wal_file) -> AsyncRead`, `write_restore(dest_path, src)` |
 | `MaintenanceStore` | one JSON file per intent under `<state_dir>/maintenance/` | `append(op, payload)`, `list_pending()`, `list(statuses…)`, `get(id)`, `mark_attempt(id, err, next_retry_at)`, `mark_done(id)`, `mark_abandoned(id, err)`, `reschedule(id, when)` |
@@ -742,9 +742,21 @@ the executor after logging.
   its own instance after promotion, and `auto_failback off` makes that
   permanent; in a pgpool-routed deployment self-attach is part of what
   "promote" means. Probe failures are debug-level (pgpool legitimately
-  down is routine). The cross-instance fan-out — converging the *other*
-  instances' maps after a promotion — is still open (TODO.md); today
-  only `cluster recover` fans out, via the `AttachNode` peer RPC.
+  down is routine).
+- Every member, always → **pgpool map reconciliation**
+  (`pgpool_reconcile.rs`, hook-contract §3): a stale map is the
+  default outcome of any transient with the watchdog off, so each
+  agent re-attaches on its own instance, every 30 s and on a kick from
+  the failover hook, any backend the map holds down that the cluster
+  reports up — a streaming standby, or the lease holder running as
+  primary; never a primary that does not hold the lease, never a
+  stopped node, never anything on unreadable evidence. Only-if-down,
+  holder first. An attach pgpool undoes (its health check fails where
+  the agent's connection succeeds, the 2026-11-02 shape) backs off
+  60 s → 10 min and logs what that disagreement means. The failover
+  hook's refusal to drop a slot is also its kick: the evidence that
+  made the report false is the evidence the backend belongs in the
+  map. `cluster attach` is the on-demand form with a fan-out.
 - A demote decision → **fence**: stop local PostgreSQL. Never gated on
   journaling. A node running as primary while another holds the lease
   is fenced the same way.
@@ -979,12 +991,26 @@ hostname = "server3"
 # database yet).
 # phantom_check_required_peers = 1
 
+[pgpool]
+# pgpool's own configuration, READ by the agent for the checks whose
+# answer depends on what pgpool was told: the backends and users
+# validate-env dials, the certificate the supervisor expects served.
+# Default: the first of /etc/pgpool2/pgpool.conf,
+# /etc/pgpool-II/pgpool.conf that exists.
+# conf = "/etc/pgpool2/pgpool.conf"
+
 [supervisor]
 # The agent ensures pgpool2.service is running, once after the
 # phantom-primary verdict resolves and continuously thereafter on a
 # rate-limited cadence. Disable if pgpool's lifecycle is managed
 # externally. Default true.
 # pgpool = true
+# While pgpool runs, compare the certificate it serves with ssl_cert
+# on disk every 60 s and restart pgpool when the file is a newer
+# certificate (renewed, not loaded — pgpool reads TLS material at
+# start only). Once per distinct file. false keeps the /healthz
+# report and the warning without the restart. Default true.
+# restart_pgpool_on_stale_tls = true
 ```
 
 The `.deb`/`.rpm` ship an annotated sample at
@@ -1023,6 +1049,8 @@ raft.election_timeout_ms     = 5000
 
 startup.phantom_check_required_peers = 1
 supervisor.pgpool                    = true
+supervisor.restart_pgpool_on_stale_tls = true
+pgpool.conf                          = first existing of /etc/pgpool2/pgpool.conf, /etc/pgpool-II/pgpool.conf
 ```
 
 Every PostgreSQL/pgpool path default above is Debian's. On the RHEL
@@ -1215,7 +1243,17 @@ Net: no `[tls]` interaction with the healthz listener at all.
   },
   "replication": { "lag_bytes": 0, "wal_receiver_state": "" },
   "sync_commit": "armed",
-  "follow_wedged": false
+  "follow_wedged": false,
+  "pgpool_map_degraded": true,
+  "pgpool_backends_down": [2],
+  "sr_check_mismatch": false,
+  "pgpool_tls": {
+    "served":  { "fingerprint": "…", "not_after": "2027-01-17T20:06:00Z" },
+    "on_disk": { "fingerprint": "…", "not_after": "2027-01-17T20:06:00Z" },
+    "stale": false,
+    "served_matches_disk": true,
+    "error": null
+  }
 }
 ```
 
@@ -1233,6 +1271,27 @@ Net: no `[tls]` interaction with the healthz listener at all.
   degraded until the node is rebuilt. Structurally unreachable in the
   designed flows since candidacy went strict flush-max — if it ever
   trips, that is a new finding.
+- `pgpool_map_degraded` / `pgpool_backends_down`: this instance's
+  pgpool holds at least one backend `down`, and which. **Not part of
+  the readiness verdict** — a pgpool with one backend left still
+  serves — but the state in which `ready: true` hid a two-week routing
+  degradation (docs/field-report-2026-11-02.md). Whether a down backend
+  is really down is `cluster status`'s question (it has every node's
+  view); the body only sees the local map, so a deliberately detached
+  dead node shows here too, correctly.
+- `sr_check_mismatch`: pgpool reports `replication_state: none` for a
+  backend this node's PostgreSQL knows is streaming — the local one
+  (walreceiver active) or, on a primary, a connected member. The one
+  cause seen in the field is `backend_application_nameN` not matching
+  the `application_name` the agent writes; `check-hooks` catches it at
+  deploy time, this catches it at runtime, and the snapshotter logs it
+  once per transition.
+- `pgpool_tls`: the supervisor's comparison of the certificate pgpool
+  serves with `ssl_cert` on disk — both expiries (alert on
+  `served.not_after`; the served one is the one clients see), and
+  `stale` when the file is a different, later-expiring certificate
+  that pgpool has not loaded. Absent until the supervisor has probed,
+  or when pgpool has SSL off.
 - `pgpool.backends` is a per-backend array, one element per
   `[[pool]]` entry, with the pgpool-side view of each backend. Fields
   are projected from `pcp_node_info -a`'s 11-field output (a curated
@@ -1454,11 +1513,11 @@ line per backend, 11 space-separated fields per `pcp-node-info.html`
 (hostname, port, status code, weight, status name, actual status,
 role, actual role, replication delay, replication state, sync state)
 followed by a `last_status_change` timestamp the agent currently
-discards. This is what `/healthz` consumes (§9), and what the executor's
-self-attach probe reads to decide whether the local pgpool has degenerated
-this node's own backend (§5.15). `pg_agentctl cluster status` does not use
-it — that fans `GetStatus` out over the peer mesh instead, so it reports
-what the *agents* see rather than what one pgpool's map says.
+discards. This is what `/healthz` consumes (§9), what the executor's
+self-attach probe and the map reconciler read (§5.15), and — through
+the `/healthz` snapshot, not a second subprocess — what `GetStatus`
+carries as `pgpool_backends`, so `pg_agentctl cluster status` can show
+every instance's map next to what the agents see.
 
 `pcp_node_count` returns the count of backends defined in `pgpool.conf`
 (not the count currently up — per upstream docs). Kept in the `Pcp`
@@ -1507,7 +1566,10 @@ and sends a final `OpProgress { phase = "done" }` on success.
    b. Run **one synchronous probe** to seed the healthz snapshot.
    c. Spawn `LocalServer`, `PeerServer` (carrying `PgAgentRaft` on the
       same listener), `MaintenanceWorker`, the healthz serve + snapshot
-      loops, and — if enabled — the pgpool supervisor.
+      loops, the pgpool map reconciler (§5.15), and — if enabled — the
+      pgpool supervisor, which also watches the served certificate
+      against `ssl_cert` when `pgpool.conf` has SSL on (§8.1
+      `[supervisor]`).
    d. `sd_notify::ready()`, only after every listener is bound and the
       initial snapshot is in place (§9.3).
    e. **Phantom-primary check**, after the subsystems are up so peers
@@ -1545,10 +1607,11 @@ what each command is *for*, and which ones can hurt you.
 | Command | Purpose |
 |---|---|
 | `print-hooks` | Emit the canonical `pgpool.conf` + `postgresql.conf` hook lines (§6). |
-| `check-hooks <pgpool.conf>` | Verify a deployed conf against that canonical list, including the decision-critical settings (`use_watchdog`, `detach_false_primary`, `auto_failback`, `failover_on_backend_error`). Exit 0 iff every row is `OK`. |
+| `check-hooks <pgpool.conf>` | Verify a deployed conf against that canonical list, including the decision-critical settings (`use_watchdog`, `detach_false_primary`, `auto_failback`, `failover_on_backend_error`) and, per declared backend, `backend_application_nameN = nodeN` — the name the agent writes into `primary_conninfo`, without which pgpool's `replication_state` reads `none` for a streaming standby. Exit 0 iff every row is `OK`. |
 | `gen-pgpool` | Render the backend block from live cluster values plus the canonical hook block. `--write` is atomic temp+rename. **Refuses to render if any node is unreachable** — better a clear error than a silently mis-sized pool. |
 | `cluster init` | One-time bootstrap (§5.7): replication role, slots, basebackup each standby, seed the lease. Run **on the chosen primary**; refused in recovery. Idempotent. Raft membership is formed by the daemons at startup, so on a cluster whose agents are already up this reports it already formed — it still forms the pool if it got there first. |
-| `cluster status` | Fan out `GetStatus`; render a topology table. Also the mesh-level mTLS reachability check `validate-env` deliberately does not cover. Exit 0 iff every node answered. |
+| `cluster status` | Fan out `GetStatus`; render a topology table, including each node's own pgpool backend map (`POOL_MAP`) and a flag line for every instance holding a backend down that the cluster reports serving. Also the mesh-level mTLS reachability check `validate-env` deliberately does not cover. Exit 0 iff every node answered. |
+| `cluster attach [--node <id>]` | Make every instance's pgpool map match what the cluster reports: the daemon runs its map reconciler locally (backoff skipped) and fans `AttachNode` out to every peer for each backend the evidence says is up. Attaches only — never reclones, never a backend that is actually down, never a primary that does not hold the lease. The daemon does the same on its own (§5.15); this is for doing it now and reading the per-instance result. |
 | `cluster recover --target <id>` | Reclone a broken standby **from** the local primary. The supported repair for a fenced ex-primary or a wedged follow. `--stop-target-pg` stops the target's PostgreSQL first; without it, a target still running PostgreSQL is refused rather than dying eight layers deeper. |
 | `cluster start-primary` | Start the local PostgreSQL as the cluster's primary and claim the lease — the bootstrap case cold start deliberately refuses, since a primary-shaped `$PGDATA` with a vacant lease stays down rather than let a cold ex-primary vouch for itself. Run it on the node you have chosen after a full-site outage, or when `cluster status` shows every node down with no holder. Refuses on: standby-shaped `$PGDATA`, a lease held elsewhere, a peer reporting a higher timeline (`--force` overrides, and forks the cluster if you are wrong), or an unreadable consensus — an unknown lease is not a vacant one. Idempotent: re-running while already the holder does not mint a new term. |
 | `cluster handoff --target <id>` | Planned role swap: promote the target, demote the local primary to follow it. Refuses on lag above one WAL segment unless `--allow-lag`. **Destructive on failure** — see the Ctrl-C caveat in TODO.md. |
@@ -1655,6 +1718,29 @@ Filesystem (always):
   nonexistent unit by printing defaults — and the default is
   `Restart=no`, so without that a typo'd unit name would report a clean
   bill of health.
+- **`pgpool backend admission`** — the connection pgpool will actually
+  make, tried the way libpq makes it: every backend from `pgpool.conf`
+  (else the `[[pool]]`), resolved from this host, dialled on every
+  address in resolver order as `health_check_user` and `sr_check_user`
+  with an SSLRequest-then-startup and no credential. PostgreSQL answers
+  the `pg_hba.conf` question before any password changes hands, so the
+  first address that answers decides: an authentication request is OK,
+  a refusal is WARN carrying the server's own message (which names the
+  address family, the user and whether SSL was on), with the hba hint
+  only when the message is pg_hba's — `57P03` from a peer still in
+  recovery is reported as what it is. TCP-level failures and a name
+  that does not resolve are WARN too — libpq moves on to the next
+  address, and a peer may be down on purpose when `ExecStartPre` runs
+  — as is a refusal on a later address, since resolver order differs
+  between hosts. This is the check that would have spoken on day one of
+  2026-11-02: a host that resolved its own name to an IPv6 ULA that
+  `pg_hba.conf` did not admit. It is the one check that looks past
+  localhost, and it never ERRs: a peer's state must not keep this
+  daemon down, and on the incident's own cluster (three nodes
+  misconfigured alike, all serving) an ERR would have turned the next
+  rolling upgrade into a chain of agents refusing to start, each with a
+  lease expiry and a failover. The persistent signal is `/healthz`
+  (`sr_check_mismatch`, `pgpool_map_degraded`) and `cluster status`.
 - **`raft: …`** — five refusals rather than warnings, because each one's
   failure mode only becomes visible during an outage: a pool smaller than
   three, an unresolved local node id, no mTLS (the consensus plane shares
@@ -1676,10 +1762,11 @@ DB-backed (skipped with a WARN row if the DB is unreachable):
 - **`role: …`** — the replication role and `pgpool` exist.
 
 **What it deliberately does not check**, because operators reasonably
-assume otherwise: the polkit rule, `pcp.conf`, `pool_passwd`, and
-`pg_hba.conf`. Each of those fails later and less informatively, and
-covering them is open work — until then Ansible should assert them
-directly. See BOOTSTRAP.md Phase 1.7.
+assume otherwise: the polkit rule, `pcp.conf` and `pool_passwd`. Each of
+those fails later and less informatively, and covering them is open
+work — until then Ansible should assert them directly. `pg_hba.conf` is
+checked only through its effect (the admission probe above), not by
+reading it. See BOOTSTRAP.md Phase 1.7.
 
 Report format:
 

@@ -72,6 +72,15 @@ hostname = "pg3.example.com"
 # pgpool_service = "pgpool2.service"
 # .pcppass lives in ~postgres/ (libpq default); no path field here.
 
+# --- pgpool.conf ------------------------------------------------------
+# pgpool's own configuration, READ by the agent (never written): the
+# backends and health-check users `validate-env` dials, and the
+# ssl_cert the supervisor compares against what pgpool serves.
+# Default: the first of /etc/pgpool2/pgpool.conf,
+# /etc/pgpool-II/pgpool.conf that exists.
+# [pgpool]
+# conf = "/etc/pgpool2/pgpool.conf"
+
 # --- /healthz ---------------------------------------------------------
 [healthz]
 # enabled = true
@@ -108,8 +117,16 @@ hostname = "pg3.example.com"
 # Disable if you manage pgpool's lifecycle externally. There is no
 # maintenance-mode toggle yet; a sustained operator stop is handled by
 # stopping pg_agentd itself.
+#
+# restart_pgpool_on_stale_tls: while pgpool runs, the supervisor
+# compares the certificate it serves with ssl_cert on disk every 60 s
+# (pgpool reads TLS material at start only, so a renewed file is not
+# a loaded one) and restarts pgpool when the file is a newer
+# certificate — once per distinct file. `false` keeps the /healthz
+# `pgpool_tls` report and the warning without the restart.
 # [supervisor]
 # pgpool = true
+# restart_pgpool_on_stale_tls = true
 
 
 # --- consensus / HA loop ----------------------------------------------

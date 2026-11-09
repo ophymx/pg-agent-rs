@@ -44,16 +44,6 @@ Defense in depth, explicitly — the class it narrows is closed at the
 root by the lease CAS, not here. See
 [docs/promotion-authority.md](docs/promotion-authority.md) §3.
 
-### Cross-instance pgpool attach after a lease promotion
-
-`cluster recover` fans the attach out to every member via the
-`AttachNode` peer RPC, and the executor self-attaches the winner's own
-backend on primary-holder ticks. The promotion path has no fan-out: after
-a failover, the *other* instances' maps can still hold the new primary's
-backend down, and with `auto_failback off` that is permanent until
-something attaches it there. Give the executor the same fan-out recover
-already has.
-
 ### `recovery_first_stage`: a real resume driver
 
 The op is journaled across `started → slot_created → data_copied →

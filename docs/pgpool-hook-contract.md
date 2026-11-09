@@ -72,12 +72,25 @@ Two hook-adjacent settings that are not commands but shape the contract:
 
 ## 3. The unpriced cost: backend-status sync is a watchdog feature
 
-> **Priced and paid:** the attach half of this obligation is closed —
-> `cluster recover` fans the attach out via the `AttachNode` peer RPC
-> (each agent attaches on its OWN instance, only-if-down, primary's
-> backend first when its map lacks one), and the executor's finding-16
-> self-attach covers the promotion case. The analysis below is the
-> original pricing.
+> **Priced and paid, twice.** The first payment covered the attaches
+> the agent itself causes: `cluster recover` fans the attach out via
+> the `AttachNode` peer RPC (each agent attaches on its OWN instance,
+> only-if-down, primary's backend first when its map lacks one), and
+> the executor's finding-16 self-attach covers the promotion case. It
+> did not cover the attaches *nobody* causes — a map that merely went
+> stale after a transient — and the home fleet ran two weeks that way
+> with every node `ready: true` (docs/field-report-2026-11-02.md). The
+> second payment is the **pgpool map reconciler**
+> (`pgpool_reconcile.rs`): every 30 s, and immediately when the
+> failover hook refuses a slot drop on evidence that pgpool's report
+> was false, each agent re-attaches on its own instance every backend
+> the map holds down that the cluster reports up (a streaming standby,
+> or the lease holder running as primary), with backoff and a named
+> diagnosis when pgpool keeps undoing it. `pg_agentctl cluster attach`
+> runs the same thing on demand and fans it out; `cluster status`
+> shows each instance's map and flags the disagreement; `/healthz`
+> carries `pgpool_map_degraded`. The analysis below is the original
+> pricing.
 
 From [pgpool 4.6 §"Watchdog"](https://www.pgpool.net/docs/46/en/html/tutorial-watchdog-intro.html):
 

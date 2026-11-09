@@ -98,6 +98,12 @@ pub struct Options {
     /// `NotApplicable` — phantom states must not have pgpool routing
     /// traffic at them.
     pub supervisor_pgpool_enabled: bool,
+    /// Served-certificate watch for the pgpool supervisor: pgpool's
+    /// frontend address and `ssl_cert`, from pgpool.conf. `None` when
+    /// pgpool.conf was not found or has `ssl = off`.
+    pub pgpool_tls: Option<crate::pgpool_tls::PgpoolTlsSpec>,
+    /// `[supervisor] restart_pgpool_on_stale_tls`.
+    pub restart_pgpool_on_stale_tls: bool,
     /// Shared mTLS material for the peer server and outbound peer clients.
     /// `None` means no TLS — caller is responsible for passing `--dev` and
     /// ensuring `serve.reject_insecure_remote_peer()` is false. The check
@@ -151,6 +157,8 @@ impl Options {
             maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
             phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
             supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+            pgpool_tls: None,
+            restart_pgpool_on_stale_tls: crate::config::DEFAULT_RESTART_PGPOOL_ON_STALE_TLS,
             cert_reloader: None,
             ha: None,
         }
@@ -223,17 +231,40 @@ pub struct Agent {
     /// the second opinion candidacy consults before deposing a holder
     /// it cannot see (finding 25).
     pub(crate) peer_seen: Arc<crate::cluster_view::PeerSeen>,
+    /// The `/healthz` snapshotter. Owned here rather than built inside
+    /// `serve` because `get_status` reads its latest snapshot for the
+    /// local pgpool map: one `pcp_node_info` a second already runs for
+    /// `/healthz`, and every peer's HA tick asking for status must not
+    /// add a subprocess each.
+    pub(crate) snapshotter: Arc<HealthSnapshotter>,
+    /// Shared between the role executor (writer) and the healthz
+    /// snapshotter (reader): the finding-15 wedged-follow flag.
+    pub(crate) follow_wedged: Arc<AtomicBool>,
+    /// Shared between the pgpool supervisor (writer) and the healthz
+    /// snapshotter (reader): the served-certificate comparison.
+    pub(crate) pgpool_tls_status: Arc<arc_swap::ArcSwapOption<crate::pgpool_tls::PgpoolTlsStatus>>,
 }
 
 impl Agent {
     /// Build a shared agent. Cheap — no I/O. Returns `Arc<Self>` because
     /// subsystems clone it as `Arc<dyn NodeInfo>`.
     pub fn new(deps: AgentDeps, opts: Options) -> Arc<Self> {
+        let follow_wedged = Arc::new(AtomicBool::new(false));
+        let pgpool_tls_status = Arc::new(arc_swap::ArcSwapOption::from(None));
+        let snapshotter = Arc::new(
+            HealthSnapshotter::new(deps.db.clone(), deps.pcp.clone())
+                .with_follow_wedged(follow_wedged.clone())
+                .with_local_node_id(opts.node_pool.local_node_id)
+                .with_pgpool_tls(pgpool_tls_status.clone()),
+        );
         Arc::new(Self {
             deps,
             opts,
             startup_verified: Arc::new(AtomicBool::new(false)),
             peer_seen: Arc::new(crate::cluster_view::PeerSeen::new()),
+            snapshotter,
+            follow_wedged,
+            pgpool_tls_status,
         })
     }
 
@@ -276,17 +307,29 @@ impl Agent {
             return Err(AgentError::InsecureRemotePeer.into());
         }
 
-        // Shared between the role executor (writer) and the healthz
-        // snapshotter (reader): the finding-15 wedged-follow flag.
-        let follow_wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let follow_wedged = self.follow_wedged.clone();
 
         // Healthz snapshotter — initial probe runs synchronously so the
         // very first request after READY sees a real snapshot, not 503.
-        let snapshotter = Arc::new(
-            HealthSnapshotter::new(self.deps.db.clone(), self.deps.pcp.clone())
-                .with_follow_wedged(follow_wedged.clone()),
-        );
+        let snapshotter = self.snapshotter.clone();
         snapshotter.probe_once().await;
+
+        // pgpool map reconciler (docs/pgpool-hook-contract.md §3): the
+        // attach half of the backend-status sync the watchdog used to
+        // provide. Ticks slowly on its own and immediately when the
+        // failover hook refuses a slot drop on evidence that pgpool's
+        // report was wrong. Needs the lease to tell a primary from a
+        // phantom; without consensus it attaches standbys only.
+        let reconciler = Arc::new(crate::pgpool_reconcile::PgpoolReconciler::new(
+            self.deps.pcp.clone(),
+            self.deps.db.clone(),
+            self.deps.peers.clone(),
+            self.opts.node_pool.clone(),
+            self.opts.ha.as_ref().map(|w| {
+                let store: Arc<dyn crate::consensus::ConsensusStore> = w.raft.store.clone();
+                store
+            }),
+        ));
 
         // Maintenance worker. NodePool is small + Clone; no Arc needed.
         let maintenance_worker = MaintenanceWorker::new(
@@ -320,11 +363,13 @@ impl Agent {
             let pg = self.opts.postgres.clone();
             let raft = self.opts.ha.as_ref().map(|ha| ha.raft.clone());
             let peer_seen = self.peer_seen.clone();
+            let reconciler = reconciler.clone();
             js.spawn(async move {
                 let mut server = LocalServer::new(
                     me, db, peers, maint, wal, replay, inflight, pcp, sd, standby, pool, pg,
                 )
-                .with_peer_seen(peer_seen);
+                .with_peer_seen(peer_seen)
+                .with_reconciler(reconciler);
                 if let Some(rt) = raft {
                     server = server.with_raft(rt);
                 }
@@ -369,6 +414,16 @@ impl Agent {
             let snap = snapshotter.clone();
             js.spawn(async move {
                 snap.run(s).await;
+                Ok(())
+            });
+        }
+
+        // pgpool map reconciler loop.
+        {
+            let s = shutdown.clone();
+            let r = reconciler.clone();
+            js.spawn(async move {
+                r.run(s).await;
                 Ok(())
             });
         }
@@ -531,9 +586,16 @@ impl Agent {
         }
 
         if self.opts.supervisor_pgpool_enabled && supervisor_eligible {
-            let supervisor = Arc::new(crate::pgpool_supervisor::PgpoolSupervisor::new(
-                self.deps.sd.clone(),
-            ));
+            let mut supervisor =
+                crate::pgpool_supervisor::PgpoolSupervisor::new(self.deps.sd.clone());
+            if let Some(spec) = self.opts.pgpool_tls.clone() {
+                supervisor = supervisor.with_tls_watch(
+                    spec,
+                    self.pgpool_tls_status.clone(),
+                    self.opts.restart_pgpool_on_stale_tls,
+                );
+            }
+            let supervisor = Arc::new(supervisor);
             // Best-effort one-shot at startup: a clean boot converges
             // in milliseconds instead of waiting `TICK` for the loop's
             // first iteration. Logs and proceeds on any error — the
@@ -1140,6 +1202,25 @@ impl NodeInfo for Agent {
 
         let ready = recovery_ok && lag_ok && pg_status_ok && pgpool_status_ok;
 
+        // The local pgpool map, from the snapshot `/healthz` serves —
+        // not a fresh `pcp_node_info`, see the field's docs on `Agent`.
+        let (pgpool_map_known, pgpool_backends) = match self.snapshotter.load() {
+            Some(snap) if snap.pgpool.reachable => (
+                true,
+                snap.pgpool
+                    .backends
+                    .iter()
+                    .map(|b| pb::PgpoolBackend {
+                        id: b.id,
+                        status: b.status.clone(),
+                        role: b.role.clone(),
+                        replication_state: b.replication_state.clone(),
+                    })
+                    .collect(),
+            ),
+            _ => (false, Vec::new()),
+        };
+
         Ok(pb::NodeStatus {
             is_running: pg_running,
             is_in_recovery: in_recovery,
@@ -1154,6 +1235,8 @@ impl NodeInfo for Agent {
             current_wal_lsn: wal_lsn,
             last_flush_lsn: flush_lsn,
             peer_primary_seen_age_ms: self.peer_seen.ages_ms(),
+            pgpool_backends,
+            pgpool_map_known,
         })
     }
 
@@ -1479,6 +1562,8 @@ mod tests {
             current_wal_lsn,
             last_flush_lsn: current_wal_lsn,
             peer_primary_seen_age_ms: Default::default(),
+            pgpool_backends: Vec::new(),
+            pgpool_map_known: false,
         }
     }
 
@@ -1673,6 +1758,8 @@ mod tests {
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                pgpool_tls: None,
+                restart_pgpool_on_stale_tls: false,
                 cert_reloader: None,
                 ha: None,
             },
@@ -2070,6 +2157,8 @@ mod tests {
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                pgpool_tls: None,
+                restart_pgpool_on_stale_tls: false,
                 cert_reloader: None,
                 ha: None,
             },
@@ -2138,6 +2227,8 @@ mod tests {
                     phantom_check_required_peers:
                         crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                     supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                    pgpool_tls: None,
+                    restart_pgpool_on_stale_tls: false,
                     cert_reloader: None,
                     ha: None,
                 },
@@ -2200,6 +2291,8 @@ mod tests {
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                pgpool_tls: None,
+                restart_pgpool_on_stale_tls: false,
                 cert_reloader: None,
                 ha: None,
             },
@@ -2255,6 +2348,8 @@ mod tests {
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers,
                 supervisor_pgpool_enabled,
+                pgpool_tls: None,
+                restart_pgpool_on_stale_tls: false,
                 cert_reloader: None,
                 ha: None,
             },
@@ -2428,6 +2523,8 @@ mod tests {
                 maintenance_sweep_interval: Duration::from_secs(30),
                 phantom_check_required_peers: crate::config::DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS,
                 supervisor_pgpool_enabled: crate::config::DEFAULT_PGPOOL_SUPERVISOR_ENABLED,
+                pgpool_tls: None,
+                restart_pgpool_on_stale_tls: false,
                 cert_reloader: None,
                 ha: None,
             },

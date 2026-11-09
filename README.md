@@ -45,7 +45,7 @@ configurable:
 |----------------|------|
 | `pg_agentd`    | Coordinator daemon. `serve` (default) runs the gRPC + healthz listeners; `validate-env` is the `nginx -t` equivalent — wired as `ExecStartPre=`. |
 | `pg_agentc`    | One-shot pgpool hook client. Marshals positional argv into a single Unix-socket RPC, then exits. |
-| `pg_agentctl`  | Operator CLI: hook config (`print-hooks`, `check-hooks`, `gen-pgpool`), cluster operations (`cluster init/status/recover/handoff/start-primary/pause/resume/allow-async`), and the two journals (`maintenance`, `ops`). Every subcommand routes through the local daemon over the Unix socket — no TLS material needed on the operator's host. Run `--help` for the current surface. |
+| `pg_agentctl`  | Operator CLI: hook config (`print-hooks`, `check-hooks`, `gen-pgpool`), cluster operations (`cluster init/status/attach/recover/handoff/start-primary/pause/resume/allow-async`), and the two journals (`maintenance`, `ops`). Every subcommand routes through the local daemon over the Unix socket — no TLS material needed on the operator's host. Run `--help` for the current surface. |
 
 ## Layout
 

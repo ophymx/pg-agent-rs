@@ -958,6 +958,8 @@ mod tests {
                 current_wal_lsn: 0,
                 last_flush_lsn: 0,
                 peer_primary_seen_age_ms: Default::default(),
+                pgpool_backends: Vec::new(),
+                pgpool_map_known: false,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {

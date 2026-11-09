@@ -186,6 +186,17 @@ pub struct HealthSnapshot {
     /// not streamed past the grace window. Redundancy is degraded
     /// until the node is rebuilt (`cluster recover`).
     pub follow_wedged: bool,
+    /// pgpool reports `replication_state = none` for a backend this
+    /// node's own PostgreSQL knows is streaming: the local backend when
+    /// the walreceiver is streaming, or on a primary a member in
+    /// `pg_stat_replication`. The one cause seen in the field is
+    /// `backend_application_nameN` not matching the `application_name`
+    /// the agent writes (`check-hooks` catches it); relaying pgpool's
+    /// `none` as if it were a fact was how it went unread for two weeks.
+    pub sr_check_mismatch: bool,
+    /// Served-certificate comparison from the supervisor
+    /// (`crate::pgpool_tls`), `None` until it has run.
+    pub pgpool_tls: Option<Arc<crate::pgpool_tls::PgpoolTlsStatus>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +211,16 @@ pub struct HealthSnapshotter {
     snap: ArcSwapOption<HealthSnapshot>,
     /// Shared with the role executor; read into each snapshot.
     follow_wedged: Arc<AtomicBool>,
+    /// This node's pool id, for the sr_check cross-check. `None`
+    /// disables the local-backend half of it.
+    local_node_id: Option<i32>,
+    /// Latch so the sr_check contradiction is logged once per
+    /// transition, not once per second.
+    sr_mismatch_logged: AtomicBool,
+    /// The supervisor's served-certificate comparison, read into each
+    /// snapshot. `None` entries until the first probe, or forever when
+    /// pgpool has SSL off.
+    pgpool_tls: Option<Arc<ArcSwapOption<crate::pgpool_tls::PgpoolTlsStatus>>>,
 }
 
 impl HealthSnapshotter {
@@ -220,13 +241,34 @@ impl HealthSnapshotter {
             probe_timeout,
             snap: ArcSwapOption::from(None),
             follow_wedged: Arc::new(AtomicBool::new(false)),
+            local_node_id: None,
+            sr_mismatch_logged: AtomicBool::new(false),
+            pgpool_tls: None,
         }
+    }
+
+    /// Wire the supervisor's served-certificate status so it surfaces
+    /// in every snapshot as `pgpool_tls`.
+    pub fn with_pgpool_tls(
+        mut self,
+        status: Arc<ArcSwapOption<crate::pgpool_tls::PgpoolTlsStatus>>,
+    ) -> Self {
+        self.pgpool_tls = Some(status);
+        self
     }
 
     /// Wire the role executor's finding-15 wedge flag so it surfaces
     /// in every snapshot as `follow_wedged`.
     pub fn with_follow_wedged(mut self, flag: Arc<AtomicBool>) -> Self {
         self.follow_wedged = flag;
+        self
+    }
+
+    /// This node's pool id, so the snapshot can compare pgpool's
+    /// `replication_state` for the local backend against the local
+    /// walreceiver.
+    pub fn with_local_node_id(mut self, id: i32) -> Self {
+        self.local_node_id = Some(id);
         self
     }
 
@@ -241,13 +283,33 @@ impl HealthSnapshotter {
     /// very first request after READY sees a real snapshot, not 503),
     /// then on every tick inside `run`.
     pub async fn probe_once(&self) {
-        let snap = build_snapshot(
+        let mut snap = build_snapshot(
             self.db.as_ref(),
             self.pcp.as_ref(),
             self.probe_timeout,
             self.follow_wedged.load(Ordering::SeqCst),
+            self.local_node_id,
         )
         .await;
+        snap.pgpool_tls = self.pgpool_tls.as_ref().and_then(|t| t.load_full());
+        match (
+            snap.sr_check_mismatch,
+            self.sr_mismatch_logged
+                .swap(snap.sr_check_mismatch, Ordering::SeqCst),
+        ) {
+            (true, false) => warn!(
+                "healthsnap: pgpool reports replication_state=none for a backend PostgreSQL \
+                 here knows is streaming. pgpool fills that column by matching \
+                 backend_application_nameN in pgpool.conf against pg_stat_replication; the \
+                 agent writes application_name=node<id>. Run `pg_agentctl check-hooks` on \
+                 pgpool.conf. Until fixed, pgpool's replication_state and delay_threshold_by_time \
+                 are blind on this instance (/healthz: sr_check_mismatch)."
+            ),
+            (false, true) => {
+                info!("healthsnap: pgpool replication_state agrees with PostgreSQL again")
+            }
+            _ => {}
+        }
         debug!(
             role = ?snap.role,
             postgres_reachable = snap.postgres.reachable,
@@ -281,6 +343,7 @@ async fn build_snapshot(
     pcp: &dyn Pcp,
     probe_timeout: Duration,
     follow_wedged: bool,
+    local_node_id: Option<i32>,
 ) -> HealthSnapshot {
     // Probe postgres and pgpool concurrently. tokio::join! drives both
     // futures in the same task — independent deadlines, no cross-stall.
@@ -289,11 +352,13 @@ async fn build_snapshot(
         probe_pgpool(pcp, probe_timeout),
     );
     let (role, postgres, replication) = pg_result;
-    let sync_commit = if role == HealthRole::Primary {
+    let (sync_commit, connected) = if role == HealthRole::Primary {
         probe_sync_commit(db, probe_timeout).await
     } else {
-        SyncCommitState::NotApplicable
+        (SyncCommitState::NotApplicable, Vec::new())
     };
+    let sr_check_mismatch =
+        sr_check_mismatch(role, &replication, &pgpool_probe, &connected, local_node_id);
     HealthSnapshot {
         timestamp: Utc::now(),
         role,
@@ -302,6 +367,8 @@ async fn build_snapshot(
         replication,
         sync_commit,
         follow_wedged,
+        sr_check_mismatch,
+        pgpool_tls: None,
     }
 }
 
@@ -309,20 +376,65 @@ async fn build_snapshot(
 /// `synchronous_standby_names` is empty, otherwise `armed` iff at
 /// least one member standby is connected — `blocked` means commits
 /// are currently hanging for want of an ack source. Inferred from
-/// state, never probed with a write.
-async fn probe_sync_commit(db: &dyn LocalDb, probe_timeout: Duration) -> SyncCommitState {
+/// state, never probed with a write. Also returns the connected member
+/// names (`node<id>`), which the sr_check cross-check reuses.
+async fn probe_sync_commit(
+    db: &dyn LocalDb,
+    probe_timeout: Duration,
+) -> (SyncCommitState, Vec<String>) {
+    let connected = match tokio::time::timeout(probe_timeout, db.connected_standby_names()).await {
+        Ok(Ok(v)) => Some(v),
+        _ => None,
+    };
     let names =
         match tokio::time::timeout(probe_timeout, db.setting("synchronous_standby_names")).await {
             Ok(Ok(v)) => v,
-            _ => return SyncCommitState::NotApplicable,
+            _ => {
+                return (
+                    SyncCommitState::NotApplicable,
+                    connected.unwrap_or_default(),
+                )
+            }
         };
     if names.trim().is_empty() {
-        return SyncCommitState::Disarmed;
+        return (SyncCommitState::Disarmed, connected.unwrap_or_default());
     }
-    match tokio::time::timeout(probe_timeout, db.connected_standby_names()).await {
-        Ok(Ok(connected)) if !connected.is_empty() => SyncCommitState::Armed,
-        Ok(Ok(_)) => SyncCommitState::Blocked,
-        _ => SyncCommitState::NotApplicable,
+    match connected {
+        Some(c) if !c.is_empty() => (SyncCommitState::Armed, c),
+        Some(c) => (SyncCommitState::Blocked, c),
+        None => (SyncCommitState::NotApplicable, Vec::new()),
+    }
+}
+
+/// Does pgpool say `none` where PostgreSQL says streaming? Checks the
+/// local backend (standby with an active walreceiver) and, on a
+/// primary, every connected member standby. Only backends pgpool holds
+/// up count: a down backend's `none` is expected.
+fn sr_check_mismatch(
+    role: HealthRole,
+    replication: &ReplicationProbe,
+    pgpool: &PgpoolProbe,
+    connected_names: &[String],
+    local_node_id: Option<i32>,
+) -> bool {
+    if !pgpool.reachable {
+        return false;
+    }
+    let says_none = |id: i32| {
+        pgpool
+            .backends
+            .iter()
+            .any(|b| b.id == id && backend_is_up(&b.status) && b.replication_state == "none")
+    };
+    match role {
+        HealthRole::Replica => {
+            replication.wal_receiver_state == "streaming" && local_node_id.is_some_and(says_none)
+        }
+        HealthRole::Primary => connected_names
+            .iter()
+            .filter_map(|n| n.strip_prefix("node")?.parse::<i32>().ok())
+            .any(says_none),
+        HealthRole::Unknown => false,
     }
 }
 
@@ -455,6 +567,23 @@ struct HealthBody {
     replication: ReplicationProbe,
     sync_commit: SyncCommitState,
     follow_wedged: bool,
+    /// This instance's pgpool holds at least one backend `down`. Not
+    /// part of the readiness verdict — a pgpool with one backend left
+    /// still serves — but it is the state in which `ready: true` hid a
+    /// two-week routing degradation (field report 2026-11-02). Whether
+    /// the down backend is really down is `cluster status`'s question;
+    /// this body only sees the local map.
+    pgpool_map_degraded: bool,
+    /// The ids behind `pgpool_map_degraded`, so an alert can name them.
+    pgpool_backends_down: Vec<i32>,
+    /// See `HealthSnapshot::sr_check_mismatch`.
+    sr_check_mismatch: bool,
+    /// What pgpool serves versus `ssl_cert` on disk: both expiries
+    /// (alert on `served.not_after`), and `stale` when the file was
+    /// renewed but not loaded. Absent until the supervisor has probed,
+    /// or when pgpool has SSL off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pgpool_tls: Option<Arc<crate::pgpool_tls::PgpoolTlsStatus>>,
 }
 
 /// Pure verdict + body builder — tests call this directly without
@@ -476,6 +605,10 @@ fn compute_health(
                 replication: ReplicationProbe::default(),
                 sync_commit: SyncCommitState::NotApplicable,
                 follow_wedged: false,
+                pgpool_map_degraded: false,
+                pgpool_backends_down: Vec::new(),
+                sr_check_mismatch: false,
+                pgpool_tls: None,
             },
         );
     };
@@ -492,6 +625,16 @@ fn compute_health(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    let pgpool_backends_down: Vec<i32> = if s.pgpool.reachable {
+        s.pgpool
+            .backends
+            .iter()
+            .filter(|b| !backend_is_up(&b.status))
+            .map(|b| b.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let body = HealthBody {
         ready,
         snapshot_age_ms: age_ms,
@@ -501,6 +644,10 @@ fn compute_health(
         replication: s.replication.clone(),
         sync_commit: s.sync_commit,
         follow_wedged: s.follow_wedged,
+        pgpool_map_degraded: !pgpool_backends_down.is_empty(),
+        pgpool_backends_down,
+        sr_check_mismatch: s.sr_check_mismatch,
+        pgpool_tls: s.pgpool_tls.clone(),
     };
     (status, body)
 }
@@ -523,6 +670,10 @@ async fn handle_healthz(State(state): State<HealthState>) -> Response {
             replication: ReplicationProbe::default(),
             sync_commit: SyncCommitState::NotApplicable,
             follow_wedged: false,
+            pgpool_map_degraded: false,
+            pgpool_backends_down: Vec::new(),
+            sr_check_mismatch: false,
+            pgpool_tls: None,
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
@@ -864,7 +1015,129 @@ mod tests {
             replication: ReplicationProbe::default(),
             sync_commit: SyncCommitState::Armed,
             follow_wedged: false,
+            sr_check_mismatch: false,
+            pgpool_tls: None,
         })
+    }
+
+    // ----- the local map, as a signal of its own ---------------------------
+
+    #[test]
+    fn body_flags_a_degraded_map_while_staying_ready() {
+        // db0 on 2026-11-02: two of three down, still routing, ready.
+        let mut snap = (*healthy_snapshot()).clone();
+        snap.pgpool.backends.push(BackendStatus {
+            id: 2,
+            hostname: "s3".into(),
+            role: "standby".into(),
+            status: "down".into(),
+            replication_state: "none".into(),
+        });
+        snap.pgpool.backends[1].status = "down".into();
+        let (status, body) = compute_health(Some(Arc::new(snap)), STALE_AFTER, Utc::now());
+        assert_eq!(status, StatusCode::OK, "readiness contract unchanged");
+        assert!(body.pgpool_map_degraded);
+        assert_eq!(body.pgpool_backends_down, vec![1, 2]);
+        let json: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["pgpool_map_degraded"], true);
+        assert_eq!(json["pgpool_backends_down"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn body_does_not_call_an_unreachable_pgpool_degraded() {
+        let mut snap = (*healthy_snapshot()).clone();
+        snap.pgpool.reachable = false;
+        snap.pgpool.backends.clear();
+        let (_, body) = compute_health(Some(Arc::new(snap)), STALE_AFTER, Utc::now());
+        assert!(!body.pgpool_map_degraded);
+        assert!(body.pgpool_backends_down.is_empty());
+    }
+
+    // ----- sr_check contract ------------------------------------------------
+
+    fn pgpool_with(entries: &[(i32, &str, &str)]) -> PgpoolProbe {
+        PgpoolProbe {
+            reachable: true,
+            backends: entries
+                .iter()
+                .map(|(id, status, repl)| BackendStatus {
+                    id: *id,
+                    hostname: format!("s{id}"),
+                    role: "standby".into(),
+                    status: (*status).into(),
+                    replication_state: (*repl).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sr_check_mismatch_on_a_streaming_standby_pgpool_calls_none() {
+        let rep = ReplicationProbe {
+            lag_bytes: 0,
+            wal_receiver_state: "streaming".into(),
+        };
+        assert!(sr_check_mismatch(
+            HealthRole::Replica,
+            &rep,
+            &pgpool_with(&[(1, "up", "none")]),
+            &[],
+            Some(1)
+        ));
+        assert!(!sr_check_mismatch(
+            HealthRole::Replica,
+            &rep,
+            &pgpool_with(&[(1, "up", "streaming")]),
+            &[],
+            Some(1)
+        ));
+        // Held down: pgpool's `none` is expected, not a contradiction.
+        assert!(!sr_check_mismatch(
+            HealthRole::Replica,
+            &rep,
+            &pgpool_with(&[(1, "down", "none")]),
+            &[],
+            Some(1)
+        ));
+        // Without a local id the standby half cannot be checked.
+        assert!(!sr_check_mismatch(
+            HealthRole::Replica,
+            &rep,
+            &pgpool_with(&[(1, "up", "none")]),
+            &[],
+            None
+        ));
+    }
+
+    #[test]
+    fn sr_check_mismatch_on_a_primary_uses_connected_members() {
+        let rep = ReplicationProbe::default();
+        let connected = vec!["node0".to_string(), "node1".to_string()];
+        assert!(sr_check_mismatch(
+            HealthRole::Primary,
+            &rep,
+            &pgpool_with(&[(0, "up", "streaming"), (1, "up", "none"), (2, "up", "none")]),
+            &connected,
+            Some(2)
+        ));
+        assert!(!sr_check_mismatch(
+            HealthRole::Primary,
+            &rep,
+            &pgpool_with(&[
+                (0, "up", "streaming"),
+                (1, "up", "streaming"),
+                (2, "up", "none")
+            ]),
+            &connected,
+            Some(2)
+        ));
+        assert!(!sr_check_mismatch(
+            HealthRole::Primary,
+            &rep,
+            &pgpool_with(&[(0, "up", "none")]),
+            &[],
+            Some(2)
+        ));
     }
 
     #[test]

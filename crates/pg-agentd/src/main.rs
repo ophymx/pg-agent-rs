@@ -369,6 +369,8 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
         maintenance_sweep_interval: DEFAULT_SWEEP_INTERVAL,
         phantom_check_required_peers: config.startup.effective_required_peers(),
         supervisor_pgpool_enabled: config.supervisor.effective_pgpool_enabled(),
+        pgpool_tls: pgpool_tls_spec(&config),
+        restart_pgpool_on_stale_tls: config.supervisor.effective_restart_on_stale_tls(),
         cert_reloader: cert_reloader.clone(),
         ha,
     };
@@ -386,6 +388,34 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
 
     let agent = Agent::new(deps, opts);
     agent.serve(listeners, shutdown).await
+}
+
+/// The served-certificate watch's inputs, from pgpool.conf. `None`
+/// (with a log line saying why) when there is no pgpool.conf to read
+/// or it has SSL off — the supervisor then watches liveness only.
+fn pgpool_tls_spec(config: &Config) -> Option<pg_agent_core::pgpool_tls::PgpoolTlsSpec> {
+    let path = config.pgpool_conf_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(path = %path.display(), ?e, "pgpool.conf unreadable; served-certificate watch off");
+            return None;
+        }
+    };
+    let conf = pg_agent_hookspec::PgpoolConf::parse(&text);
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
+    let spec = pg_agent_core::pgpool_tls::PgpoolTlsSpec::from_conf(&conf, dir);
+    match &spec {
+        Some(s) => info!(
+            addr = %s.addr,
+            cert = %s.cert_path.display(),
+            "pgpool served-certificate watch on"
+        ),
+        None => {
+            info!(path = %path.display(), "pgpool.conf has ssl off; served-certificate watch off")
+        }
+    }
+    spec
 }
 
 async fn create_state_subdirs(dirs: &[&PathBuf]) -> anyhow::Result<()> {
