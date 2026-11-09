@@ -148,7 +148,15 @@ jobs:
       # artifacts this workflow attaches are the thing NOTICE describes, so
       # the one place the check must not be skippable is the one place it
       # is about to be shipped.
+      #
+      # On the x86_64 leg only. The action is a Docker image carrying an
+      # x86_64 cargo-deny binary, and on the arm64 runner it dies with
+      # "cannot execute binary file: Exec format error" — which, with
+      # fail-fast, cancelled the whole v0.10.0 release the first time the
+      # arm64 leg saw a tag. The dependency set and its licenses are the
+      # same on both architectures; one leg's answer is the answer.
       - name: Licenses (cargo-deny)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
