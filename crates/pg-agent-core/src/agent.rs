@@ -677,6 +677,25 @@ impl Agent {
             js.abort_all();
         }
 
+        // openraft's core task is not in the JoinSet. It runs on its own
+        // and reports metrics into a watch channel whose receivers live
+        // in the `Raft` handle, so dropping the handle (which happens
+        // when this `Arc<Agent>` goes) while the core still ticks logs
+        // `ERROR error reporting metrics error=channel closed` on every
+        // clean stop — seen on all three db nodes during the first
+        // pushdb roll. Stopping the core first is the order openraft
+        // expects; it has nothing left to do once the servers are gone.
+        if let Some(ha) = &self.opts.ha {
+            match tokio::time::timeout(SHUTDOWN_GRACE, ha.raft.raft.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("pg_agentd: raft core shutdown: {e}"),
+                Err(_) => warn!(
+                    "pg_agentd: raft core shutdown exceeded {:?}; leaving it to the runtime",
+                    SHUTDOWN_GRACE
+                ),
+            }
+        }
+
         outcome
     }
 }
