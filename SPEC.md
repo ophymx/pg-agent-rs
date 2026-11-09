@@ -1285,7 +1285,9 @@ Net: no `[tls]` interaction with the healthz listener at all.
   cause seen in the field is `backend_application_nameN` not matching
   the `application_name` the agent writes; `check-hooks` catches it at
   deploy time, this catches it at runtime, and the snapshotter logs it
-  once per transition.
+  once the mismatch has held for 5 consecutive probes (the field is
+  per-probe; a single `none` is pgpool's own sr_check mid-cycle, and
+  the WARN is for a misconfiguration, which does not clear itself).
 - `pgpool_tls`: the supervisor's comparison of the certificate pgpool
   serves with `ssl_cert` on disk — both expiries (alert on
   `served.not_after`; the served one is the one clients see), and

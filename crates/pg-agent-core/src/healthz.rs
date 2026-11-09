@@ -54,7 +54,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +72,16 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Tight enough that even a worst-case 500 ms hang on postgres still
 /// lets pgpool's probe complete within the same tick.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Consecutive probes that must agree before `sr_check_mismatch` is
+/// logged. pgpool fills `replication_state` from its own sr_check
+/// worker on its own period, so a single probe can land between that
+/// worker dropping and re-reading a backend and see `none` for a
+/// standby that was streaming the whole time — db1 did exactly that
+/// for one tick during an agent roll. The misconfiguration the WARN
+/// describes is permanent, so waiting this long costs nothing; the
+/// `/healthz` field itself stays per-probe.
+pub const SR_MISMATCH_WARN_AFTER: u32 = 5;
 
 /// Snapshot age past which we flip `/healthz` to 503 — distinguishes
 /// "probe loop wedged" from "pgpool just answered and said it's down".
@@ -216,7 +226,9 @@ pub struct HealthSnapshotter {
     local_node_id: Option<i32>,
     /// Latch so the sr_check contradiction is logged once per
     /// transition, not once per second.
-    sr_mismatch_logged: AtomicBool,
+    /// Consecutive probes with `sr_check_mismatch` set; the WARN fires
+    /// once it reaches [`SR_MISMATCH_WARN_AFTER`].
+    sr_mismatch_streak: AtomicU32,
     /// The supervisor's served-certificate comparison, read into each
     /// snapshot. `None` entries until the first probe, or forever when
     /// pgpool has SSL off.
@@ -242,7 +254,7 @@ impl HealthSnapshotter {
             snap: ArcSwapOption::from(None),
             follow_wedged: Arc::new(AtomicBool::new(false)),
             local_node_id: None,
-            sr_mismatch_logged: AtomicBool::new(false),
+            sr_mismatch_streak: AtomicU32::new(0),
             pgpool_tls: None,
         }
     }
@@ -292,12 +304,16 @@ impl HealthSnapshotter {
         )
         .await;
         snap.pgpool_tls = self.pgpool_tls.as_ref().and_then(|t| t.load_full());
-        match (
-            snap.sr_check_mismatch,
-            self.sr_mismatch_logged
-                .swap(snap.sr_check_mismatch, Ordering::SeqCst),
-        ) {
-            (true, false) => warn!(
+        // Edge-triggered on the debounced streak, not the raw sample:
+        // WARN once when the streak reaches the threshold, INFO once
+        // when a streak that got that far ends.
+        let streak = if snap.sr_check_mismatch {
+            self.sr_mismatch_streak.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            self.sr_mismatch_streak.swap(0, Ordering::SeqCst)
+        };
+        match (snap.sr_check_mismatch, streak) {
+            (true, SR_MISMATCH_WARN_AFTER) => warn!(
                 "healthsnap: pgpool reports replication_state=none for a backend PostgreSQL \
                  here knows is streaming. pgpool fills that column by matching \
                  backend_application_nameN in pgpool.conf against pg_stat_replication; the \
@@ -305,7 +321,7 @@ impl HealthSnapshotter {
                  pgpool.conf. Until fixed, pgpool's replication_state and delay_threshold_by_time \
                  are blind on this instance (/healthz: sr_check_mismatch)."
             ),
-            (false, true) => {
+            (false, prev) if prev >= SR_MISMATCH_WARN_AFTER => {
                 info!("healthsnap: pgpool replication_state agrees with PostgreSQL again")
             }
             _ => {}

@@ -220,6 +220,6 @@ against the code and pgpool's documentation:
 | 1 | The failover hook's refusal kicks the map reconciler (`localserver.rs`), which attaches the detached backend after the hook returns. |
 | 2 | `pgpool_reconcile.rs`: tick every 30 s, attach only-if-down on cluster evidence, holder first, backoff on reverts. `pg_agentctl cluster attach [--node N]` runs it now and fans `AttachNode` out. |
 | 3 | `/healthz`: `pgpool_map_degraded`, `pgpool_backends_down`. `GetStatus` carries each node's map; `cluster status` shows a `POOL_MAP` column and a `!` line per instance whose map contradicts the cluster. |
-| 4 | `check-hooks` and `gen-pgpool` enforce `backend_application_nameN = nodeN`; `/healthz` `sr_check_mismatch` plus a warn once per transition. |
+| 4 | `check-hooks` and `gen-pgpool` enforce `backend_application_nameN = nodeN`; `/healthz` `sr_check_mismatch` plus a warn once the mismatch has held for 5 consecutive probes (a single-probe `none` is pgpool's sr_check mid-cycle, seen during the first live roll). |
 | 5 | `validate-env` "pgpool backend admission": every backend, every resolved address, as `health_check_user` and `sr_check_user`, libpq's first-answering-address rule, the server's own refusal text. WARN, never ERR: on this very cluster an ERR would have made the next rolling upgrade a chain of agents refusing to start. |
 | 6 | `/healthz` `pgpool_tls` (served and on-disk expiry, `stale`); the supervisor restarts pgpool once per newer file (`[supervisor] restart_pgpool_on_stale_tls`). |
