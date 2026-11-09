@@ -12,3 +12,7 @@ testing/.certs/
 # existed.
 testing/docker/pg-agent.deb
 testing/docker/pg-agent.rpm
+# Probes that run against the real home cluster (hostnames, ~/.pgpass
+# user, pushdb workflow): local operator tooling, not part of the
+# project. testing/acceptance is the dockerized suite and stays tracked.
+testing/live/
