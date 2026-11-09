@@ -168,6 +168,22 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: ./scripts/build-pkgs.sh
 
+      # `build-pkgs.sh` stamps a build as the release only when HEAD is
+      # the release's tag on a clean tree, and `+git<sha>` otherwise. A
+      # tag build is that case by construction (actions/checkout fetches
+      # the tag ref it was given), so a dev stamp here means the
+      # detection broke, and the artifact about to be attached to the
+      # release page would sort above the release in apt. Read the
+      # control field, which is what apt compares, not the filename.
+      - name: Assert the package is stamped as the release
+        run: |
+          set -eu
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          got="$(dpkg-deb -f dist/pg-agent-rs_*.deb Version)"
+          echo "deb Version: $got"
+          [ "$got" = "$version" ] || {
+            echo "::error::deb Version=$got, expected the release $version — HEAD is not a clean v$version?" >&2; exit 1; }
+
       # Static linkage is the property the whole distro matrix rests
       # on, and it is one `cargo build` flag away from silently
       # regressing. Assert it on the artifact rather than trusting the

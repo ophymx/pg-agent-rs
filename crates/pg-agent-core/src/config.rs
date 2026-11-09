@@ -81,6 +81,16 @@ pub const DEFAULT_PGPOOL_NODE_ID_FILES: [&str; 2] = [
     "/etc/pgpool-II/pgpool_node_id", // RHEL family
 ];
 
+/// Where `pgpool.conf` lives, in probe order — same two families as
+/// the node-id file. The agent reads it for the parts of pgpool's
+/// configuration its own checks depend on: the backend addresses and
+/// health-check users `validate-env` dials, and the `ssl_cert` the
+/// supervisor compares against what pgpool actually serves.
+pub const DEFAULT_PGPOOL_CONF_FILES: [&str; 2] = [
+    "/etc/pgpool2/pgpool.conf",   // Debian, Ubuntu
+    "/etc/pgpool-II/pgpool.conf", // RHEL family
+];
+
 // ---------------------------------------------------------------------------
 // Env var names
 // ---------------------------------------------------------------------------
@@ -129,6 +139,8 @@ pub struct Config {
     #[serde(default)]
     pub pcp: PcpConfig,
     #[serde(default)]
+    pub pgpool: PgpoolConfig,
+    #[serde(default)]
     pub healthz: HealthzConfig,
     #[serde(default)]
     pub startup: StartupConfig,
@@ -170,7 +182,11 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    /// Replication slot name for this node: `node{id}`.
+    /// Replication slot name for this node: `node{id}`. Also the
+    /// `application_name` written into `primary_conninfo`, and so the
+    /// value pgpool.conf must carry in `backend_application_name{id}`
+    /// — `pg_agent_hookspec::backend_application_name` is the contract's
+    /// definition and a test below pins the two together.
     pub fn slot_name(&self) -> String {
         format!("node{}", self.id)
     }
@@ -277,6 +293,37 @@ impl PcpConfig {
     }
 }
 
+/// `[pgpool]` — where the agent finds pgpool's own configuration.
+///
+/// The agent never writes `pgpool.conf` (that is `gen-pgpool`'s
+/// fragment and the operator's include); it reads it, for checks whose
+/// correctness depends on what pgpool was actually told: which
+/// backends it health-checks as which user, and which certificate it
+/// was configured to serve.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PgpoolConfig {
+    /// Path to `pgpool.conf`. Default: the first of
+    /// [`DEFAULT_PGPOOL_CONF_FILES`] that exists.
+    #[serde(default)]
+    pub conf: Option<PathBuf>,
+}
+
+impl Config {
+    /// The `pgpool.conf` to read: the configured path, else the first
+    /// default location that exists. `None` when neither — pgpool may
+    /// not be installed here (dev, single node), which every consumer
+    /// treats as "nothing to check" rather than an error.
+    pub fn pgpool_conf_path(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.pgpool.conf {
+            return Some(p.clone());
+        }
+        DEFAULT_PGPOOL_CONF_FILES
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthzConfig {
     /// Pointer-like Option so we can distinguish "unset" (defaults to true)
@@ -354,15 +401,30 @@ pub const DEFAULT_PHANTOM_CHECK_REQUIRED_PEERS: usize = 1;
 pub struct SupervisorConfig {
     #[serde(default)]
     pub pgpool: Option<bool>,
+    /// Restart pgpool when the certificate it serves is an older one
+    /// than `ssl_cert` on disk (renewed, not loaded — pgpool reads TLS
+    /// material at start only). Default true. The comparison is
+    /// one-directional on purpose: a file that is merely different is
+    /// not acted on, only one that expires later, so a bad write to
+    /// the file cannot restart pgpool in a loop. `false` keeps the
+    /// `/healthz` `pgpool_tls` report and the warning, without the
+    /// restart.
+    #[serde(default)]
+    pub restart_pgpool_on_stale_tls: Option<bool>,
 }
 
 impl SupervisorConfig {
     pub fn effective_pgpool_enabled(&self) -> bool {
         self.pgpool.unwrap_or(DEFAULT_PGPOOL_SUPERVISOR_ENABLED)
     }
+    pub fn effective_restart_on_stale_tls(&self) -> bool {
+        self.restart_pgpool_on_stale_tls
+            .unwrap_or(DEFAULT_RESTART_PGPOOL_ON_STALE_TLS)
+    }
 }
 
 pub const DEFAULT_PGPOOL_SUPERVISOR_ENABLED: bool = true;
+pub const DEFAULT_RESTART_PGPOOL_ON_STALE_TLS: bool = true;
 
 /// `[raft]` — timing knobs for the lease-backed HA loop
 /// (docs/promotion-authority.md §5). Absent block = all defaults, which
@@ -1839,5 +1901,21 @@ mod tests {
         // is safe to call with every field set to a mismatched value.
         warn_node_ref_mismatch(&drifted, &pool.members[1], Some(&pg));
         warn_node_ref_mismatch(&drifted, &pool.members[1], None);
+    }
+
+    #[test]
+    fn slot_name_is_the_backend_application_name_contract() {
+        for id in [0, 1, 7, 42] {
+            let n = NodeConfig {
+                id,
+                hostname: "h".into(),
+            };
+            assert_eq!(
+                n.slot_name(),
+                pg_agent_hookspec::backend_application_name(id),
+                "primary_conninfo's application_name and pgpool.conf's \
+                 backend_application_nameN must be the same string"
+            );
+        }
     }
 }

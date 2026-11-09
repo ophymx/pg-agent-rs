@@ -27,6 +27,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Recommended `wal_keep_size` floor, in MB. Covers the failover gap
 /// that replication slots structurally cannot (see the check's docs):
@@ -184,6 +185,7 @@ pub async fn preflight(cfg: &Config, db: Option<Arc<dyn LocalDb>>) -> PreflightR
     fs_recovery_conf_include(cfg, db.as_ref(), &mut r).await;
     unit_restart_policy(cfg, &mut r).await;
     raft_prerequisites(cfg, &mut r);
+    net_backend_admission(cfg, &mut r).await;
 
     // ---- db-backed checks ----------------------------------------------
     match db {
@@ -199,6 +201,277 @@ pub async fn preflight(cfg: &Config, db: Option<Arc<dyn LocalDb>>) -> PreflightR
     }
 
     r
+}
+
+// ---------------------------------------------------------------------------
+// Network checkers
+// ---------------------------------------------------------------------------
+
+/// Per-address budget for the backend admission probe. Addresses and
+/// identities are tried in sequence per backend (backends in
+/// parallel), so a dual-stack peer that drops SYNs on both families
+/// costs four probes: 8 s against the unit's 30 s `TimeoutStartSec`,
+/// with the rest of the preflight still to run.
+const ADMISSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// pgpool's defaults when `pgpool.conf` does not say.
+const PGPOOL_DEFAULT_CHECK_USER: &str = "nobody";
+const PGPOOL_DEFAULT_CHECK_DATABASE: &str = "postgres";
+
+/// Would pgpool's health check and `sr_check` get past `pg_hba.conf`
+/// on every backend, from this host, over every address the backend
+/// name resolves to?
+///
+/// This is the connection the rest of the preflight never tried. On
+/// 2026-11-02 a node resolved its own name to an IPv6 ULA first;
+/// `pg_hba.conf` admitted the IPv4 range only; pgpool's health check
+/// — libpq, which connects to the first address and does NOT move on
+/// after a server-side refusal — failed on that node for weeks while
+/// the agent, peers and every client arriving over IPv4 were fine.
+/// The fleet is moving to IPv6, so every host gains a ULA before its
+/// hba rules catch up.
+///
+/// Follows libpq's rule: addresses are tried in resolver order; the
+/// first that answers on the wire decides — admitted is OK, refused
+/// is WARN with the server's own message (which names the address,
+/// the user and whether SSL was on), plus the pg_hba hint when the
+/// message is pg_hba's. Addresses that fail at TCP are WARN, since
+/// libpq would skip them; a later address refused by the server is
+/// WARN too, because resolver order is not stable across hosts.
+///
+/// **Nothing here is ERR.** This is the one check in the file that
+/// looks past localhost, and the module's rule stands: a peer's state
+/// must not keep this daemon down. A refusal can be pg_hba, but it
+/// can also be `57P03` from a peer still in recovery, `53300` from a
+/// saturated one, or a role that does not exist yet on a fresh
+/// cluster — every one of them a degraded state the agent exists to
+/// ride through. And the pg_hba case itself is the incident's shape:
+/// three nodes misconfigured alike and serving; an ERR would have
+/// turned the next rolling upgrade into a chain of agents refusing to
+/// start, with a lease expiry and a failover for each. The loud,
+/// persistent signal lives in `/healthz` (`sr_check_mismatch`,
+/// `pgpool_map_degraded`) and `cluster status`; this check explains
+/// the cause once, at start.
+///
+/// Inputs come from `pgpool.conf` (backends, users, databases) when
+/// it can be read, else from the agent's own pool and pgpool's
+/// defaults — in which case the user being refused is a guess
+/// (`nobody`), and the row says so.
+async fn net_backend_admission(cfg: &Config, r: &mut PreflightReport) {
+    let (backends, identities, source) = admission_inputs(cfg);
+    let guessed_user = !source.starts_with('/');
+    if backends.is_empty() {
+        r.checks.push(Check::warn(
+            "pgpool backend admission",
+            "no backends known (no pgpool.conf and an empty [[pool]])",
+        ));
+        return;
+    }
+    let mut tasks = Vec::with_capacity(backends.len());
+    for b in backends {
+        let identities = identities.clone();
+        tasks.push(async move { probe_backend_admission(b, &identities, guessed_user).await });
+    }
+    let results = futures_util::future::join_all(tasks).await;
+    r.checks.push(Check::ok(
+        "pgpool backend admission",
+        format!("inputs from {source}"),
+    ));
+    for checks in results {
+        r.checks.extend(checks);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmissionBackend {
+    id: i32,
+    hostname: String,
+    port: u16,
+}
+
+/// `(user, database)` pairs pgpool connects with.
+type Identity = (String, String);
+
+fn admission_inputs(cfg: &Config) -> (Vec<AdmissionBackend>, Vec<Identity>, String) {
+    if let Some(path) = cfg.pgpool_conf_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let conf = pg_agent_hookspec::PgpoolConf::parse(&text);
+            let backends: Vec<AdmissionBackend> = conf
+                .backends()
+                .into_iter()
+                .map(|b| AdmissionBackend {
+                    id: b.id,
+                    hostname: b.hostname,
+                    port: b.port,
+                })
+                .collect();
+            if !backends.is_empty() {
+                let get = |k: &str, default: &str| {
+                    conf.get(k)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or(default)
+                        .to_string()
+                };
+                let mut identities = vec![
+                    (
+                        get("health_check_user", PGPOOL_DEFAULT_CHECK_USER),
+                        get("health_check_database", PGPOOL_DEFAULT_CHECK_DATABASE),
+                    ),
+                    (
+                        get("sr_check_user", PGPOOL_DEFAULT_CHECK_USER),
+                        get("sr_check_database", PGPOOL_DEFAULT_CHECK_DATABASE),
+                    ),
+                ];
+                identities.dedup();
+                return (backends, identities, path.display().to_string());
+            }
+        }
+    }
+    // No pgpool.conf: the pool as the agent knows it, and the users
+    // pgpool would use if nobody configured any.
+    let port = cfg.postgres.port.unwrap_or(5432);
+    let backends = cfg
+        .pool
+        .iter()
+        .map(|n| AdmissionBackend {
+            id: n.id,
+            hostname: n.hostname.clone(),
+            port,
+        })
+        .collect();
+    (
+        backends,
+        vec![(
+            PGPOOL_DEFAULT_CHECK_USER.to_string(),
+            PGPOOL_DEFAULT_CHECK_DATABASE.to_string(),
+        )],
+        "[[pool]] (no pgpool.conf found)".to_string(),
+    )
+}
+
+async fn probe_backend_admission(
+    b: AdmissionBackend,
+    identities: &[Identity],
+    guessed_user: bool,
+) -> Vec<Check> {
+    use crate::pgwire_probe::{probe_admission, Admission};
+    let name = format!("pgpool backend {} ({}:{})", b.id, b.hostname, b.port);
+    // A name that does not resolve is pgpool's problem (and DNS's),
+    // not a reason to keep this daemon down — the peer may be
+    // decommissioned, or DNS may be part of the outage.
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host((b.hostname.as_str(), b.port)).await {
+            Ok(it) => {
+                let mut seen = HashSet::new();
+                it.filter(|a| seen.insert(*a)).collect()
+            }
+            Err(e) => {
+                return vec![Check::warn(
+                    name,
+                    format!(
+                        "resolve {}: {e} — pgpool's health check cannot reach it either",
+                        b.hostname
+                    ),
+                )];
+            }
+        };
+    if addrs.is_empty() {
+        return vec![Check::warn(
+            name,
+            format!("{} resolves to no address", b.hostname),
+        )];
+    }
+    let mut out = Vec::new();
+    for (user, database) in identities {
+        let who = format!("{name} as {user}@{database}");
+        // libpq's connect loop: the first address that answers on the
+        // wire decides; TCP-level failures move on to the next.
+        let mut decided = false;
+        for addr in &addrs {
+            if let std::net::IpAddr::V6(v6) = addr.ip() {
+                if v6.is_unicast_link_local() {
+                    out.push(Check::warn(
+                        who.clone(),
+                        format!("{addr}: link-local address skipped (unusable without a scope)"),
+                    ));
+                    continue;
+                }
+            }
+            match probe_admission(*addr, &b.hostname, user, database, ADMISSION_PROBE_TIMEOUT).await
+            {
+                Admission::Admitted { tls, auth } => {
+                    let detail = format!(
+                        "{addr}: pg_hba admits ({auth}, {})",
+                        if tls { "ssl" } else { "no ssl" }
+                    );
+                    out.push(if decided {
+                        Check::ok(who.clone(), detail)
+                    } else {
+                        Check::ok(who.clone(), format!("{detail} — first answering address"))
+                    });
+                    decided = true;
+                }
+                Admission::Rejected {
+                    sqlstate, message, ..
+                } => {
+                    if decided {
+                        out.push(Check::warn(
+                            who.clone(),
+                            format!(
+                                "{addr}: refused ({sqlstate}: {message}) — would fail pgpool's \
+                                 check if resolution put this address first"
+                            ),
+                        ));
+                    } else {
+                        let mut detail = format!(
+                            "{addr}: first answering address refused the connection \
+                             ({sqlstate}: {message}); pgpool's health check / sr_check \
+                             from this host fails here"
+                        );
+                        if is_pg_hba_refusal(&message) {
+                            detail.push_str(
+                                " — add a pg_hba.conf line for this address family and \
+                                 reload PostgreSQL",
+                            );
+                        } else {
+                            detail.push_str(" — pg_hba was not consulted; the backend is not accepting this connection yet");
+                        }
+                        if guessed_user {
+                            detail.push_str(
+                                " (no pgpool.conf found, so the user is pgpool's default, \
+                                 not necessarily yours)",
+                            );
+                        }
+                        out.push(Check::warn(who.clone(), detail));
+                        decided = true;
+                    }
+                }
+                Admission::Unreachable { error } => {
+                    out.push(Check::warn(
+                        who.clone(),
+                        format!("{addr}: no PostgreSQL answered ({error}); libpq would try the next address"),
+                    ));
+                }
+            }
+        }
+        if !decided {
+            out.push(Check::warn(
+                who,
+                "no address answered — backend down, or unreachable from this host".to_string(),
+            ));
+        }
+    }
+    out
+}
+
+/// Did `pg_hba.conf` refuse this connection, as opposed to the server
+/// refusing to talk at all (`57P03` starting up / shutting down,
+/// `53300` too many clients) or a trust-auth lookup failing (`28000`
+/// role does not exist, `3D000` database does not exist)? PostgreSQL
+/// names the file in every hba refusal: "no pg_hba.conf entry for
+/// host ..." and "pg_hba.conf rejects connection for host ...".
+fn is_pg_hba_refusal(message: &str) -> bool {
+    message.contains("pg_hba.conf")
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,5 +2092,286 @@ mod tests {
             .unwrap()
             .join(crate::raftstore::RAFT_SUBDIR)
             .is_dir());
+    }
+
+    // ----- pgpool backend admission ---------------------------------------
+
+    /// A fake backend that answers the SSLRequest with `N` and the
+    /// startup with `reply`, once per accepted connection.
+    async fn fake_backend(reply: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut ssl = [0u8; 8];
+                    if s.read_exact(&mut ssl).await.is_err() {
+                        return;
+                    }
+                    let _ = s.write_all(b"N").await;
+                    let mut head = [0u8; 4];
+                    if s.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let len = u32::from_be_bytes(head) as usize;
+                    let mut rest = vec![0u8; len - 4];
+                    let _ = s.read_exact(&mut rest).await;
+                    let _ = s.write_all(&reply).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn framed(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut m = vec![kind];
+        m.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    }
+
+    #[tokio::test]
+    async fn admission_ok_when_the_first_address_is_admitted() {
+        let addr = fake_backend(framed(b'R', &10u32.to_be_bytes())).await;
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 0,
+                hostname: "127.0.0.1".into(),
+                port: addr.port(),
+            },
+            &[("pgpool".into(), "postgres".into())],
+            false,
+        )
+        .await;
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Ok);
+        assert!(
+            checks[0].detail.contains("scram-sha-256"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0].name.contains("as pgpool@postgres"));
+    }
+
+    /// The incident's shape. A pg_hba refusal is reported with the
+    /// server's message and the hba hint — and it is WARN, because
+    /// three nodes misconfigured alike were serving, and an ERR here
+    /// would have made the next rolling upgrade a chain of failovers.
+    #[tokio::test]
+    async fn admission_warns_with_the_hba_hint_when_pg_hba_refuses() {
+        let body = b"SFATAL\0C28000\0Mno pg_hba.conf entry for host \"127.0.0.1\", user \"pgpool\", database \"postgres\", no encryption\0\0";
+        let addr = fake_backend(framed(b'E', body)).await;
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 1,
+                hostname: "127.0.0.1".into(),
+                port: addr.port(),
+            },
+            &[("pgpool".into(), "postgres".into())],
+            false,
+        )
+        .await;
+        assert_eq!(checks[0].status, CheckStatus::Warn, "{checks:?}");
+        assert!(
+            checks[0].detail.contains("no pg_hba.conf entry"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0].detail.contains("pg_hba.conf line"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            !checks[0].detail.contains("no pgpool.conf"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    /// A peer still in recovery answers `57P03` before pg_hba is ever
+    /// consulted. That is a degraded cluster the agent must start
+    /// into, and the row must not send the operator to pg_hba.conf.
+    #[tokio::test]
+    async fn admission_refusal_before_pg_hba_is_a_warning_without_the_hba_hint() {
+        let body = b"SFATAL\0C57P03\0Mthe database system is starting up\0\0";
+        let addr = fake_backend(framed(b'E', body)).await;
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 1,
+                hostname: "127.0.0.1".into(),
+                port: addr.port(),
+            },
+            &[("pgpool".into(), "postgres".into())],
+            false,
+        )
+        .await;
+        assert_eq!(checks[0].status, CheckStatus::Warn, "{checks:?}");
+        assert!(
+            checks[0]
+                .detail
+                .contains("57P03: the database system is starting up"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            !checks[0].detail.contains("pg_hba.conf line"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0].detail.contains("pg_hba was not consulted"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_refusal_names_the_guessed_user_without_pgpool_conf() {
+        // No pgpool.conf → the user is pgpool's default `nobody`, a
+        // guess, and the row says so.
+        let body = b"SFATAL\0C28000\0Mno pg_hba.conf entry for host \"127.0.0.1\", user \"nobody\", database \"postgres\", no encryption\0\0";
+        let addr = fake_backend(framed(b'E', body)).await;
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 1,
+                hostname: "127.0.0.1".into(),
+                port: addr.port(),
+            },
+            &[("nobody".into(), "postgres".into())],
+            true,
+        )
+        .await;
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(
+            checks[0].detail.contains("no pgpool.conf"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    /// A decommissioned peer still in pgpool.conf, or DNS down during
+    /// the outage: pgpool's problem, not a reason to keep this daemon
+    /// down.
+    #[tokio::test]
+    async fn admission_warns_when_a_backend_name_does_not_resolve() {
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 3,
+                hostname: "db-does-not-exist.invalid".into(),
+                port: 5432,
+            },
+            &[("pgpool".into(), "postgres".into())],
+            false,
+        )
+        .await;
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(checks[0].detail.contains("resolve"), "{}", checks[0].detail);
+    }
+
+    #[test]
+    fn pg_hba_refusals_are_told_apart_from_the_rest() {
+        assert!(is_pg_hba_refusal(
+            "no pg_hba.conf entry for host \"fd00::1\", user \"pgpool\", database \"postgres\", SSL encryption"
+        ));
+        assert!(is_pg_hba_refusal(
+            "pg_hba.conf rejects connection for host \"10.0.0.1\", user \"pgpool\", database \"postgres\""
+        ));
+        assert!(!is_pg_hba_refusal("the database system is starting up"));
+        assert!(!is_pg_hba_refusal("sorry, too many clients already"));
+        assert!(!is_pg_hba_refusal("role \"pgpool\" does not exist"));
+    }
+
+    #[tokio::test]
+    async fn admission_warns_not_errs_when_nothing_listens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 2,
+                hostname: "127.0.0.1".into(),
+                port,
+            },
+            &[("pgpool".into(), "postgres".into())],
+            false,
+        )
+        .await;
+        assert!(
+            checks.iter().all(|c| c.status == CheckStatus::Warn),
+            "{checks:?}"
+        );
+        assert!(checks
+            .iter()
+            .any(|c| c.detail.contains("no address answered")));
+    }
+
+    #[tokio::test]
+    async fn admission_probes_each_identity() {
+        let addr = fake_backend(framed(b'R', &0u32.to_be_bytes())).await;
+        let checks = probe_backend_admission(
+            AdmissionBackend {
+                id: 0,
+                hostname: "127.0.0.1".into(),
+                port: addr.port(),
+            },
+            &[
+                ("hc".into(), "postgres".into()),
+                ("sr".into(), "postgres".into()),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(checks.len(), 2);
+        assert!(checks.iter().any(|c| c.name.contains("as hc@")));
+        assert!(checks.iter().any(|c| c.name.contains("as sr@")));
+        assert!(checks.iter().all(|c| c.detail.contains("trust")));
+    }
+
+    #[test]
+    fn admission_inputs_come_from_pgpool_conf_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join("pgpool.conf");
+        std::fs::write(
+            &conf,
+            "backend_hostname0 = 'db0'\nbackend_port0 = 5433\n\
+             backend_hostname1 = 'db1'\n\
+             health_check_user = 'hc'\nsr_check_user = 'sr'\nsr_check_database = 'template1'\n",
+        )
+        .unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.pgpool.conf = Some(conf.clone());
+        let (backends, identities, source) = admission_inputs(&cfg);
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].port, 5433);
+        assert_eq!(backends[1].port, 5432, "pgpool's default");
+        assert_eq!(
+            identities,
+            vec![
+                ("hc".to_string(), "postgres".to_string()),
+                ("sr".to_string(), "template1".to_string())
+            ]
+        );
+        assert_eq!(source, conf.display().to_string());
+    }
+
+    #[test]
+    fn admission_inputs_fall_back_to_the_pool_without_pgpool_conf() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = make_cfg(&tmp);
+        cfg.pgpool.conf = Some(tmp.path().join("absent.conf"));
+        let (backends, identities, source) = admission_inputs(&cfg);
+        assert_eq!(backends.len(), cfg.pool.len());
+        assert_eq!(
+            identities,
+            vec![("nobody".to_string(), "postgres".to_string())]
+        );
+        assert!(source.contains("no pgpool.conf"));
     }
 }

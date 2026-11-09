@@ -21,6 +21,9 @@
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod pgpool_conf;
+pub use pgpool_conf::{backend_application_name, parse_pgpool_conf, Backend, PgpoolConf};
+
 // ---------------------------------------------------------------------------
 // Hook subcommand names
 // ---------------------------------------------------------------------------

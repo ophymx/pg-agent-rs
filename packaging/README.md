@@ -75,11 +75,31 @@ against that staging directory:
 scripts/build-pkgs.sh             # both .deb and .rpm
 scripts/build-pkgs.sh deb         # just .deb
 scripts/build-pkgs.sh rpm         # just .rpm
-VERSION=1.2.3-rc1 scripts/build-pkgs.sh   # override the version
+VERSION=1.2.3-rc1 scripts/build-pkgs.sh   # stamp exactly this version (.deb only)
 TARGET=x86_64-unknown-linux-gnu scripts/build-pkgs.sh  # escape hatch
 ```
 
 Outputs land in `dist/` (git-ignored).
+
+### Versions
+
+The package version is the workspace version only when HEAD is that
+version's tag on a clean tree — the release case. Any other tree is a
+dev build and is stamped `<workspace>+git<yyyymmdd>.<sha>`, plus
+`.dirty` when there are uncommitted changes; the `.rpm` carries the
+same stamp in its Release field (`1.git…`). Both sort above the
+release they were cut from and below the next release, so a dev build
+pushed onto a host (`dpkg -i`) stays put until the next release is
+published and goes back to the release only by name:
+`apt-get install --allow-downgrades pg-agent-rs=<workspace>`.
+
+Without this, a dev build cut from a tree still at a released version
+would be stamped as that release — same version, different binary —
+and apt could neither tell them apart nor put the real one back.
+
+`VERSION=…` stamps exactly that string. cargo-generate-rpm has no
+version override, so the `.rpm` half refuses it; bump `Cargo.toml`
+instead.
 
 Prerequisites: `cargo install cargo-deb cargo-generate-rpm`,
 `rustup target add x86_64-unknown-linux-musl`, and a musl C toolchain

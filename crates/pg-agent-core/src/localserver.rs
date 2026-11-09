@@ -39,8 +39,8 @@ use crate::walstore::WalStore;
 use chrono::SecondsFormat;
 use pg_agent_proto::pgagentpb::{
     pg_agent_local_server::{PgAgentLocal, PgAgentLocalServer},
-    AbandonInflightOpRequest, AllowAsyncRequest, ClusterHandoffRequest, ClusterInitRequest,
-    ClusterInitResponse, ClusterInitStandbyResult, ClusterRecoverRequest,
+    AbandonInflightOpRequest, AllowAsyncRequest, ClusterAttachRequest, ClusterHandoffRequest,
+    ClusterInitRequest, ClusterInitResponse, ClusterInitStandbyResult, ClusterRecoverRequest,
     ClusterStartPrimaryRequest, ClusterStatusEntry, ClusterStatusRequest, ClusterStatusResponse,
     ConsensusStatus, EscalationRequest, FailoverRequest, FollowPrimaryRequest,
     GetInflightOpRequest, GetMaintenanceRequest, GetPgpoolBackendsRequest,
@@ -242,6 +242,12 @@ pub struct LocalServer {
     /// `cluster status` fan-out counts as an observation rather than
     /// being a second status path that silently records nothing.
     peer_seen: Option<Arc<crate::cluster_view::PeerSeen>>,
+    /// The local pgpool map reconciler. The failover hook kicks it when
+    /// it refuses a slot drop on evidence that pgpool's failure report
+    /// was wrong — the same evidence says the backend belongs in the
+    /// map — and `ClusterAttach` runs it on demand. `None` only in
+    /// handler unit tests that need neither.
+    reconciler: Option<Arc<crate::pgpool_reconcile::PgpoolReconciler>>,
 }
 
 impl LocalServer {
@@ -276,7 +282,17 @@ impl LocalServer {
             wal_peer_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
             raft: None,
             peer_seen: None,
+            reconciler: None,
         }
+    }
+
+    /// Wire the pgpool map reconciler (see the field's docs).
+    pub fn with_reconciler(
+        mut self,
+        reconciler: Arc<crate::pgpool_reconcile::PgpoolReconciler>,
+    ) -> Self {
+        self.reconciler = Some(reconciler);
+        self
     }
 
     /// Let `ClusterInit` bootstrap Raft membership.
@@ -503,6 +519,16 @@ impl PgAgentLocal for LocalServer {
         {
             crate::preconditions::PreconditionOutcome::Refuse { message } => {
                 warn!(detached = %detached.hostname, %message, "failover: precondition refused");
+                // The refusal's evidence — reachable, running, streaming
+                // — is also the attach predicate, and this instance's
+                // pgpool just detached that backend. Left alone, the map
+                // stays wrong until an operator notices (field report
+                // 2026-11-02: two weeks). The reconciler re-attaches it
+                // after this hook returns, with backoff if pgpool's
+                // health check keeps disagreeing with us.
+                if let Some(r) = &self.reconciler {
+                    r.kick();
+                }
                 return Ok(Response::new(OpResult { ok: false, message }));
             }
             crate::preconditions::PreconditionOutcome::Unverifiable { reason } => {
@@ -2046,6 +2072,174 @@ impl PgAgentLocal for LocalServer {
     /// error description in `error`; the RPC itself always succeeds.
     /// Exit-code semantics (any-node-down → caller fails) live in
     /// `pg_agentctl`'s renderer; the daemon's job is just to report.
+    /// `pg_agentctl cluster attach [--node N]` — make every instance's
+    /// pgpool map match what the cluster reports. Runs the local
+    /// reconciler (operator-forced: the revert backoff is skipped), then
+    /// fans `AttachNode` out to every peer for each backend the
+    /// evidence says is up. Attaches only; never reclones, never
+    /// touches a backend that is actually down, never attaches a
+    /// primary that does not hold the lease. The receiving side keeps
+    /// its own only-if-down and primary-first rules.
+    async fn cluster_attach(
+        &self,
+        req: Request<ClusterAttachRequest>,
+    ) -> Result<Response<OpResult>, Status> {
+        let only = req.into_inner().node_id;
+        if let Some(id) = only {
+            self.node_pool
+                .node_by_id(id)
+                .map_err(|e| Status::invalid_argument(format!("cluster_attach: node {id}: {e}")))?;
+        }
+        let Some(reconciler) = &self.reconciler else {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: "cluster_attach: no pgpool reconciler wired on this daemon".into(),
+            }));
+        };
+        info!(?only, "cluster_attach");
+
+        let local_id = self.node_pool.local_node_id;
+        let local_host = self
+            .node_pool
+            .local_node()
+            .map(|n| n.hostname.clone())
+            .unwrap_or_else(|_| "local".into());
+        let mut lines: Vec<String> = Vec::new();
+        let mut ok = true;
+
+        // 1. This instance. A background pass may be mid-flight (they
+        //    share the single-flight gate); an operator asking for an
+        //    answer waits for it rather than being told "nothing down".
+        let mut report = reconciler.reconcile_once(true, only).await;
+        for _ in 0..20 {
+            if !report.skipped {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            report = reconciler.reconcile_once(true, only).await;
+        }
+        if report.skipped {
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: "cluster_attach: the daemon's own reconcile pass has been running for \
+                          over 5 s (a peer status fan-out is probably hanging); retry shortly"
+                    .into(),
+            }));
+        }
+        if let Some(e) = &report.map_error {
+            ok = false;
+            lines.push(format!(
+                "{local_host} (node {local_id}): pgpool map unavailable: {e}"
+            ));
+        } else if report.actions.is_empty() {
+            lines.push(format!(
+                "{local_host} (node {local_id}): every backend already up"
+            ));
+        }
+        for a in &report.actions {
+            use crate::pgpool_reconcile::Action;
+            let text = match &a.action {
+                Action::Attached => format!("attached node {}", a.node_id),
+                Action::AttachFailed { error } => {
+                    ok = false;
+                    format!("attach node {} failed: {error}", a.node_id)
+                }
+                Action::LeftDown { reason } => {
+                    format!("node {} left down — {reason}", a.node_id)
+                }
+                Action::Deferred { .. } => unreachable!("forced pass never defers"),
+                Action::BlockedOnPrimary { error } => {
+                    ok = false;
+                    format!("node {} not attached — {error}", a.node_id)
+                }
+            };
+            lines.push(format!("{local_host} (node {local_id}): {text}"));
+        }
+
+        // 2. Every other instance, for every backend the cluster says
+        //    is up. The evidence came from the pass above when the local
+        //    map had something down; otherwise gather it now.
+        let holder = reconciler.lease_holder().await;
+        let evidence = if report.evidence.is_empty() {
+            reconciler.gather_evidence(holder).await
+        } else {
+            report.evidence.clone()
+        };
+        let Some(primary_id) = holder else {
+            // Peers attach the primary first when their map lacks one,
+            // and that needs its id. Without a readable lease we cannot
+            // name it — an unknown lease is not a vacant one.
+            lines.push(
+                "peers: skipped — the lease is unreadable, so the primary cannot be named                  for the fan-out; retry once consensus answers"
+                    .into(),
+            );
+            return Ok(Response::new(OpResult {
+                ok: false,
+                message: lines.join("\n"),
+            }));
+        };
+        let mut targets: Vec<i32> = evidence
+            .iter()
+            .filter(|(id, ev)| ev.says_up() && only.is_none_or(|o| o == **id))
+            .map(|(id, _)| *id)
+            .collect();
+        targets.sort_unstable();
+        // Primary first here too, so a peer whose map lacks a primary
+        // gets it before any standby lands behind it.
+        if let Some(pos) = targets.iter().position(|id| *id == primary_id) {
+            targets.swap(0, pos);
+        }
+        for member in self.node_pool.members.iter().filter(|n| n.id != local_id) {
+            let client = match self.peers.client(member).await {
+                Ok(c) => c,
+                Err(e) => {
+                    ok = false;
+                    lines.push(format!(
+                        "{} (node {}): unreachable: {e}",
+                        member.hostname, member.id
+                    ));
+                    continue;
+                }
+            };
+            for backend in &targets {
+                match client.attach_node(*backend, primary_id).await {
+                    Ok(()) => lines.push(format!(
+                        "{} (node {}): node {backend} attached or already up",
+                        member.hostname, member.id
+                    )),
+                    Err(e) => {
+                        ok = false;
+                        lines.push(format!(
+                            "{} (node {}): attach node {backend}: {e}",
+                            member.hostname, member.id
+                        ));
+                    }
+                }
+            }
+        }
+        let skipped: Vec<String> = evidence
+            .iter()
+            .filter(|(id, ev)| !ev.says_up() && only.is_none_or(|o| o == **id))
+            .map(|(id, ev)| match ev {
+                crate::pgpool_reconcile::Evidence::NotServing { reason }
+                | crate::pgpool_reconcile::Evidence::Unknown { reason } => {
+                    format!("node {id}: {reason}")
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        if !skipped.is_empty() {
+            lines.push(format!(
+                "not attached anywhere (cluster does not report them up): {}",
+                skipped.join("; ")
+            ));
+        }
+        Ok(Response::new(OpResult {
+            ok,
+            message: lines.join("\n"),
+        }))
+    }
+
     async fn cluster_status(
         &self,
         _req: Request<ClusterStatusRequest>,
@@ -4096,6 +4290,8 @@ mod tests {
                 current_wal_lsn: 0,
                 last_flush_lsn: 0,
                 peer_primary_seen_age_ms: Default::default(),
+                pgpool_backends: Vec::new(),
+                pgpool_map_known: false,
             })
         }
         async fn get_node_config(&self) -> anyhow::Result<NodeConfigResponse> {
@@ -4414,6 +4610,32 @@ mod tests {
     struct StubPcp {
         attach_calls: StdMutex<Vec<i32>>,
         attach_fails: AtomicBool,
+        /// What `pcp_node_info -a` reports. Empty by default (no
+        /// handler under test used to read it); the reconciler tests
+        /// install a map. An attach flips the entry to `up`.
+        map: StdMutex<Vec<crate::pcp::NodeInfo>>,
+    }
+
+    impl StubPcp {
+        fn set_map(&self, entries: &[(i32, bool, &str)]) {
+            *self.map.lock().unwrap() = entries
+                .iter()
+                .map(|(id, up, role)| crate::pcp::NodeInfo {
+                    id: *id,
+                    hostname: format!("db{id}"),
+                    port: 5432,
+                    status_code: if *up { 2 } else { 3 },
+                    lb_weight: 0.5,
+                    status_name: if *up { "up" } else { "down" }.into(),
+                    actual_status: "up".into(),
+                    role: (*role).into(),
+                    actual_role: (*role).into(),
+                    replication_delay: "0".into(),
+                    replication_state: "none".into(),
+                    sync_state: "none".into(),
+                })
+                .collect();
+        }
     }
 
     #[async_trait]
@@ -4422,6 +4644,12 @@ mod tests {
             self.attach_calls.lock().unwrap().push(node_id);
             if self.attach_fails.load(Ordering::SeqCst) {
                 anyhow::bail!("stub: pcp attach_node boom");
+            }
+            for n in self.map.lock().unwrap().iter_mut() {
+                if n.id == node_id {
+                    n.status_code = 2;
+                    n.status_name = "up".into();
+                }
             }
             Ok(())
         }
@@ -4432,7 +4660,7 @@ mod tests {
             Ok(0)
         }
         async fn node_info_all(&self) -> anyhow::Result<Vec<crate::pcp::NodeInfo>> {
-            Ok(Vec::new())
+            Ok(self.map.lock().unwrap().clone())
         }
     }
 
@@ -4596,6 +4824,8 @@ mod tests {
                 current_wal_lsn: lsn,
                 last_flush_lsn: lsn,
                 peer_primary_seen_age_ms: Default::default(),
+                pgpool_backends: Vec::new(),
+                pgpool_map_known: false,
             })
         }
         async fn stop(&self) -> anyhow::Result<()> {
@@ -5653,6 +5883,206 @@ mod tests {
             .has("failover", "detached=1,new_main=0,old_primary=0")
             .await
             .unwrap());
+    }
+
+    /// A server with the pgpool map reconciler wired, sharing the
+    /// fixture's pcp / db / peers, lease held by `holder`.
+    fn make_server_with_reconciler(
+        holder: i32,
+    ) -> (
+        LocalServer,
+        Arc<StubDb>,
+        Arc<StubPeers>,
+        Arc<StubPcp>,
+        Arc<crate::pgpool_reconcile::PgpoolReconciler>,
+    ) {
+        let (s, db, peers, _maint, _wal, _replay, pcp, _sd, _standby, _inflight) = make_server();
+        let store = crate::consensus::InMemoryConsensusStore::default();
+        store.install(crate::consensus::ClusterState {
+            lease: Some(crate::consensus::Lease {
+                holder,
+                term: 1,
+                since: Utc::now(),
+            }),
+            ..Default::default()
+        });
+        let store: Arc<dyn crate::consensus::ConsensusStore> = Arc::new(store);
+        let reconciler = Arc::new(crate::pgpool_reconcile::PgpoolReconciler::new(
+            pcp.clone(),
+            db.clone(),
+            peers.clone(),
+            make_pool(),
+            Some(store),
+        ));
+        (
+            s.with_reconciler(reconciler.clone()),
+            db,
+            peers,
+            pcp,
+            reconciler,
+        )
+    }
+
+    /// Field report 2026-11-02, item 1: the hook had the evidence and
+    /// the credential and stopped at the refusal. Now the refusal kicks
+    /// the reconciler, which puts the backend back.
+    #[tokio::test]
+    async fn failover_refusal_reattaches_the_backend_pgpool_wrongly_detached() {
+        let (s, db, peers, pcp, reconciler) = make_server_with_reconciler(0);
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_standby().set_streaming();
+        peers.override_client(1, detached_client);
+        // This instance's pgpool just degenerated backend 1.
+        pcp.set_map(&[(0, true, "primary"), (1, false, "standby")]);
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(reconciler.clone().run(shutdown.clone()));
+
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok, "still a refusal: {}", resp.message);
+        assert!(db.dropped_slots.lock().unwrap().is_empty());
+
+        // The attach happens after the hook returned, off its path.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while pcp.attach_calls.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reconciler never attached"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    #[tokio::test]
+    async fn failover_refusal_without_a_reconciler_is_still_a_refusal() {
+        // Handler-only wiring (no reconciler): nothing attaches, the
+        // refusal stands. Guards the kick being optional.
+        let (s, _db, peers, _maint, _wal, _replay, pcp, _sd, _standby, _inflight) = make_server();
+        let detached_client = Arc::new(StubPeerClient::default());
+        detached_client.mark_standby().set_streaming();
+        peers.override_client(1, detached_client);
+        let resp = s
+            .failover(Request::new(failover_req(1, 0, 0)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+    }
+
+    // ----- cluster_attach --------------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_attach_attaches_locally_and_fans_out_to_peers() {
+        let (s, _db, peers, pcp, _r) = make_server_with_reconciler(0);
+        let peer1 = Arc::new(StubPeerClient::default());
+        peer1.mark_standby().set_streaming();
+        peers.override_client(1, peer1.clone());
+        pcp.set_map(&[(0, true, "primary"), (1, false, "standby")]);
+
+        let resp = s
+            .cluster_attach(Request::new(ClusterAttachRequest { node_id: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert_eq!(*pcp.attach_calls.lock().unwrap(), vec![1]);
+        assert!(
+            resp.message.contains("local (node 0): attached node 1"),
+            "{}",
+            resp.message
+        );
+        // Fan-out: peer1 asked to attach node 0 (the holder, first) and
+        // node 1, each with the holder named.
+        let fanout = peer1.attach_fanout_calls.lock().unwrap().clone();
+        assert_eq!(fanout, vec![(0, 0), (1, 0)]);
+        assert!(resp
+            .message
+            .contains("peer1.local (node 1): node 1 attached or already up"));
+    }
+
+    #[tokio::test]
+    async fn cluster_attach_leaves_a_stopped_standby_alone_everywhere() {
+        let (s, _db, peers, pcp, _r) = make_server_with_reconciler(0);
+        let peer1 = Arc::new(StubPeerClient::default()); // not running
+        peers.override_client(1, peer1.clone());
+        pcp.set_map(&[(0, true, "primary"), (1, false, "standby")]);
+
+        let resp = s
+            .cluster_attach(Request::new(ClusterAttachRequest { node_id: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        assert!(pcp.attach_calls.lock().unwrap().is_empty());
+        assert!(
+            resp.message.contains("node 1 left down"),
+            "{}",
+            resp.message
+        );
+        // Only the holder is fanned out; node 1 is named as skipped.
+        let fanout = peer1.attach_fanout_calls.lock().unwrap().clone();
+        assert_eq!(fanout, vec![(0, 0)]);
+        assert!(
+            resp.message.contains("not attached anywhere"),
+            "{}",
+            resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_attach_restricted_to_one_node() {
+        let (s, _db, peers, pcp, _r) = make_server_with_reconciler(0);
+        let peer1 = Arc::new(StubPeerClient::default());
+        peer1.mark_standby().set_streaming();
+        peers.override_client(1, peer1.clone());
+        pcp.set_map(&[(0, false, "primary"), (1, false, "standby")]);
+
+        let resp = s
+            .cluster_attach(Request::new(ClusterAttachRequest { node_id: Some(1) }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "{}", resp.message);
+        // Restricted to node 1, but the holder (0) is down here too: it
+        // goes first anyway, because node 1 cannot be routed behind a
+        // map with no primary. Fan-out carries only the asked-for node.
+        assert_eq!(
+            *pcp.attach_calls.lock().unwrap(),
+            vec![0, 1],
+            "{}",
+            resp.message
+        );
+        let fanout = peer1.attach_fanout_calls.lock().unwrap().clone();
+        assert_eq!(fanout, vec![(1, 0)]);
+    }
+
+    #[tokio::test]
+    async fn cluster_attach_rejects_an_unknown_node() {
+        let (s, ..) = make_server_with_reconciler(0);
+        let err = s
+            .cluster_attach(Request::new(ClusterAttachRequest { node_id: Some(9) }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn cluster_attach_without_a_reconciler_says_so() {
+        let (s, ..) = make_server();
+        let resp = s
+            .cluster_attach(Request::new(ClusterAttachRequest { node_id: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert!(resp.message.contains("no pgpool reconciler"));
     }
 
     #[tokio::test]

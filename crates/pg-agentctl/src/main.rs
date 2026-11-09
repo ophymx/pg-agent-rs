@@ -171,6 +171,24 @@ enum ClusterCmd {
         #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
         config: std::path::PathBuf,
     },
+    /// Make every pgpool's backend map match what the cluster reports.
+    /// With the watchdog off nothing synchronises the maps, and a
+    /// transient failure can leave an instance routing around a healthy
+    /// node indefinitely (`auto_failback` is off because slots are in
+    /// use). Attaches backends held down that the cluster reports up —
+    /// on this instance and, through each peer's agent, on every other.
+    /// Never reclones (that is `recover`), never attaches a backend
+    /// that is actually down, never attaches a primary that does not
+    /// hold the lease. The daemon also does this on its own every 30 s
+    /// and whenever pgpool's failover hook fires on a false report;
+    /// this verb is for doing it now and seeing the result.
+    Attach {
+        /// Restrict to one pool id. Default: every backend.
+        #[arg(short, long)]
+        node: Option<i32>,
+        #[arg(short, long, default_value = pg_agent_core::config::DEFAULT_CONFIG_FILE)]
+        config: std::path::PathBuf,
+    },
     /// Start this node's PostgreSQL as the cluster's primary and claim
     /// the lease. The bootstrap case the agent deliberately will not
     /// automate: a primary-shaped data directory with a vacant lease
@@ -306,6 +324,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
                     cli.json,
                 )
                 .await
+            }
+            ClusterCmd::Attach { node, config } => {
+                cluster_attach(config, node, cli.socket.as_deref(), cli.json).await
             }
             ClusterCmd::StartPrimary { force, config } => {
                 cluster_start_primary(config, force, cli.socket.as_deref(), cli.json).await
@@ -516,6 +537,48 @@ async fn cluster_start_primary(
         println!("OK: {}", resp.message);
     } else {
         eprintln!("cluster start-primary: {}", resp.message);
+    }
+    Ok(if resp.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// `cluster attach [--node N]` — a thin dialer; the daemon runs its
+/// pgpool map reconciler locally and fans `AttachNode` out to the
+/// peers. The message is one line per instance and backend.
+async fn cluster_attach(
+    config_path: PathBuf,
+    node: Option<i32>,
+    cli_socket: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    use pg_agent_proto::pgagentpb::ClusterAttachRequest;
+
+    let socket = config_loader::resolve_socket_path(cli_socket, &config_path)?;
+    let mut client = client::dial_local(&socket).await?;
+    let resp = client
+        .cluster_attach(ClusterAttachRequest { node_id: node })
+        .await
+        .map_err(|s| rpc_failed("ClusterAttach", s))?
+        .into_inner();
+
+    if json {
+        let payload = serde_json::json!({
+            "ok":      resp.ok,
+            "node":    node,
+            "lines":   resp.message.lines().collect::<Vec<_>>(),
+            "message": resp.message,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        for line in resp.message.lines() {
+            println!("{line}");
+        }
+        if !resp.ok {
+            eprintln!("cluster attach: not every instance converged (see above)");
+        }
     }
     Ok(if resp.ok {
         ExitCode::SUCCESS
@@ -804,6 +867,7 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         "READY",
         "LAG",
         "REPL_STATE",
+        "POOL_MAP",
     ];
     if show_tl {
         headers.push("TL");
@@ -877,6 +941,30 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
         write_row(w, row, &widths)?;
     }
 
+    // Map disagreement: an instance holding a backend down that the
+    // cluster reports up. Every column above can be green while this
+    // is true — the 2026-11-02 incident ran two weeks in that state —
+    // so it gets its own lines and the verb that fixes it.
+    let stale = stale_pool_maps(rows);
+    if !stale.is_empty() {
+        writeln!(w)?;
+        for (r, down) in &stale {
+            let ids: Vec<String> = down.iter().map(ToString::to_string).collect();
+            writeln!(
+                w,
+                "! pgpool on {} (node {}) holds node {} down while the cluster reports it up",
+                r.hostname,
+                r.id,
+                ids.join(", ")
+            )?;
+        }
+        writeln!(
+            w,
+            "  routing is degraded there; `pg_agentctl cluster attach` re-attaches, or wait \
+             for the daemon's own reconcile"
+        )?;
+    }
+
     let unreachable: Vec<&StatusRow> = rows.iter().filter(|r| r.result.is_err()).collect();
     if !unreachable.is_empty() {
         writeln!(w)?;
@@ -907,6 +995,51 @@ fn print_status_table(rows: &[StatusRow], w: &mut dyn std::io::Write) -> std::io
     Ok(())
 }
 
+/// Backends each reachable row's pgpool holds down although the
+/// cluster reports them serving — the same predicate the daemon's
+/// reconciler attaches on (a streaming standby, or a running primary),
+/// minus the lease check the CLI cannot make. Returns `(row, down ids)`
+/// for every row with at least one.
+fn stale_pool_maps(rows: &[StatusRow]) -> Vec<(&StatusRow, Vec<i32>)> {
+    let serving = |id: i32| -> bool {
+        rows.iter().any(|r| {
+            r.id == id
+                && matches!(&r.result, Ok(s)
+                    if s.is_postgres_status_ok
+                        && s.is_postgres_running
+                        && (!s.is_in_recovery || s.replication_state == "streaming"))
+        })
+    };
+    rows.iter()
+        .filter_map(|r| {
+            let s = r.result.as_ref().ok()?;
+            if !s.pgpool_map_known {
+                return None;
+            }
+            let down: Vec<i32> = s
+                .pgpool_backends
+                .iter()
+                .filter(|b| b.status == "down" && serving(b.id))
+                .map(|b| b.id)
+                .collect();
+            (!down.is_empty()).then_some((r, down))
+        })
+        .collect()
+}
+
+/// `0:up 1:down 2:up` — the reporting node's own pgpool map, or `-`
+/// when it could not read one.
+fn format_pool_map(s: &pg_agent_proto::pgagentpb::NodeStatus) -> String {
+    if !s.pgpool_map_known {
+        return "-".into();
+    }
+    s.pgpool_backends
+        .iter()
+        .map(|b| format!("{}:{}", b.id, b.status))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// What the `*` marker is asserting, which differs enough between the
 /// two cases that one footnote cannot serve both: one says "you have
 /// two primaries, keep this one", the other says "you have none, start
@@ -930,7 +1063,7 @@ fn format_status_cells(
     id: i32,
     hostname: &str,
     s: &pg_agent_proto::pgagentpb::NodeStatus,
-) -> [String; 8] {
+) -> [String; 9] {
     // `is_in_recovery` is only meaningful when we actually reached
     // postgres. When PG is stopped or the systemd probe failed, the
     // proto field is the agent's default `false` — printing "primary"
@@ -970,13 +1103,15 @@ fn format_status_cells(
         ready.into(),
         lag,
         repl_state,
+        format_pool_map(s),
     ]
 }
 
-fn format_unreachable_cells(id: i32, hostname: &str) -> [String; 8] {
+fn format_unreachable_cells(id: i32, hostname: &str) -> [String; 9] {
     [
         id.to_string(),
         hostname.to_string(),
+        "—".into(),
         "—".into(),
         "—".into(),
         "—".into(),
@@ -1125,6 +1260,17 @@ fn status_row_to_json(r: &StatusRow) -> serde_json::Value {
                 // on; an operator diagnosing a refused failover needs
                 // the same evidence the loop had.
                 "peer_primary_seen_age_ms":    s.peer_primary_seen_age_ms,
+                // This node's OWN pgpool map. The maps are per instance
+                // and nothing synchronises them (hook-contract §3), so
+                // automation comparing them across rows is doing the
+                // check the daemon's reconciler does.
+                "pgpool_map_known":            s.pgpool_map_known,
+                "pgpool_backends":             s.pgpool_backends.iter().map(|b| serde_json::json!({
+                    "id":                b.id,
+                    "status":            b.status,
+                    "role":              b.role,
+                    "replication_state": b.replication_state,
+                })).collect::<Vec<_>>(),
             },
         }),
         Err(e) => serde_json::json!({
@@ -1228,6 +1374,15 @@ fn render_pgpool_fragment(rows: &[BackendRow]) -> String {
         let _ = writeln!(s, "backend_port{i} = {}", r.port);
         let _ = writeln!(s, "backend_data_directory{i} = '{}'", r.data_dir);
         let _ = writeln!(s, "backend_flag{i} = 'ALLOW_TO_FAILOVER'");
+        // Contract, not tuning: the agent writes this same name into the
+        // standby's primary_conninfo, and pgpool's replication_state /
+        // sync_state columns are blank without the match
+        // (hookspec::pgpool_conf module docs).
+        let _ = writeln!(
+            s,
+            "backend_application_name{i} = '{}'",
+            hookspec::backend_application_name(i)
+        );
         s.push('\n');
     }
     const KEY_WIDTH: usize = 26;
@@ -1590,50 +1745,13 @@ fn print_intent_human(i: &pg_agent_proto::pgagentpb::MaintenanceIntent) {
     }
 }
 
-/// Parse `pgpool.conf` enough to extract single-quoted directive values.
-///
-/// Matches lines of the form `key = 'value'`, ignoring `#` comments.
-/// Last-write-wins on duplicate keys, matching pgpool's own resolution.
-fn parse_pgpool_conf(text: &str) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    for raw in text.lines() {
-        // Trim leading whitespace and skip comments.
-        let line = raw.trim_start();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Strip trailing `# comment` (best-effort — pgpool's own parser
-        // is more lenient, but this is fine for the canonical lines we
-        // care about, which never embed `#` in the quoted value).
-        let line = match line.find('#') {
-            Some(i) => &line[..i],
-            None => line,
-        };
-        let Some(eq) = line.find('=') else {
-            continue;
-        };
-        let key = line[..eq].trim().to_string();
-        let value_raw = line[eq + 1..].trim();
-        // Single-quoted value: strip exactly one leading and one
-        // trailing quote. Otherwise treat the whole rest as the value.
-        let value =
-            if value_raw.starts_with('\'') && value_raw.ends_with('\'') && value_raw.len() >= 2 {
-                value_raw[1..value_raw.len() - 1].to_string()
-            } else {
-                value_raw.to_string()
-            };
-        out.insert(key, value);
-    }
-    out
-}
-
 fn check_hooks(path: &std::path::Path, json: bool) -> anyhow::Result<ExitCode> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let parsed = parse_pgpool_conf(&text);
+    let parsed = hookspec::PgpoolConf::parse(&text);
 
     #[derive(Debug)]
     struct Row {
-        key: &'static str,
+        key: String,
         want: String,
         got: Option<String>,
         ok: bool,
@@ -1646,19 +1764,33 @@ fn check_hooks(path: &std::path::Path, json: bool) -> anyhow::Result<ExitCode> {
         e.extend(hookspec::pgpool_settings());
         e
     };
-    let rows: Vec<Row> = expected
+    let mut rows: Vec<Row> = expected
         .into_iter()
         .map(|h| {
-            let got = parsed.get(h.key).cloned();
+            let got = parsed.get(h.key).map(str::to_string);
             let ok = got.as_deref() == Some(h.value.as_str());
             Row {
-                key: h.key,
+                key: h.key.to_string(),
                 want: h.value,
                 got,
                 ok,
             }
         })
         .collect();
+    // One row per declared backend: `backend_application_nameN` must be
+    // the slot name, or pgpool reports `none` for a streaming standby
+    // and /healthz relays it (field report 2026-11-02, item 4).
+    rows.extend(
+        parsed
+            .backend_application_name_checks()
+            .into_iter()
+            .map(|c| Row {
+                key: c.key,
+                want: c.want,
+                got: c.got,
+                ok: c.ok,
+            }),
+    );
 
     let all_ok = rows.iter().all(|r| r.ok);
 
@@ -1747,6 +1879,8 @@ mod tests {
         assert!(out.contains("backend_port0 = 5432"));
         assert!(out.contains("backend_data_directory0 = '/var/lib/postgresql/17/main'"));
         assert!(out.contains("backend_flag0 = 'ALLOW_TO_FAILOVER'"));
+        assert!(out.contains("backend_application_name0 = 'node0'"));
+        assert!(out.contains("backend_application_name1 = 'node1'"));
         assert!(out.contains("backend_hostname1 = 'pg1.local'"));
         assert!(out.contains("backend_port1 = 5433"));
         assert!(out.contains("failover_command"));
@@ -1757,28 +1891,6 @@ mod tests {
         assert!(!out.contains("wd_escalation_command"));
         assert!(out.contains("use_watchdog"));
         assert!(out.contains("detach_false_primary"));
-    }
-
-    #[test]
-    fn parse_pgpool_conf_extracts_quoted_values() {
-        let s = "\
-# leading comment
-failover_command = 'pg_agentc failover %d %h %p %P %r %R'
-# blank line below
-
-backend_port0 = 5432  # trailing comment
-quoted_with_spaces = '  spaces inside  '
-        ";
-        let m = parse_pgpool_conf(s);
-        assert_eq!(
-            m.get("failover_command").map(String::as_str),
-            Some("pg_agentc failover %d %h %p %P %r %R")
-        );
-        assert_eq!(m.get("backend_port0").map(String::as_str), Some("5432"));
-        assert_eq!(
-            m.get("quoted_with_spaces").map(String::as_str),
-            Some("  spaces inside  ")
-        );
     }
 
     #[test]
@@ -1808,6 +1920,30 @@ quoted_with_spaces = '  spaces inside  '
     }
 
     #[test]
+    fn check_hooks_reports_drift_when_backend_application_name_is_wrong() {
+        // Every hook and setting canonical; the backend block carries
+        // the FQDN where the slot name belongs (the 2026-11-02 shape).
+        let mut text = String::new();
+        for h in hookspec::pgpool_hooks() {
+            text.push_str(&format!("{} = '{}'\n", h.key, h.value));
+        }
+        for h in hookspec::pgpool_settings() {
+            text.push_str(&format!("{} = {}\n", h.key, h.value));
+        }
+        text.push_str("backend_hostname0 = 'db0.example'\n");
+        text.push_str("backend_application_name0 = 'db0.example'\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("pgpool.conf");
+        std::fs::write(&p, text).unwrap();
+        let code = check_hooks(&p, false).unwrap();
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "a wrong backend_application_name is drift"
+        );
+    }
+
+    #[test]
     fn check_hooks_succeeds_on_canonical_block() {
         let mut text = String::new();
         for h in hookspec::pgpool_hooks() {
@@ -1816,6 +1952,8 @@ quoted_with_spaces = '  spaces inside  '
         for h in hookspec::pgpool_settings() {
             text.push_str(&format!("{} = {}\n", h.key, h.value));
         }
+        text.push_str("backend_hostname0 = 'db0.example'\n");
+        text.push_str("backend_application_name0 = 'node0'\n");
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("pgpool.conf");
         std::fs::write(&p, text).unwrap();
@@ -1875,6 +2013,8 @@ quoted_with_spaces = '  spaces inside  '
             current_wal_lsn,
             last_flush_lsn: current_wal_lsn,
             peer_primary_seen_age_ms: Default::default(),
+            pgpool_backends: Vec::new(),
+            pgpool_map_known: false,
         }
     }
 
@@ -1926,6 +2066,103 @@ quoted_with_spaces = '  spaces inside  '
         assert!(s.contains("connect refused"));
     }
 
+    /// The 2026-11-02 maps: every node green, db0's pgpool holding
+    /// db0 and db1 down while both stream. The table must say so and
+    /// name the verb.
+    #[test]
+    fn print_status_table_flags_a_pgpool_map_the_cluster_contradicts() {
+        use pg_agent_proto::pgagentpb::PgpoolBackend;
+        let map = |statuses: [&str; 3]| -> Vec<PgpoolBackend> {
+            statuses
+                .iter()
+                .enumerate()
+                .map(|(i, st)| PgpoolBackend {
+                    id: i as i32,
+                    status: (*st).into(),
+                    role: if i == 2 { "primary" } else { "standby" }.into(),
+                    replication_state: "none".into(),
+                })
+                .collect()
+        };
+        let mut db0 = ns(true, true, true, 0, "streaming");
+        db0.pgpool_map_known = true;
+        db0.pgpool_backends = map(["down", "down", "up"]);
+        let mut db1 = ns(true, true, true, 0, "streaming");
+        db1.pgpool_map_known = true;
+        db1.pgpool_backends = map(["up", "down", "up"]);
+        let mut db2 = ns(false, true, true, 0, "");
+        db2.pgpool_map_known = true;
+        db2.pgpool_backends = map(["up", "up", "up"]);
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "db0".into(),
+                result: Ok(db0),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "db1".into(),
+                result: Ok(db1),
+            },
+            StatusRow {
+                id: 2,
+                hostname: "db2".into(),
+                result: Ok(db2),
+            },
+        ];
+        let mut buf = Vec::new();
+        print_status_table(&rows, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("POOL_MAP"), "{s}");
+        assert!(s.contains("0:down 1:down 2:up"), "{s}");
+        assert!(
+            s.contains("! pgpool on db0 (node 0) holds node 0, 1 down"),
+            "{s}"
+        );
+        assert!(
+            s.contains("! pgpool on db1 (node 1) holds node 1 down"),
+            "{s}"
+        );
+        assert!(s.contains("cluster attach"), "{s}");
+        // db2's map agrees with the cluster: no line for it.
+        assert!(!s.contains("pgpool on db2"), "{s}");
+    }
+
+    #[test]
+    fn stale_pool_maps_ignores_backends_that_really_are_down() {
+        use pg_agent_proto::pgagentpb::PgpoolBackend;
+        let mut db0 = ns(false, true, true, 0, "");
+        db0.pgpool_map_known = true;
+        db0.pgpool_backends = vec![
+            PgpoolBackend {
+                id: 0,
+                status: "up".into(),
+                role: "primary".into(),
+                replication_state: "none".into(),
+            },
+            PgpoolBackend {
+                id: 1,
+                status: "down".into(),
+                role: "standby".into(),
+                replication_state: "none".into(),
+            },
+        ];
+        let rows = vec![
+            StatusRow {
+                id: 0,
+                hostname: "db0".into(),
+                result: Ok(db0),
+            },
+            StatusRow {
+                id: 1,
+                hostname: "db1".into(),
+                // Stopped standby: pgpool is right to hold it down.
+                result: Ok(ns(true, false, false, 0, "")),
+            },
+        ];
+        assert!(stale_pool_maps(&rows).is_empty());
+    }
+
     #[test]
     fn format_status_cells_role_is_unknown_when_pg_is_down() {
         // Reachable peer, systemd probe succeeded, postgres NOT running.
@@ -1947,6 +2184,8 @@ quoted_with_spaces = '  spaces inside  '
             current_wal_lsn: 0,
             last_flush_lsn: 0,
             peer_primary_seen_age_ms: Default::default(),
+            pgpool_backends: Vec::new(),
+            pgpool_map_known: false,
         };
         let cells = format_status_cells(2, "pg2.local", &status);
         assert_eq!(cells[2], "unknown", "role must not default to primary");
@@ -1975,6 +2214,8 @@ quoted_with_spaces = '  spaces inside  '
             current_wal_lsn: 0,
             last_flush_lsn: 0,
             peer_primary_seen_age_ms: Default::default(),
+            pgpool_backends: Vec::new(),
+            pgpool_map_known: false,
         };
         let cells = format_status_cells(3, "pg3.local", &status);
         assert_eq!(cells[2], "unknown");

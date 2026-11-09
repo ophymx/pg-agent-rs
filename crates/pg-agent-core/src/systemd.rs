@@ -106,6 +106,16 @@ pub trait Systemd: Send + Sync {
 
     /// ReloadOrRestart — starts the unit if not running.
     async fn reload_or_restart_postgres(&self) -> anyhow::Result<()>;
+
+    /// RestartUnit on pgpool2.service — a full stop/start, which is
+    /// the only way pgpool picks up new TLS material (it reads
+    /// `ssl_cert` at start; SIGHUP does not). Kicks every pooled
+    /// connection, so the supervisor calls it only when the served
+    /// certificate is provably older than the file. Default errs so
+    /// test stubs that model no restart need not change.
+    async fn restart_pgpool(&self) -> anyhow::Result<()> {
+        anyhow::bail!("restart_pgpool: not supported by this Systemd implementation")
+    }
     // No `reload_or_restart_pgpool`: its only caller was the peer
     // `ReloadPgpool` RPC, which nothing ever dialed (every config
     // reload in this design is local to the node whose config
@@ -130,6 +140,7 @@ trait Manager {
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn reload_or_restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
+    fn restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn list_units_by_names(&self, names: Vec<String>) -> zbus::Result<Vec<UnitStatus>>;
     fn subscribe(&self) -> zbus::Result<()>;
 
@@ -322,6 +333,13 @@ impl Systemd for DbusSystemd {
         self.run_unit_op("reload-or-restart", &self.pg_service, || {
             self.proxy
                 .reload_or_restart_unit(&self.pg_service, "replace")
+        })
+        .await
+    }
+
+    async fn restart_pgpool(&self) -> anyhow::Result<()> {
+        self.run_unit_op("restart", &self.pgpool_service, || {
+            self.proxy.restart_unit(&self.pgpool_service, "replace")
         })
         .await
     }

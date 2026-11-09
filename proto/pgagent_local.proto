@@ -281,6 +281,14 @@ message ClusterHandoffRequest {
   bool allow_lag = 2;
 }
 
+// `pg_agentctl cluster attach`: make every instance's pgpool map match
+// what the cluster reports, attaching backends held down that are up —
+// never recloning, never touching a backend that is actually down.
+message ClusterAttachRequest {
+  // Restrict to one backend id. Absent = every backend.
+  optional int32 node_id = 1;
+}
+
 message GetPgpoolBackendsRequest {}
 
 // One row per pool member. Mirrors `ClusterStatusEntry`'s per-node
@@ -337,6 +345,7 @@ service PgAgentLocal {
   // the wrong place to leave an operator, who until now had to reach
   // for systemctl and then wait for the HA loop to notice.
   rpc ClusterStartPrimary (ClusterStartPrimaryRequest) returns (OpResult);
+  rpc ClusterAttach     (ClusterAttachRequest)     returns (OpResult);
   rpc GetPgpoolBackends (GetPgpoolBackendsRequest) returns (GetPgpoolBackendsResponse);
 
   rpc ListMaintenance  (ListMaintenanceRequest)  returns (ListMaintenanceResponse);

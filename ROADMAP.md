@@ -30,12 +30,13 @@ Table-stakes features anyone coming from Patroni will miss.
   is the operator verb and the executor's scheduled path. *Why now:*
   operations need a planned, reversible-up-to-the-cutover path.
 
-- **`pg_agentctl cluster attach <id>`** *(S)* — wrap `pcp_attach_node`
-  with the pgpool reload and `gen-pgpool` refresh so "add a new standby
-  to a running cluster" is one command. Today the flow ends in a manual
-  `pcp_attach_node` plus a manual `gen-pgpool --write` and reload. *Why
-  now:* the only remaining manual steps in the add-standby workflow;
-  pure ergonomics, no new state.
+- **Add-a-standby in one command** *(S)* — `cluster attach` now
+  exists, but as the map-convergence verb (attach what the cluster
+  reports up, on every instance). Adding a NEW standby to a running
+  cluster still ends in a manual `gen-pgpool --write` and a pgpool
+  reload before that attach can see it. Fold the refresh and reload in.
+  *Why now:* the only remaining manual steps in the add-standby
+  workflow; pure ergonomics, no new state.
 
 - **Per-node tags in `config.toml`** *(S)* — surface and respect
   `nofailover = true`, `noloadbalance = true`, `clonefrom = true`.

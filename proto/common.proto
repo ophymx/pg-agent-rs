@@ -75,6 +75,24 @@ message NodeStatus {
   // block the single most common failover in existence. What a
   // witness must vouch for is the role, not the socket.
   map<int32, uint64> peer_primary_seen_age_ms = 13;
+  // The LOCAL pgpool's backend map, as this node's /healthz snapshotter
+  // last read it (at most ~1 s old). With the watchdog off every
+  // instance has its own map and nothing synchronises them
+  // (docs/pgpool-hook-contract.md §3), so a cluster can be healthy
+  // everywhere and routed wrongly on one node — which is exactly what
+  // `cluster status` could not show before this field existed. Empty
+  // when pgpool_map_known is false (pgpool unreachable, or a peer on a
+  // pre-feature build).
+  repeated PgpoolBackend pgpool_backends = 14;
+  bool pgpool_map_known = 15;
+}
+
+// One backend as the reporting node's pgpool sees it.
+message PgpoolBackend {
+  int32  id                = 1;
+  string status            = 2; // "up" / "waiting" / "down"
+  string role              = 3; // "primary" / "standby"
+  string replication_state = 4; // "streaming" / "catchup" / "none"
 }
 
 message GetStatusRequest {}
